@@ -25,10 +25,28 @@
    image in its original order. T2VA and audio-only Ref2VA need no images.
 6. Set `chunk_frames` to the largest chunk that fits in VRAM. `124` is the
    conservative default; the value is snapped down to H3's `17k + 5` grid.
-7. Decode the returned AV latent normally.
+7. Enable `debug` to print the exact rewritten prompt and sampled/output frame
+   range for every chunk in the ComfyUI console and return the same text through
+   the `chunk_prompts` output.
+8. Decode the returned AV latent normally.
 
 Existing H3 first/last-frame guides are assigned to the chunk containing their
 frame. Ref2VA references remain attached to every chunk.
+
+## Accumulated live preview
+
+Add `MiniMax H3 Unlimited Preview` between the model loader/model patches and
+the guider used by `SamplerCustomAdvanced-Unlimited`. Its widget plays the
+chunks generated so far as one growing preview. The active chunk is replaced
+at each sampler callback; completed earlier chunks remain in the browser and
+are not decoded or transferred again.
+
+`tiny_vae: none` uses H3's fast Latent2RGB approximation. Select
+`taeh3.safetensors` from `models/vae_approx` for a more representative RGB
+preview. Tiny-VAE decoding is slower and uses additional VRAM, so increase
+`frame_stride` if preview overhead is too high. `fps` controls playback timing
+and should match the sampler's prompt FPS. The five continuation frames are
+shown only once because the preview removes the overlap from later chunks.
 
 ## Shot timing
 
@@ -41,9 +59,22 @@ The prompt parser follows MiniMax's documented format:
 
 The first shot is untimed. Every later shot must be sequential and use a
 strictly increasing `MM:SS.mmm` cut time. For each chunk, times are converted
-to global frames with `fps`, shots outside the chunk are removed, and cuts are
-written back as chunk-local timestamps. For example, at 24 fps a global cut at
-frame 100 becomes local frame 50 (`00:02.083`) in a chunk starting at frame 50.
+to global frames with `fps`, shots outside the chunk are removed, local shots
+are renumbered from one, and cuts are written back as chunk-local timestamps.
+For example, at 24 fps a global cut at frame 100 becomes local frame 50
+(`00:02.083`) in a chunk starting at frame 50.
+
+Later chunks are presented as continuations rather than fresh I2VA/FL2VA
+requests: the original picture anchors are removed from their Qwen prompt and
+the source images are not presented again. Ref2VA identity/style references
+remain available to every chunk. A chunk that starts midway through a shot is
+explicitly told to continue from its latent opening frames without replaying
+the earlier action.
+
+When one shot is longer than a chunk, its sentences are distributed across the
+chunk timelines instead of sending the complete shot description to every
+sampler call. The five carried frames are context only and do not consume a
+second copy of the prompt action range.
 
 The parser recognizes both `integrated_multimodal_description:` and
 `detailed_description:`. Other MiniMax prompt sections are preserved.
@@ -56,9 +87,9 @@ The parser recognizes both `integrated_multimodal_description:` and
 - Video Ref2VA sources cannot be reconstructed from an image input. Image and
   audio Ref2VA presentations are supported; a conditioning containing a video
   reference fails clearly instead of silently dropping its Qwen video tokens.
-- When a chunk starts partway through a long shot, the full text of that active
-  shot is retained. The previous chunk's latent tail provides its actual visual
-  and audio starting state.
+- When a chunk starts partway through a long shot, its description is retained
+  with a continuation instruction. Natural-language timing remains generative,
+  so very long action-dense shots may still benefit from a larger chunk size.
 - Chunked denoise masks are not supported.
 
 Prompt format references: [MiniMax base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
