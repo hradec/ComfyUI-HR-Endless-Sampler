@@ -10,6 +10,7 @@ import comfy.utils
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
+from tqdm.auto import tqdm
 
 from .preview import begin_preview_execution
 
@@ -279,6 +280,35 @@ class _FixedNoise:
         return self.samples
 
 
+class _ChunkProgress:
+    def __init__(self, count):
+        self.count = count
+        self.bar = None
+
+    def start(self, index):
+        if self.bar is None:
+            self.bar = tqdm(
+                total=self.count,
+                desc=f"Chunk {index + 1}/{self.count}",
+                unit="chunk",
+                leave=False,
+                position=0,
+                dynamic_ncols=True,
+                disable=not comfy.utils.PROGRESS_BAR_ENABLED,
+            )
+        self.bar.n = index
+        self.bar.set_description_str(f"Chunk {index + 1}/{self.count}")
+        self.bar.refresh()
+
+    def finish(self, index):
+        self.bar.n = index + 1
+        self.bar.refresh()
+
+    def close(self):
+        if self.bar is not None:
+            self.bar.close()
+
+
 class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
     @classmethod
     def define_schema(cls):
@@ -302,6 +332,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                              tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt to the console and return them through chunk_prompts."),
+                io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
+                             tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
             ],
@@ -313,7 +345,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         )
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False, images=None):
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
+                debug_stop_chunk=0, images=None):
         samples = latent_image["samples"]
         if not samples.is_nested:
             sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
@@ -328,6 +361,9 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames)
         if len(plan) > 1 and "noise_mask" in latent_image:
             raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
+        if debug_stop_chunk > len(plan):
+            raise ValueError(f"debug_stop_chunk is {debug_stop_chunk}, but this latent has only {len(plan)} chunks")
+        active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
 
         fixed_latent = latent_image.copy()
         fixed_latent["samples"] = comfy.sample.fix_empty_latent_channels(
@@ -359,10 +395,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         output_template = None
         denoised_template = None
         debug_prompts = []
-        preview_execution = begin_preview_execution(guider.model_patcher, len(plan))
+        preview_execution = begin_preview_execution(guider.model_patcher, len(active_plan))
+        chunk_progress = _ChunkProgress(len(active_plan))
 
         try:
-            for index, chunk in enumerate(plan):
+            for index, chunk in enumerate(active_plan):
                 vs, ve = chunk["video_start"], chunk["video_end"]
                 aus, aue = chunk["audio_start"], chunk["audio_end"]
                 context_audio_t = chunk["context_audio_t"]
@@ -424,6 +461,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         0 if index == 0 else CONTEXT_VIDEO_STEPS,
                     )
                 try:
+                    chunk_progress.start(index)
                     sampled, denoised = super().execute(
                         _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
                     )
@@ -442,10 +480,12 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 output_audio.append(previous_audio[..., audio_trim:].clone())
                 denoised_video.append(denoised_chunk_video[:, :, video_trim:].clone())
                 denoised_audio.append(denoised_chunk_audio[..., audio_trim:].clone())
+                chunk_progress.finish(index)
         finally:
             guider.original_conds = original_conds
             if preview_execution is not None:
                 preview_execution.close()
+            chunk_progress.close()
 
         output_template["samples"] = comfy.nested_tensor.NestedTensor((
             torch.cat(output_video, dim=2),

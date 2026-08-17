@@ -17,6 +17,8 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `chunk_frames`: the maximum number of H3 frames sampled at once;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
   console and returns the same text through `chunk_prompts`;
+- `debug_stop_chunk`: returns after the selected 1-based serial chunk for fast
+  boundary diagnostics; zero keeps the normal complete run;
 - optional `images`: pixel images needed to rebuild Qwen visual conditioning.
 
 The sampler node id and display name are both:
@@ -171,6 +173,21 @@ the sampler output directly has three benefits:
 
 After sampling, the repeated two video latent steps and corresponding eight or
 nine audio steps are removed. Only new content is appended to the final output.
+
+### Why the global-window experiment was removed
+
+An experimental implementation kept one full noisy latent and evaluated all
+temporal windows during every denoising step. It preserved global sampler state,
+but later windows were evaluated before any window had a finished result. They
+therefore could not receive MiniMax's requested final five generated frames as
+continuation input.
+
+Blending overlapping predictions produced visible changes exactly at overlap
+boundaries. Changing to context-only overlaps merely moved those changes to the
+single-owner boundaries, and later windows could advance a prompted shot before
+its global cut time. The architecture was removed instead of retaining a
+complicated partial fix. Serial stock sampler calls are the current behavior
+because each continuation begins from actual completed frames.
 
 ## Existing H3 conditioning
 
@@ -363,6 +380,16 @@ This preserves ComfyUI's normal sampler, sigma, callback, preview, model
 loading, offloading, dtype, and backend behavior. The custom node does not
 implement a separate diffusion sampler.
 
+Chunks run strictly in sequence. The next stock sampler call is not created
+until the previous call has finished and its final video/audio latent tail has
+been cloned into native H3 continuation conditioning. A dedicated tqdm line
+shows `Chunk N/total` above the stock sampler's normal per-step progress.
+
+`debug_stop_chunk` truncates the execution plan only after the complete global
+prompt timeline has been calculated. This means a diagnostic partial result
+uses exactly the same prompt intervals and continuation data as those chunks
+would use during a full run. The default value is zero and does not truncate.
+
 Both stock outputs are collected:
 
 ```text
@@ -410,6 +437,13 @@ Two decode modes are available:
   preview. The decoder weights exist only for the current Unlimited execution
   and are released when it finishes.
 
+`max_resolution: 0` keeps the decoder's native output size. Positive values cap
+the longest preview side. The wrapper reports which decoder is active and sends
+the encoded resolution, FPS, rolling step duration, ETA inputs, sigma schedule,
+latent-change magnitude, and step-time samples to the local widget. The browser
+draws the two telemetry graphs for the active chunk while retaining completed
+chunk media in its playlist.
+
 `frame_stride` chooses every Nth H3 latent position. Animated-frame durations
 still use H3's `(1, 4, 4, 4, 4)` pixel-frame coverage, so skipped positions do
 not speed up playback. Cumulative millisecond rounding keeps the total WebP
@@ -449,9 +483,6 @@ uses ComfyUI's local websocket event path.
 - Full-reference prefix analysis sections remain present even when their
   detailed shots are outside the current chunk. They preserve label meanings,
   but may still describe the overall video rather than only the local window.
-- I2VA/FL2VA picture instructions describe a global target. Reusing those
-  pictures in later chunks can provide identity or destination context, but the
-  previous latent tail remains the actual local start-state constraint.
 
 ## Verification performed
 
@@ -467,6 +498,10 @@ Completed checks include:
 - exact reconstructed video/audio shapes for mocked multi-chunk sampling;
 - eight-versus-nine-step audio boundary trimming;
 - restoration of the guider's original conditioning after sampling;
+- serial proof that chunk two receives chunk one's completed two-step video
+  tail and synchronized audio tail before its sampler call starts;
+- `debug_stop_chunk=2` partial video/audio output sizes and unchanged prompt
+  timing against the complete global plan;
 - remapping of global first/last-frame keyframes;
 - replacement of `cross_attn` and `minimax_token_tags` for every chunk;
 - official base-prompt and full-reference description field parsing;
@@ -479,6 +514,8 @@ Completed checks include:
 - CPU loading and decoding with the installed 24-channel
   `taeh3.safetensors` checkpoint;
 - Latent2RGB wrapper callback delivery and reset/chunk/complete event order;
+- preview sample-start/progress telemetry, native-resolution dimensions, and
+  active decoder reporting;
 - animated WebP creation and exact 124-frame/119-frame playback durations at
   24 FPS.
 

@@ -28,7 +28,9 @@
 7. Enable `debug` to print the exact rewritten prompt and sampled/output frame
    range for every chunk in the ComfyUI console and return the same text through
    the `chunk_prompts` output.
-8. Decode the returned AV latent normally.
+8. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
+   number. `0` is the normal setting and samples the complete video.
+9. Decode the returned AV latent normally.
 
 Existing H3 first/last-frame guides are assigned to the chunk containing their
 frame. Ref2VA references remain attached to every chunk.
@@ -45,8 +47,16 @@ are not decoded or transferred again.
 `taeh3.safetensors` from `models/vae_approx` for a more representative RGB
 preview. Tiny-VAE decoding is slower and uses additional VRAM, so increase
 `frame_stride` if preview overhead is too high. `fps` controls playback timing
-and should match the sampler's prompt FPS. The five continuation frames are
-shown only once because the preview removes the overlap from later chunks.
+and should match the sampler's prompt FPS. `max_resolution: 0` preserves the
+preview decoder's native resolution. The widget shows the active `Chunk N/N`,
+preview resolution, FPS, seconds per step, ETA, sigma/latent-change history,
+and step-time history. The five continuation frames are shown only once because
+the preview removes the overlap from later chunks.
+
+The console also displays a chunk progress line above the stock sampler's step
+progress. A later chunk starts only after the previous chunk has completed, so
+its native H3 continuation guide contains the previous result's finished final
+five video frames and synchronized audio tail.
 
 ## Shot timing
 
