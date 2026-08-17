@@ -3,11 +3,15 @@
 `SamplerCustomAdvanced-Unlimited` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long MiniMax H3 video/audio latents.
 
-It samples at most `chunk_frames` at a time. After the first chunk, the final
-five video frames and the matching generated-audio tail are supplied to the
-next chunk through H3's native guide conditioning. The repeated latent prefix
-is removed before the chunks are joined, so both output latents have the same
-video and audio shapes requested by the upstream H3 conditioning node.
+### Why this exists?
+1. by replacing just the Sampler node, Minimax H3 now produces longer than 15secs videos using the same amount of VRAM seamlessly. No complicated loop workflows and video clip concatenations. Just use a normal workflow with the new node and it just works!
+2. since we can now do longer videos with the same VRAM, why not SAVE VRAM with smaller chunks and use the left over to increase the resolution? Yep, we can do that now! We can do 2K video inference with only 16GB of VRAM now. No upscale necessary... just render 2K straight. 
+
+### How is this possible?
+1. The new Sampler node samples at most `chunk_frames` at a time.
+2. After the first chunk, the final five video frames and the matching generated-audio tail are supplied to the next chunk through H3's native guide conditioning.
+3. The repeated latent prefix is removed before the chunks are joined, so both output latents have the same video and audio shapes requested by the upstream H3 conditioning node.
+4. The video/audio decoding stage just decodes the latent as usual, creating a longer than 15secs video and/or higher resolution than possible with low-vram. 
 
 ## Use
 
