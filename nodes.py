@@ -1,3 +1,4 @@
+import logging
 import math
 import re
 
@@ -10,6 +11,8 @@ from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 
+from .preview import begin_preview_execution
+
 
 AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
@@ -18,6 +21,10 @@ CANVAS_MULTIPLE = 32
 DESCRIPTION_FIELD = re.compile(r"(?:integrated_multimodal_description|detailed_description)\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
 DESCRIPTION_END = re.compile(r"\n\s*(?:overall_soundscape|non_diegetic_music)\s*:", re.IGNORECASE)
+PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
+SHOT_OPENING = re.compile(r"^(\s*)(?:the camera|the shot)\s+(?:cuts|transitions|changes|switches)\s+to\s+", re.IGNORECASE)
+SHOT_BREAK = re.compile(r"(?<=[.!?])\s+|(?<=[.!?][\"'])\s+|\n\s*\n+")
+SHOT_CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
 
 
 def _pixel_frames(latent_t):
@@ -39,7 +46,50 @@ def _frame_timestamp(frame, fps):
     return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
 
-def _prompt_for_chunk(prompt, frame_start, frame_end, fps):
+def _drop_picture_anchors(prompt):
+    field = DESCRIPTION_FIELD.search(prompt)
+    if field is None:
+        return PICTURE_LABEL.sub("the established subject and scene", prompt)
+    prefix = "\n".join(line for line in prompt[:field.start()].splitlines() if "picture" not in line.lower())
+    if prefix:
+        prefix += "\n"
+    return prefix + PICTURE_LABEL.sub("the established subject and scene", prompt[field.start():])
+
+
+def _shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end):
+    if frame_start <= shot_start and frame_end >= shot_end:
+        return body
+
+    units = []
+    for sentence in SHOT_BREAK.split(body):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        clauses = SHOT_CLAUSE_BREAK.split(sentence) if len(re.findall(r"\w+", sentence)) > 32 else [sentence]
+        for clause in clauses:
+            words = clause.split()
+            units.extend(" ".join(words[index:index + 24]) for index in range(0, len(words), 24))
+    weights = [max(1, len(re.findall(r"\w+", unit))) for unit in units]
+    total_weight = sum(weights)
+    start_weight = total_weight * max(frame_start, shot_start) - total_weight * shot_start
+    end_weight = total_weight * min(frame_end, shot_end) - total_weight * shot_start
+    duration = shot_end - shot_start
+    start_weight /= duration
+    end_weight /= duration
+
+    selected = []
+    offset = 0
+    for unit, weight in zip(units, weights):
+        if start_weight <= offset < end_weight:
+            selected.append(unit)
+        offset += weight
+    return " " + " ".join(selected) if selected else " Continue the established shot and its ongoing action."
+
+
+def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content_start=None, continuation=False, drop_picture_anchors=False):
+    content_start = frame_start if content_start is None else content_start
+    if drop_picture_anchors:
+        prompt = _drop_picture_anchors(prompt)
     field = DESCRIPTION_FIELD.search(prompt)
     description_start = field.end() if field is not None else 0
     description_end_match = DESCRIPTION_END.search(prompt, description_start)
@@ -65,19 +115,24 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, fps):
 
     selected = []
     for index, marker in enumerate(markers):
-        shot_end = shot_starts[index + 1] if index + 1 < len(markers) else math.inf
-        if shot_starts[index] < frame_end and shot_end > frame_start:
+        shot_end = shot_starts[index + 1] if index + 1 < len(markers) else total_frames
+        if shot_starts[index] < frame_end and shot_end > content_start:
             segment_end = markers[index + 1].start() if index + 1 < len(markers) else description_end
-            selected.append((marker, prompt[marker.end():segment_end], shot_starts[index]))
+            body = _shot_body_for_range(prompt[marker.end():segment_end], shot_starts[index], shot_end, content_start, frame_end)
+            if body is not None:
+                selected.append((marker, body, shot_starts[index]))
     if not selected:
-        raise ValueError(f"No prompt shots overlap frames {frame_start} through {frame_end - 1}")
+        raise ValueError(f"No prompt shots overlap frames {content_start} through {frame_end - 1}")
 
     rewritten = []
     for index, (marker, body, shot_start) in enumerate(selected):
-        marker_text = f"[Shot {marker.group(1)}]"
+        marker_text = f"[Shot {index + 1}]"
         if index:
             marker_text += f" At {_frame_timestamp(shot_start - frame_start, fps)},"
-        rewritten.append(marker_text + body)
+        elif continuation and shot_start < content_start:
+            body = SHOT_OPENING.sub(r"\1the continuing shot shows ", body, count=1)
+            marker_text += " Continue seamlessly from the provided opening frames at this point in the shot; do not restart or replay earlier actions."
+        rewritten.append(marker_text + body.rstrip() + " ")
     return prompt[:markers[0].start()] + "".join(rewritten) + prompt[description_end:]
 
 
@@ -95,7 +150,7 @@ def _reference_image(image, width, height):
     return _resize(image, target_width, target_height, "disabled")
 
 
-def _prompt_tokens(clip, prompt, images, positive, width, height):
+def _prompt_tokens(clip, prompt, images, positive, width, height, continuation):
     refs = positive[0].get("minimax_refs") if positive else None
     image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
     if refs:
@@ -117,13 +172,13 @@ def _prompt_tokens(clip, prompt, images, positive, width, height):
         return clip.tokenize(prompt, minimax_ref_items=ref_items)
 
     prompt_images = []
-    for index, image in enumerate(image_list):
+    for index, image in enumerate(() if continuation else image_list):
         prompt_images.append(_resize(image, width, height, "disabled" if index == 0 else "center"))
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, images, positive, width, height):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height))
+def _encode_prompt(clip, prompt, images, positive, width, height, continuation):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation))
     if len(conditioning) != 1:
         raise ValueError("SamplerCustomAdvanced-Unlimited expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -245,24 +300,29 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                tooltip="FPS used to convert absolute prompt timestamps to chunk-local frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
+                io.Boolean.Input("debug", default=False,
+                                 tooltip="Log every chunk prompt to the console and return them through chunk_prompts."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
                 io.Latent.Output(display_name="denoised_output"),
+                io.String.Output(display_name="chunk_prompts"),
             ],
         )
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None):
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False, images=None):
         samples = latent_image["samples"]
         if not samples.is_nested:
-            return super().execute(noise, guider, sampler, sigmas, latent_image)
+            sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
+            return io.NodeOutput(sampled[0], sampled[1], "")
 
         streams = samples.unbind()
         if len(streams) != 2 or streams[0].ndim != 5 or streams[0].shape[1] != 24 or streams[1].ndim != 4 or streams[1].shape[1] != 32:
-            return super().execute(noise, guider, sampler, sigmas, latent_image)
+            sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
+            return io.NodeOutput(sampled[0], sampled[1], "")
 
         video, audio = streams
         plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames)
@@ -285,6 +345,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         positive = original_conds.get("positive")
         if positive is None:
             raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
+        ref2va = bool(positive[0].get("minimax_refs"))
+        total_frames = plan[-1]["frame_end"]
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
         output_video = []
@@ -296,6 +358,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         previous_frame_count = None
         output_template = None
         denoised_template = None
+        debug_prompts = []
+        preview_execution = begin_preview_execution(guider.model_patcher, len(plan))
 
         try:
             for index, chunk in enumerate(plan):
@@ -319,8 +383,26 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 if previous_audio is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
-                chunk_prompt = _prompt_for_chunk(prompt, chunk["frame_start"], chunk["frame_end"], fps)
-                encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height)
+                continuation = index > 0
+                content_start = chunk["frame_start"] + (5 if continuation else 0)
+                chunk_prompt = _prompt_for_chunk(
+                    prompt,
+                    chunk["frame_start"],
+                    chunk["frame_end"],
+                    total_frames,
+                    fps,
+                    content_start=content_start,
+                    continuation=continuation,
+                    drop_picture_anchors=continuation and not ref2va,
+                )
+                if debug:
+                    debug_prompt = (
+                        f"=== Chunk {index + 1}: sampled frames {chunk['frame_start']}-{chunk['frame_end'] - 1}; "
+                        f"output frames {content_start}-{chunk['frame_end'] - 1} ===\n{chunk_prompt}"
+                    )
+                    debug_prompts.append(debug_prompt)
+                    logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
+                encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation)
                 guider.original_conds = _conditioning_for_chunk(
                     original_conds,
                     chunk["frame_start"],
@@ -332,9 +414,22 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 )
 
                 chunk_seed = (noise.seed + index) & 0xffffffffffffffff
-                sampled, denoised = super().execute(
-                    _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
-                )
+                if preview_execution is not None:
+                    preview_execution.set_chunk(
+                        index,
+                        chunk["frame_start"],
+                        chunk["frame_end"] - 1,
+                        content_start,
+                        chunk["frame_end"] - 1,
+                        0 if index == 0 else CONTEXT_VIDEO_STEPS,
+                    )
+                try:
+                    sampled, denoised = super().execute(
+                        _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
+                    )
+                finally:
+                    if preview_execution is not None:
+                        preview_execution.clear_chunk()
                 output_template = sampled
                 denoised_template = denoised
                 previous_video, previous_audio = sampled["samples"].unbind()
@@ -349,6 +444,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 denoised_audio.append(denoised_chunk_audio[..., audio_trim:].clone())
         finally:
             guider.original_conds = original_conds
+            if preview_execution is not None:
+                preview_execution.close()
 
         output_template["samples"] = comfy.nested_tensor.NestedTensor((
             torch.cat(output_video, dim=2),
@@ -358,6 +455,6 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             torch.cat(denoised_video, dim=2),
             torch.cat(denoised_audio, dim=-1),
         ))
-        return io.NodeOutput(output_template, denoised_template)
+        return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts))
 
     sample = execute
