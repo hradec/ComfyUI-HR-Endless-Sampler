@@ -1,70 +1,104 @@
 # SamplerCustomAdvanced-Unlimited development memory
 
-## Goal
+## Goal and current architecture
 
-This custom node adds `SamplerCustomAdvanced-Unlimited`, a MiniMax H3-specific
-replacement for ComfyUI's stock `SamplerCustomAdvanced`. Its purpose is to
-sample a long joint video/audio latent as smaller temporal chunks so the H3 DiT
-does not have to hold the complete video sequence in VRAM at once.
+This custom node replaces ComfyUI's stock `SamplerCustomAdvanced` for long
+MiniMax H3 audio/video generation. It keeps the stock sampler contract and adds
+the H3 prompt inputs needed to select prompt content by global time.
 
-The node keeps the stock sampler inputs and delegates every individual chunk to
-the stock `SamplerCustomAdvanced`. It adds:
+The current implementation performs one stock sampler call over the complete
+requested AV latent. Inside every model prediction it evaluates smaller,
+overlapping temporal windows and blends them before returning to the sampler:
 
-- `clip`: the same MiniMax H3 CLIP/Qwen model used by the upstream conditioning
-  node;
+```text
+global x at sigma N
+  -> predict window 1
+  -> predict window 2
+  -> predict window 3
+  -> blend complete global prediction
+  -> stock sampler updates global x once
+global x at sigma N-1
+```
+
+This is deliberately different from the original implementation, which ran a
+complete sigma schedule independently for every chunk and passed five finished
+frames forward as continuation conditioning. Independent runs reset the noisy
+latent and multistep solver history, allowing later chunks to reinterpret
+details and sometimes repeat actions. The single-trajectory design preserves
+the evolving latent and solver history for the whole video.
+
+The node adds these inputs to the stock sampler interface:
+
+- `clip`: the MiniMax H3 Qwen/CLIP model used by the upstream conditioner;
 - `prompt`: the original MiniMax-formatted prompt;
-- `fps`: the frame rate used to convert prompt timestamps to global frames;
-- `chunk_frames`: the maximum number of H3 frames sampled at once;
-- `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
-  console and returns the same text through `chunk_prompts`;
-- optional `images`: pixel images needed to rebuild Qwen visual conditioning.
+- `fps`: converts prompt timestamps to global frames;
+- `chunk_frames`: the largest temporal H3 transformer window;
+- `debug`: logs and returns each rewritten window prompt;
+- optional `images`: reconstructs Qwen visual presentation tokens.
 
-The sampler node id and display name are both:
+The registered nodes are:
 
 ```text
 SamplerCustomAdvanced-Unlimited
-```
-
-An optional model-patch node provides the accumulated live preview:
-
-```text
 MiniMaxH3UnlimitedPreview -> MiniMax H3 Unlimited Preview
 ```
 
-## Files
+## Files and ownership
 
-- `__init__.py` registers the node through `NODE_CLASS_MAPPINGS` and
-  `NODE_DISPLAY_NAME_MAPPINGS`.
-- `nodes.py` contains chunk planning, prompt rewriting, Qwen conditioning
-  rebuilding, continuation guides, sampling, output assembly, and the narrow
-  preview-session calls around each stock sampler invocation.
-- `preview.py` contains the H3 preview model wrapper, Latent2RGB and optional
-  tiny-VAE decoding, asynchronous WebP encoding, and local preview events.
-- `web/unlimited_preview.js` owns the preview widget and the browser-side chunk
-  playlist.
-- `README.md` contains concise user-facing setup and limitations.
-- `memory.md` is this implementation and design handoff.
+- `nodes.py` owns input validation, H3 window planning, prompt rewriting,
+  Qwen re-encoding, execution-scoped guider setup, and stock sampler delegation.
+- `windowed.py` owns H3 AV window evaluation, condition selection, global
+  position layouts, overlap fusion, and per-window memory estimation.
+- `preview.py` owns the optional model-patcher preview wrapper, Latent2RGB or
+  tiny-VAE decoding, WebP encoding, and local websocket events.
+- `web/unlimited_preview.js` owns the browser preview widget.
+- `README.md` is the user-facing setup and limitation reference.
+
+The implementation does not monkey-patch `MiniMaxH3`, `MiniMaxH3Model`, or
+ComfyUI's sampler functions. The context handler is installed only on a cloned
+`guider.model_options` dictionary for one node execution and restored in a
+`finally` block.
+
+## Why sampler state matters
+
+ComfyUI's sampler maintains an evolving noisy latent `x` throughout the sigma
+schedule. Multistep samplers also retain values such as `old_denoised` or
+derivative histories. Those tensors are valid only for the same latent shape,
+coordinates, and adjacent sigma steps.
+
+They cannot be transferred from a finished chunk at sigma zero to a new chunk
+starting at sigma maximum. The former continuation implementation therefore
+had no true cross-chunk sampler memory even though it allocated a full-length
+input and assembled a full-length output.
+
+MiniMax H3 also has no causal KV cache or recurrent scene state. It uses
+bidirectional attention and recomputes Q/K/V tensors for every transformer
+layer and denoising step. Saving attention activations would be mathematically
+stale for a new sigma and would retain the large tensors windowing is intended
+to release.
+
+The supported way to preserve state is consequently to keep one global `x`
+and window only the expensive H3 prediction performed at each sigma.
 
 ## MiniMax H3 latent structure
 
-H3 samples a nested AV latent containing two tensors:
+H3 samples a nested AV latent:
 
 ```text
 video: [B, 24, T_video, H/16, W/16]
 audio: [B, 32, 2, T_audio]
 ```
 
-The video temporal axis is not one latent step per pixel frame. H3 uses the
-repeating frame coverage:
+Video latent positions cover the repeating pixel-frame pattern:
 
 ```text
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 ```
 
-Therefore a valid `17k + 5` pixel-frame sequence has `5k + 2` video latent
-steps. Examples:
+A valid `17k + 5` pixel-frame sequence therefore has `5k + 2` video latent
+positions.
 
-| Pixel frames | Video latent steps |
+| Pixel frames | Video latent positions |
 | ---: | ---: |
 | 5 | 2 |
 | 22 | 7 |
@@ -73,429 +107,247 @@ steps. Examples:
 | 243 | 72 |
 | 362 | 107 |
 
-H3 audio latents run at 40 Hz while video normally runs at 24 FPS. The expected
-audio length is:
+Audio runs at 40 Hz while the normal video timeline is 24 FPS:
 
 ```text
-round(pixel_frames * 40 / 24)
+T_audio = round(pixel_frames * 40 / 24)
 ```
 
-The node validates both the video grid and the matching audio duration before
-chunking. Invalid nested shapes fail clearly rather than producing an
-incorrectly synchronized latent.
+`_chunk_plan` validates both streams and creates windows whose video starts
+remain aligned to the five-token phase. The default 124-frame window is 37
+video latent positions. Later windows start two latent positions before the
+previous endpoint, giving five overlapping pixel frames. Audio boundaries are
+derived from cumulative global frame positions, so the matching overlap
+alternates between eight and nine audio positions where rounding requires it.
 
-## Temporal chunk planning
+No overlap is trimmed from the result. The same global latent positions appear
+in multiple model evaluations and their predictions are blended.
 
-`chunk_frames` is snapped down to H3's `17k + 5` grid. The default is 124
-frames, or 37 video latent steps.
+## One global stock sampler call
 
-The first chunk contributes its complete latent. Every later chunk contains a
-five-frame continuation prefix followed by new frames. Five frames correspond
-to the final two video latent steps because a valid chunk ends on the same
-`1, 4` phase of `FRAME_PER_TOKEN`.
+`nodes.py` calls `SamplerCustomAdvanced.execute` exactly once with the original
+full nested latent and original noise object. This preserves ComfyUI's normal:
 
-For two 124-frame chunks, the delivered duration is consequently:
+- noise generation;
+- sigma schedule and selected solver;
+- sampler callbacks and cancellation;
+- model loading, low-VRAM offload, dtype, and backend policy;
+- `output` and `denoised_output` contracts.
+
+ComfyUI packs the nested video and audio into one flat sampler latent. The
+custom context handler receives that flat `x` from `calc_cond_batch`, unpacks
+it using the original full shapes, and extracts synchronized window views.
+
+The handler allocates full-sized prediction accumulators and one-dimensional
+video/audio weight counts for the duration of a model prediction. These are
+execution-local tensors and are discarded after the prediction returns. It
+does not create persistent model or module-level tensor caches.
+
+## H3 window evaluation and fusion
+
+For each planned window, `MiniMaxH3WindowedContextHandler`:
+
+1. slices the global video latent along dimension 2;
+2. slices the matching audio interval along dimension 3;
+3. packs those two local tensors into ComfyUI's sampler representation;
+4. selects the positive conditioning encoded for that exact window;
+5. rebuilds `latent_shapes` and the H3 `PackedLayout` for the local AV shapes;
+6. calls ComfyUI's normal conditional model evaluation;
+7. unpacks the video/audio prediction;
+8. accumulates it into the global locations using pyramid weights.
+
+After every window, each accumulated position is divided by its total weight
+and the complete AV prediction is packed and returned. Non-overlapping
+positions reduce to their sole prediction. Overlapping positions smoothly
+combine both neighboring predictions.
+
+The overlap is the information bridge. At the next sigma, both windows read
+the shared global `x` containing the previously blended overlap, allowing
+appearance and motion information to propagate across boundaries over the
+denoising trajectory. This is still an approximation of full attention:
+tokens in distant non-overlapping windows never attend directly.
+
+## Global H3 temporal positions
+
+A local `PackedLayout` normally resets target video and audio positions to the
+start of the window. That would tell H3 every window occurs at time zero and
+would break global keyframe alignment.
+
+The handler builds a normal H3 `PackedLayout` and offsets only its target rows:
 
 ```text
-124 + (124 - 5) = 243 frames
+video offset = FRAME_RESCALE * pixel_frame_at(video_window_start)
+audio offset = global audio window start
 ```
 
-In latent steps this is:
+Text and Ref2VA reference rows retain their normal layout coordinates.
+Existing keyframes retain their original global `resolved_frame_index`, so
+their condition rows already land on the global target timeline. All keyframes
+and references remain available to every window, matching the conditioning a
+single full H3 call would receive.
+
+The video and audio offsets are intentionally separate. Five video frames span
+`5 * 40 / 24 = 8.333...` audio positions, so a rounded audio boundary is not
+always identical to the fractional H3 video time coordinate.
+
+Layouts are cached only on the context-handler instance for the current
+sampler execution. They contain structural CPU metadata, not model activations.
+
+## Memory estimation
+
+The sampler must retain the complete global latent and any solver history, but
+these tensors are much smaller than H3's transformer activations. Before model
+loading, an execution-scoped `PREPARE_SAMPLING` wrapper replaces the flat
+full-latent shape used for VRAM estimation with the largest packed AV window
+shape. This keeps ComfyUI's low-VRAM loader aligned with the tensors the H3
+transformer actually evaluates.
+
+The wrapper changes estimation only. The real sampler still receives and
+updates the full latent.
+
+## Prompt timing and window conditioning
+
+The parser accepts MiniMax's documented markers:
 
 ```text
-37 + (37 - 2) = 72 video latent steps
+[Shot 1] ...
+[Shot 2] At MM:SS.mmm, ...
 ```
 
-The repeated two-step prefix is removed before final assembly. This keeps the
-result on H3's native grid and makes the returned video latent exactly the same
-shape as the upstream requested latent.
+Shot numbering must start at one and timestamps must increase strictly. Both
+`integrated_multimodal_description:` and `detailed_description:` are supported.
 
-### Audio rounding at boundaries
+For each window the parser:
 
-Five frames correspond to 8.333 audio steps, so the amount trimmed at a join
-cannot always be a fixed integer. The planner calculates cumulative global
-audio boundaries and chooses eight or nine context steps as needed. This avoids
-accumulating audio/video drift across a long sequence.
+1. converts global timestamps to frames with `fps`;
+2. retains shots intersecting the complete window, including its overlap;
+3. renumbers the local opening shot to `[Shot 1]` without a timestamp;
+4. keeps later cuts at their global timestamps to match global target RoPE;
+5. distributes long-shot sentence or clause units across their global range;
+6. adds a continuation instruction when a window begins midway through a shot.
 
-The previous chunk's audio endpoint can overhang or underhang its final pixel
-frame by a fraction of one 40 Hz step because of rounding. The audio guide's
-start position includes this signed offset, matching H3's native timeline
-layout rather than assuming every chunk ends on an exact audio boundary.
+For example, a global cut at frame 100 remains `00:04.167` at 24 FPS in a
+window starting at frame 50. The old independent-chunk implementation rewrote
+that cut to local frame 50 / `00:02.083` because each chunk reset its target
+positions to zero; doing so with global target positions would be incorrect.
 
-## Noise behavior
+Every rewritten prompt is encoded before sampling. Window-specific positive
+conditions receive an internal integer marker. During each model call the
+handler selects only the conditions matching the active window. Other guider
+branches remain unmarked and are reused.
 
-The input noise object generates noise once for the complete requested latent
-on the CPU/intermediate device. Each chunk receives the corresponding video and
-audio slices through a small fixed-noise wrapper.
-
-This was chosen instead of asking the input noise object to generate each chunk
-independently because equally shaped chunks generated from the same seed could
-repeat the same noise. Slicing one full deterministic noise value preserves a
-stable global noise field and supports custom ComfyUI noise implementations.
-
-The sampler seed passed to H3 is incremented for each chunk. The fixed noise
-itself still comes from the original global seed; the incremented sampling seed
-keeps H3's conditioning-side stochastic behavior distinct between chunks.
-
-## Continuation from the previous generation
-
-The node does not use the first frame of the previous generation. It uses the
-previous sampled chunk's final latent tail:
-
-```text
-video_context = previous_video[:, :, -2:]
-audio_context = previous_audio[..., -context_audio_steps:]
-```
-
-These tensors are cloned so they do not keep long-lived views into a larger
-chunk tensor.
-
-The video tail is added to positive conditioning as a native H3 guide at local
-frame zero:
-
-```python
-{"resolved_frame_index": 0, "latent": video_context}
-```
-
-The matching audio tail is added as a separate native audio guide. Its start is
-chosen so its endpoint aligns with the five-frame video prefix, including the
-previous chunk's fractional audio-grid overhang.
-
-The prefix is guide conditioning, not a decode/re-encode round trip. Reusing
-the sampler output directly has three benefits:
-
-- it avoids needing the video VAE and audio VAE for generated continuation;
-- it avoids VAE quality loss at every link in the chain;
-- it is cheaper than decoding the previous video to images and encoding it
-  again as Ref2VA media.
-
-After sampling, the repeated two video latent steps and corresponding eight or
-nine audio steps are removed. Only new content is appended to the final output.
-
-## Existing H3 conditioning
-
-The sampler receives a guider whose `original_conds` already contains converted
-conditioning dictionaries. The implementation clones these dictionaries for
-each chunk and restores the original guider state in a `finally` block.
-
-Only positive conditioning is changed. Negative or other guider branches remain
-untouched.
-
-Existing `minimax_keyframes` use global resolved frame positions. For each
-chunk, keyframes intersecting that chunk are copied and remapped to local frame
-positions:
-
-```text
-local position = global position - chunk global start
-```
-
-This allows an upstream first-frame or last-frame guide to affect only the
-chunk containing that global frame. Existing `minimax_refs`, control metadata,
-and other conditioning fields are preserved.
-
-## MiniMax shot prompt handling
-
-The implementation follows the official MiniMax prompt guides:
-
-- `[Shot 1]` is the opening shot and has no timestamp.
-- Every later shot uses `[Shot N] At MM:SS.mmm,`.
-- Shot numbers must start at one and increase sequentially.
-- Cut timestamps must be strictly increasing.
-
-The parser recognizes both official description fields:
-
-```text
-integrated_multimodal_description:
-detailed_description:
-```
-
-The first is used by T2VA/I2VA/FL2VA/L2VA prompts. The second is used by
-full-reference prompts. Prefix sections such as `subject_definitions`,
-`summary`, and `retention_analysis`, and suffix sections such as
-`overall_soundscape` and `non_diegetic_music`, are preserved.
-
-For each chunk, the parser:
-
-1. converts every absolute `MM:SS.mmm` timestamp to a global frame using
-   `round(seconds * fps)`;
-2. treats a shot as active when its global interval intersects the chunk's
-   global interval;
-3. removes shot bodies that do not intersect the chunk;
-4. renumbers the active opening shot to `[Shot 1]` and makes it untimed;
-5. subtracts the chunk's global start frame from every later cut;
-6. converts each local cut frame back to `MM:SS.mmm` for Qwen.
-
-For example, at 24 FPS:
-
-```text
-global cut frame: 100
-chunk global start: 50
-local cut frame: 50
-local cut time: 00:02.083
-```
-
-When a chunk begins in the middle of a long shot, the text body is retained but
-prefixed with an explicit instruction to continue from the provided opening
-frames without restarting or replaying earlier actions. A leading `the camera
-cuts to` / `the shot transitions to` phrase is changed to describe the
-continuing shot. Natural-language prose cannot otherwise be safely divided at
-an arbitrary frame boundary. The carried video/audio latent tail establishes
-the actual starting state.
-
-If a shot spans a chunk boundary, the node divides its sentence-level action
-units proportionally across the shot's global frame interval and assigns each
-unit to exactly one chunk according to its start position. The five-frame
-latent overlap is excluded from that action range because it is continuation
-context and is trimmed from the assembled output. This prevents a long final
-shot from being rendered once at the end of one chunk and then rendered again
-from the beginning in the next chunk. If a sparse shot has fewer text units
-than temporal chunks, a later empty interval receives only a neutral instruction
-to continue the established shot rather than repeating an earlier action or
-failing prompt construction.
-
-## Replacing only prompt-owned conditioning
-
-The original prompt has already been processed by MiniMax's Qwen3-VL text
-encoder when it reaches the guider. Arbitrary text cannot be inserted directly
-into the final hidden-state tensor. The node therefore needs the original
-`clip` and prompt.
-
-For each chunk it tokenizes and encodes the rewritten prompt, then replaces
-only these positive-conditioning fields:
+Only prompt-owned positive fields are replaced:
 
 ```text
 cross_attn
 minimax_token_tags
 ```
 
-These are the fields owned by the Qwen prompt presentation. The node does not
-replace latent references, keyframes, controls, sampler settings, or unrelated
-metadata.
+References, keyframes, controls, hooks, and other conditioning metadata are
+preserved. Each duplicated positive condition receives a new UUID so ComfyUI
+does not treat distinct window prompts as the same condition.
 
-## What the `images` input means
+## The `images` input
 
-The optional `images` input is used only to reconstruct Qwen/CLIP visual
-conditioning. It does not create H3 video-VAE or audio-VAE latents.
+`images` supplies pixels only for reconstructing Qwen visual presentation. It
+does not create H3 video-VAE or audio-VAE latents.
 
-For ordinary I2VA/FL2VA conditioning, the image batch is interpreted as:
+For I2VA/FL2VA, the first item is the original first frame and an optional
+second item is the last frame. These images are presented to Qwen only for the
+first window. Later prompts remove zero-time picture anchors, while the
+upstream H3 keyframe latents remain available globally.
 
-```text
-images[0] -> <Picture 1> / original first-frame image
-images[1] -> <Picture 2> / optional original last-frame image
-```
+For image-only Ref2VA, every batch item is a separate reusable picture
+reference and is presented to every window in the order described by
+`minimax_refs`. Audio reference blocks already own their encoded audio latents
+and require no waveform input here.
 
-The first image is resized to the generation canvas with the same stretched
-geometry-anchor behavior used by the stock H3 node. Later images use
-aspect-preserving center crop, matching the stock last-frame behavior.
+Existing Ref2VA `video` and `video_audio` blocks cannot be rebuilt from an
+IMAGE batch. A Qwen `<Video N>` presentation has timestamps, one ordered media
+item, a video-VAE latent, and optional synchronized audio. The node rejects
+that mismatch rather than silently presenting video frames as unrelated
+`<Picture N>` items.
 
-For image-only Ref2VA, each batch item is a separate picture reference:
+## Preview behavior
 
-```text
-images[0] -> <Picture 1>
-images[1] -> <Picture 2>
-images[2] -> <Picture 3>
-```
+`MiniMax H3 Unlimited Preview` remains a model-patcher wrapper around the stock
+outer-sampler callback. The single-trajectory sampler registers one preview
+item covering the complete requested timeline. After each sigma step, the
+callback receives the full denoised AV estimate and replaces that item.
 
-The image references are reconstructed in the same order as the existing
-`minimax_refs` payload. Audio-only reference blocks contribute their `<Audio N>`
-labels to Qwen but need no waveform here because their audio latents already
-exist in `minimax_refs`.
+Latent2RGB is inexpensive. Tiny-VAE preview decodes one selected latent
+position at a time and can become slow for long videos, so `frame_stride` is
+the intended cost control. WebP compression remains on a bounded background
+worker and local websocket send failures remain non-fatal.
 
-This explains why the current node does not take a video VAE or audio VAE:
+`max_resolution` defaults to `0`, meaning the decoder output is not downscaled.
+The backend reports the actual encoded width and height plus the selected
+previewer name, making a tiny-VAE fallback visible instead of silent. The
+browser also displays playback FPS, rolling seconds per step, ETA, a combined
+sigma/latent-change graph, and a step-time graph. Latent change is calculated
+from a bounded 65,536-value sample of the video latent so the graph does not
+retain a second full-length latent in CPU memory.
 
-- the `images` input supplies only pixels for Qwen visual tokens;
-- upstream keyframes and Ref2VA blocks are already VAE-encoded in the guider;
-- previous generated video and audio are already available as sampled latents.
+The context handler reports the active transformer window to the preview as
+`Chunk N/total`. It also owns a temporary `tqdm` chunk bar created before the
+stock sampler starts, so ComfyUI's ordinary denoising-step bar is placed below
+it. The chunk bar resets on window zero for each model evaluation and is closed
+in the sampler node's existing `finally` cleanup.
 
-Ordinary I2VA/FL2VA images are presented to Qwen only for the first chunk.
-Presenting them again would relabel the original image as a fresh local
-`<Picture 1>` and repeat its zero-second alignment instruction, competing with
-the previous chunk's latent continuation guide. Later ordinary chunks remove
-those picture-alignment lines and replace remaining picture-label prose with a
-neutral reference to the already established subject and scene. Image-only
-Ref2VA inputs are different: they describe reusable identity, scene, motion, or
-style references and remain presented to every chunk.
+## Compatibility and restoration
 
-## Why an IMAGE batch is not a Ref2VA video
+Non-H3 and non-nested latents fall through to the stock sampler unchanged.
+The public node id, existing inputs, and three outputs are preserved. The
+`chunk_frames` and `chunk_prompts` names remain for workflow compatibility,
+although they now refer to transformer windows.
 
-An IMAGE batch normally represents separate `<Picture N>` references. A
-Ref2VA `<Video N>` has additional temporal structure:
+The original `guider.original_conds` and `guider.model_options` are restored in
+a `finally` block after success, cancellation, or failure. No context handler,
+prompt marker, or layout cache leaks into later queue executions.
 
-- all frames belong to one ordered media item;
-- Qwen samples the video at 2 FPS and inserts timestamps;
-- the video VAE encodes the complete temporal sequence as one reference latent;
-- an optional synchronized soundtrack is encoded by the audio VAE;
-- the prompt refers to the sequence as `<Video N>`, not as many pictures.
+Multi-window denoise masks are rejected because synchronized packed AV mask
+windowing has not been implemented. A single-window request retains stock mask
+behavior.
 
-Consequently, the node refuses existing `video` or `video_audio` Ref2VA blocks
-when rebuilding Qwen conditioning from `images`. Silently treating those frames
-as separate pictures would make the Qwen presentation disagree with the DiT
-reference payload.
+## Known limits
 
-Correct support for new Ref2VA videos would require dedicated inputs such as:
+- Full latent and solver memory still grow linearly with duration.
+- A complete spatial frame window must fit; there is no spatial tiling.
+- Fixed local attention windows approximate, rather than reproduce,
+  full-sequence attention.
+- Very long global RoPE positions may exceed the model's trained duration.
+- Small or occluded details can still drift without explicit prompt/reference
+  support.
+- Prompt timestamps remain generative guidance rather than deterministic cuts.
 
-- one or more separately delimited `ref_video` IMAGE sequences;
-- the MiniMax video VAE;
-- optional reference-video audio and the MiniMax audio VAE;
-- an explicit choice between a full reusable reference and a reference aligned
-  one-to-one with the target's global timeline.
+## Verification
 
-For a timeline-aligned source, each chunk would have to slice the raw frames,
-snap them to H3's temporal grid, sample the same slice at 2 FPS for Qwen,
-VAE-encode the slice, and replace the corresponding `minimax_refs` video block.
-If it has synchronized audio, that audio must be sliced and encoded on the same
-timeline. For identity, appearance, general motion, camera, or style references,
-the complete reference video should normally remain available to every chunk
-instead of being timeline-sliced.
+Lightweight verification uses the Python environment installed with ComfyUI.
+The current checks cover:
 
-None of this is needed for continuation from the immediately preceding
-generated chunk; direct latent-tail guides are the more accurate path.
+- Python compilation of `__init__.py`, `nodes.py`, `preview.py`, and
+  `windowed.py`;
+- ComfyUI custom-node loading and schema registration;
+- the H3 duration/window planner over multiple valid durations;
+- exact video/audio coverage and eight/nine-position audio overlaps;
+- identity reconstruction after window slicing, weighted fusion, and packing;
+- selection of the prompt conditioning matching each window;
+- local `latent_shapes` replacement;
+- global video and audio target offsets in `PackedLayout`;
+- per-window packed VRAM-estimation shape;
+- prompt timestamp rewriting and strict marker validation;
+- existing preview backend and JavaScript syntax checks.
 
-## Stock sampler delegation and output assembly
+A full H3 GPU render is still required to measure actual peak VRAM, speed, seam
+quality, and long-range consistency on the target system.
 
-Every planned chunk is placed in a temporary latent dictionary and passed to:
+## References inspected
 
-```python
-SamplerCustomAdvanced.execute(...)
-```
-
-This preserves ComfyUI's normal sampler, sigma, callback, preview, model
-loading, offloading, dtype, and backend behavior. The custom node does not
-implement a separate diffusion sampler.
-
-Both stock outputs are collected:
-
-```text
-output
-denoised_output
-```
-
-Continuation prefixes are trimmed from both, and their video and audio streams
-are concatenated independently. The final tensors are wrapped in a new
-`NestedTensor`. Their shapes match the original upstream H3 AV latent exactly.
-
-Non-H3 or non-nested latents fall through to the stock sampler unchanged.
-
-## Accumulated live preview
-
-`MiniMax H3 Unlimited Preview` is a separate model-patch node. Its MODEL output
-must feed the guider passed to `SamplerCustomAdvanced-Unlimited`. Keeping the
-preview at the model boundary follows ComfyUI's existing outer-sampler wrapper
-contract and avoids adding UI or transport behavior to the sampler itself.
-
-At the start of one Unlimited execution, `nodes.py` finds wrappers registered
-under the private `minimax_h3_unlimited_preview` key and opens a short-lived
-preview session. Before each stock sampler call it supplies:
-
-```text
-chunk index and count
-sampled global frame range
-assembled-output frame range
-number of carried video latent steps to hide
-```
-
-The wrapper observes the normal stock sampler callback. It restores the H3
-video stream from either a nested AV value or ComfyUI's flattened sampler
-representation, removes the two carried latent steps from later previews, and
-decodes the remaining latent positions. The original callback still runs, so
-ComfyUI's normal progress and preview behavior are preserved.
-
-Two decode modes are available:
-
-- `tiny_vae: none` applies the H3 latent-format RGB factors in one tensor
-  operation. This is the cheapest path but only an approximation.
-- A compatible 24-channel flat decoder such as `taeh3.safetensors` is built
-  from its checkpoint-defined layer indices and decodes one latent position at
-  a time. This limits peak activation memory while producing a more useful RGB
-  preview. The decoder weights exist only for the current Unlimited execution
-  and are released when it finishes.
-
-`frame_stride` chooses every Nth H3 latent position. Animated-frame durations
-still use H3's `(1, 4, 4, 4, 4)` pixel-frame coverage, so skipped positions do
-not speed up playback. Cumulative millisecond rounding keeps the total WebP
-duration equal to the represented pixel-frame duration at the selected `fps`.
-
-PIL WebP compression runs on a bounded background worker. When encoding falls
-behind, the queued intermediate step is replaced by the latest one instead of
-blocking diffusion. Tiny-VAE and Latent2RGB decoding happen before that worker;
-therefore tiny-VAE preview can slow sampling, and `frame_stride` is the direct
-control for reducing that cost.
-
-Each event transfers only the current chunk's animated WebP. The browser stores
-one data URL and duration per chunk, replaces the active chunk as denoising
-progresses, and loops over every available chunk. Earlier chunks are neither
-decoded nor sent again. A reset event clears stale media at the next execution,
-and a completion event leaves the assembled preview playing.
-
-Preview loading, decoding, encoding, and event-send errors are non-fatal. An
-invalid tiny decoder is disabled for that execution and falls back to
-Latent2RGB. Preview state contains no network client or outbound request; it
-uses ComfyUI's local websocket event path.
-
-## Current limitations
-
-- Chunking reduces temporal DiT memory, not the memory required for one
-  high-resolution frame. It cannot guarantee arbitrary spatial resolution.
-- The upstream H3 latent nodes may impose their own user-interface duration
-  maximum even though the sampler planner itself works with longer valid
-  latents.
-- Chunked denoise masks are rejected. Slicing and synchronizing nested AV masks
-  needs a separate, explicitly designed path.
-- New Ref2VA video media is unsupported for the reasons above. Existing image
-  and audio reference presentations can be rebuilt.
-- Prompt cut timing remains generative guidance. Rewriting a cut to the correct
-  local timestamp does not make diffusion frame-exact in the way a deterministic
-  video editor would be.
-- Full-reference prefix analysis sections remain present even when their
-  detailed shots are outside the current chunk. They preserve label meanings,
-  but may still describe the overall video rather than only the local window.
-- I2VA/FL2VA picture instructions describe a global target. Reusing those
-  pictures in later chunks can provide identity or destination context, but the
-  previous latent tail remains the actual local start-state constraint.
-
-## Verification performed
-
-The implementation was checked with the Python environment used by the running
-ComfyUI installation.
-
-Completed checks include:
-
-- Python compilation of `__init__.py`, `nodes.py`, and `preview.py`;
-- loading through ComfyUI's real `load_custom_node` path;
-- schema registration with the expected node id and all new inputs;
-- a planner matrix covering 212 H3 durations and eight chunk settings;
-- exact reconstructed video/audio shapes for mocked multi-chunk sampling;
-- eight-versus-nine-step audio boundary trimming;
-- restoration of the guider's original conditioning after sampling;
-- remapping of global first/last-frame keyframes;
-- replacement of `cross_attn` and `minimax_token_tags` for every chunk;
-- official base-prompt and full-reference description field parsing;
-- conversion of global frame 100 to local frame 50 / `00:02.083` at 24 FPS;
-- strict rejection of malformed or non-increasing shot markers;
-- reconstruction of image/audio Ref2VA presentation order;
-- clear rejection of video Ref2VA conditioning from an IMAGE-only input;
-- registration of `MiniMaxH3UnlimitedPreview` and its web directory through
-  ComfyUI's real custom-node loader;
-- CPU loading and decoding with the installed 24-channel
-  `taeh3.safetensors` checkpoint;
-- Latent2RGB wrapper callback delivery and reset/chunk/complete event order;
-- animated WebP creation and exact 124-frame/119-frame playback durations at
-  24 FPS.
-
-A full MiniMax H3 GPU render was not run as part of the lightweight automated
-verification. The mocked path exercised chunk planning, prompt replacement,
-conditioning mutation, continuation guide construction, trimming, and final
-shape assembly without loading the large model.
-
-## Documentation used
-
-- MiniMax base video prompt guide:
+- MiniMax base prompt guide:
   <https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md>
-- MiniMax full-reference prompt guide:
+- MiniMax Ref2VA prompt guide:
   <https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md>
-- Installed ComfyUI implementations inspected during development:
-  `comfy_extras/nodes_custom_sampler.py`,
-  `comfy_extras/nodes_minimax_h3.py`,
-  `comfy/model_base.py`,
-  `comfy/ldm/minimax/model.py`, and
-  `comfy/ldm/minimax/vae.py`.
+- Installed ComfyUI implementation:
+  `comfy/samplers.py`, `comfy/context_windows.py`,
+  `comfy_extras/nodes_custom_sampler.py`, `comfy/model_base.py`, and
+  `comfy/ldm/minimax/model.py`.

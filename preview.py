@@ -4,6 +4,7 @@ import logging
 import math
 import queue
 import threading
+import time
 
 import torch
 import torch.nn as nn
@@ -127,6 +128,12 @@ def _packed_video(x0, latent_shapes):
     return x0
 
 
+def _latent_signature(latent, limit=65536):
+    flat = latent.detach().reshape(-1)
+    stride = max(1, math.ceil(flat.numel() / limit))
+    return flat[::stride][:limit].to(device="cpu", dtype=torch.float32)
+
+
 def _resize_pil(image, max_resolution):
     if max_resolution > 0 and (image.width > max_resolution or image.height > max_resolution):
         return ImageOps.contain(image, (max_resolution, max_resolution), Image.Resampling.LANCZOS)
@@ -198,8 +205,8 @@ def _send(payload):
 
 
 class _PreviewExecution:
-    def __init__(self, wrappers, chunk_count):
-        self.items = [(wrapper, wrapper.begin(chunk_count)) for wrapper in wrappers]
+    def __init__(self, wrappers, window_count):
+        self.items = [(wrapper, wrapper.begin(window_count)) for wrapper in wrappers]
 
     def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
         for wrapper, execution_id in self.items:
@@ -209,14 +216,18 @@ class _PreviewExecution:
         for wrapper, execution_id in self.items:
             wrapper.clear_chunk(execution_id)
 
+    def set_window(self, index):
+        for wrapper, execution_id in self.items:
+            wrapper.set_window(execution_id, index)
+
     def close(self):
         for wrapper, execution_id in self.items:
             wrapper.finish(execution_id)
 
 
-def begin_preview_execution(model_patcher, chunk_count):
+def begin_preview_execution(model_patcher, window_count):
     wrappers = model_patcher.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, PREVIEW_WRAPPER_KEY)
-    return _PreviewExecution(wrappers, chunk_count) if wrappers else None
+    return _PreviewExecution(wrappers, window_count) if wrappers else None
 
 
 class _AccumulatedPreviewWrapper:
@@ -228,18 +239,24 @@ class _AccumulatedPreviewWrapper:
         self.frame_stride = frame_stride
         self.tiny_vae_name = tiny_vae
         self.execution_id = 0
-        self.chunk_count = 0
+        self.window_count = 0
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
 
-    def begin(self, chunk_count):
+    def begin(self, window_count):
         self.execution_id += 1
-        self.chunk_count = chunk_count
+        self.window_count = window_count
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
-        _send({"node_id": self.node_id, "action": "reset", "execution": self.execution_id, "chunk_count": chunk_count})
+        _send({
+            "node_id": self.node_id,
+            "action": "reset",
+            "execution": self.execution_id,
+            "chunk_count": 1,
+            "window_count": window_count,
+        })
         return self.execution_id
 
     def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
@@ -257,6 +274,16 @@ class _AccumulatedPreviewWrapper:
         if execution_id == self.execution_id:
             self.current_chunk = None
 
+    def set_window(self, execution_id, index):
+        if execution_id == self.execution_id:
+            _send({
+                "node_id": self.node_id,
+                "action": "window",
+                "execution": execution_id,
+                "window": index,
+                "window_count": self.window_count,
+            })
+
     def finish(self, execution_id):
         if execution_id != self.execution_id:
             return
@@ -270,6 +297,7 @@ class _AccumulatedPreviewWrapper:
         if self.decoder is None:
             try:
                 self.decoder = _TinyDecoder(self.tiny_vae_name)
+                logging.info(f"MiniMax H3 preview is using tiny VAE '{self.tiny_vae_name}'.")
             except Exception as error:
                 logging.warning(f"MiniMax H3 accumulated preview could not load '{self.tiny_vae_name}', using Latent2RGB: {error}")
                 self.decoder_failed = True
@@ -286,13 +314,75 @@ class _AccumulatedPreviewWrapper:
         original_callback = callback
         execution_id = self.execution_id
         chunk_index = chunk["index"]
+        sigmas_list = sigmas.detach().cpu().tolist() if sigmas is not None else []
+        decoder = self._decoder()
+        previewer_name = f"Tiny VAE: {self.tiny_vae_name}" if decoder is not None else "Latent2RGB"
+        if decoder is not None and latent_shapes and decoder.latent_channels != int(latent_shapes[0][1]):
+            logging.warning(
+                f"MiniMax H3 preview ignored '{self.tiny_vae_name}': it expects {decoder.latent_channels} "
+                f"latent channels, but the video latent has {latent_shapes[0][1]}."
+            )
+            self.decoder = None
+            self.decoder_failed = True
+            decoder = None
+            previewer_name = "Latent2RGB"
+
+        initial_signature = None
+        try:
+            if sigmas is not None and len(sigmas) > 0:
+                sigma = sigmas[0].to(noise.device) if hasattr(sigmas[0], "to") else sigmas[0]
+                initial_signature = _latent_signature(_packed_video(noise * sigma, latent_shapes))
+        except Exception as error:
+            logging.warning(f"MiniMax H3 preview could not initialize the latent-change graph: {error}")
+        timing = {"last_time": time.perf_counter(), "step_ms": [], "signature": initial_signature}
+        _send({
+            "node_id": self.node_id,
+            "action": "sample_start",
+            "execution": execution_id,
+            "chunk": chunk_index,
+            "steps": max(0, len(sigmas_list) - 1),
+            "sigmas": sigmas_list,
+            "fps": self.fps,
+            "previewer": previewer_name,
+        })
 
         def preview_callback(step, x0, x, callback_total):
+            nonlocal decoder, previewer_name
             try:
                 video = _packed_video(x0, latent_shapes)
                 if video.ndim == 5:
+                    now = time.perf_counter()
+                    step_ms = (now - timing["last_time"]) * 1000.0
+                    timing["last_time"] = now
+                    timing["step_ms"].append(step_ms)
+                    if len(timing["step_ms"]) > 8:
+                        timing["step_ms"].pop(0)
+                    average_step_ms = sum(timing["step_ms"]) / len(timing["step_ms"])
+
+                    signature = _latent_signature(video)
+                    previous_signature = timing["signature"]
+                    timing["signature"] = signature
+                    delta = None
+                    if previous_signature is not None and previous_signature.shape == signature.shape:
+                        difference = signature - previous_signature
+                        delta = (difference.norm() / max(1, difference.numel()) ** 0.5).item()
+
+                    _send({
+                        "node_id": self.node_id,
+                        "action": "progress",
+                        "execution": execution_id,
+                        "chunk": chunk_index,
+                        "step": step + 1,
+                        "steps": callback_total,
+                        "sigma": sigmas_list[step] if 0 <= step < len(sigmas_list) else None,
+                        "delta": delta,
+                        "step_ms": step_ms,
+                        "avg_step_ms": average_step_ms,
+                        "fps": self.fps,
+                        "previewer": previewer_name,
+                    })
+
                     indices, durations = _frame_selection(video.shape[2], chunk["trim_steps"], self.frame_stride, self.fps)
-                    decoder = self._decoder()
                     if decoder is not None:
                         try:
                             frames = _tiny_frames(video, decoder, indices, self.max_resolution)
@@ -300,6 +390,8 @@ class _AccumulatedPreviewWrapper:
                             logging.warning(f"MiniMax H3 tiny VAE preview failed, using Latent2RGB: {error}")
                             self.decoder = None
                             self.decoder_failed = True
+                            decoder = None
+                            previewer_name = "Latent2RGB (tiny VAE failed)"
                             frames = _latent_rgb_frames(video, latent_format, indices, self.max_resolution)
                     else:
                         frames = _latent_rgb_frames(video, latent_format, indices, self.max_resolution)
@@ -309,7 +401,7 @@ class _AccumulatedPreviewWrapper:
                             "action": "chunk",
                             "execution": execution_id,
                             "chunk": chunk_index,
-                            "chunk_count": self.chunk_count,
+                            "chunk_count": 1,
                             "step": step + 1,
                             "steps": callback_total,
                             "sampled_start": chunk["sampled_start"],
@@ -317,6 +409,10 @@ class _AccumulatedPreviewWrapper:
                             "output_start": chunk["output_start"],
                             "output_end": chunk["output_end"],
                             "duration_ms": sum(durations),
+                            "width": frames[0].width,
+                            "height": frames[0].height,
+                            "fps": self.fps,
+                            "previewer": previewer_name,
                         }
 
                         def encode_and_send(frames=frames, durations=durations, payload=payload):
@@ -344,10 +440,11 @@ class MiniMaxH3UnlimitedPreview(io.ComfyNode):
             node_id="MiniMaxH3UnlimitedPreview",
             display_name="MiniMax H3 Unlimited Preview",
             category="model/sampling/custom",
-            description="Accumulates live MiniMax H3 previews across SamplerCustomAdvanced-Unlimited chunks.",
+            description="Shows the full-length denoised preview produced by SamplerCustomAdvanced-Unlimited after each sampler step.",
             inputs=[
                 io.Model.Input("model"),
-                io.Int.Input("max_resolution", default=512, min=64, max=2048, step=64),
+                io.Int.Input("max_resolution", default=0, min=0, max=8192, step=8,
+                             tooltip="Maximum preview side in pixels. 0 keeps the decoder's native output resolution."),
                 io.Int.Input("quality", default=75, min=30, max=100, step=1),
                 io.Float.Input("fps", default=24.0, min=1.0, max=60.0, step=0.001),
                 io.Int.Input("frame_stride", default=1, min=1, max=16, step=1,

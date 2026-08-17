@@ -1,17 +1,16 @@
 import logging
 import math
 import re
+import uuid
 
-import torch
-
-import comfy.nested_tensor
-import comfy.sample
+import comfy.model_patcher
 import comfy.utils
-from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
+from comfy.ldm.minimax.model import FRAME_PER_TOKEN
 from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 
 from .preview import begin_preview_execution
+from .windowed import MiniMaxH3WindowedContextHandler, WINDOW_INDEX_KEY, add_prepare_sampling_wrapper
 
 
 AUDIO_LATENT_FPS = 40
@@ -86,7 +85,7 @@ def _shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end):
     return " " + " ".join(selected) if selected else " Continue the established shot and its ongoing action."
 
 
-def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content_start=None, continuation=False, drop_picture_anchors=False):
+def _prompt_for_window(prompt, frame_start, frame_end, total_frames, fps, content_start=None, continuation=False, drop_picture_anchors=False):
     content_start = frame_start if content_start is None else content_start
     if drop_picture_anchors:
         prompt = _drop_picture_anchors(prompt)
@@ -128,10 +127,10 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
     for index, (marker, body, shot_start) in enumerate(selected):
         marker_text = f"[Shot {index + 1}]"
         if index:
-            marker_text += f" At {_frame_timestamp(shot_start - frame_start, fps)},"
+            marker_text += f" At {_frame_timestamp(shot_start, fps)},"
         elif continuation and shot_start < content_start:
             body = SHOT_OPENING.sub(r"\1the continuing shot shows ", body, count=1)
-            marker_text += " Continue seamlessly from the provided opening frames at this point in the shot; do not restart or replay earlier actions."
+            marker_text += " Continue the already established shot at this point; do not restart or replay earlier actions."
         rewritten.append(marker_text + body.rstrip() + " ")
     return prompt[:markers[0].start()] + "".join(rewritten) + prompt[description_end:]
 
@@ -235,8 +234,7 @@ def _chunk_plan(video_t, audio_t, chunk_frames):
     return plan
 
 
-def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prompt, video_context=None,
-                            audio_context=None, audio_end_frame=5.0):
+def _conditioning_for_window(original_conds, encoded_prompt, window_index, video_shape, audio_shape):
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
     positive = conds.get("positive")
     if positive is None:
@@ -250,33 +248,10 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
             cond["minimax_token_tags"] = token_tags
         else:
             cond.pop("minimax_token_tags", None)
-        keyframes = []
-        for keyframe in cond.get("minimax_keyframes", ()):
-            position = keyframe["resolved_frame_index"]
-            if frame_start <= position < frame_end:
-                local_keyframe = keyframe.copy()
-                local_keyframe["resolved_frame_index"] = position - frame_start
-                keyframes.append(local_keyframe)
-
-        if video_context is not None:
-            keyframes.append({"resolved_frame_index": 0, "latent": video_context})
-        if audio_context is not None:
-            audio_start = audio_end_frame - audio_context.shape[-1] / FRAME_RESCALE
-            keyframes.append({"resolved_frame_index": audio_start, "audio_latent": audio_context})
-        if keyframes:
-            cond["minimax_keyframes"] = keyframes
-        else:
-            cond.pop("minimax_keyframes", None)
+        cond["latent_shapes"] = [video_shape, audio_shape]
+        cond[WINDOW_INDEX_KEY] = window_index
+        cond["uuid"] = uuid.uuid4()
     return conds
-
-
-class _FixedNoise:
-    def __init__(self, seed, samples):
-        self.seed = seed
-        self.samples = samples
-
-    def generate_noise(self, _latent):
-        return self.samples
 
 
 class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
@@ -286,7 +261,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             node_id="SamplerCustomAdvanced-Unlimited",
             display_name="SamplerCustomAdvanced-Unlimited",
             category="model/sampling/custom",
-            description="Samples a long MiniMax H3 AV latent as continuation-guided temporal chunks. Replace SamplerCustomAdvanced and set the largest chunk that fits in VRAM.",
+            description="Samples one long MiniMax H3 AV latent trajectory through overlapping temporal model windows. Replace SamplerCustomAdvanced and set the largest window that fits in VRAM.",
             inputs=[
                 io.Noise.Input("noise"),
                 io.Guider.Input("guider"),
@@ -297,11 +272,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True,
                                 tooltip="MiniMax prompt using [Shot 1] and [Shot N] At MM:SS.mmm, markers."),
                 io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.001,
-                               tooltip="FPS used to convert absolute prompt timestamps to chunk-local frame positions."),
+                               tooltip="FPS used to convert absolute prompt timestamps to global frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
-                             tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
+                             tooltip="Maximum H3 frames evaluated by the model at once. Values are snapped down to the 17k+5 frame grid."),
                 io.Boolean.Input("debug", default=False,
-                                 tooltip="Log every chunk prompt to the console and return them through chunk_prompts."),
+                                 tooltip="Log every window prompt to the console and return them through chunk_prompts."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
             ],
@@ -327,21 +302,10 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         video, audio = streams
         plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames)
         if len(plan) > 1 and "noise_mask" in latent_image:
-            raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
-
-        fixed_latent = latent_image.copy()
-        fixed_latent["samples"] = comfy.sample.fix_empty_latent_channels(
-            guider.model_patcher,
-            samples,
-            latent_image.get("downscale_ratio_spacial"),
-            latent_image.get("downscale_ratio_temporal"),
-        )
-        full_noise = noise.generate_noise(fixed_latent)
-        if not full_noise.is_nested or len(full_noise.unbind()) != 2:
-            raise ValueError("SamplerCustomAdvanced-Unlimited expected nested video and audio noise")
-        video_noise, audio_noise = full_noise.unbind()
+            raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks with multiple windows")
 
         original_conds = guider.original_conds
+        original_model_options = guider.model_options
         positive = original_conds.get("positive")
         if positive is None:
             raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
@@ -349,112 +313,62 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         total_frames = plan[-1]["frame_end"]
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
-        output_video = []
-        output_audio = []
-        denoised_video = []
-        denoised_audio = []
-        previous_video = None
-        previous_audio = None
-        previous_frame_count = None
-        output_template = None
-        denoised_template = None
+        window_conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
+        window_conds["positive"] = []
         debug_prompts = []
+        for index, chunk in enumerate(plan):
+            continuation = index > 0
+            window_prompt = _prompt_for_window(
+                prompt,
+                chunk["frame_start"],
+                chunk["frame_end"],
+                total_frames,
+                fps,
+                continuation=continuation,
+                drop_picture_anchors=continuation and not ref2va,
+            )
+            if debug:
+                debug_prompt = (
+                    f"=== Window {index + 1}: frames {chunk['frame_start']}-{chunk['frame_end'] - 1} ===\n"
+                    f"{window_prompt}"
+                )
+                debug_prompts.append(debug_prompt)
+                logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
+            encoded_prompt = _encode_prompt(clip, window_prompt, images, positive, width, height, continuation)
+            window_shapes = [video[:, :, chunk["video_start"]:chunk["video_end"]].shape,
+                             audio[..., chunk["audio_start"]:chunk["audio_end"]].shape]
+            encoded_conds = _conditioning_for_window(
+                original_conds, encoded_prompt, index, window_shapes[0], window_shapes[1]
+            )
+            window_conds["positive"].extend(encoded_conds["positive"])
+
         preview_execution = begin_preview_execution(guider.model_patcher, len(plan))
-
+        context_handler = None
         try:
-            for index, chunk in enumerate(plan):
-                vs, ve = chunk["video_start"], chunk["video_end"]
-                aus, aue = chunk["audio_start"], chunk["audio_end"]
-                context_audio_t = chunk["context_audio_t"]
-
-                chunk_latent = fixed_latent.copy()
-                chunk_latent["samples"] = comfy.nested_tensor.NestedTensor((
-                    video[:, :, vs:ve],
-                    audio[..., aus:aue],
-                ))
-                chunk_noise = comfy.nested_tensor.NestedTensor((
-                    video_noise[:, :, vs:ve],
-                    audio_noise[..., aus:aue],
-                ))
-
-                video_context = None if previous_video is None else previous_video[:, :, -CONTEXT_VIDEO_STEPS:].clone()
-                audio_context = None if previous_audio is None else previous_audio[..., -context_audio_t:].clone()
-                audio_end_frame = 5.0
-                if previous_audio is not None:
-                    overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
-                    audio_end_frame += overhang / FRAME_RESCALE
-                continuation = index > 0
-                content_start = chunk["frame_start"] + (5 if continuation else 0)
-                chunk_prompt = _prompt_for_chunk(
-                    prompt,
-                    chunk["frame_start"],
-                    chunk["frame_end"],
-                    total_frames,
-                    fps,
-                    content_start=content_start,
-                    continuation=continuation,
-                    drop_picture_anchors=continuation and not ref2va,
+            if len(plan) > 1:
+                guider.model_options = comfy.model_patcher.create_model_options_clone(original_model_options)
+                context_handler = MiniMaxH3WindowedContextHandler(
+                    plan,
+                    [video.shape, audio.shape],
+                    preview_execution.set_window if preview_execution is not None else None,
                 )
-                if debug:
-                    debug_prompt = (
-                        f"=== Chunk {index + 1}: sampled frames {chunk['frame_start']}-{chunk['frame_end'] - 1}; "
-                        f"output frames {content_start}-{chunk['frame_end'] - 1} ===\n{chunk_prompt}"
-                    )
-                    debug_prompts.append(debug_prompt)
-                    logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
-                encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation)
-                guider.original_conds = _conditioning_for_chunk(
-                    original_conds,
-                    chunk["frame_start"],
-                    chunk["frame_end"],
-                    encoded_prompt,
-                    video_context,
-                    audio_context,
-                    audio_end_frame,
-                )
-
-                chunk_seed = (noise.seed + index) & 0xffffffffffffffff
-                if preview_execution is not None:
-                    preview_execution.set_chunk(
-                        index,
-                        chunk["frame_start"],
-                        chunk["frame_end"] - 1,
-                        content_start,
-                        chunk["frame_end"] - 1,
-                        0 if index == 0 else CONTEXT_VIDEO_STEPS,
-                    )
-                try:
-                    sampled, denoised = super().execute(
-                        _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
-                    )
-                finally:
-                    if preview_execution is not None:
-                        preview_execution.clear_chunk()
-                output_template = sampled
-                denoised_template = denoised
-                previous_video, previous_audio = sampled["samples"].unbind()
-                previous_frame_count = chunk["frame_end"] - chunk["frame_start"]
-                denoised_chunk_video, denoised_chunk_audio = denoised["samples"].unbind()
-
-                video_trim = 0 if index == 0 else CONTEXT_VIDEO_STEPS
-                audio_trim = 0 if index == 0 else context_audio_t
-                output_video.append(previous_video[:, :, video_trim:].clone())
-                output_audio.append(previous_audio[..., audio_trim:].clone())
-                denoised_video.append(denoised_chunk_video[:, :, video_trim:].clone())
-                denoised_audio.append(denoised_chunk_audio[..., audio_trim:].clone())
+                guider.model_options["context_handler"] = context_handler
+                add_prepare_sampling_wrapper(guider.model_options)
+            guider.original_conds = window_conds
+            if preview_execution is not None:
+                preview_execution.set_chunk(0, 0, total_frames - 1, 0, total_frames - 1, 0)
+                if len(plan) == 1:
+                    preview_execution.set_window(0)
+            sampled, denoised = super().execute(noise, guider, sampler, sigmas, latent_image)
         finally:
             guider.original_conds = original_conds
+            guider.model_options = original_model_options
             if preview_execution is not None:
+                preview_execution.clear_chunk()
                 preview_execution.close()
+            if context_handler is not None:
+                context_handler.close()
 
-        output_template["samples"] = comfy.nested_tensor.NestedTensor((
-            torch.cat(output_video, dim=2),
-            torch.cat(output_audio, dim=-1),
-        ))
-        denoised_template["samples"] = comfy.nested_tensor.NestedTensor((
-            torch.cat(denoised_video, dim=2),
-            torch.cat(denoised_audio, dim=-1),
-        ))
-        return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts))
+        return io.NodeOutput(sampled, denoised, "\n\n".join(debug_prompts))
 
     sample = execute
