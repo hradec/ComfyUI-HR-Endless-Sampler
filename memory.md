@@ -17,11 +17,20 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `chunk_frames`: the maximum number of H3 frames sampled at once;
 - `context_frames`: the completed H3-valid tail carried into every later
   chunk, defaulting to five frames;
+- `guide_overlap`: three-way selector for the configured completed-tail guide
+  and overlap, a fixed five-frame guide and overlap, or fully off;
+- `video_continuation`: experimental bounded native Ref2VA continuation using
+  the previous `context_frames` tail as a new `<Video N>`;
+- `qwen_full_history`: experimental Qwen-only view of every completed frame,
+  sampled at 2 FPS, without adding that history to DiT reference attention;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
-  console and returns the same text through `chunk_prompts`;
+  console, returns the same text through `chunk_prompts`, and enables detailed
+  VRAM snapshots around conditioning and sampling;
 - `debug_stop_chunk`: returns after the selected 1-based serial chunk for fast
   boundary diagnostics; zero keeps the normal complete run;
-- optional `images`: pixel images needed to rebuild Qwen visual conditioning.
+- optional `images`: pixel images needed to rebuild Qwen visual conditioning;
+- optional `vae`: the H3 video VAE, required only by the two experimental
+  decoded-video conditioning modes.
 
 The sampler node id and display name are both:
 
@@ -99,13 +108,17 @@ Relevant published history:
 - `main` contains the original serial implementation and the merged continuity
   and preview work through merge commit `9714162`;
 - `restore-serial-continuation` is the active branch and is published through
-  `b17e8fd` (`Improve sampler diagnostics and preview`);
+  `da537bd` (`Improve continuation controls and preview`);
 - `improve-windowed-sampling` preserves the rejected global-window experiment
   at `cdbbd24` for forensic comparison only.
 
 `stash@{0}` contains a global-window follow-up experiment and is not applied.
 The local `prompt.txt` is user diagnostic material, remains untracked, and must
 not be added to commits unless explicitly requested.
+
+The three independent continuation-toggle experiments described below are
+currently uncommitted working-tree changes on top of `da537bd`, ready for a GPU
+comparison before they are published.
 
 ## MiniMax H3 latent structure
 
@@ -303,6 +316,164 @@ it from both sampler outputs, and tells the preview to hide it. Longer context
 may preserve more visual history, but it repeats more computation, creates more
 chunks for a fixed `chunk_frames`, and can overconstrain motion or replay prior
 action.
+
+### Independent continuation experiments
+
+Three sampler controls isolate the continuation mechanisms so GPU tests can
+compare them without silently coupling their effects. Their defaults preserve
+the published serial path: `guide_overlap=context_frames`,
+`video_continuation=false`, and `qwen_full_history=false`.
+
+`guide_overlap` has three modes. `context_frames` injects the configured
+completed video and audio tails as native H3 keyframes, samples the same global
+interval as overlap, and trims it afterward. `5 frames` performs that identical
+guide + overlap process with H3's minimum five-frame tail, regardless of the
+larger configured value. Both are the original continuation mechanism at
+different strengths; there is no overlap-only mode.
+
+`off` carries no prior video latent, audio latent, or global noise interval into
+the next chunk and adds no continuation keyframe. H3's temporal phase still
+requires every independently sampled local chunk to begin on its `17k + 5`
+grid. The node therefore prepends newly allocated empty five-frame video/audio
+latents with separately generated noise and discards their sampled result.
+This is local packing, not previous-chunk overlap. It lets the remainder join
+the single output latent at the correct temporal phase while ensuring that any
+previous-result information comes only from the separately selected native
+video-continuation or Qwen-history mechanism.
+
+`video_continuation` implements the full-reference continuation experiment for
+later chunks. It clones only the final `context_frames` latent positions from
+the completed previous chunk. The H3 VAE decodes that bounded tail, and Qwen is
+shown frames sampled at the same 2 FPS cadence used by ComfyUI's stock H3
+Ref2VA node. The clean bounded latent is independently appended to
+`minimax_refs` as a video block, so the DiT can attend to the continuation
+source without merging it into the noisy target latent.
+
+The generated video label uses the next available video ordinal. A later chunk
+prompt gains a `<Video N>` definition, a `[video continuation]` task type (or
+adds it to existing task types), a retention entry, and a detailed-description
+instruction to continue from the end of that video. The original prompt is
+used afresh for every chunk, so the dynamic sections cannot accumulate. The
+implementation prefers `detailed_description` when a hybrid diagnostic prompt
+also contains `integrated_multimodal_description`; this prevents `[Shot N]`
+mentions in Ref2VA analysis sections from being mistaken for timeline markers.
+
+`qwen_full_history` deliberately changes only Qwen conditioning. Before each
+later chunk, the already assembled output from the beginning through the last
+completed chunk is decoded and sampled at 2 FPS. That video presentation is
+appended to Qwen's reference items, but no matching `minimax_refs` block and no
+prompt rewrite are added. This directly tests whether long visual history in
+Qwen improves consistency without increasing DiT reference attention. The
+currently sampled chunk cannot be included because it is still noise when its
+Qwen prompt is encoded.
+
+Both decoded-video modes require the H3 video VAE and a Ref2VA conditioning
+whose original Qwen presentation can be reconstructed by this node. Decoded
+pixel tensors are execution-local and released after CLIP encoding. Dynamic
+video presentations are sampled at 2 FPS and downscaled to at most a 512x512
+pixel-area budget before Qwen encoding. This does not resize the clean DiT
+reference latent or any original Ref2VA image. The native mode keeps only its
+bounded full-resolution clean latent for the sampler call. The full-history
+mode keeps no additional DiT latent, although its temporary VAE decode and Qwen
+token count grow with completed duration. When both experiments are enabled,
+Qwen receives the bounded native video followed by the full-history video; only
+the bounded one is referenced by the prompt and DiT.
+
+### Conditioning-model eviction and the Qwen token wall
+
+A 1920x1088 diagnostic using `chunk_frames=56`, `context_frames=22`, native
+video continuation, and no Qwen full history completed chunk one but OOMed at
+chunk two's first DiT QKV projection. The decoded video and Qwen prompt had
+already completed. The console immediately before the failure reported
+`0 models unloaded`.
+
+The first hypothesis was residual VAE/Qwen model residency. VAE decode and CLIP
+encode call ComfyUI's dynamic loader but do not unload their models after
+returning, and dynamic loading avoids evicting other dynamic models when
+possible. MiniMax H3 also does not currently report `minimax_refs` through
+`extra_conds_shapes`, so generic sampling-memory estimates omit the packed
+reference rows.
+
+After every chunk's prompt encoding, the sampler now calls ComfyUI's targeted
+`unload_model_and_clones` first for the CLIP patcher and then for the connected
+VAE patcher. This runs before stock `SamplerCustomAdvanced` prepares the DiT,
+including for chunk one when an upstream node may have left the VAE loaded. The
+encoded cross-attention, token tags, and small clean reference latent remain;
+decoded pixel frames have already left scope. Targeted eviction also releases
+the associated CUDA cache without unloading unrelated models. The tradeoff is
+additional model reload/offload time at every chunk boundary.
+
+A second render confirmed both targeted unload calls before chunks one and two
+but failed at the identical QKV operation. Allocated and peak memory changed by
+only about 5 MiB (`9383/12123 MiB` before eviction versus `9378/12118 MiB`
+afterward). This disproved retained conditioning-model weights as the immediate
+cause of that OOM, although explicit eviction remains useful headroom hygiene.
+
+The successful 56+22 guide and failing 56+22 native reference have the same
+14,280 clean visual-condition rows at 1920x1088. The native path additionally
+presents two decoded full-resolution frames to Qwen. Qwen turns that pair into
+approximately 2,040 more packed vision rows. The installed INT8 linear backend
+scales output in parts, retains every part, and then allocates a second complete
+buffer with `torch.cat`; this small sequence increase crosses its sharp QKV
+allocation threshold.
+
+Dynamic Qwen video frames are therefore resized by aspect-preserving pixel area
+to at most `512 * 512` before tokenization. A 1920x1088 pair becomes 672x384,
+reducing its merged vision rows from roughly 2,040 to 252. The separate clean
+video latent still enters the DiT at the original 1920x1088 latent resolution.
+Debug logging reports the actual frame count and Qwen presentation resolution
+for every dynamic video item.
+
+### Debug VRAM accounting
+
+Debug mode records memory at execution setup, each chunk start, before and
+after VAE decode/Qwen encoding, after targeted conditioning-model eviction,
+immediately before the stock sampler, and after it returns. A temporary
+`APPLY_MODEL` wrapper also records memory directly before and after every DiT
+evaluation. This is earlier than the normal sampler callback, so the first
+failed evaluation in an OOMing chunk still produces a snapshot and an
+abbreviated CUDA allocator summary.
+
+Each snapshot distinguishes device memory used by all processes, physically
+free memory, PyTorch allocated/active/reserved memory, inactive cache, and
+per-chunk peaks. It also lists the loaded sizes reported by the known H3 DiT,
+Qwen/CLIP, and video-VAE patchers and every patcher in ComfyUI's resident-model
+registry, including each patcher's active patch-key count so failed LoRA
+attachment is visible. Selected node-owned and model-call tensors are shown as
+logical GPU payload sizes. Those payload values can overlap when tensors are
+views or are reachable under more than one conditioning field; the
+PyTorch/device totals remain the authoritative allocation figures.
+
+The monitor is installed only while a debug execution is active and is removed
+in the same `finally` cleanup that restores the guider conditioning. Non-debug
+sampling therefore keeps the stock model-call path and logging volume.
+
+An initial four-step diagnostic passed the previously failing second-chunk
+first evaluation while the GPU stayed near its physical capacity, but that
+process rejected every H3 LoRA key and reported `MiniMaxH3 ... 0 patches
+attached`. A restarted run with the latest sampler then reported 208 H3 patch
+keys, presented the bounded Qwen video as two 672x384 frames, and also passed
+chunk two. Finally, the same workflow without the LoRA and with the normal 20
+steps did not OOM. Reducing the step count does not change one DiT evaluation's
+tensor shapes, and the LoRA was not common to the successful tests. The shared
+change was therefore the updated continuation path: bounded Qwen-video
+downscaling plus explicit Qwen/VAE eviction. This confirms that the former
+full-resolution Qwen vision rows were what pushed the chunk-two INT8 QKV
+allocation past the 16 GB limit.
+
+Attention-patch isolation tests produced the same conclusion. With Sage
+Attention plus SOL-attn and Spectrum disabled, chunk two peaked at about
+12,057 MiB active and 14,144 MiB reserved. With Spectrum Apply MiniMax H3
+enabled, the comparable chunk peaked at about 12,050 MiB active and 14,208 MiB
+reserved and continued into chunk three. The roughly 64 MiB reserved-memory
+difference is negligible beside the 12 GiB DiT forward and does not grow by
+chunk. Spectrum was therefore not the source of the former chunk-two OOM.
+
+The official base guide clarified that ordinary first/last-frame workflows are
+I2VA/FL2VA/L2VA tasks with a fixed alignment instruction and three core prompt
+fields. The six-section format and `[video continuation]` task type belong to
+the full-reference guide. For that reason, neither the guide-only path nor the
+Qwen-history-only experiment receives the new Ref2VA summary text.
 
 ## Existing H3 conditioning
 
@@ -677,6 +848,19 @@ Completed checks include:
 - schema registration with the expected node id and all new inputs;
 - a planner matrix covering 212 H3 durations and eight chunk settings;
 - exact reconstructed video/audio shapes for mocked multi-chunk sampling;
+- mocked execution of configured-tail guide + overlap, five-frame guide +
+  overlap, fully off, bounded native video, Qwen-full-history, and combined
+  configurations with exact final AV shapes;
+- bounded native references appearing in both Qwen presentation and the DiT
+  `minimax_refs` list, while full-history references appear only in Qwen;
+- 2 FPS decoded-video frame selection and half-second timestamps matching the
+  installed stock H3 Ref2VA implementation;
+- non-mutation and final restoration of the original Ref2VA reference list;
+- targeted Qwen/VAE unload ordering before every stock sampler invocation;
+- dynamic Qwen video downscaling with preserved aspect ratio, 32-pixel canvas
+  alignment, correct timestamps, and unchanged DiT reference dimensions;
+- native continuation insertion into subject definitions, combined summary
+  task types, retention analysis, and the local first-shot instruction;
 - context lengths of 5, 22, 39, 56, and 107 frames with exact reconstructed
   output sizes and synchronized audio trimming;
 - mocked `context_frames=22` serial execution proving that later chunks receive

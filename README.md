@@ -29,15 +29,44 @@
    values are `5, 22, 39, 56, ...`; the default is `5`, and it must remain
    smaller than `chunk_frames`. Longer context can improve continuity but
    leaves fewer new frames per chunk and therefore increases runtime.
-8. Enable `debug` to print the exact rewritten prompt and sampled/output frame
+8. Choose the `guide_overlap` mode:
+
+   - `context_frames` uses the configured completed video/audio tail as both
+     guide and overlap;
+   - `5 frames` uses the same guide + overlap mechanism with H3's minimum
+     five-frame tail;
+   - `off` carries no previous-chunk guide or overlap. A newly generated local
+     five-frame packing prefix is discarded so the combined output remains a
+     valid H3 latent; it contains no previous-chunk frames.
+9. `video_continuation` is an experimental Ref2VA alternative. It decodes only
+   the bounded `context_frames` tail for Qwen, adds that tail as the next
+   `<Video N>` reference for the DiT, and adds the documented
+   `[video continuation]` sections to later chunk prompts. Connect the H3 `vae`.
+   The DiT reference stays at latent resolution; only Qwen's decoded copy is
+   limited to a 512x512 pixel-area budget to control packed-token memory.
+10. `qwen_full_history` is an independent experiment. Before each later chunk,
+    Qwen sees decoded 2 FPS frames from all completed output so far. It does not
+    rewrite the prompt or add that history as a DiT reference. Connect the H3
+    `vae`.
+11. Enable `debug` to print the exact rewritten prompt and sampled/output frame
    range for every chunk in the ComfyUI console and return the same text through
-   the `chunk_prompts` output.
-9. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
+   the `chunk_prompts` output. Debug mode also logs VRAM at each VAE/Qwen/DiT
+   boundary and immediately before and after every DiT evaluation. The report
+   includes physical free memory, PyTorch allocation/cache/peaks, known model
+   residency, and visible GPU tensor payloads. A failed DiT evaluation emits an
+   additional abbreviated CUDA allocator summary before re-raising the error.
+12. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
    number. `0` is the normal setting and samples the complete video.
-10. Decode the returned AV latent normally.
+13. Decode the returned AV latent normally.
 
 Existing H3 first/last-frame guides are assigned to the chunk containing their
 frame. Ref2VA references remain attached to every chunk.
+
+After each chunk prompt is encoded, the node explicitly unloads Qwen and the
+connected H3 video VAE before starting the DiT. ComfyUI's dynamic loader does
+not include MiniMax reference rows in its normal sampling-memory estimate and
+can otherwise leave both conditioning models resident at a chunk boundary.
+This cleanup trades model reload time for maximum sampling headroom.
 
 ## Accumulated live preview
 
@@ -116,6 +145,16 @@ The parser recognizes both `integrated_multimodal_description:` and
   so very long action-dense shots may still benefit from a larger chunk size.
 - Longer `context_frames` uses more of each chunk for repeated guide context,
   increasing the number of sampler calls and total runtime.
+- `video_continuation` and `qwen_full_history` require image/audio Ref2VA
+  conditioning that this node can reconstruct plus the MiniMax H3 video VAE.
+  They are ignored for the first chunk because no generated history exists yet.
+- Native `video_continuation` adds only the bounded tail to DiT attention.
+  `qwen_full_history` adds no DiT reference, but its Qwen token and temporary
+  VAE-decode cost grows with the completed duration. Dynamic Qwen video frames
+  are downscaled by area before encoding; original Ref2VA images are unchanged.
+- `guide_overlap: off` is the clean native-continuation experiment: the
+  previous result reaches the next chunk only through `video_continuation`
+  and/or `qwen_full_history`, according to those independent switches.
 - Chunked denoise masks are not supported.
 
 Prompt format references: [MiniMax base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
