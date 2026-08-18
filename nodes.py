@@ -17,19 +17,23 @@ from .preview import begin_preview_execution
 
 AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
-CONTEXT_VIDEO_STEPS = 2
+MIN_VIDEO_STEPS = 2
 CANVAS_MULTIPLE = 32
 DESCRIPTION_FIELD = re.compile(r"(?:integrated_multimodal_description|detailed_description)\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
 DESCRIPTION_END = re.compile(r"\n\s*(?:overall_soundscape|non_diegetic_music)\s*:", re.IGNORECASE)
 PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
-SHOT_OPENING = re.compile(r"^(\s*)(?:the camera|the shot)\s+(?:cuts|transitions|changes|switches)\s+to\s+", re.IGNORECASE)
+SHOT_OPENING = re.compile(r"^(\s*)(?:(?:the\s+)?camera|the\s+shot)\s+(?:cuts?|transitions?|changes?|switches?)\s+to\s+", re.IGNORECASE)
 SHOT_BREAK = re.compile(r"(?<=[.!?])\s+|(?<=[.!?][\"'])\s+|\n\s*\n+")
 SHOT_CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
 
 
 def _pixel_frames(latent_t):
     return sum(FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)] for index in range(latent_t))
+
+
+def _video_steps(frames):
+    return ((frames - 5) // 17) * 5 + MIN_VIDEO_STEPS
 
 
 def _audio_steps(frames):
@@ -81,7 +85,7 @@ def _shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end):
     selected = []
     offset = 0
     for unit, weight in zip(units, weights):
-        if start_weight <= offset < end_weight:
+        if offset < end_weight and offset + weight > start_weight:
             selected.append(unit)
         offset += weight
     return " " + " ".join(selected) if selected else " Continue the established shot and its ongoing action."
@@ -185,11 +189,16 @@ def _encode_prompt(clip, prompt, images, positive, width, height, continuation):
     return conditioning[0]
 
 
-def _chunk_plan(video_t, audio_t, chunk_frames):
+def _chunk_plan(video_t, audio_t, chunk_frames, context_frames=5):
     max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
-    max_chunk_t = ((max_chunk_frames - 5) // 17) * 5 + CONTEXT_VIDEO_STEPS
+    if context_frames < 5 or (context_frames - 5) % 17:
+        raise ValueError("context_frames must use MiniMax H3's 17k+5 frame grid: 5, 22, 39, 56, ...")
+    if context_frames >= max_chunk_frames:
+        raise ValueError(f"context_frames ({context_frames}) must be smaller than the effective chunk size ({max_chunk_frames})")
+    max_chunk_t = _video_steps(max_chunk_frames)
+    context_video_t = _video_steps(context_frames)
 
-    if video_t < CONTEXT_VIDEO_STEPS or (video_t - CONTEXT_VIDEO_STEPS) % 5:
+    if video_t < MIN_VIDEO_STEPS or (video_t - MIN_VIDEO_STEPS) % 5:
         raise ValueError("SamplerCustomAdvanced-Unlimited expects a MiniMax H3 video latent on the 17k+5 frame grid")
 
     total_frames = _pixel_frames(video_t)
@@ -208,12 +217,12 @@ def _chunk_plan(video_t, audio_t, chunk_frames):
             new_video_t = chunk_t
             chunk_frame_count = _pixel_frames(chunk_t)
         else:
-            new_video_t = min(max_chunk_t - CONTEXT_VIDEO_STEPS, remaining)
-            chunk_t = new_video_t + CONTEXT_VIDEO_STEPS
-            video_start = video_end - CONTEXT_VIDEO_STEPS
+            new_video_t = min(max_chunk_t - context_video_t, remaining)
+            chunk_t = new_video_t + context_video_t
+            video_start = video_end - context_video_t
             chunk_frame_count = _pixel_frames(chunk_t)
 
-        output_frames += chunk_frame_count if not plan else chunk_frame_count - 5
+        output_frames += chunk_frame_count if not plan else chunk_frame_count - context_frames
         next_audio_end = _audio_steps(output_frames)
         chunk_audio_t = _audio_steps(chunk_frame_count)
         new_audio_t = next_audio_end - audio_end
@@ -225,6 +234,7 @@ def _chunk_plan(video_t, audio_t, chunk_frames):
             "video_end": video_start + chunk_t,
             "audio_start": audio_start,
             "audio_end": next_audio_end,
+            "context_video_t": 0 if not plan else context_video_t,
             "context_audio_t": context_audio_t,
             "frame_start": 0 if not plan else output_frames - chunk_frame_count,
             "frame_end": output_frames,
@@ -330,6 +340,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                tooltip="FPS used to convert absolute prompt timestamps to chunk-local frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
+                io.Int.Input("context_frames", default=5, min=5, max=3600, step=17,
+                             tooltip="Completed frames carried into each later chunk. Valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt to the console and return them through chunk_prompts."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
@@ -346,7 +358,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
-                debug_stop_chunk=0, images=None):
+                debug_stop_chunk=0, images=None, context_frames=5):
         samples = latent_image["samples"]
         if not samples.is_nested:
             sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
@@ -358,7 +370,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             return io.NodeOutput(sampled[0], sampled[1], "")
 
         video, audio = streams
-        plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames)
+        plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_frames)
         if len(plan) > 1 and "noise_mask" in latent_image:
             raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
         if debug_stop_chunk > len(plan):
@@ -402,6 +414,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             for index, chunk in enumerate(active_plan):
                 vs, ve = chunk["video_start"], chunk["video_end"]
                 aus, aue = chunk["audio_start"], chunk["audio_end"]
+                context_video_t = chunk["context_video_t"]
                 context_audio_t = chunk["context_audio_t"]
 
                 chunk_latent = fixed_latent.copy()
@@ -414,14 +427,14 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     audio_noise[..., aus:aue],
                 ))
 
-                video_context = None if previous_video is None else previous_video[:, :, -CONTEXT_VIDEO_STEPS:].clone()
+                video_context = None if previous_video is None else previous_video[:, :, -context_video_t:].clone()
                 audio_context = None if previous_audio is None else previous_audio[..., -context_audio_t:].clone()
-                audio_end_frame = 5.0
+                audio_end_frame = float(context_frames)
                 if previous_audio is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
                 continuation = index > 0
-                content_start = chunk["frame_start"] + (5 if continuation else 0)
+                content_start = chunk["frame_start"] + (context_frames if continuation else 0)
                 chunk_prompt = _prompt_for_chunk(
                     prompt,
                     chunk["frame_start"],
@@ -458,7 +471,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         chunk["frame_end"] - 1,
                         content_start,
                         chunk["frame_end"] - 1,
-                        0 if index == 0 else CONTEXT_VIDEO_STEPS,
+                        context_video_t,
                     )
                 try:
                     chunk_progress.start(index)
@@ -474,7 +487,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 previous_frame_count = chunk["frame_end"] - chunk["frame_start"]
                 denoised_chunk_video, denoised_chunk_audio = denoised["samples"].unbind()
 
-                video_trim = 0 if index == 0 else CONTEXT_VIDEO_STEPS
+                video_trim = context_video_t
                 audio_trim = 0 if index == 0 else context_audio_t
                 output_video.append(previous_video[:, :, video_trim:].clone())
                 output_audio.append(previous_audio[..., audio_trim:].clone())

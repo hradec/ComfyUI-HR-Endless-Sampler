@@ -239,6 +239,10 @@ class _AccumulatedPreviewWrapper:
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
+        self.started_at = None
+
+    def _elapsed_ms(self):
+        return None if self.started_at is None else (time.perf_counter() - self.started_at) * 1000.0
 
     def begin(self, chunk_count):
         self.execution_id += 1
@@ -246,7 +250,14 @@ class _AccumulatedPreviewWrapper:
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
-        _send({"node_id": self.node_id, "action": "reset", "execution": self.execution_id, "chunk_count": chunk_count})
+        self.started_at = time.perf_counter()
+        _send({
+            "node_id": self.node_id,
+            "action": "reset",
+            "execution": self.execution_id,
+            "chunk_count": chunk_count,
+            "elapsed_ms": 0.0,
+        })
         return self.execution_id
 
     def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
@@ -267,9 +278,16 @@ class _AccumulatedPreviewWrapper:
     def finish(self, execution_id):
         if execution_id != self.execution_id:
             return
-        _send({"node_id": self.node_id, "action": "complete", "execution": execution_id})
+        _send({
+            "node_id": self.node_id,
+            "action": "complete",
+            "execution": execution_id,
+            "chunk_count": self.chunk_count,
+            "elapsed_ms": self._elapsed_ms(),
+        })
         self.current_chunk = None
         self.decoder = None
+        self.started_at = None
 
     def _decoder(self):
         if self.tiny_vae_name == "none" or self.decoder_failed:
@@ -325,6 +343,7 @@ class _AccumulatedPreviewWrapper:
             "sigmas": sigmas_list,
             "fps": self.fps,
             "previewer": previewer_name,
+            "elapsed_ms": self._elapsed_ms(),
         })
 
         def preview_callback(step, x0, x, callback_total):
@@ -356,12 +375,14 @@ class _AccumulatedPreviewWrapper:
                         "chunk_count": self.chunk_count,
                         "step": step + 1,
                         "steps": callback_total,
+                        "sigmas": sigmas_list,
                         "sigma": sigmas_list[step] if 0 <= step < len(sigmas_list) else None,
                         "delta": delta,
                         "step_ms": step_ms,
                         "avg_step_ms": average_step_ms,
                         "fps": self.fps,
                         "previewer": previewer_name,
+                        "elapsed_ms": self._elapsed_ms(),
                     })
 
                     indices, durations = _frame_selection(video.shape[2], chunk["trim_steps"], self.frame_stride, self.fps)
@@ -386,6 +407,7 @@ class _AccumulatedPreviewWrapper:
                             "chunk_count": self.chunk_count,
                             "step": step + 1,
                             "steps": callback_total,
+                            "sigmas": sigmas_list,
                             "sampled_start": chunk["sampled_start"],
                             "sampled_end": chunk["sampled_end"],
                             "output_start": chunk["output_start"],
@@ -395,6 +417,7 @@ class _AccumulatedPreviewWrapper:
                             "height": frames[0].height,
                             "fps": self.fps,
                             "previewer": previewer_name,
+                            "elapsed_ms": self._elapsed_ms(),
                         }
 
                         def encode_and_send(frames=frames, durations=durations, payload=payload):

@@ -9,7 +9,7 @@
 
 ### How is this possible?
 1. The new Sampler node samples at most `chunk_frames` at a time.
-2. After the first chunk, the final five video frames and the matching generated-audio tail are supplied to the next chunk through H3's native guide conditioning.
+2. After the first chunk, the final `context_frames` video frames (five by default) and the matching generated-audio tail are supplied to the next chunk through H3's native guide conditioning.
 3. The repeated latent prefix is removed before the chunks are joined, so both output latents have the same video and audio shapes requested by the upstream H3 conditioning node.
 4. The video/audio decoding stage just decodes the latent as usual, creating a longer than 15secs video and/or higher resolution than possible with low-vram. 
 
@@ -25,12 +25,16 @@
    image in its original order. T2VA and audio-only Ref2VA need no images.
 6. Set `chunk_frames` to the largest chunk that fits in VRAM. `124` is the
    conservative default; the value is snapped down to H3's `17k + 5` grid.
-7. Enable `debug` to print the exact rewritten prompt and sampled/output frame
+7. Set `context_frames` to the completed tail carried into later chunks. Valid
+   values are `5, 22, 39, 56, ...`; the default is `5`, and it must remain
+   smaller than `chunk_frames`. Longer context can improve continuity but
+   leaves fewer new frames per chunk and therefore increases runtime.
+8. Enable `debug` to print the exact rewritten prompt and sampled/output frame
    range for every chunk in the ComfyUI console and return the same text through
    the `chunk_prompts` output.
-8. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
+9. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
    number. `0` is the normal setting and samples the complete video.
-9. Decode the returned AV latent normally.
+10. Decode the returned AV latent normally.
 
 Existing H3 first/last-frame guides are assigned to the chunk containing their
 frame. Ref2VA references remain attached to every chunk.
@@ -49,14 +53,22 @@ preview. Tiny-VAE decoding is slower and uses additional VRAM, so increase
 `frame_stride` if preview overhead is too high. `fps` controls playback timing
 and should match the sampler's prompt FPS. `max_resolution: 0` preserves the
 preview decoder's native resolution. The widget shows the active `Chunk N/N`,
-preview resolution, FPS, seconds per step, ETA, sigma/latent-change history,
-and step-time history. The five continuation frames are shown only once because
-the preview removes the overlap from later chunks.
+preview resolution, FPS, seconds per step, elapsed time, ETA,
+sigma/latent-change history, and step-time history. The configured continuation
+frames are shown only once because the preview removes the overlap from later
+chunks.
+
+If the browser is refreshed during sampling, the widget reconnects on the next
+preview event and continues showing the running job. Hover either graph to draw
+a vertical sampling-step marker and inspect any retained preview step from the
+active chunk; moving off the graph returns to the live accumulated playback.
+New denoising previews replace their cached chunk at the next playback boundary,
+so an update cannot restart a chunk or splice it into the preceding chunk.
 
 The console also displays a chunk progress line above the stock sampler's step
 progress. A later chunk starts only after the previous chunk has completed, so
 its native H3 continuation guide contains the previous result's finished final
-five video frames and synchronized audio tail.
+`context_frames` video frames and synchronized audio tail.
 
 ## Shot timing
 
@@ -83,8 +95,10 @@ the earlier action.
 
 When one shot is longer than a chunk, its sentences are distributed across the
 chunk timelines instead of sending the complete shot description to every
-sampler call. The five carried frames are context only and do not consume a
-second copy of the prompt action range.
+sampler call. A sentence that spans a chunk boundary remains in both prompts so
+a continuation never loses the shot's only concrete description. The carried
+frames are context only and do not consume a second copy of the prompt action
+range.
 
 The parser recognizes both `integrated_multimodal_description:` and
 `detailed_description:`. Other MiniMax prompt sections are preserved.
@@ -100,6 +114,8 @@ The parser recognizes both `integrated_multimodal_description:` and
 - When a chunk starts partway through a long shot, its description is retained
   with a continuation instruction. Natural-language timing remains generative,
   so very long action-dense shots may still benefit from a larger chunk size.
+- Longer `context_frames` uses more of each chunk for repeated guide context,
+  increasing the number of sampler calls and total runtime.
 - Chunked denoise masks are not supported.
 
 Prompt format references: [MiniMax base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)

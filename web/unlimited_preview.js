@@ -82,20 +82,37 @@ function drawSeries(context, values, total, width, height, color, dashed=false, 
 }
 
 
-function drawSigmaDelta(canvas, sigmas, deltas, steps) {
-    const { context, width, height } = canvasContext(canvas);
-    context.clearRect(0, 0, width, height);
-    drawGrid(context, width, height);
-    drawSeries(context, sigmas, Math.max(steps + 1, sigmas.length), width, height, "rgba(210,210,210,0.6)", true);
-    drawSeries(context, [null, ...deltas], Math.max(steps + 1, deltas.length + 1), width, height, "#e67e22", false, true);
+function drawMarker(context, step, total, width, height) {
+    if (!Number.isFinite(step) || total < 2) return;
+    const x = 4 + step / (total - 1) * (width - 8) + 0.5;
+    context.strokeStyle = "rgba(220,220,220,0.65)";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(x, 3);
+    context.lineTo(x, height - 3);
+    context.stroke();
 }
 
 
-function drawStepTimes(canvas, values, steps) {
+function drawSigmaDelta(canvas, sigmas, deltas, steps, markerStep=null) {
     const { context, width, height } = canvasContext(canvas);
+    const total = Math.max(steps + 1, sigmas.length, deltas.length + 1);
     context.clearRect(0, 0, width, height);
     drawGrid(context, width, height);
-    drawSeries(context, values, Math.max(steps, values.length), width, height, "#e67e22", false, true);
+    drawSeries(context, sigmas, total, width, height, "rgba(210,210,210,0.6)", true);
+    drawSeries(context, [null, ...deltas], total, width, height, "#e67e22", false, true);
+    drawMarker(context, markerStep, total, width, height);
+}
+
+
+function drawStepTimes(canvas, values, steps, markerStep=null) {
+    const { context, width, height } = canvasContext(canvas);
+    const aligned = [null, ...values];
+    const total = Math.max(steps + 1, aligned.length);
+    context.clearRect(0, 0, width, height);
+    drawGrid(context, width, height);
+    drawSeries(context, aligned, total, width, height, "#e67e22", false, true);
+    drawMarker(context, markerStep, total, width, height);
 }
 
 
@@ -158,6 +175,10 @@ app.registerExtension({
 
             const sigmaGraph = graphCell("σ / Δ");
             const timeGraph = graphCell("step time");
+            sigmaGraph.canvas.style.cursor = "crosshair";
+            timeGraph.canvas.style.cursor = "crosshair";
+            sigmaGraph.canvas.title = "Hover to inspect the preview at a sampling step";
+            timeGraph.canvas.title = "Hover to inspect the preview at a sampling step";
 
             let execution = null;
             let chunkCount = 0;
@@ -166,10 +187,13 @@ app.registerExtension({
             let durations = [];
             let playing = 0;
             let timer = null;
+            let pendingChunk = null;
             let imageUpdate = 0;
             let sigmas = [];
             let deltas = [];
             let stepTimes = [];
+            let stepPreviews = [];
+            let hoverStep = null;
             let currentStep = 0;
             let totalSteps = 0;
             let averageStepMs = null;
@@ -190,23 +214,58 @@ app.registerExtension({
                 return typeof chunks[index] === "string" && chunks[index].length > 0;
             }
 
+            function displaySource(source, displayed=null) {
+                if (!source) {
+                    displayed?.(false);
+                    return;
+                }
+                const update = ++imageUpdate;
+                const replacement = new Image();
+                replacement.onload = () => {
+                    if (update !== imageUpdate) return;
+                    image.src = replacement.src;
+                    displayed?.(true);
+                };
+                replacement.onerror = () => {
+                    if (update === imageUpdate) displayed?.(false);
+                };
+                replacement.src = source;
+            }
+
             function show(index) {
                 if (!available(index)) return;
-                playing = index;
-                const update = ++imageUpdate;
-                image.removeAttribute("src");
-                requestAnimationFrame(() => {
-                    if (update === imageUpdate) image.src = chunks[index];
-                });
                 stop();
-                if (chunkCount <= 1) return;
-                timer = setTimeout(() => {
-                    let next = index + 1;
-                    while (next < chunkCount && !available(next)) next++;
-                    if (next >= chunkCount) next = 0;
-                    while (next < chunkCount && !available(next)) next++;
-                    if (next < chunkCount) show(next);
-                }, Math.max(100, durations[index] || 1000));
+                playing = index;
+                pendingChunk = index;
+                const source = chunks[index];
+                const duration = Math.max(100, durations[index] || 1000);
+                displaySource(source, () => {
+                    pendingChunk = null;
+                    if (chunkCount <= 1) {
+                        if (chunks[index] !== source) show(index);
+                        return;
+                    }
+                    timer = setTimeout(() => {
+                        let next = index + 1;
+                        while (next < chunkCount && !available(next)) next++;
+                        if (next >= chunkCount) next = 0;
+                        while (next < chunkCount && !available(next)) next++;
+                        if (next < chunkCount) show(next);
+                    }, duration);
+                });
+            }
+
+            function restorePlayback() {
+                if (available(activeChunk)) {
+                    show(activeChunk);
+                    return;
+                }
+                if (available(playing)) {
+                    show(playing);
+                    return;
+                }
+                const first = chunks.findIndex((_, index) => available(index));
+                if (first >= 0) show(first);
             }
 
             function renderStatus() {
@@ -218,51 +277,66 @@ app.registerExtension({
                 const elapsedSeconds = completedElapsed ?? (startedAt == null ? NaN : (performance.now() - startedAt) / 1000);
                 const elapsed = formatEta(elapsedSeconds);
                 const chunk = chunkCount ? `Chunk ${activeChunk + 1}/${chunkCount}` : "Chunk —/—";
-                status.textContent = `${complete ? "Complete · " : ""}${chunk} · ${resolution} · ${fps} · step ${currentStep}/${totalSteps || "—"} · ${secondsPerStep} · Elapsed ${elapsed} · ETA ${eta}`;
-                sigmaGraph.value.textContent = Number.isFinite(deltas[currentStep - 1]) ? deltas[currentStep - 1].toFixed(3) : "—";
-                timeGraph.value.textContent = Number.isFinite(stepTimes[currentStep - 1]) ? `${(stepTimes[currentStep - 1] / 1000).toFixed(2)}s` : "—";
+                const displayStep = hoverStep ?? currentStep;
+                const inspecting = hoverStep == null ? "" : "inspect ";
+                status.textContent = `${complete ? "Complete · " : ""}${chunk} · ${resolution} · ${fps} · ${inspecting}step ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · Elapsed ${elapsed} · ETA ${eta}`;
+                sigmaGraph.value.textContent = Number.isFinite(deltas[displayStep - 1]) ? deltas[displayStep - 1].toFixed(3) : "—";
+                timeGraph.value.textContent = Number.isFinite(stepTimes[displayStep - 1]) ? `${(stepTimes[displayStep - 1] / 1000).toFixed(2)}s` : "—";
             }
 
             function redrawGraphs() {
-                drawSigmaDelta(sigmaGraph.canvas, sigmas, deltas, totalSteps);
-                drawStepTimes(timeGraph.canvas, stepTimes, totalSteps);
+                drawSigmaDelta(sigmaGraph.canvas, sigmas, deltas, totalSteps, hoverStep);
+                drawStepTimes(timeGraph.canvas, stepTimes, totalSteps, hoverStep);
+            }
+
+            function resetExecution(data) {
+                execution = data.execution;
+                chunkCount = data.chunk_count || 0;
+                activeChunk = data.chunk ?? 0;
+                chunks = new Array(chunkCount);
+                durations = new Array(chunkCount);
+                playing = 0;
+                sigmas = Array.isArray(data.sigmas) ? data.sigmas : [];
+                deltas = [];
+                stepTimes = [];
+                stepPreviews = [];
+                hoverStep = null;
+                currentStep = 0;
+                totalSteps = data.steps || Math.max(0, sigmas.length - 1);
+                averageStepMs = null;
+                previewWidth = null;
+                previewHeight = null;
+                previewFps = data.fps ?? null;
+                const elapsedMs = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms : 0;
+                startedAt = performance.now() - elapsedMs;
+                completedElapsed = null;
+                complete = false;
+                if (elapsedTimer != null) clearInterval(elapsedTimer);
+                elapsedTimer = setInterval(renderStatus, 1000);
+                stop();
+                pendingChunk = null;
+                imageUpdate++;
+                image.removeAttribute("src");
+                renderStatus();
+                redrawGraphs();
             }
 
             node._minimaxUnlimitedPreview = data => {
                 if (data.action === "reset") {
-                    execution = data.execution;
-                    chunkCount = data.chunk_count || 0;
-                    activeChunk = 0;
-                    chunks = new Array(chunkCount);
-                    durations = new Array(chunkCount);
-                    playing = 0;
-                    sigmas = [];
-                    deltas = [];
-                    stepTimes = [];
-                    currentStep = 0;
-                    totalSteps = 0;
-                    averageStepMs = null;
-                    previewWidth = null;
-                    previewHeight = null;
-                    previewFps = null;
-                    startedAt = performance.now();
-                    completedElapsed = null;
-                    complete = false;
-                    if (elapsedTimer != null) clearInterval(elapsedTimer);
-                    elapsedTimer = setInterval(renderStatus, 1000);
-                    stop();
-                    imageUpdate++;
-                    image.removeAttribute("src");
-                    renderStatus();
-                    redrawGraphs();
+                    resetExecution(data);
                     return;
                 }
-                if (data.execution !== execution) return;
+                if (data.execution !== execution) {
+                    if (execution !== null) return;
+                    resetExecution(data);
+                }
                 if (data.action === "sample_start") {
                     activeChunk = data.chunk ?? activeChunk;
                     sigmas = Array.isArray(data.sigmas) ? data.sigmas : [];
                     deltas = [];
                     stepTimes = [];
+                    stepPreviews = [];
+                    hoverStep = null;
                     currentStep = 0;
                     totalSteps = data.steps || Math.max(0, sigmas.length - 1);
                     averageStepMs = null;
@@ -272,18 +346,21 @@ app.registerExtension({
                     return;
                 }
                 if (data.action === "complete") {
-                    completedElapsed = startedAt == null ? null : (performance.now() - startedAt) / 1000;
+                    completedElapsed = Number.isFinite(data.elapsed_ms)
+                        ? data.elapsed_ms / 1000
+                        : startedAt == null ? null : (performance.now() - startedAt) / 1000;
                     if (elapsedTimer != null) clearInterval(elapsedTimer);
                     elapsedTimer = null;
                     complete = true;
                     renderStatus();
-                    if (timer == null && available(0)) show(0);
+                    if (hoverStep == null && timer == null) restorePlayback();
                     return;
                 }
                 if (data.action === "progress") {
                     activeChunk = data.chunk ?? activeChunk;
                     currentStep = data.step || currentStep;
                     totalSteps = data.steps || totalSteps;
+                    if (Array.isArray(data.sigmas)) sigmas = data.sigmas;
                     deltas[currentStep - 1] = data.delta;
                     stepTimes[currentStep - 1] = data.step_ms;
                     averageStepMs = data.avg_step_ms;
@@ -296,14 +373,51 @@ app.registerExtension({
 
                 const index = data.chunk;
                 activeChunk = index;
-                chunks[index] = `data:image/webp;base64,${data.image}`;
+                currentStep = data.step || currentStep;
+                totalSteps = data.steps || totalSteps;
+                if (Array.isArray(data.sigmas)) sigmas = data.sigmas;
+                const source = `data:image/webp;base64,${data.image}`;
+                chunks[index] = source;
+                stepPreviews[currentStep] = source;
                 durations[index] = data.duration_ms;
                 previewWidth = data.width;
                 previewHeight = data.height;
                 previewFps = data.fps ?? previewFps;
                 renderStatus();
-                if (timer == null || index === playing) show(index === playing ? index : 0);
+                redrawGraphs();
+                if (hoverStep == null && timer == null && pendingChunk == null) show(index);
             };
+
+            function inspectGraph(event) {
+                const rect = event.currentTarget.getBoundingClientRect();
+                const count = Math.max(totalSteps + 1, sigmas.length, stepTimes.length + 1, stepPreviews.length);
+                if (count < 2) return;
+                const position = Math.max(0, Math.min(1, (event.clientX - rect.left - 4) / Math.max(1, rect.width - 8)));
+                const step = Math.round(position * (count - 1));
+                if (step === hoverStep) return;
+                hoverStep = step;
+                stop();
+                pendingChunk = null;
+                imageUpdate++;
+                if (stepPreviews[step]) displaySource(stepPreviews[step]);
+                else if (available(activeChunk)) displaySource(chunks[activeChunk]);
+                renderStatus();
+                redrawGraphs();
+            }
+
+            function stopInspecting() {
+                if (hoverStep == null) return;
+                hoverStep = null;
+                renderStatus();
+                redrawGraphs();
+                restorePlayback();
+            }
+
+            for (const canvas of [sigmaGraph.canvas, timeGraph.canvas]) {
+                canvas.addEventListener("mousemove", inspectGraph);
+                canvas.addEventListener("mouseleave", stopInspecting);
+                canvas.addEventListener("mousedown", event => event.stopPropagation());
+            }
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);
@@ -313,6 +427,7 @@ app.registerExtension({
             const previousRemoved = node.onRemoved;
             node.onRemoved = function () {
                 stop();
+                pendingChunk = null;
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 resizeObserver.disconnect();
                 imageUpdate++;

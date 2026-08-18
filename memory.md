@@ -15,6 +15,8 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `prompt`: the original MiniMax-formatted prompt;
 - `fps`: the frame rate used to convert prompt timestamps to global frames;
 - `chunk_frames`: the maximum number of H3 frames sampled at once;
+- `context_frames`: the completed H3-valid tail carried into every later
+  chunk, defaulting to five frames;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
   console and returns the same text through `chunk_prompts`;
 - `debug_stop_chunk`: returns after the selected 1-based serial chunk for fast
@@ -46,6 +48,64 @@ MiniMaxH3UnlimitedPreview -> MiniMax H3 Unlimited Preview
   playlist.
 - `README.md` contains concise user-facing setup and limitations.
 - `memory.md` is this implementation and design handoff.
+
+## Development history and decisions
+
+The first implementation used independent, strictly serial stock sampler calls.
+It completed an approximately 356-frame Ref2VA render, represented as 362
+frames on H3's valid temporal grid in logged tests, with roughly 30 percent
+less peak VRAM than sampling the complete latent at once. This proved the basic
+memory-saving design, but later chunks sometimes replayed actions or appeared
+to contain two interpretations of the same shot joined together.
+
+The serial implementation was then extended with exact per-chunk prompt logging,
+sentence/clause ownership for shots that span boundaries, native accumulated
+previews, and clearer continuation instructions. A proposed change that removed
+a trailing phrase such as `The tiger stops` from a later prompt was reverted
+after the same duplicate-shot symptom was found inside the first chunk. That
+observation showed the phrase alone was not the root cause. The current parser
+still assigns action units by their proportional position in the global shot;
+debug output makes that assignment visible instead of silently discarding text.
+
+A second architecture was tested to see whether one global latent and one
+diffusion schedule could preserve more state. It evaluated every temporal
+window during each diffusion step. This experiment produced deterministic
+changes at window boundaries and could not supply completed continuation frames
+to later windows. It was abandoned and the serial architecture was restored.
+
+The restored path was compared directly with serial commit `4be0ad9`: prompt
+rewriting, completed-tail conditioning, trimming, and stock sampler delegation
+were unchanged when the serial path was restored. Later sampler additions are
+`debug_stop_chunk`, the outer chunk progress bar, and configurable
+`context_frames`. The experimental global-window commit remains on the separate
+`improve-windowed-sampling` branch and an associated stash is inert; neither is
+part of the active `restore-serial-continuation` branch.
+
+The accumulated preview subsequently gained real Tiny-VAE selection,
+native-resolution mode, sampling telemetry, two graphs, live elapsed time, and
+paired chunk/step visibility. The separate `Previewer: ...` browser row was
+removed; decoder selection and fallback are still reported in the ComfyUI log.
+
+## Repository state at this handoff
+
+The GitHub remote is:
+
+```text
+git@github.com:hradec/ComfyUI-MiniMax-H3-Sampler-Unlimited.git
+```
+
+Relevant published history:
+
+- `main` contains the original serial implementation and the merged continuity
+  and preview work through merge commit `9714162`;
+- `restore-serial-continuation` is the active branch and is published through
+  `b17e8fd` (`Improve sampler diagnostics and preview`);
+- `improve-windowed-sampling` preserves the rejected global-window experiment
+  at `cdbbd24` for forensic comparison only.
+
+`stash@{0}` contains a global-window follow-up experiment and is not applied.
+The local `prompt.txt` is user diagnostic material, remains untracked, and must
+not be added to commits unless explicitly requested.
 
 ## MiniMax H3 latent structure
 
@@ -92,11 +152,17 @@ incorrectly synchronized latent.
 frames, or 37 video latent steps.
 
 The first chunk contributes its complete latent. Every later chunk contains a
-five-frame continuation prefix followed by new frames. Five frames correspond
-to the final two video latent steps because a valid chunk ends on the same
-`1, 4` phase of `FRAME_PER_TOKEN`.
+`context_frames` continuation prefix followed by new frames. Valid values are
+5, 22, 39, 56, and so on. They correspond to 2, 7, 12, 17, and so on video
+latent steps. `context_frames` must be smaller than the effective snapped
+`chunk_frames` value.
 
-For two 124-frame chunks, the delivered duration is consequently:
+`chunk_frames` remains the total amount sampled in one stock call, including
+the repeated prefix. Increasing `context_frames` therefore reduces the new
+content produced by later chunks and can increase the number of sampler calls;
+it does not silently increase the temporal VRAM cap.
+
+With the default five-frame context, two 124-frame chunks deliver:
 
 ```text
 124 + (124 - 5) = 243 frames
@@ -108,16 +174,18 @@ In latent steps this is:
 37 + (37 - 2) = 72 video latent steps
 ```
 
-The repeated two-step prefix is removed before final assembly. This keeps the
-result on H3's native grid and makes the returned video latent exactly the same
-shape as the upstream requested latent.
+The configured context latent steps are removed before final assembly. This
+keeps the result on H3's native grid and makes the returned video latent exactly
+the same shape as the upstream requested latent.
 
 ### Audio rounding at boundaries
 
-Five frames correspond to 8.333 audio steps, so the amount trimmed at a join
-cannot always be a fixed integer. The planner calculates cumulative global
-audio boundaries and chooses eight or nine context steps as needed. This avoids
-accumulating audio/video drift across a long sequence.
+The configured context duration normally corresponds to a fractional number of
+40 Hz audio steps. For the default five frames it is 8.333 steps, so a join uses
+eight or nine context steps. The planner calculates cumulative global audio
+boundaries and chooses the matching integer length for every boundary. This
+avoids accumulating audio/video drift across a long sequence and works the same
+way for longer context values.
 
 The previous chunk's audio endpoint can overhang or underhang its final pixel
 frame by a fraction of one 40 Hz step because of rounding. The audio guide's
@@ -145,7 +213,8 @@ The node does not use the first frame of the previous generation. It uses the
 previous sampled chunk's final latent tail:
 
 ```text
-video_context = previous_video[:, :, -2:]
+context_video_steps = ((context_frames - 5) // 17) * 5 + 2
+video_context = previous_video[:, :, -context_video_steps:]
 audio_context = previous_audio[..., -context_audio_steps:]
 ```
 
@@ -160,7 +229,7 @@ frame zero:
 ```
 
 The matching audio tail is added as a separate native audio guide. Its start is
-chosen so its endpoint aligns with the five-frame video prefix, including the
+chosen so its endpoint aligns with the configured video prefix, including the
 previous chunk's fractional audio-grid overhang.
 
 The prefix is guide conditioning, not a decode/re-encode round trip. Reusing
@@ -171,23 +240,69 @@ the sampler output directly has three benefits:
 - it is cheaper than decoding the previous video to images and encoding it
   again as Ref2VA media.
 
-After sampling, the repeated two video latent steps and corresponding eight or
-nine audio steps are removed. Only new content is appended to the final output.
+After sampling, the configured video and audio context steps are removed. Only
+new content is appended to the final output.
 
-### Why the global-window experiment was removed
+### Failed approach: one latent sampled through temporal windows
 
-An experimental implementation kept one full noisy latent and evaluated all
-temporal windows during every denoising step. It preserved global sampler state,
-but later windows were evaluated before any window had a finished result. They
-therefore could not receive MiniMax's requested final five generated frames as
-continuation input.
+The experimental implementation kept one full noisy latent and evaluated all
+temporal windows during every denoising step. Its intended benefit was to retain
+one global sigma schedule and sampler invocation while limiting each model
+forward to one temporal window.
 
-Blending overlapping predictions produced visible changes exactly at overlap
-boundaries. Changing to context-only overlaps merely moved those changes to the
-single-owner boundaries, and later windows could advance a prompted shot before
-its global cut time. The architecture was removed instead of retaining a
-complicated partial fix. Serial stock sampler calls are the current behavior
-because each continuation begins from actual completed frames.
+The first variant blended predictions in overlapping window regions. It caused
+visible duplicate transitions at exact overlap boundaries, observed at frames
+51 and 102 in a diagnostic render. Both neighboring windows were predicting
+the overlap from different temporal and prompt contexts, so averaging them did
+not make them one coherent prediction.
+
+The second variant assigned each output region to only one window and treated
+the overlap as context. It removed overlap averaging but moved the visible
+changes to the single-owner output boundaries, observed at frames 56 and 107.
+It could also place Shot 2 before its requested global cut.
+
+The fundamental problem affects both variants: during diffusion step N, the
+next window is sampled before the previous window has completed steps N+1
+through the end of the sigma schedule. Its tail is still noisy and cannot be
+the final completed frames required by MiniMax's continuation method.
+Passing a partially denoised overlap is not equivalent to conditioning on a
+completed previous clip. The later window can independently reinterpret the
+end of the prior shot, producing the observed replay, fade, early cut, or
+glued-double-shot behavior.
+
+The console exposed this architecture clearly: `Chunk 1/N` through `Chunk N/N`
+repeated inside every diffusion step. In the restored serial path, chunk 1 runs
+its complete step progress before chunk 2 begins its own complete progress.
+
+The global-window architecture was removed instead of retaining another blend,
+weighting, or boundary heuristic. Serial stock sampler calls are the current
+behavior because each continuation begins from actual completed video and audio
+latents.
+
+### Attention state is not continuation memory
+
+ComfyUI's sampler does not retain an attention buffer that can be detached from
+one H3 invocation and injected into another. Attention keys, queries, values,
+and intermediate activations are temporary results tied to a particular latent,
+timestep, prompt presentation, and model forward. The stock sampler's persistent
+state is the evolving latent and sampler algorithm state, not a reusable model
+memory describing characters or props.
+
+Within a chunk, H3 maintains appearance through the complete current latent,
+prompt tokens, keyframes, and Ref2VA references. Across serial chunks this node
+can carry only explicit model inputs: the completed latent tail, synchronized
+audio tail, prompt conditioning, and reusable references. This is why an
+invented detail such as a tiara can drift if it is absent or unclear in those
+inputs.
+
+H3 accepts longer native continuation clips only on its `17k + 5` frame grid:
+5, 22, 39, 56 frames, and so on. `context_frames` now exposes these lengths.
+The planner derives the matching video latent steps and synchronized audio tail,
+excludes the complete carried interval from new prompt action ownership, trims
+it from both sampler outputs, and tells the preview to hide it. Longer context
+may preserve more visual history, but it repeats more computation, creates more
+chunks for a fixed `chunk_frames`, and can overconstrain motion or replay prior
+action.
 
 ## Existing H3 conditioning
 
@@ -259,16 +374,31 @@ continuing shot. Natural-language prose cannot otherwise be safely divided at
 an arbitrary frame boundary. The carried video/audio latent tail establishes
 the actual starting state.
 
-If a shot spans a chunk boundary, the node divides its sentence-level action
-units proportionally across the shot's global frame interval and assigns each
-unit to exactly one chunk according to its start position. The five-frame
-latent overlap is excluded from that action range because it is continuation
-context and is trimmed from the assembled output. This prevents a long final
-shot from being rendered once at the end of one chunk and then rendered again
-from the beginning in the next chunk. If a sparse shot has fewer text units
-than temporal chunks, a later empty interval receives only a neutral instruction
-to continue the established shot rather than repeating an earlier action or
-failing prompt construction.
+If a shot spans a chunk boundary, the node maps its sentence-level action units
+proportionally across the shot's global frame interval. A unit is retained in
+every new-content interval that it overlaps. The configured latent overlap is
+excluded from that action range because it is continuation context and is
+trimmed from the assembled output. This matters for sparse descriptions: a
+single sentence can span more than one chunk, and removing it from later chunks
+leaves MiniMax with no concrete shot description and can cause an unintended
+cut or a new interpretation based only on reference images. The continuation
+instruction and completed opening frames tell MiniMax not to restart the
+overlapping sentence's action.
+
+This division explains apparently isolated phrases in debug output. For
+example, `The tiger stops` is not selected by meaning or by taking an arbitrary
+number of trailing words. It is a sentence/clause unit whose proportional span
+overlaps that chunk's new-content interval. Removing one observed phrase does
+not solve a boundary problem and can remove an action from the global story
+entirely.
+
+Prompt timing remains global even though each sampler call receives local
+timestamps. For example, with `context_frames=5`, if a global cut is at frame
+59 and a chunk samples frames 51-106, the rewritten cut is local frame 8. Only
+global frames 56-58 are new content before that cut. Such a three-frame runway
+is valid mathematically but difficult for a generative model. Very small chunks
+or longer context can therefore make a boundary-adjacent cut unstable even when
+timestamp conversion and latent handoff are correct.
 
 ## Replacing only prompt-owned conditioning
 
@@ -423,9 +553,9 @@ number of carried video latent steps to hide
 
 The wrapper observes the normal stock sampler callback. It restores the H3
 video stream from either a nested AV value or ComfyUI's flattened sampler
-representation, removes the two carried latent steps from later previews, and
-decodes the remaining latent positions. The original callback still runs, so
-ComfyUI's normal progress and preview behavior are preserved.
+representation, removes the configured carried latent steps from later
+previews, and decodes the remaining latent positions. The original callback
+still runs, so ComfyUI's normal progress and preview behavior are preserved.
 
 Two decode modes are available:
 
@@ -438,11 +568,34 @@ Two decode modes are available:
   and are released when it finishes.
 
 `max_resolution: 0` keeps the decoder's native output size. Positive values cap
-the longest preview side. The wrapper reports which decoder is active and sends
-the encoded resolution, FPS, rolling step duration, ETA inputs, sigma schedule,
-latent-change magnitude, and step-time samples to the local widget. The browser
-draws the two telemetry graphs for the active chunk while retaining completed
-chunk media in its playlist.
+the longest preview side. The wrapper sends encoded resolution, FPS, rolling
+step duration, ETA inputs, sigma schedule, latent-change magnitude, and
+step-time samples to the local widget. The browser draws the two telemetry
+graphs for the active chunk while retaining completed chunk media in its
+playlist. It also measures total elapsed sampling time from the reset event,
+updates it once per second, and freezes the final value on completion. Decoder
+selection is intentionally not given a separate UI row.
+
+Every sampling event carries the execution id, chunk count, sigma schedule, and
+backend elapsed time. If a browser refresh misses the original reset event, the
+new widget adopts the next event for the still-running execution, reconstructs
+its timer and graph scale, and resumes when the next encoded preview arrives.
+This follows the useful recovery behavior observed in KJ's preview override
+without retaining large preview tensors or media in server-global state.
+
+For the active chunk, the browser keeps each received step WebP until the next
+chunk starts. Hovering either graph maps the pointer's horizontal position to a
+sampling boundary, draws the same vertical marker on both graphs, updates their
+values, pauses the chunk playlist, and displays that step's animated preview.
+Leaving the graph returns to the newest active chunk and resumes playback.
+Intermediate previews may be absent if the bounded encoder intentionally drops
+an outdated job while a newer step is waiting.
+
+The browser does not replace a chunk while that chunk is already playing. New
+sampling-step WebPs update its cached source and become visible on the next
+playlist pass. The next chunk's duration timer starts only after its replacement
+image has loaded, so decode latency cannot consume part of that chunk's playback
+slot or make it appear to begin inside the preceding chunk.
 
 `frame_stride` chooses every Nth H3 latent position. Animated-frame durations
 still use H3's `(1, 4, 4, 4, 4)` pixel-frame coverage, so skipped positions do
@@ -459,12 +612,34 @@ Each event transfers only the current chunk's animated WebP. The browser stores
 one data URL and duration per chunk, replaces the active chunk as denoising
 progresses, and loops over every available chunk. Earlier chunks are neither
 decoded nor sent again. A reset event clears stale media at the next execution,
-and a completion event leaves the assembled preview playing.
+and a completion event leaves the assembled preview playing. Each replacement
+WebP is preloaded before its source is assigned to the visible image, keeping
+the previous preview on screen instead of exposing the widget's black background
+for one browser animation frame.
 
 Preview loading, decoding, encoding, and event-send errors are non-fatal. An
 invalid tiny decoder is disabled for that execution and falls back to
 Latent2RGB. Preview state contains no network client or outbound request; it
 uses ComfyUI's local websocket event path.
+
+## LoRA scheduling finding
+
+ComfyUI exposes hook/keyframe nodes that can schedule LoRA strength across
+diffusion percentages. In principle that can apply an ordinary compatible LoRA
+only during selected steps, and a serial sampler would repeat the same schedule
+for every chunk.
+
+The installed hook LoRA loader did not map the tested MiniMax H3 Turbo LoRA
+format. The console printed `lora key not loaded` for the H3 blocks and reported
+`0 patches attached`. A known working run through the ordinary H3-compatible
+LoRA loader reported `208 patches attached`. With a six-step Turbo schedule,
+zero patches means the model is effectively being sampled for only six steps
+without the distillation LoRA and can produce chaotic or under-denoised output.
+
+For the tested Turbo LoRA, use the ordinary loader path that reports the
+expected attached patches and keep it active for all intended Turbo steps. Do
+not diagnose such a result as a serial continuation failure until the model-load
+line confirms that the LoRA actually attached.
 
 ## Current limitations
 
@@ -480,6 +655,12 @@ uses ComfyUI's local websocket event path.
 - Prompt cut timing remains generative guidance. Rewriting a cut to the correct
   local timestamp does not make diffusion frame-exact in the way a deterministic
   video editor would be.
+- A cut placed only a few new frames after a continuation prefix can be
+  unstable. Increasing `chunk_frames` or choosing boundaries farther from cuts
+  gives H3 more temporal runway without changing the requested global cut.
+- Identity details invented during generation are not guaranteed to persist
+  across chunks unless they are visible in the carried frames, described in the
+  prompt, or fixed by reusable reference media.
 - Full-reference prefix analysis sections remain present even when their
   detailed shots are outside the current chunk. They preserve label meanings,
   but may still describe the overall video rather than only the local window.
@@ -496,15 +677,22 @@ Completed checks include:
 - schema registration with the expected node id and all new inputs;
 - a planner matrix covering 212 H3 durations and eight chunk settings;
 - exact reconstructed video/audio shapes for mocked multi-chunk sampling;
-- eight-versus-nine-step audio boundary trimming;
+- context lengths of 5, 22, 39, 56, and 107 frames with exact reconstructed
+  output sizes and synchronized audio trimming;
+- mocked `context_frames=22` serial execution proving that later chunks receive
+  the previous completed seven-step video tail and matching audio tail;
 - restoration of the guider's original conditioning after sampling;
-- serial proof that chunk two receives chunk one's completed two-step video
-  tail and synchronized audio tail before its sampler call starts;
+- serial proof with the default five-frame context that chunk two receives
+  chunk one's completed two-step video tail and synchronized audio tail before
+  its sampler call starts;
 - `debug_stop_chunk=2` partial video/audio output sizes and unchanged prompt
   timing against the complete global plan;
 - remapping of global first/last-frame keyframes;
 - replacement of `cross_attn` and `minimax_token_tags` for every chunk;
 - official base-prompt and full-reference description field parsing;
+- sparse mid-shot continuation retaining its concrete shot sentence while
+  rewriting a leading `camera cut to` as an already-established continuing
+  view;
 - conversion of global frame 100 to local frame 50 / `00:02.083` at 24 FPS;
 - strict rejection of malformed or non-increasing shot markers;
 - reconstruction of image/audio Ref2VA presentation order;
@@ -516,8 +704,25 @@ Completed checks include:
 - Latent2RGB wrapper callback delivery and reset/chunk/complete event order;
 - preview sample-start/progress telemetry, native-resolution dimensions, and
   active decoder reporting;
+- JavaScript syntax and lifecycle review for the elapsed timer, completion
+  freeze, removal cleanup, and removal of the separate previewer status row;
+- JavaScript lifecycle review for refresh recovery from an in-progress event
+  and interactive graph-step preview selection with a synchronized vertical
+  marker;
 - animated WebP creation and exact 124-frame/119-frame playback durations at
   24 FPS.
+
+Manual GPU/log observations also established:
+
+- the original serial implementation completed a long multi-chunk render with
+  materially lower peak VRAM;
+- the failed global approach changed windows during each sampler step and made
+  artifacts at its exact overlap/ownership boundaries;
+- the restored implementation runs a complete sigma schedule per chunk;
+- later serial conditioning receives the previous chunk's completed final two
+  video latent positions rather than an unfinished per-step overlap;
+- the tested scheduled Hook LoRA path attached zero H3 patches, while the known
+  working ordinary loader attached 208.
 
 A full MiniMax H3 GPU render was not run as part of the lightweight automated
 verification. The mocked path exercised chunk planning, prompt replacement,
