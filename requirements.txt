@@ -1,0 +1,7 @@
+# CUDA 12.1 is the oldest llama-cpp-python CUDA wheel compatible with the
+# CUDA 12 runtime used by current ComfyUI/PyTorch installations. Newer CUDA 12
+# runtimes and drivers remain backward-compatible with this wheel.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+huggingface-hub>=0.34.0
+llama-cpp-python==0.3.35

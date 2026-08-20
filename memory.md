@@ -20,17 +20,24 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `guide_overlap`: three-way selector for the configured completed-tail guide
   and overlap, a fixed five-frame guide and overlap, or fully off;
 - `video_continuation`: experimental bounded native Ref2VA continuation using
-  the previous `context_frames` tail as a new `<Video N>`;
+  the previous synchronized `context_frames` AV tail as a new `<Audio N>` +
+  `<Video N>` reference;
 - `qwen_full_history`: experimental Qwen-only view of every completed frame,
   sampled at 2 FPS, without adding that history to DiT reference attention;
+- automatic Gemma 4 semantic continuation: when a later chunk begins within
+  an already generated source shot, it observes the previous sampler chunk and
+  writes only that shot's next short H3 continuation prose;
+- `prompt_preview_only`: returns the canonical prompt plan without noise,
+  per-chunk conditioning, VAE/DiT loading, or diffusion;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
-  console, returns the same text through `chunk_prompts`, and enables detailed
-  VRAM snapshots around conditioning and sampling;
+  console and enables detailed VRAM snapshots around conditioning and sampling;
+- an always-on final report: reports wall time for H3, Qwen, each VAE decode
+  path, and Gemma 4, plus peak RAM and VRAM use for the sampler execution;
 - `debug_stop_chunk`: returns after the selected 1-based serial chunk for fast
   boundary diagnostics; zero keeps the normal complete run;
 - optional `images`: pixel images needed to rebuild Qwen visual conditioning;
-- optional `vae`: the H3 video VAE, required only by the two experimental
-  decoded-video conditioning modes.
+- optional `vae`: the H3 video VAE, required by decoded-video modes and by
+  automatic Gemma continuation when a long shot crosses a chunk boundary.
 
 The sampler node id and display name are both:
 
@@ -51,10 +58,19 @@ MiniMaxH3UnlimitedPreview -> MiniMax H3 Unlimited Preview
 - `nodes.py` contains chunk planning, prompt rewriting, Qwen conditioning
   rebuilding, continuation guides, sampling, output assembly, and the narrow
   preview-session calls around each stock sampler invocation.
+- `gemma4.py` owns the self-downloading Gemma model paths, MTMD vision runtime,
+  immutable source-action ledger, strict JSON observation validation, image
+  conversion, and source-constrained H3 continuation-prose generation.
+- `gemma4_prompts.txt` contains the editable runtime `[SYSTEM]` and
+  `[OBSERVATION]` messages passed to Gemma. It documents its supported
+  placeholders and includes the relevant H3 structured-prompt conventions.
 - `preview.py` contains the H3 preview model wrapper, Latent2RGB and optional
-  tiny-VAE decoding, asynchronous WebP encoding, and local preview events.
+  tiny-VAE decoding, asynchronous static-WebP frame-group encoding, bounded
+  server-side history, exact output-frame metadata, and local preview
+  events/state restoration.
 - `web/unlimited_preview.js` owns the preview widget and the browser-side chunk
-  playlist.
+  playlist, colored transport, prompt-shot range brackets, keyboard stepping,
+  and frame-number overlay.
 - `README.md` contains concise user-facing setup and limitations.
 - `memory.md` is this implementation and design handoff.
 
@@ -73,8 +89,11 @@ previews, and clearer continuation instructions. A proposed change that removed
 a trailing phrase such as `The tiger stops` from a later prompt was reverted
 after the same duplicate-shot symptom was found inside the first chunk. That
 observation showed the phrase alone was not the root cause. The current parser
-still assigns action units by their proportional position in the global shot;
-debug output makes that assignment visible instead of silently discarding text.
+no longer assigns action units by proportional word position. It keeps the
+complete active-shot prose and adds a timecoded continuation endpoint plus the
+shot's cut/end events. Later testing established that this fixes shot-level
+clock arithmetic but does not define where individual actions inside the prose
+occur.
 
 A second architecture was tested to see whether one global latent and one
 diffusion schedule could preserve more state. It evaluated every temporal
@@ -345,18 +364,27 @@ video-continuation or Qwen-history mechanism.
 later chunks. It clones only the final `context_frames` latent positions from
 the completed previous chunk. The H3 VAE decodes that bounded tail, and Qwen is
 shown frames sampled at the same 2 FPS cadence used by ComfyUI's stock H3
-Ref2VA node. The clean bounded latent is independently appended to
-`minimax_refs` as a video block, so the DiT can attend to the continuation
-source without merging it into the noisy target latent.
+Ref2VA node. The matching generated-audio tail is selected using cumulative
+global 40 Hz endpoints rather than rounding the isolated duration; this avoids
+an occasional one-step AV error for fractional durations such as 22/24 second.
+The clean bounded pair is independently appended to `minimax_refs` as a native
+`video_audio` block, so the DiT can attend to both continuation streams without
+merging them into the noisy target latent.
 
-The generated video label uses the next available video ordinal. A later chunk
-prompt gains a `<Video N>` definition, a `[video continuation]` task type (or
-adds it to existing task types), a retention entry, and a detailed-description
-instruction to continue from the end of that video. The original prompt is
-used afresh for every chunk, so the dynamic sections cannot accumulate. The
-implementation prefers `detailed_description` when a hybrid diagnostic prompt
-also contains `integrated_multimodal_description`; this prevents `[Shot N]`
-mentions in Ref2VA analysis sections from being mistaken for timeline markers.
+The generated video and synchronized soundtrack labels use the next available
+video and audio ordinals. Following ComfyUI's native ordering, Qwen receives the
+`<Audio N>` label immediately before the decoded `<Video N>` frames. Its H3
+tokenizer does not ingest a waveform for that audio item; the actual audio
+latent goes directly to the DiT inside the combined reference block. Therefore
+this path needs no audio VAE and does not pretend that Qwen can hear generated
+audio. A later chunk prompt gains concise definitions and retention entries for
+both labels, a `[video continuation]` task type, and a detailed-description
+instruction placing both synchronized endpoints at the same position on the
+active shot's timeline. The original prompt is used afresh for every chunk, so the dynamic sections cannot
+accumulate. The implementation prefers `detailed_description` when a hybrid
+diagnostic prompt also contains `integrated_multimodal_description`; this
+prevents `[Shot N]` mentions in Ref2VA analysis sections from being mistaken
+for timeline markers.
 
 `qwen_full_history` deliberately changes only Qwen conditioning. Before each
 later chunk, the already assembled output from the beginning through the last
@@ -366,6 +394,27 @@ prompt rewrite are added. This directly tests whether long visual history in
 Qwen improves consistency without increasing DiT reference attention. The
 currently sampled chunk cannot be included because it is still noise when its
 Qwen prompt is encoded.
+
+`prompt_preview_only` runs the same canonical planning function used by normal
+sampling and returns every active chunk's exact prompt plus sampled/output frame
+ranges. It exits before full-noise generation, per-chunk Qwen encoding, preview
+setup, VAE decoding, model loading, or DiT sampling. Noise, sampler, sigmas, and
+CLIP are lazy inputs, so ComfyUI does not evaluate those branches for this mode.
+The toggle is an optional schema input with a `False` execution default so
+workflows saved before it was introduced continue to validate and sample
+normally instead of failing with `Required input is missing`.
+The guider and H3 latent remain required because the planner needs reference
+types/ordinals and the exact nested AV temporal shape. The two latent outputs
+are unchanged placeholders and are not valid generated results in this mode.
+
+The mode is an explicit serialized boolean rather than being inferred solely
+from connected output sockets. ComfyUI caches a node by its inputs and upstream
+ancestry, not by the set of downstream output sockets currently requested. An
+automatic text-only execution returning placeholder latents could otherwise be
+cached and later reused after a latent output was connected. Including
+`prompt_preview_only` in the node inputs gives preview and sampling executions
+different cache signatures. `chunk_prompts` is populated from the same plan in
+both modes; `debug` controls console/VRAM logging rather than text availability.
 
 Both decoded-video modes require the H3 video VAE and a Ref2VA conditioning
 whose original Qwen presentation can be reconstructed by this node. Decoded
@@ -448,6 +497,18 @@ The monitor is installed only while a debug execution is active and is removed
 in the same `finally` cleanup that restores the guider conditioning. Non-debug
 sampling therefore keeps the stock model-call path and logging volume.
 
+Every sampler execution, including non-debug runs and partial/error exits,
+also writes one compact final timing and high-water report. It separately
+accumulates H3 sampling, Qwen encoding/tokenization, VAE decoding of the prior
+chunk for Gemma, VAE decoding of bounded continuation context, VAE decoding of
+Qwen full history, and Gemma 4's whole local handoff. It records peak ComfyUI
+process RSS and system RAM use, along with sampled whole-device VRAM use and
+PyTorch allocated/reserved high-water. PyTorch's native peak counter can be
+reset by the per-chunk debug monitor, so the final report retains the largest
+value observed after each timed phase as well. This is intended for quickly
+comparing which optional continuation path consumes time or memory without
+reading every debug snapshot.
+
 An initial four-step diagnostic passed the previously failing second-chunk
 first evaluation while the GPU stayed near its physical capacity, but that
 process rejected every H3 LoRA key and reported `MiniMaxH3 ... 0 patches
@@ -517,16 +578,20 @@ full-reference prompts. Prefix sections such as `subject_definitions`,
 `summary`, and `retention_analysis`, and suffix sections such as
 `overall_soundscape` and `non_diegetic_music`, are preserved.
 
-For each chunk, the parser:
+For each physical chunk, the current parser:
 
 1. converts every absolute `MM:SS.mmm` timestamp to a global frame using
    `round(seconds * fps)`;
-2. treats a shot as active when its global interval intersects the chunk's
-   global interval;
-3. removes shot bodies that do not intersect the chunk;
-4. renumbers the active opening shot to `[Shot 1]` and makes it untimed;
-5. subtracts the chunk's global start frame from every later cut;
-6. converts each local cut frame back to `MM:SS.mmm` for Qwen.
+2. keeps only source shots whose intervals intersect the *sampled* physical
+   window, including an already-completed predecessor when carried guide frames
+   straddle a source cut;
+3. renumbers those selected shots locally and writes the documented H3 form
+   `[Shot N] At MM:SS.mmm, ...`, with the time measured from the physical chunk
+   start so a cut lands after any carried guide prefix;
+4. uses only a compact preservation line for a predecessor represented solely
+   by carried frames, rather than replaying its completed source action;
+5. uses the original source body for a new shot, and Gemma-authored semantic
+   continuation prose for a shot that began in a previous chunk.
 
 For example, at 24 FPS:
 
@@ -537,39 +602,289 @@ local cut frame: 50
 local cut time: 00:02.083
 ```
 
-When a chunk begins in the middle of a long shot, the text body is retained but
-prefixed with an explicit instruction to continue from the provided opening
-frames without restarting or replaying earlier actions. A leading `the camera
-cuts to` / `the shot transitions to` phrase is changed to describe the
-continuing shot. Natural-language prose cannot otherwise be safely divided at
-an arbitrary frame boundary. The carried video/audio latent tail establishes
-the actual starting state.
+When a chunk begins in the middle of a long shot, it no longer receives the
+complete source shot, a custom time range, a reference-endpoint clock, or a
+synthetic `shot ends` command. Gemma observes the previously generated video
+and writes only the next H3-ready continuation description. The sampler itself
+keeps canonical timecodes only for genuine source cuts that physically occur in
+the current chunk.
 
-If a shot spans a chunk boundary, the node maps its sentence-level action units
-proportionally across the shot's global frame interval. A unit is retained in
-every new-content interval that it overlaps. The configured latent overlap is
-excluded from that action range because it is continuation context and is
-trimmed from the assembled output. This matters for sparse descriptions: a
-single sentence can span more than one chunk, and removing it from later chunks
-leaves MiniMax with no concrete shot description and can cause an unintended
-cut or a new interpretation based only on reference images. The continuation
-instruction and completed opening frames tell MiniMax not to restart the
-overlapping sentence's action.
+Proportional sentence and clause slicing was removed after practical tests
+showed that word position does not represent action timing. It could leave a
+chunk with a fragment such as `The tiger stops`, causing H3 to restart or
+invent a shot without the original action and camera context.
 
-This division explains apparently isolated phrases in debug output. For
-example, `The tiger stops` is not selected by meaning or by taking an arbitrary
-number of trailing words. It is a sentence/clause unit whose proportional span
-overlaps that chunk's new-content interval. Removing one observed phrase does
-not solve a boundary problem and can remove an action from the global story
-entirely.
+### Retired prompt-timing experiments (historical)
 
-Prompt timing remains global even though each sampler call receives local
-timestamps. For example, with `context_frames=5`, if a global cut is at frame
-59 and a chunk samples frames 51-106, the rewritten cut is local frame 8. Only
-global frames 56-58 are new content before that cut. Such a three-frame runway
-is valid mathematically but difficult for a generative model. Very small chunks
-or longer context can therefore make a boundary-adjacent cut unstable even when
-timestamp conversion and latent handoff are correct.
+An initial experiment placed verbose complete-duration, reference interval,
+target interval, and stop instructions before the full shot prose. MiniMax
+respected the reference-defined start and did not replay completed action, but
+ignored the requested target endpoint and compressed the remaining prose into
+the available latent duration. That experiment was removed.
+
+A retired legacy experiment preserved the complete active-shot prose and might append
+a simple shot-relative command after the final active split shot: `At
+MM:SS.mmm, shot ends.`. The earlier bracketed form, `[MM:SS.mmm] Shot ends.`,
+was replaced after recognizing that MiniMax's documented timeline-event grammar
+uses `At MM:SS.mmm`. Earlier active shots do not receive the suffix when another
+timed shot follows in the chunk. The following chunk-local `[Shot N] At ...`
+cut already defines their endpoint. The old behavior could put a shot-relative
+`00:04.667` immediately before a chunk-local `00:01.083` cut. This behavior is
+removed when the sampler was simplified around Gemma semantic continuation.
+
+The subsequently retired default `storyboard` prompt experiment followed a
+MiniMax-like storyboard shape: every selected
+source shot gets one master header, a completed-reference micro-range when
+available, a new-generated micro-range, the complete original shot prose on
+the full master range, and an explicit endpoint. For example:
+
+```text
+Shot 1 | 00:02.000-00:07.000 | Duration 5s | Reference <Video 1>
+00:02.708-00:03.625: <Video 1> is the already completed portion of this shot.
+00:03.625-00:04.333: Continue from the end of <Video 1>. Generate the part of the overall shot that occurs during this interval.
+00:02.000-00:07.000: <full original shot prompt>
+00:07.000: Shot ends.
+```
+
+The header and full-shot range use the source prompt's global timeline rather
+than a chunk-local clock. This deliberately tells H3 that the prose belongs to
+the whole shot, while this invocation has a bounded place inside it. Chunk 1
+also receives a generated-range line so it does not compress a long opening
+shot into its first short latent. Later native Ref2VA chunks label the exact
+decoded `<Video N>` range; guide-only chunks instead label the same interval as
+`Provided opening frames`. In a chunk that crosses a cut, the planner writes a
+separate storyboard block for every source shot whose new generated interval
+*or* bounded reference interval intersects the chunk. Thus a reference ending
+exactly at a cut still identifies its completed preceding shot, even when the
+new generated range starts at the following shot. A reference-only predecessor
+contains only its header and compact completed-reference range, not the full
+already-finished action prose or a second `Shot ends` event; full prose and the
+endpoint are retained only for a shot with new output. A reference interval is
+associated only with a shot it actually overlaps.
+
+For a shot with new output, its original multi-line prose is flattened into one
+line before insertion. Newlines become sentence boundaries (a period is added
+only when the preceding line did not already end in terminal punctuation), and
+the line is written as `master-range: ONLY GENERATE THE TIMESLICE generated-range
+OF THIS FULL PROMPT: <flattened full prompt>`. This removes newline/list
+structure that could distract H3 while making the requested bounded interval
+the first instruction attached to the complete source prompt.
+
+Both retired prompt formats performed interval math in integer frames and exposed only
+`MM:SS.mmm` values to MiniMax. A native continuation prompt identifies `<Video
+N>` concisely in `subject_definitions`, `summary`, and `retention_analysis`.
+For the retired `legacy` path, the first active shot said `<Video N>
+and its synchronized <Audio N> ends At MM:SS.mmm`, using the reference
+endpoint's position on a cumulative timeline anchored at the first active
+source shot. Every following `[Shot N] At ...` cut
+and the final `At MM:SS.mmm, shot ends.` command use that same clock. The events
+therefore remain monotonic and tell MiniMax which part of the complete shot
+description the reference has already covered and how much remains. Immediately
+after the endpoint, the prompt says `Continue from this timecode; all subsequent
+timecodes use the same timeline.` The wording deliberately avoids `relative to
+this timecode`, which could imply that later values are offsets from a reset
+clock rather than positions on the cumulative clock. An earlier implementation mistake
+used the endpoint's chunk-local position instead (for example `00:00.208` for
+a five-frame guide overlap at 24 FPS). That described only the overlap inside
+the new sampling window and did not locate the reference within the shot. In a
+long shot spanning chunks 5, 6, and 7, H3 consequently received the same full
+action prose with no shot-progress anchor and replayed the action shortly after
+the chunk 6 handoff. The endpoint is now calculated as `content_start -
+shot_start`; the bounded reference length and guide-overlap length remain
+unchanged. A subsequent preview exposed another contradiction: the reference
+ended at `00:03.792` on the active-shot clock while a following cut was still
+written as chunk-local `00:01.083`. Following cuts are now measured from the
+same first-active-shot origin, and a later shot's endpoint is cumulative from
+that origin rather than resetting to that shot's duration. The previous verbose
+paragraph mapping every part of the bounded reference to several time ranges
+remains removed.
+
+In those retired variants, the configured latent overlap was excluded from the new action range because it
+is continuation context and is trimmed from the assembled output. This matters
+for sparse descriptions: a single sentence can span more than one chunk, and
+removing it from later chunks leaves MiniMax with no concrete shot description
+and can cause an unintended cut or a new interpretation based only on reference
+images. The continuation instruction and completed opening frames tell MiniMax
+not to restart the overlapping sentence's action.
+
+The removed proportional division explains apparently isolated phrases in old
+debug output. For example, `The tiger stops` was selected because its inferred
+sentence/clause span overlapped the chunk, not because the parser understood
+its meaning. That behavior was ultimately removed because prose length is not
+a reliable action clock.
+
+### Confirmed limitation: complete prose has no action-level clock
+
+An August 2026 diagnostic at 24 FPS confirmed that the current native
+continuation timestamps were arithmetically correct while H3 still replayed
+different parts of one long shot. The shot began at global frame 118 and
+contained this ordered action:
+
+```text
+Tila closeup and pointing -> dialogue -> continuous zoom out ->
+Heman dismounts and walks right
+```
+
+Chunk 4 sampled frames 102-140 and contributed frames 107-140. Its continuation
+reference ended at `00:01.625` on the preceding active-shot clock and the Tila
+cut was correctly placed at `00:02.083`, global frame 118. The prompt explicitly
+said `Without a cut` before the zoom-out and dismount, but the generated chunk
+showed only a quick Tila closeup followed by an invented hard cut to Heman
+already walking. That hard cut was model behavior, not a second cut inserted by
+the planner.
+
+Chunk 5 sampled frames 136-174 and contributed frames 141-174. Because the Tila
+shot started at frame 118, its bounded `<Video 1>` endpoint was correctly
+reported as:
+
+```text
+(141 - 118) / 24 = 00:00.958
+```
+
+Nevertheless, the complete shot prose followed that endpoint instruction,
+including the already shown `Tila ... points to the right` action. H3 replayed
+the pointing in chunk 5. Chunk 6 contributed from frame 175, correctly placed
+the endpoint at `(175 - 118) / 24 = 00:02.375`, received the same complete
+prose again, and this time resumed with the zoom-out. The final shot endpoint
+was consistently `00:04.667`, corresponding to the shot's complete 112-frame
+duration.
+
+This is not an accidental duplicate `[Shot N]` block, overlap calculation
+error, or non-monotonic timecode. It is a prompt-planning limitation. The
+continuation endpoint tells H3 how far the reference has progressed through the
+shot's clock, but the prose contains no timestamps mapping `point`, `speak`,
+`zoom`, `dismount`, or `walk` to that clock. H3 must infer that mapping from a
+short visual reference and can choose a different action on each continuation.
+Complete-shot repetition is therefore insufficient for a shot that spans
+several chunks and contains multiple sequential actions.
+
+### Implemented default: Gemma 4 semantic continuation director
+
+There is no `gemma4_continuity` toggle, continuation-format selector, or
+Gemma GPU-layer widget. Gemma is automatic when a later chunk's new output
+begins inside an existing source shot. It uses `n_gpu_layers=-1` while H3 and
+Qwen are explicitly unloaded, then destroys its llama.cpp context before H3
+sampling resumes. A new shot that starts exactly at a chunk output boundary is
+left to its original author-written prompt because no footage of that shot has
+yet been generated.
+
+For one eligible handoff, the sampler:
+
+1. builds an immutable action ledger from the original source shot, splitting
+   only at sentence and semicolon boundaries; each item receives a stable
+   `S<shot>.A<action>` identifier;
+2. decodes the immediately preceding *sampled* chunk with the H3 VAE and sends
+   its chronological 2 FPS stills to Gemma, rather than only the five or
+   twenty-two carried guide frames;
+3. supplies the source shot range, FPS, accepted action prefix, and number and
+   approximate duration of the new frames that belong to this source shot;
+4. receives JSON containing the ordered completed prefix, first unfinished ID,
+   confidence, factual final-state observation, and a one-to-four-sentence
+   `continuation_description` written in H3's concrete playback-order style;
+5. validates that action IDs are a non-regressing ordered source prefix, then
+   substitutes only `continuation_description` as the active shot body.
+
+Thus H3 receives canonical source-shot markers and only the next semantic
+action prose. It is no longer asked to map a complete long-shot prompt onto a
+custom master clock or to infer action progress from `ONLY GENERATE THE
+TIMESLICE` wording. Source cuts are still deterministic sampler calculations
+and remain normal `[Shot N] At ...` H3 markers; Gemma must not emit markers,
+timestamps, cuts, reference labels, or `shot ends` text in its continuation
+body. The original source prompt remains the authority: Gemma is instructed not
+to invent actions, camera work, dialogue, characters, objects, or outcomes.
+
+An unavailable/mismatched `llama-cpp-python` runtime or a failed model download
+stops explicitly. A malformed Gemma response is logged and falls back to the
+canonical source-shot continuation for that chunk. Debug `chunk_prompts`
+includes the ledger state, observation, confidence, Gemma's actual H3
+continuation prose, and raw validated JSON immediately before the actual H3
+prompt.
+
+The Gemma instructions are deliberately not embedded in `gemma4.py`.
+`gemma4_prompts.txt` has a `[SYSTEM]` message and an `[OBSERVATION]` template;
+the latter receives source-shot number/range/FPS, immutable ledger, accepted
+action IDs, and new-continuation frame/duration through documented
+`{{lowercase_placeholders}}`. The file is reparsed before every Gemma handoff,
+so an experimenter can edit and save it while ComfyUI is running and the next
+eligible chunk will use the new wording. It validates both section headers and
+every placeholder; an invalid template is reported as a recoverable observation
+failure and that chunk uses the canonical source fallback. The system message
+includes H3 phrasing rules because Gemma now authors the H3-facing body.
+
+`gemma4.py` downloads the exact files from
+`https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf` to the persistent
+ComfyUI model path `models/llama_cpp/gemma-4-12b-it-qat-q4_0`. `hf_hub_download`
+uses that local directory directly, avoiding a duplicate seven-gigabyte global
+Hugging Face cache copy. The first release is intentionally visual only: no H3
+audio VAE is connected, so Gemma cannot determine whether speech was completed.
+That is a future extension, together with richer action segmentation and
+full-current-shot semantic history when the immediately previous chunk is not
+enough.
+
+The required binding is exactly `llama-cpp-python==0.3.35`: it exposes the
+generic MTMD Python handler used for Gemma 4's `mmproj`. The development
+environment currently has 0.3.16, which is deliberately rejected with an
+installation message until `requirements.txt` is installed using ComfyUI's
+isolated `tools/python.sh` interpreter.
+
+### Planned experiment: align chunks to shot boundaries
+
+A separate sampler toggle should test shot-aware chunk planning. When enabled,
+the planner should prefer ending a sampler call at a source-prompt shot
+boundary instead of placing one physical chunk across two shots. A shot that
+fits within the effective temporal capacity would then be sampled normally as
+one complete single-shot call. Gemma would only be needed to direct continuity
+when one shot itself is too long for a single call, rather than intervening at
+every ordinary cut.
+
+Long shots should be divided into balanced intra-shot segments. In particular,
+if a shot exceeds the available capacity by only one to five frames, sampling
+one maximum-sized segment followed by a nearly empty segment would give H3 no
+useful temporal runway. The planner should instead split that shot roughly in
+half and sample two meaningful smaller segments. More generally, it should
+choose the minimum required segment count and distribute the shot duration
+across those segments so the final remainder is not pathologically short.
+Gemma's adaptive AV observation would run only at those intra-shot joins.
+
+This design must use effective *new-output* capacity, not blindly compare shot
+duration with the `chunk_frames` widget. Later calls spend part of their sampled
+window on `context_frames` guide/overlap, or on the minimum local packing prefix
+when guide overlap is off. The complete sampled window must still stay at or
+below the requested VRAM cap.
+
+There is also an unresolved H3-grid constraint. Valid H3 sampling windows use
+the `17k + 5` pixel-frame grid, and the output advance between ordinary
+continuation chunks is correspondingly quantized. Prompt cuts can occur at any
+integer frame after timestamp conversion, so an arbitrary shot endpoint may
+not be a legal physical chunk endpoint. Exact shot alignment therefore cannot
+be implemented by simply changing `frame_end`; it needs a proven padding,
+ownership, and trimming scheme that preserves the final AV latent grid without
+reintroducing the rejected overlapping-window blend/ownership artifacts. The
+toggle should remain experimental until that mapping is validated. A fallback
+may align only grid-compatible cuts and retain the existing planner for others.
+
+Gemma is intentionally an internal sampler dependency. It does not use
+ComfyUI's `CLIP`, Generate Text node, an LLM socket/input, Ollama, or a server
+process. The implemented director uses Google's official Gemma 4 12B
+instruction QAT Q4 GGUF at
+`https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf` through
+`llama-cpp-python`'s in-process generic MTMD handler. The user had already
+benchmarked this model at roughly 150 tokens per second on this GPU, so the
+between-chunk visual planning latency is expected to be practical; multimodal
+input length, temporary model swapping, and GPU-layer count still affect the
+integrated result. The actual download, model/projector loading, validated
+visual observation, and immediate release are described in the implemented
+Gemma section above.
+
+The source prompt's cut positions are converted to integer frames for exact
+internal intersection math, but generated prompts do not expose global frame
+numbers. With native video continuation enabled, actual future cuts, the
+bounded continuation endpoint, and the final split-shot endpoint use a single
+cumulative timeline beginning at the first active source shot. Guide-only
+continuation retains the established chunk-local cuts and shot-duration suffix.
+A cut placed only a few new frames after a continuation boundary can still be
+difficult for a generative model even when the timestamp conversion and latent
+handoff are correct.
 
 ## Replacing only prompt-owned conditioning
 
@@ -615,11 +930,12 @@ images[2] -> <Picture 3>
 ```
 
 The image references are reconstructed in the same order as the existing
-`minimax_refs` payload. Audio-only reference blocks contribute their `<Audio N>`
-labels to Qwen but need no waveform here because their audio latents already
-exist in `minimax_refs`.
+`minimax_refs` payload. Audio-only reference blocks and the dynamic continuation
+soundtrack contribute their `<Audio N>` labels to Qwen but need no waveform
+there because their audio latents already exist in `minimax_refs`.
 
-This explains why the current node does not take a video VAE or audio VAE:
+The optional video VAE is used only to show continuation/history frames to
+Qwen. No audio VAE is needed for generated continuation:
 
 - the `images` input supplies only pixels for Qwen visual tokens;
 - upstream keyframes and Ref2VA blocks are already VAE-encoded in the guider;
@@ -748,30 +1064,42 @@ updates it once per second, and freezes the final value on completion. Decoder
 selection is intentionally not given a separate UI row.
 
 Every sampling event carries the execution id, chunk count, sigma schedule, and
-backend elapsed time. If a browser refresh misses the original reset event, the
-new widget adopts the next event for the still-running execution, reconstructs
-its timer and graph scale, and resumes when the next encoded preview arrives.
-This follows the useful recovery behavior observed in KJ's preview override
-without retaining large preview tensors or media in server-global state.
+backend elapsed time. The backend keeps a bounded in-memory snapshot containing
+the current execution metadata and only the latest encoded frame group for each
+chunk. A local read-only endpoint returns that snapshot to a newly created
+widget, so browser refresh restores all prior chunks immediately instead of
+waiting for and adopting only the next live event. No latent or decoded tensor
+is retained, and only the eight most recently used preview-node ids are kept.
 
-For the active chunk, the browser keeps each received step WebP until the next
-chunk starts. Hovering either graph maps the pointer's horizontal position to a
-sampling boundary, draws the same vertical marker on both graphs, updates their
-values, pauses the chunk playlist, and displays that step's animated preview.
-Leaving the graph returns to the newest active chunk and resumes playback.
+For the active chunk, the browser keeps each received step frame group until the
+next chunk starts. Hovering either graph maps the pointer's horizontal position
+to a sampling boundary, draws the same vertical marker on both graphs, updates
+their values, pauses the chunk playlist, and loops that step's frame group.
+Leaving the graph restarts the playlist from the first available chunk.
 Intermediate previews may be absent if the bounded encoder intentionally drops
 an outdated job while a newer step is waiting.
 
-The browser does not replace a chunk while that chunk is already playing. New
-sampling-step WebPs update its cached source and become visible on the next
-playlist pass. The next chunk's duration timer starts only after its replacement
-image has loaded, so decode latency cannot consume part of that chunk's playback
-slot or make it appear to begin inside the preceding chunk.
+Each chunk update is an atomic object containing an ordered array of static WebP
+frames and their individual durations. The browser snapshots that object when
+it enters a chunk and uses one explicit `(chunk index, frame index)` cursor. It
+must finish the snapshot's final frame before advancing to the next available
+chunk index. If denoising replaces a chunk while it is playing, the new group is
+used only on the next playlist pass. There is no browser-managed timer competing
+with an independently looping animated image, so frames from chunk 4 cannot be
+inserted into chunk 2 or chunk 3.
 
-`frame_stride` chooses every Nth H3 latent position. Animated-frame durations
+`frame_stride` chooses every Nth H3 latent position. Per-frame durations
 still use H3's `(1, 4, 4, 4, 4)` pixel-frame coverage, so skipped positions do
-not speed up playback. Cumulative millisecond rounding keeps the total WebP
+not speed up playback. Cumulative millisecond rounding keeps the total group
 duration equal to the represented pixel-frame duration at the selected `fps`.
+
+The preview frontend records that backend/source FPS with every frame group,
+then scales those stored duration values to the current `fps` widget value at
+playback time. Changing the widget during an active inference immediately
+cancels and reschedules the displayed frame at the new rate; it neither waits
+for another preview message nor changes H3 sampling. The widget uses a one-FPS
+step so its arrows provide practical live speed control, while direct numeric
+entry can still specify a fractional rate.
 
 PIL WebP compression runs on a bounded background worker. When encoding falls
 behind, the queued intermediate step is replaced by the latest one instead of
@@ -779,19 +1107,18 @@ blocking diffusion. Tiny-VAE and Latent2RGB decoding happen before that worker;
 therefore tiny-VAE preview can slow sampling, and `frame_stride` is the direct
 control for reducing that cost.
 
-Each event transfers only the current chunk's animated WebP. The browser stores
-one data URL and duration per chunk, replaces the active chunk as denoising
-progresses, and loops over every available chunk. Earlier chunks are neither
-decoded nor sent again. A reset event clears stale media at the next execution,
-and a completion event leaves the assembled preview playing. Each replacement
-WebP is preloaded before its source is assigned to the visible image, keeping
-the previous preview on screen instead of exposing the widget's black background
-for one browser animation frame.
+Each live event transfers only the current chunk's latest static-WebP frame
+group. The browser stores one group per chunk, replaces the active group as
+denoising progresses, and loops over every available chunk in numeric order. A
+refresh performs one snapshot transfer containing the retained latest groups;
+normal live events do not resend earlier chunks. A reset event clears stale
+media at the next execution, and a completion event leaves the assembled
+preview playing.
 
 Preview loading, decoding, encoding, and event-send errors are non-fatal. An
 invalid tiny decoder is disabled for that execution and falls back to
 Latent2RGB. Preview state contains no network client or outbound request; it
-uses ComfyUI's local websocket event path.
+uses ComfyUI's local websocket event path plus a read-only local snapshot route.
 
 ## LoRA scheduling finding
 
@@ -826,6 +1153,17 @@ line confirms that the LoRA actually attached.
 - Prompt cut timing remains generative guidance. Rewriting a cut to the correct
   local timestamp does not make diffusion frame-exact in the way a deterministic
   video editor would be.
+- Automatic Gemma continuation observes only 2 FPS stills from the immediately
+  preceding sampled chunk, uses sentence/semicolon action units, and has no
+  generated-audio input. It can therefore misjudge fine motion, rapid dialogue,
+  or an action whose relevant beginning is no longer visible. Strict ID
+  validation prevents malformed responses from corrupting the action plan, and
+  a failure uses the canonical original source-shot body for that chunk. Quality
+  must still be tested against the known Tila-pointing/zoom-out case.
+- Shot-aware physical chunk boundaries are not implemented. Prompt cuts are
+  arbitrary integer frames, while H3 sampler windows are constrained to its
+  `17k + 5` temporal grid; exact alignment requires a validated padding and
+  latent-ownership scheme.
 - A cut placed only a few new frames after a continuation prefix can be
   unstable. Increasing `chunk_frames` or choosing boundaries farther from cuts
   gives H3 more temporal runway without changing the requested global cut.
@@ -890,11 +1228,10 @@ Completed checks include:
   active decoder reporting;
 - JavaScript syntax and lifecycle review for the elapsed timer, completion
   freeze, removal cleanup, and removal of the separate previewer status row;
-- JavaScript lifecycle review for refresh recovery from an in-progress event
-  and interactive graph-step preview selection with a synchronized vertical
-  marker;
-- animated WebP creation and exact 124-frame/119-frame playback durations at
-  24 FPS.
+- JavaScript lifecycle review for snapshot restoration after refresh and
+  interactive graph-step preview selection with a synchronized vertical marker;
+- static WebP frame-group creation, sorted cache restoration, and exact
+  124-frame/119-frame playback durations at 24 FPS.
 
 Manual GPU/log observations also established:
 
@@ -919,6 +1256,37 @@ shape assembly without loading the large model.
   <https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md>
 - MiniMax full-reference prompt guide:
   <https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md>
+- MiniMax CLI H3 storyboard/reference template used when designing the
+  `storyboard` continuation format:
+  <https://github.com/MiniMax-AI/cli/blob/main/skill/h3-video/references/h3-video.md>
+- Naxdy's third-party **Minimax H3 Prompt Enhancer** system prompt:
+  <https://gist.github.com/Naxdy/43b7422a1e4a79fb8b0489c6c39eaace>. It is
+  not official MiniMax documentation and does not establish model behavior, but
+  it is a useful design reference: it treats reference order as semantic, keeps
+  `<Video N>` and `<Audio N>` ordinals independent, uses the six-section Ref2VA
+  brief, and recommends short sequential timed beats with observable end
+  states. The current sampler behavior was not changed from this source; its
+  beat guidance is relevant to future Gemma action-ledger segmentation.
+- deAPI's third-party T2VA-oriented prompting article:
+  <https://deapi.ai/blog/minimax-h3-prompting-guide-how-to-write-structured-prompts-for-text-to-video>.
+  It is a practical restatement of the structured fields, increasing
+  `MM:SS.mmm` cut times, concrete observable language, and camera-motion prose
+  already covered by the official guides. Its useful extra heuristic is to
+  budget dialogue at roughly 2.5 words per second and, where lip-sync quality
+  matters, prefer one speaker per shot. It does not document serial chunk
+  continuation, Ref2VA latent handling, or H3 internals, so its published model
+  specifications and workflow claims are not treated as implementation facts.
+- Official Gemma 4 12B QAT Q4 model and projector used by the local continuity
+  director:
+  <https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf>
+- `llama-cpp-python`, whose 0.3.35 generic MTMD vision handler is required for
+  the Gemma integration:
+  <https://github.com/abetlen/llama-cpp-python>
+- NVIDIA Unified Memory reference consulted for the rejected idea of keeping
+  active H3 attention/reference tensors in system RAM:
+  <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html>
+- PyTorch CUDA memory-management notes consulted for allocator/cache behavior:
+  <https://docs.pytorch.org/docs/stable/notes/cuda.html>
 - Installed ComfyUI implementations inspected during development:
   `comfy_extras/nodes_custom_sampler.py`,
   `comfy_extras/nodes_minimax_h3.py`,

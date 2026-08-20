@@ -5,6 +5,7 @@ import math
 import queue
 import threading
 import time
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
 import folder_paths
+from aiohttp import web
 from comfy.taesd.taesd import Block, Clamp, conv
 from comfy_api.latest import io
 
@@ -26,6 +28,88 @@ except ImportError:
 
 PREVIEW_WRAPPER_KEY = "minimax_h3_unlimited_preview"
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+_PREVIEW_CACHE_LIMIT = 8
+_PREVIEW_CACHE = OrderedDict()
+_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _cache_payload(payload):
+    node_id = payload.get("node_id")
+    execution = payload.get("execution")
+    if node_id is None or execution is None:
+        return
+    node_id = str(node_id)
+    action = payload.get("action")
+    with _PREVIEW_CACHE_LOCK:
+        state = _PREVIEW_CACHE.get(node_id)
+        if action == "reset":
+            state = {
+                "execution": execution,
+                "reset": payload.copy(),
+                "sample_start": None,
+                "progress": None,
+                "complete": None,
+                "chunks": {},
+                "deltas": [],
+                "step_times": [],
+            }
+            _PREVIEW_CACHE[node_id] = state
+            _PREVIEW_CACHE.move_to_end(node_id)
+            while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_LIMIT:
+                del _PREVIEW_CACHE[next(iter(_PREVIEW_CACHE))]
+            return
+        if state is None or state["execution"] != execution:
+            return
+        if action == "sample_start":
+            state["sample_start"] = payload.copy()
+            state["progress"] = None
+            state["complete"] = None
+            state["deltas"] = []
+            state["step_times"] = []
+        elif action == "progress":
+            state["progress"] = payload.copy()
+            step = int(payload.get("step") or 0)
+            if step > 0:
+                for key, source in (("deltas", "delta"), ("step_times", "step_ms")):
+                    values = state[key]
+                    while len(values) < step:
+                        values.append(None)
+                    values[step - 1] = payload.get(source)
+        elif action == "chunk":
+            state["chunks"][int(payload["chunk"])] = payload.copy()
+        elif action == "complete":
+            state["complete"] = payload.copy()
+
+
+def _cached_snapshot(node_id):
+    with _PREVIEW_CACHE_LOCK:
+        state = _PREVIEW_CACHE.get(str(node_id))
+        if state is None and node_id:
+            suffix = f":{node_id}"
+            for cached_id in reversed(_PREVIEW_CACHE):
+                if cached_id == str(node_id) or cached_id.endswith(suffix):
+                    state = _PREVIEW_CACHE[cached_id]
+                    break
+        if state is None:
+            return None
+        return {
+            "execution": state["execution"],
+            "reset": state["reset"].copy(),
+            "sample_start": None if state["sample_start"] is None else state["sample_start"].copy(),
+            "progress": None if state["progress"] is None else state["progress"].copy(),
+            "complete": None if state["complete"] is None else state["complete"].copy(),
+            "chunks": [state["chunks"][index].copy() for index in sorted(state["chunks"])],
+            "deltas": list(state["deltas"]),
+            "step_times": list(state["step_times"]),
+        }
+
+
+_PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instance", None)
+if _PROMPT_SERVER is not None:
+    @_PROMPT_SERVER.routes.get("/minimax_h3_unlimited_preview/state")
+    async def minimax_h3_unlimited_preview_state(request):
+        snapshot = _cached_snapshot(request.rel_url.query.get("node_id", ""))
+        return web.json_response(snapshot or {}, headers={"Cache-Control": "no-store"})
 
 
 class _LatestEncoder:
@@ -167,46 +251,42 @@ def _tiny_frames(video, decoder, indices, max_resolution):
     return [_tensor_image(decoder.decode_frame(video[0, :, index].unsqueeze(0)), max_resolution) for index in indices]
 
 
-def _frame_selection(video_t, trim_steps, stride, fps):
+def _frame_selection(video_t, trim_steps, stride, fps, output_start=0):
     indices = list(range(trim_steps, video_t, stride))
     durations = []
+    frame_numbers = []
     preview_frames = 0
     for index in indices:
+        frame_numbers.append(int(output_start) + preview_frames)
         span = sum(FRAME_PER_TOKEN[position % len(FRAME_PER_TOKEN)] for position in range(index, min(video_t, index + stride)))
         next_preview_frames = preview_frames + span
         durations.append(max(1, round(next_preview_frames * 1000.0 / fps) - round(preview_frames * 1000.0 / fps)))
         preview_frames = next_preview_frames
-    return indices, durations
+    return indices, durations, frame_numbers
 
 
-def _encode_webp(frames, durations, quality):
-    if not frames:
-        return None
-    buffer = pyio.BytesIO()
-    frames[0].save(
-        buffer,
-        format="WEBP",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
-        loop=0,
-        quality=quality,
-        method=3,
-    )
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
+def _encode_frame_group(frames, durations, quality):
+    encoded = []
+    for frame in frames:
+        buffer = pyio.BytesIO()
+        frame.save(buffer, format="WEBP", quality=quality, method=3)
+        encoded.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+    return encoded, list(durations)
 
 
 def _send(payload):
-    if PromptServer is not None and PromptServer.instance is not None:
+    _cache_payload(payload)
+    prompt_server = None if PromptServer is None else getattr(PromptServer, "instance", None)
+    if prompt_server is not None:
         try:
-            PromptServer.instance.send_sync("minimax_h3_unlimited_preview", payload, PromptServer.instance.client_id)
+            prompt_server.send_sync("minimax_h3_unlimited_preview", payload, prompt_server.client_id)
         except Exception as error:
             logging.warning(f"MiniMax H3 accumulated preview could not send an update: {error}")
 
 
 class _PreviewExecution:
-    def __init__(self, wrappers, chunk_count):
-        self.items = [(wrapper, wrapper.begin(chunk_count)) for wrapper in wrappers]
+    def __init__(self, wrappers, chunk_ranges, shot_ranges):
+        self.items = [(wrapper, wrapper.begin(chunk_ranges, shot_ranges)) for wrapper in wrappers]
 
     def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
         for wrapper, execution_id in self.items:
@@ -221,9 +301,9 @@ class _PreviewExecution:
             wrapper.finish(execution_id)
 
 
-def begin_preview_execution(model_patcher, chunk_count):
+def begin_preview_execution(model_patcher, chunk_ranges, shot_ranges=()):
     wrappers = model_patcher.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, PREVIEW_WRAPPER_KEY)
-    return _PreviewExecution(wrappers, chunk_count) if wrappers else None
+    return _PreviewExecution(wrappers, chunk_ranges, shot_ranges) if wrappers else None
 
 
 class _AccumulatedPreviewWrapper:
@@ -244,9 +324,13 @@ class _AccumulatedPreviewWrapper:
     def _elapsed_ms(self):
         return None if self.started_at is None else (time.perf_counter() - self.started_at) * 1000.0
 
-    def begin(self, chunk_count):
+    def begin(self, chunk_ranges, shot_ranges=()):
         self.execution_id += 1
-        self.chunk_count = chunk_count
+        if isinstance(chunk_ranges, int):
+            chunk_ranges = [{"chunk": index + 1} for index in range(chunk_ranges)]
+        chunk_ranges = [dict(item) for item in chunk_ranges]
+        shot_ranges = [dict(item) for item in shot_ranges]
+        self.chunk_count = len(chunk_ranges)
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
@@ -255,7 +339,10 @@ class _AccumulatedPreviewWrapper:
             "node_id": self.node_id,
             "action": "reset",
             "execution": self.execution_id,
-            "chunk_count": chunk_count,
+            "chunk_count": self.chunk_count,
+            "chunk_ranges": chunk_ranges,
+            "shot_ranges": shot_ranges,
+            "total_frames": max((int(item.get("end", -1)) for item in chunk_ranges), default=-1) + 1,
             "elapsed_ms": 0.0,
         })
         return self.execution_id
@@ -385,7 +472,13 @@ class _AccumulatedPreviewWrapper:
                         "elapsed_ms": self._elapsed_ms(),
                     })
 
-                    indices, durations = _frame_selection(video.shape[2], chunk["trim_steps"], self.frame_stride, self.fps)
+                    indices, durations, frame_numbers = _frame_selection(
+                        video.shape[2],
+                        chunk["trim_steps"],
+                        self.frame_stride,
+                        self.fps,
+                        chunk["output_start"],
+                    )
                     if decoder is not None:
                         try:
                             frames = _tiny_frames(video, decoder, indices, self.max_resolution)
@@ -412,6 +505,7 @@ class _AccumulatedPreviewWrapper:
                             "sampled_end": chunk["sampled_end"],
                             "output_start": chunk["output_start"],
                             "output_end": chunk["output_end"],
+                            "frame_numbers": frame_numbers,
                             "duration_ms": sum(durations),
                             "width": frames[0].width,
                             "height": frames[0].height,
@@ -421,9 +515,10 @@ class _AccumulatedPreviewWrapper:
                         }
 
                         def encode_and_send(frames=frames, durations=durations, payload=payload):
-                            encoded = _encode_webp(frames, durations, self.quality)
-                            if encoded is not None:
-                                payload["image"] = encoded
+                            encoded, frame_durations = _encode_frame_group(frames, durations, self.quality)
+                            if encoded:
+                                payload["frames"] = encoded
+                                payload["frame_durations_ms"] = frame_durations
                                 _send(payload)
 
                         encoder.submit(encode_and_send)
@@ -451,7 +546,8 @@ class MiniMaxH3UnlimitedPreview(io.ComfyNode):
                 io.Int.Input("max_resolution", default=0, min=0, max=8192, step=8,
                              tooltip="Maximum preview side in pixels. 0 keeps the decoder's native output resolution."),
                 io.Int.Input("quality", default=75, min=30, max=100, step=1),
-                io.Float.Input("fps", default=24.0, min=1.0, max=60.0, step=0.001),
+                io.Float.Input("fps", default=24.0, min=1.0, max=60.0, step=1.0,
+                               tooltip="Preview playback FPS. The browser applies changes immediately while a preview is playing."),
                 io.Int.Input("frame_stride", default=1, min=1, max=16, step=1,
                              tooltip="Preview every Nth H3 latent frame while preserving its playback duration."),
                 io.Combo.Input("tiny_vae", options=["none"] + folder_paths.get_filename_list("vae_approx"), default="none",
