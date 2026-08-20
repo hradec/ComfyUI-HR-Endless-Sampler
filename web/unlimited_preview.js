@@ -251,6 +251,7 @@ app.registerExtension({
             // may differ while an inference is already in progress.
             let sourceFps = null;
             let playbackFps = null;
+            let fpsWidget = null;
             let startedAt = null;
             let completedElapsed = null;
             let elapsedTimer = null;
@@ -276,7 +277,11 @@ app.registerExtension({
             }
 
             function currentPlaybackFps() {
-                return validFps(playbackFps) || validFps(sourceFps) || 12;
+                // Read the widget itself first. During workflow restoration
+                // ComfyUI assigns serialized widget values without reliably
+                // invoking callbacks, so a value cached during onNodeCreated
+                // can otherwise remain stuck at the 24 FPS default.
+                return validFps(fpsWidget?.value) || validFps(playbackFps) || validFps(sourceFps) || 24;
             }
 
             function frameDuration(group, frameIndex) {
@@ -786,6 +791,10 @@ app.registerExtension({
                     return;
                 }
                 try {
+                    // Workflow widget restoration normally completes before
+                    // the asynchronous history request. Synchronize it here
+                    // so restored playback starts at the visible FPS value.
+                    setPlaybackFps(fpsWidget?.value, false);
                     const response = await api.fetchApi(
                         `/minimax_h3_unlimited_preview/state?node_id=${encodeURIComponent(node.id)}`,
                         { cache: "no-store" },
@@ -872,7 +881,7 @@ app.registerExtension({
             node.addDOMWidget("preview", "minimax_h3_unlimited_preview", root, { serialize: false });
             node.setSize([Math.max(node.size?.[0] || 460, 460), Math.max(node.size?.[1] || 540, 540)]);
 
-            const fpsWidget = node.widgets?.find(widget => widget.name === "fps");
+            fpsWidget = node.widgets?.find(widget => widget.name === "fps");
             const previousFpsCallback = fpsWidget?.callback;
             if (fpsWidget) {
                 fpsWidget.callback = function () {

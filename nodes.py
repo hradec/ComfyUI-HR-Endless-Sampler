@@ -57,12 +57,47 @@ def _audio_steps(frames):
     return round(frames * AUDIO_LATENT_FPS / VIDEO_FPS)
 
 
-def _context_video_steps(context_frames, max_chunk_frames):
-    if context_frames < 5 or (context_frames - 5) % 17:
-        raise ValueError("context_frames must use MiniMax H3's 17k+5 frame grid: 5, 22, 39, 56, ...")
-    if context_frames >= max_chunk_frames:
-        raise ValueError(f"context_frames ({context_frames}) must be smaller than the effective chunk size ({max_chunk_frames})")
-    return _video_steps(context_frames)
+def _bounded_video_steps(frame_count, max_chunk_frames, field_name):
+    if frame_count == 0:
+        return 0
+    if frame_count < 5 or (frame_count - 5) % 17:
+        raise ValueError(f"{field_name} must be 0 or use MiniMax H3's 17k+5 frame grid: 5, 22, 39, 56, ...")
+    if frame_count >= max_chunk_frames:
+        raise ValueError(f"{field_name} ({frame_count}) must be smaller than the effective chunk size ({max_chunk_frames})")
+    return _video_steps(frame_count)
+
+
+def _continuation_controls(context_frames, guide_overlap, video_continuation, max_chunk_frames):
+    """Normalize legacy widgets, then validate overlap, keyframe, and Video1 lengths."""
+    legacy_context_frames = context_frames
+    if video_continuation is True:
+        video_continuation = legacy_context_frames
+    elif video_continuation is False:
+        video_continuation = 0
+    if guide_overlap is True or guide_overlap == "context_frames":
+        guide_overlap = legacy_context_frames
+    elif guide_overlap is False or guide_overlap == "5 frames":
+        context_frames = 5
+        guide_overlap = 5
+    elif guide_overlap == "off":
+        context_frames = 0
+        guide_overlap = 0
+
+    values = {
+        "context_frames": context_frames,
+        "guide_overlap": guide_overlap,
+        "video_continuation": video_continuation,
+    }
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer: 0, 5, 22, 39, 56, ...")
+        _bounded_video_steps(value, max_chunk_frames, name)
+    if context_frames > guide_overlap:
+        raise ValueError(
+            f"context_frames ({context_frames}) cannot exceed guide_overlap ({guide_overlap}); "
+            "keyframed context must exist inside the physical overlap"
+        )
+    return context_frames, guide_overlap, video_continuation, _video_steps(context_frames) if context_frames else 0
 
 
 def _timestamp_frame(minutes, seconds, milliseconds, fps):
@@ -243,14 +278,14 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
     return rewritten_prompt
 
 
-def _planned_chunk_prompts(prompt, plan, active_plan, fps, overlap_frames, guide_overlap, video_continuation,
+def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_continuation,
                            ref2va, video_number, audio_number):
     total_frames = plan[-1]["frame_end"]
-    guide_enabled = guide_overlap != "off"
+    guide_enabled = guide_frames > 0
     planned = []
     for index, chunk in enumerate(active_plan):
         continuation = index > 0
-        content_start = chunk["frame_start"] + (overlap_frames if continuation else 0)
+        content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
         continuation_video_label = f"<Video {video_number}>" if continuation and video_continuation else None
         continuation_audio_label = f"<Audio {audio_number}>" if continuation and video_continuation else None
         chunk_prompt = _prompt_for_chunk(
@@ -355,10 +390,10 @@ def _encode_prompt(clip, prompt, images, positive, width, height, continuation, 
     return conditioning[0]
 
 
-def _chunk_plan(video_t, audio_t, chunk_frames, context_frames=5):
+def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
     max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
     max_chunk_t = _video_steps(max_chunk_frames)
-    context_video_t = _context_video_steps(context_frames, max_chunk_frames)
+    context_video_t = _bounded_video_steps(overlap_frames, max_chunk_frames, "guide_overlap")
 
     if video_t < MIN_VIDEO_STEPS or (video_t - MIN_VIDEO_STEPS) % 5:
         raise ValueError("SamplerCustomAdvanced-Unlimited expects a MiniMax H3 video latent on the 17k+5 frame grid")
@@ -384,7 +419,7 @@ def _chunk_plan(video_t, audio_t, chunk_frames, context_frames=5):
             video_start = video_end - context_video_t
             chunk_frame_count = _pixel_frames(chunk_t)
 
-        output_frames += chunk_frame_count if not plan else chunk_frame_count - context_frames
+        output_frames += chunk_frame_count if not plan else chunk_frame_count - overlap_frames
         next_audio_end = _audio_steps(output_frames)
         chunk_audio_t = _audio_steps(chunk_frame_count)
         new_audio_t = next_audio_end - audio_end
@@ -398,6 +433,7 @@ def _chunk_plan(video_t, audio_t, chunk_frames, context_frames=5):
             "audio_end": next_audio_end,
             "context_video_t": 0 if not plan else context_video_t,
             "context_audio_t": context_audio_t,
+            "output_trim_frames": 0 if not plan else overlap_frames,
             "frame_start": 0 if not plan else output_frames - chunk_frame_count,
             "frame_end": output_frames,
         })
@@ -420,7 +456,7 @@ def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames):
 
 
 def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prompt, video_context=None,
-                            audio_context=None, audio_end_frame=5.0, video_refs=()):
+                            audio_context=None, audio_end_frame=5.0, video_refs=(), video_context_start=0):
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
     positive = conds.get("positive")
     if positive is None:
@@ -445,7 +481,7 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
                 keyframes.append(local_keyframe)
 
         if video_context is not None:
-            keyframes.append({"resolved_frame_index": 0, "latent": video_context})
+            keyframes.append({"resolved_frame_index": video_context_start, "latent": video_context})
         if audio_context is not None:
             audio_start = audio_end_frame - audio_context.shape[-1] / FRAME_RESCALE
             keyframes.append({"resolved_frame_index": audio_start, "audio_latent": audio_context})
@@ -781,18 +817,18 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                tooltip="FPS used to convert source-prompt cut timestamps to exact frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
-                io.Int.Input("context_frames", default=5, min=5, max=3600, step=17,
-                             tooltip="Bounded completed-frame context for guide_overlap and video_continuation. Valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames."),
+                io.Int.Input("context_frames", default=5, min=0, max=3600, step=1,
+                             tooltip="Independent completed-frame native keyframe context inside guide_overlap. 0 disables keyframes. Other valid values are 5, 22, 39, 56, ... and cannot exceed guide_overlap."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots to the console. chunk_prompts is returned whether debug is enabled or not."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
-                io.Combo.Input("guide_overlap", options=["context_frames", "5 frames", "off"], default="context_frames",
-                               tooltip="Guide + overlap strength. context_frames uses the configured tail; 5 frames uses H3's minimum tail; off carries no previous frames and is intended for native video_continuation tests."),
-                io.Boolean.Input("video_continuation", default=False,
-                                 tooltip="Experimental: expose the bounded previous AV context as synchronized native Ref2VA <Audio N> + <Video N> references and add [video continuation] to later chunk prompts. Requires the video vae."),
+                io.Int.Input("guide_overlap", default=5, min=0, max=3600, step=1,
+                             tooltip="Independent physical guide overlap and trim length. 0 disables overlap. Other valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames."),
+                io.Int.Input("video_continuation", default=0, min=0, max=3600, step=1,
+                             tooltip="Independent synchronized native Ref2VA <Audio N> + <Video N> tail length. 0 disables Video1. Other valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames. Requires the video vae."),
                 io.Boolean.Input("qwen_full_history", default=False,
                                  tooltip="Experimental: show Qwen 2 FPS frames decoded from all completed output before each chunk. Does not add a DiT video reference or rewrite the prompt. Requires vae."),
                 io.Boolean.Input("prompt_preview_only", default=False, optional=True,
@@ -817,7 +853,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
                 prompt_preview_only=False, debug_stop_chunk=0, images=None, context_frames=5,
-                guide_overlap="context_frames", video_continuation=False, qwen_full_history=False, vae=None,
+                guide_overlap=5, video_continuation=0, qwen_full_history=False, vae=None,
                 **_deprecated_inputs):
         samples = latent_image["samples"]
         if not samples.is_nested:
@@ -834,17 +870,16 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             return io.NodeOutput(sampled[0], sampled[1], "")
 
         video, audio = streams
-        if guide_overlap is True:
-            guide_overlap = "context_frames"
-        elif guide_overlap is False:
-            guide_overlap = "5 frames"
-        if guide_overlap not in ("context_frames", "5 frames", "off"):
-            raise ValueError("guide_overlap must be context_frames, 5 frames, or off")
-        overlap_frames = context_frames if guide_overlap == "context_frames" else 5
         max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
-        if video_continuation and guide_overlap == "off":
-            _context_video_steps(context_frames, max_chunk_frames)
-        if guide_overlap == "off":
+        context_frames, guide_overlap, video_continuation, guide_video_t = _continuation_controls(
+            context_frames,
+            guide_overlap,
+            video_continuation,
+            max_chunk_frames,
+        )
+        overlap_frames = guide_overlap
+        use_video_continuation = video_continuation > 0
+        if overlap_frames == 0:
             plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)
         else:
             plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, overlap_frames)
@@ -855,7 +890,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         gemma_handoff_needed = any(
             _gemma_continuing_shot(
                 gemma_shots,
-                chunk["frame_start"] + (overlap_frames if index else 0),
+                chunk["frame_start"] + chunk.get("output_trim_frames", 0),
                 chunk["frame_end"],
             ) is not None
             for index, chunk in enumerate(active_plan)
@@ -867,7 +902,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         if positive is None:
             raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
-        if len(active_plan) > 1 and (video_continuation or qwen_full_history) and not ref2va:
+        if len(active_plan) > 1 and (use_video_continuation or qwen_full_history) and not ref2va:
             raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
         original_refs = positive[0].get("minimax_refs", ())
         video_number = 1 + sum(ref["kind"] in ("video", "video_audio") for ref in original_refs)
@@ -877,13 +912,20 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             plan,
             active_plan,
             fps,
-            overlap_frames,
-            guide_overlap,
-            video_continuation,
+            context_frames,
+            use_video_continuation,
             ref2va,
             video_number,
             audio_number,
         )
+        if debug:
+            logging.info(
+                "SamplerCustomAdvanced-Unlimited independent continuation controls: "
+                "context_frames=%d, guide_overlap=%d, video_continuation=%d",
+                context_frames,
+                guide_overlap,
+                video_continuation,
+            )
         if prompt_preview_only:
             prompt_preview = "\n\n".join(debug_prompt for _chunk_prompt, debug_prompt in planned_prompts)
             if debug:
@@ -895,7 +937,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
 
         if len(active_plan) > 1 and "noise_mask" in latent_image:
             raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
-        if len(active_plan) > 1 and (video_continuation or qwen_full_history or gemma_handoff_needed):
+        if len(active_plan) > 1 and (use_video_continuation or qwen_full_history or gemma_handoff_needed):
             if vae is None:
                 raise ValueError("video_continuation, qwen_full_history, and automatic Gemma continuation require a MiniMax H3 video VAE")
 
@@ -938,7 +980,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         preview_chunk_ranges = [
             {
                 "chunk": index + 1,
-                "start": chunk["frame_start"] + (overlap_frames if index else 0),
+                "start": chunk["frame_start"] + chunk.get("output_trim_frames", 0),
                 "end": chunk["frame_end"] - 1,
             }
             for index, chunk in enumerate(active_plan)
@@ -983,7 +1025,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         },
                     )
                 continuation = index > 0
-                content_start = chunk["frame_start"] + (overlap_frames if continuation else 0)
+                content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
                 gemma_body_overrides = {}
                 gemma_report = None
                 if gemma_director is not None and continuation:
@@ -1082,18 +1124,23 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 chunk_latent["samples"] = comfy.nested_tensor.NestedTensor((chunk_video, chunk_audio))
                 chunk_noise = comfy.nested_tensor.NestedTensor((chunk_video_noise, chunk_audio_noise))
 
-                guide_enabled = guide_overlap != "off"
-                video_context = None if previous_video is None or not guide_enabled else previous_video[:, :, -context_video_t:].clone()
-                audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -context_audio_t:].clone()
+                guide_enabled = context_frames > 0
+                guide_audio_t = (
+                    0 if not guide_enabled
+                    else _audio_steps(content_start) - _audio_steps(content_start - context_frames)
+                )
+                video_context = None if previous_video is None or not guide_enabled else previous_video[:, :, -guide_video_t:].clone()
+                audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -guide_audio_t:].clone()
+                video_context_start = guide_overlap - context_frames
                 audio_end_frame = float(overlap_frames)
                 if audio_context is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
                 video_items = []
                 video_refs = []
-                if continuation and video_continuation:
-                    reference_latent = previous_video[:, :, -_video_steps(context_frames):].clone()
-                    reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - context_frames)
+                if continuation and use_video_continuation:
+                    reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
+                    reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - video_continuation)
                     reference_audio = previous_audio[..., -reference_audio_t:].clone()
                     if vram_monitor is not None:
                         vram_monitor.report(
@@ -1137,8 +1184,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         presentations,
                     )
                 if gemma_body_overrides:
-                    continuation_video_label = f"<Video {video_number}>" if continuation and video_continuation else None
-                    continuation_audio_label = f"<Audio {audio_number}>" if continuation and video_continuation else None
+                    continuation_video_label = f"<Video {video_number}>" if continuation and use_video_continuation else None
+                    continuation_audio_label = f"<Audio {audio_number}>" if continuation and use_video_continuation else None
                     chunk_prompt = _prompt_for_chunk(
                         prompt,
                         chunk["frame_start"],
@@ -1206,7 +1253,17 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     audio_context,
                     audio_end_frame,
                     video_refs,
+                    video_context_start,
                 )
+
+                # Every dependency on the previous sampler container has now
+                # been converted into the bounded guide/reference tensors in
+                # the current conditioning. The accumulated output already
+                # owns its trimmed clone, so do not keep the previous full
+                # nested AV result alive through the next DiT evaluation.
+                if continuation:
+                    previous_video = None
+                    previous_audio = None
 
                 chunk_seed = (noise.seed + index) & 0xffffffffffffffff
                 if preview_execution is not None:
@@ -1246,8 +1303,13 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 finally:
                     if preview_execution is not None:
                         preview_execution.clear_chunk()
-                output_template = sampled
-                denoised_template = denoised
+                # Preserve latent metadata without making the template another
+                # owner of a full per-chunk nested sample. Final concatenated
+                # samples are installed into these dictionaries after the loop.
+                output_template = sampled.copy()
+                denoised_template = denoised.copy()
+                output_template.pop("samples", None)
+                denoised_template.pop("samples", None)
                 previous_video, previous_audio = sampled["samples"].unbind()
                 previous_frame_count = chunk["frame_end"] - chunk["frame_start"]
                 denoised_chunk_video, denoised_chunk_audio = denoised["samples"].unbind()
@@ -1260,6 +1322,34 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 denoised_audio.append(denoised_chunk_audio[..., audio_trim:].clone())
                 chunk_progress.finish(index)
                 completed_chunks = index + 1
+
+                # The next chunk needs only previous_video/previous_audio and
+                # the accumulated trimmed outputs. Release this chunk's input,
+                # noise, denoised result, and conditioning owners now instead
+                # of carrying them through the next Gemma/VAE handoff.
+                guider.original_conds = original_conds
+                encoded_prompt = None
+                chunk_latent = None
+                chunk_noise = None
+                chunk_video = None
+                chunk_audio = None
+                chunk_video_noise = None
+                chunk_audio_noise = None
+                video_context = None
+                audio_context = None
+                video_refs.clear()
+                reference_latent = None
+                reference_audio = None
+                prefix_video = None
+                prefix_audio = None
+                prefix_latent = None
+                prefix_noise = None
+                prefix_video_noise = None
+                prefix_audio_noise = None
+                sampled = None
+                denoised = None
+                denoised_chunk_video = None
+                denoised_chunk_audio = None
             sampling_completed = True
         finally:
             guider.original_conds = original_conds

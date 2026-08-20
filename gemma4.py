@@ -1,10 +1,12 @@
-"""In-process Gemma 4 continuity observation for MiniMax H3 Unlimited.
+"""Process-isolated Gemma 4 continuity observation for MiniMax H3 Unlimited.
 
 Gemma is intentionally short lived: a single observation loads the GGUF and
 multimodal projector, observes sequential stills from the completed H3 chunk,
 returns a constrained progress record plus H3-ready continuation prose, and
-immediately releases llama.cpp's non-PyTorch CUDA allocations. H3/Qwen are then
-free to use the GPU normally.
+then exits its worker process.  Process exit is deliberate: llama.cpp's CUDA
+backend owns allocations outside PyTorch and can retain a backend/context
+high-water mark after ``Llama.close()``.  Exiting the worker guarantees those
+allocations are returned before H3/Qwen use the GPU again.
 """
 
 from __future__ import annotations
@@ -14,7 +16,10 @@ import gc
 import io
 import json
 import logging
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -35,6 +40,7 @@ GEMMA4_PROMPTS_PATH = Path(__file__).with_name("gemma4_prompts.txt")
 _ACTION_BREAK = re.compile(r"(?<=[.!?])\s+|(?<=;)\s+|\n+")
 _PROMPT_SECTION = re.compile(r"(?ms)^\[([A-Z][A-Z0-9_]*)\]\s*$\n?(.*?)(?=^\[[A-Z][A-Z0-9_]*\]\s*$|\Z)")
 _PROMPT_PLACEHOLDER = re.compile(r"\{\{([a-z_][a-z0-9_]*)\}\}")
+_WORKER_RESULT_PREFIX = "MINIMAX_H3_GEMMA4_RESULT="
 
 
 class Gemma4DependencyError(RuntimeError):
@@ -244,6 +250,162 @@ def _validate_observation(value: dict[str, Any], ledger: Sequence[GemmaAction], 
     )
 
 
+def _observation_payload(observation: GemmaObservation) -> dict[str, Any]:
+    return {
+        "completed_count": observation.completed_count,
+        "in_progress_action_id": observation.in_progress_action_id,
+        "confidence": observation.confidence,
+        "observation": observation.observation,
+        "continuation_description": observation.continuation_description,
+        "raw_json": observation.raw_json,
+    }
+
+
+def _observation_from_payload(value: dict[str, Any]) -> GemmaObservation:
+    return GemmaObservation(
+        completed_count=int(value["completed_count"]),
+        in_progress_action_id=value.get("in_progress_action_id"),
+        confidence=str(value["confidence"]),
+        observation=str(value["observation"]),
+        continuation_description=str(value["continuation_description"]),
+        raw_json=str(value["raw_json"]),
+    )
+
+
+def _observe_in_process(
+    shot_number: int,
+    shot_start: int,
+    shot_end: int,
+    fps: float,
+    ledger: Sequence[GemmaAction],
+    known_completed: int,
+    image_urls: Sequence[str],
+    continuation_frames: int,
+    debug: bool,
+) -> GemmaObservation:
+    """Run one observation inside the disposable worker process."""
+    Llama, MTMDChatHandler = _load_runtime()
+    model_path, mmproj_path = _ensure_model_files()
+    action_lines = "\n".join(f"- {action.action_id}: {action.text}" for action in ledger)
+    completed_ids = [action.action_id for action in ledger[:known_completed]]
+    templates = _gemma_prompt_templates()
+    message = _render_gemma_prompt(
+        templates["OBSERVATION"],
+        {
+            "shot_number": str(shot_number),
+            "shot_start": str(shot_start),
+            "shot_end": str(shot_end - 1),
+            "fps": f"{fps:g}",
+            "action_ledger": action_lines,
+            "completed_ids": ", ".join(completed_ids) if completed_ids else "none",
+            "continuation_frames": str(continuation_frames),
+            "continuation_seconds": f"{continuation_frames / fps:.3f}",
+        },
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": message}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": image_url}}
+        for image_url in image_urls
+    )
+
+    handler = None
+    llm = None
+    response = None
+    try:
+        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=debug, use_gpu=True)
+        llm = Llama(
+            model_path=str(model_path),
+            chat_handler=handler,
+            n_gpu_layers=-1,
+            n_ctx=8192,
+            n_batch=512,
+            flash_attn=True,
+            verbose=debug,
+        )
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": templates["SYSTEM"]},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=512,
+            response_format={"type": "json_object"},
+        )
+        choice = response["choices"][0]["message"]
+        text = choice.get("content") or ""
+        if not isinstance(text, str):
+            raise Gemma4ObservationError("Gemma 4 returned no textual response")
+        payload, raw_json = _extract_json_object(text)
+        return _validate_observation(payload, ledger, known_completed, raw_json)
+    finally:
+        if llm is not None:
+            llm.close()
+        # MTMD's context is registered on Llama's ExitStack and is closed by
+        # llm.close(). Drop all Python owners too; worker exit below is the
+        # authoritative cleanup for llama.cpp/ggml's non-PyTorch CUDA state.
+        llm = None
+        handler = None
+        response = None
+        content.clear()
+        gc.collect()
+        comfy.model_management.soft_empty_cache(force=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _worker_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    comfy_root = str(Path(folder_paths.__file__).resolve().parent)
+    current_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        comfy_root if not current_pythonpath else comfy_root + os.pathsep + current_pythonpath
+    )
+    return environment
+
+
+def _observe_in_worker(request: dict[str, Any]) -> GemmaObservation:
+    command = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=_worker_environment(),
+    )
+    try:
+        stdout, _ = process.communicate(json.dumps(request, ensure_ascii=False))
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        request.clear()
+
+    result_line = next(
+        (line[len(_WORKER_RESULT_PREFIX):] for line in reversed(stdout.splitlines())
+         if line.startswith(_WORKER_RESULT_PREFIX)),
+        None,
+    )
+    if result_line is None:
+        raise Gemma4ObservationError(
+            f"Gemma 4 worker exited with status {process.returncode} without returning a result"
+        )
+    try:
+        result = json.loads(result_line)
+    except json.JSONDecodeError as error:
+        raise Gemma4ObservationError("Gemma 4 worker returned malformed result JSON") from error
+    if not result.get("ok"):
+        message = str(result.get("message") or "unknown worker failure")
+        if result.get("error_type") == "Gemma4DependencyError":
+            raise Gemma4DependencyError(message)
+        raise Gemma4ObservationError(message)
+    if process.returncode != 0:
+        raise Gemma4ObservationError(f"Gemma 4 worker exited with status {process.returncode}")
+    return _observation_from_payload(result["observation"])
+
+
 class Gemma4ContinuityDirector:
     """One-shot local Gemma 4 visual observer with deterministic result checks."""
 
@@ -257,66 +419,51 @@ class Gemma4ContinuityDirector:
             raise Gemma4ObservationError("Gemma 4 needs at least one decoded observation frame")
         if continuation_frames <= 0:
             raise Gemma4ObservationError("Gemma 4 needs a positive number of new continuation frames")
-        Llama, MTMDChatHandler = _load_runtime()
-        model_path, mmproj_path = _ensure_model_files()
-        action_lines = "\n".join(f"- {action.action_id}: {action.text}" for action in ledger)
-        completed_ids = [action.action_id for action in ledger[:known_completed]]
-        templates = _gemma_prompt_templates()
-        message = _render_gemma_prompt(
-            templates["OBSERVATION"],
-            {
-                "shot_number": str(shot_number),
-                "shot_start": str(shot_start),
-                "shot_end": str(shot_end - 1),
-                "fps": f"{fps:g}",
-                "action_ledger": action_lines,
-                "completed_ids": ", ".join(completed_ids) if completed_ids else "none",
-                "continuation_frames": str(continuation_frames),
-                "continuation_seconds": f"{continuation_frames / fps:.3f}",
-            },
-        )
-        content: list[dict[str, Any]] = [{"type": "text", "text": message}]
-        content.extend(
-            {"type": "image_url", "image_url": {"url": _image_data_url(frame)}}
-            for frame in frames
-        )
+        image_urls = [_image_data_url(frame) for frame in frames]
+        request = {
+            "shot_number": shot_number,
+            "shot_start": shot_start,
+            "shot_end": shot_end,
+            "fps": fps,
+            "ledger": [
+                {"action_id": action.action_id, "text": action.text}
+                for action in ledger
+            ],
+            "known_completed": known_completed,
+            "image_urls": image_urls,
+            "continuation_frames": continuation_frames,
+            "debug": self.debug,
+        }
+        return _observe_in_worker(request)
 
-        llm = None
-        try:
-            handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=self.debug, use_gpu=True)
-            llm = Llama(
-                model_path=str(model_path),
-                chat_handler=handler,
-                n_gpu_layers=-1,
-                n_ctx=8192,
-                n_batch=512,
-                flash_attn=True,
-                verbose=self.debug,
-            )
-            response = llm.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": templates["SYSTEM"]},
-                    {"role": "user", "content": content},
-                ],
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=512,
-                response_format={"type": "json_object"},
-            )
-            choice = response["choices"][0]["message"]
-            text = choice.get("content") or ""
-            if not isinstance(text, str):
-                raise Gemma4ObservationError("Gemma 4 returned no textual response")
-            payload, raw_json = _extract_json_object(text)
-            return _validate_observation(payload, ledger, known_completed, raw_json)
-        finally:
-            if llm is not None:
-                llm.close()
-            del llm
-            gc.collect()
-            # llama.cpp allocations do not belong to PyTorch's allocator. This
-            # empties only now-unused PyTorch cache as an extra safety margin
-            # before H3/Qwen are loaded for the next chunk.
-            comfy.model_management.soft_empty_cache(force=True)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+
+def _worker_main() -> int:
+    try:
+        request = json.load(sys.stdin)
+        ledger = tuple(GemmaAction(str(item["action_id"]), str(item["text"])) for item in request["ledger"])
+        observation = _observe_in_process(
+            shot_number=int(request["shot_number"]),
+            shot_start=int(request["shot_start"]),
+            shot_end=int(request["shot_end"]),
+            fps=float(request["fps"]),
+            ledger=ledger,
+            known_completed=int(request["known_completed"]),
+            image_urls=[str(item) for item in request["image_urls"]],
+            continuation_frames=int(request["continuation_frames"]),
+            debug=bool(request["debug"]),
+        )
+        result = {"ok": True, "observation": _observation_payload(observation)}
+    except Exception as error:
+        result = {
+            "ok": False,
+            "error_type": type(error).__name__,
+            "message": str(error),
+        }
+    print(_WORKER_RESULT_PREFIX + json.dumps(result, ensure_ascii=False), flush=True)
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--worker"]:
+        raise SystemExit(_worker_main())
+    raise SystemExit("gemma4.py is an internal worker; use it through the sampler node")

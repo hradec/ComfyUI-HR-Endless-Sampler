@@ -15,13 +15,13 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `prompt`: the original MiniMax-formatted prompt;
 - `fps`: the frame rate used to convert prompt timestamps to global frames;
 - `chunk_frames`: the maximum number of H3 frames sampled at once;
-- `context_frames`: the completed H3-valid tail carried into every later
-  chunk, defaulting to five frames;
-- `guide_overlap`: three-way selector for the configured completed-tail guide
-  and overlap, a fixed five-frame guide and overlap, or fully off;
-- `video_continuation`: experimental bounded native Ref2VA continuation using
-  the previous synchronized `context_frames` AV tail as a new `<Audio N>` +
-  `<Video N>` reference;
+- `guide_overlap`: the independent physical repeated/trimmed overlap; `0`
+  disables it and `5` is the default;
+- `context_frames`: the independent completed tail inside `guide_overlap` that
+  becomes native H3 video/audio keyframes; `0` disables keyframes and `5` is
+  the default;
+- `video_continuation`: the independent bounded previous AV tail exposed as a
+  new native `<Audio N>` + `<Video N>` Ref2VA reference; `0` disables it;
 - `qwen_full_history`: experimental Qwen-only view of every completed frame,
   sampled at 2 FPS, without adding that history to DiT reference attention;
 - automatic Gemma 4 semantic continuation: when a later chunk begins within
@@ -183,18 +183,20 @@ incorrectly synchronized latent.
 `chunk_frames` is snapped down to H3's `17k + 5` grid. The default is 124
 frames, or 37 video latent steps.
 
-The first chunk contributes its complete latent. Every later chunk contains a
-`context_frames` continuation prefix followed by new frames. Valid values are
-5, 22, 39, 56, and so on. They correspond to 2, 7, 12, 17, and so on video
-latent steps. `context_frames` must be smaller than the effective snapped
-`chunk_frames` value.
+The first chunk contributes its complete latent. When `guide_overlap` is
+nonzero, every later chunk contains that completed continuation prefix followed
+by new frames. Valid nonzero values are 5, 22, 39, 56, and so on. They
+correspond to 2, 7, 12, 17, and so on video latent steps. Both nonzero
+`guide_overlap` and `context_frames` must be smaller than the effective snapped
+`chunk_frames` value, but only `guide_overlap` changes chunk geometry and
+`context_frames` cannot exceed it.
 
 `chunk_frames` remains the total amount sampled in one stock call, including
-the repeated prefix. Increasing `context_frames` therefore reduces the new
+the repeated prefix. Increasing `guide_overlap` therefore reduces the new
 content produced by later chunks and can increase the number of sampler calls;
 it does not silently increase the temporal VRAM cap.
 
-With the default five-frame context, two 124-frame chunks deliver:
+With the default five-frame guide overlap, two 124-frame chunks deliver:
 
 ```text
 124 + (124 - 5) = 243 frames
@@ -206,13 +208,13 @@ In latent steps this is:
 37 + (37 - 2) = 72 video latent steps
 ```
 
-The configured context latent steps are removed before final assembly. This
+The configured guide-overlap latent steps are removed before final assembly. This
 keeps the result on H3's native grid and makes the returned video latent exactly
 the same shape as the upstream requested latent.
 
 ### Audio rounding at boundaries
 
-The configured context duration normally corresponds to a fractional number of
+The configured guide-overlap duration normally corresponds to a fractional number of
 40 Hz audio steps. For the default five frames it is 8.333 steps, so a join uses
 eight or nine context steps. The planner calculates cumulative global audio
 boundaries and chooses the matching integer length for every boundary. This
@@ -327,42 +329,40 @@ audio tail, prompt conditioning, and reusable references. This is why an
 invented detail such as a tiara can drift if it is absent or unclear in those
 inputs.
 
-H3 accepts longer native continuation clips only on its `17k + 5` frame grid:
-5, 22, 39, 56 frames, and so on. `context_frames` now exposes these lengths.
-The planner derives the matching video latent steps and synchronized audio tail,
-excludes the complete carried interval from new prompt action ownership, trims
-it from both sampler outputs, and tells the preview to hide it. Longer context
-may preserve more visual history, but it repeats more computation, creates more
-chunks for a fixed `chunk_frames`, and can overconstrain motion or replay prior
-action.
+H3-compatible temporal inputs use its `17k + 5` frame grid: 5, 22, 39, 56
+frames, and so on. The three independent length controls also accept `0`.
+The planner derives video latent steps and synchronized audio tails separately:
+`guide_overlap` owns repeated output geometry, `context_frames` owns only the
+completed keyframe tail inside that geometry, and `video_continuation` owns only
+the native AV reference. Longer physical context repeats more computation and
+creates more chunks for a fixed `chunk_frames`; longer guide or Video1 inputs
+can use more attention/conditioning memory.
 
 ### Independent continuation experiments
 
-Three sampler controls isolate the continuation mechanisms so GPU tests can
-compare them without silently coupling their effects. Their defaults preserve
-the published serial path: `guide_overlap=context_frames`,
-`video_continuation=false`, and `qwen_full_history=false`.
+Four sampler controls isolate the continuation mechanisms so GPU tests can
+compare them without silently coupling their effects. Their defaults are
+`guide_overlap=5`, `context_frames=5`, `video_continuation=0`, and
+`qwen_full_history=false`.
 
-`guide_overlap` has three modes. `context_frames` injects the configured
-completed video and audio tails as native H3 keyframes, samples the same global
-interval as overlap, and trims it afterward. `5 frames` performs that identical
-guide + overlap process with H3's minimum five-frame tail, regardless of the
-larger configured value. Both are the original continuation mechanism at
-different strengths; there is no overlap-only mode.
+`guide_overlap` is the independent physical overlap/trim length. A nonzero
+value samples that previous global interval again and removes it during output
+assembly. `guide_overlap=0` carries no previous global latent/noise interval;
+H3's temporal phase still requires each local sample to begin on its `17k + 5`
+grid, so the node prepends a newly allocated empty five-frame AV packing prefix
+and discards it. This prefix contains no previous generated result.
 
-`off` carries no prior video latent, audio latent, or global noise interval into
-the next chunk and adds no continuation keyframe. H3's temporal phase still
-requires every independently sampled local chunk to begin on its `17k + 5`
-grid. The node therefore prepends newly allocated empty five-frame video/audio
-latents with separately generated noise and discards their sampled result.
-This is local packing, not previous-chunk overlap. It lets the remainder join
-the single output latent at the correct temporal phase while ensuring that any
-previous-result information comes only from the separately selected native
-video-continuation or Qwen-history mechanism.
+`context_frames` independently selects how much of the ending of that physical
+context is replaced by completed video/audio keyframes. `0` adds no native
+guide. A nonzero context must be no longer than `guide_overlap`; for example,
+`guide_overlap=22, context_frames=5` places the previous final five frames at
+local frames 17-21 of the overlap, rather than incorrectly placing them at its
+beginning.
 
-`video_continuation` implements the full-reference continuation experiment for
-later chunks. It clones only the final `context_frames` latent positions from
-the completed previous chunk. The H3 VAE decodes that bounded tail, and Qwen is
+`video_continuation` is a third independent frame count. When nonzero, the
+full-reference continuation experiment clones exactly that final AV tail from
+the completed previous chunk. It does not change physical context or keyframes.
+The H3 VAE decodes that bounded tail, and Qwen is
 shown frames sampled at the same 2 FPS cadence used by ComfyUI's stock H3
 Ref2VA node. The matching generated-audio tail is selected using cumulative
 global 40 Hz endpoints rather than rounding the isolated duration; this avoids
@@ -763,10 +763,10 @@ several chunks and contains multiple sequential actions.
 There is no `gemma4_continuity` toggle, continuation-format selector, or
 Gemma GPU-layer widget. Gemma is automatic when a later chunk's new output
 begins inside an existing source shot. It uses `n_gpu_layers=-1` while H3 and
-Qwen are explicitly unloaded, then destroys its llama.cpp context before H3
-sampling resumes. A new shot that starts exactly at a chunk output boundary is
-left to its original author-written prompt because no footage of that shot has
-yet been generated.
+Qwen are explicitly unloaded, in a disposable Python worker process that exits
+before H3 sampling resumes. A new shot that starts exactly at a chunk output
+boundary is left to its original author-written prompt because no footage of
+that shot has yet been generated.
 
 For one eligible handoff, the sampler:
 
@@ -848,8 +848,8 @@ Gemma's adaptive AV observation would run only at those intra-shot joins.
 
 This design must use effective *new-output* capacity, not blindly compare shot
 duration with the `chunk_frames` widget. Later calls spend part of their sampled
-window on `context_frames` guide/overlap, or on the minimum local packing prefix
-when guide overlap is off. The complete sampled window must still stay at or
+window on the physical `guide_overlap`, or on the minimum local packing prefix
+when `guide_overlap=0`. The complete sampled window must still stay at or
 below the requested VRAM cap.
 
 There is also an unresolved H3-grid constraint. Valid H3 sampling windows use
@@ -868,7 +868,8 @@ ComfyUI's `CLIP`, Generate Text node, an LLM socket/input, Ollama, or a server
 process. The implemented director uses Google's official Gemma 4 12B
 instruction QAT Q4 GGUF at
 `https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf` through
-`llama-cpp-python`'s in-process generic MTMD handler. The user had already
+`llama-cpp-python`'s generic MTMD handler inside a short-lived child process.
+The user had already
 benchmarked this model at roughly 150 tokens per second on this GPU, so the
 between-chunk visual planning latency is expected to be practical; multimodal
 input length, temporary model swapping, and GPU-layer count still affect the
@@ -1160,6 +1161,10 @@ line confirms that the LoRA actually attached.
   validation prevents malformed responses from corrupting the action plan, and
   a failure uses the canonical original source-shot body for that chunk. Quality
   must still be tested against the known Tila-pointing/zoom-out case.
+- Gemma observations now run in a disposable child process. This adds Python
+  startup overhead at each observation, but process exit is the only reliable
+  way to reclaim llama.cpp/ggml CUDA backend state before Qwen and H3 resume;
+  PyTorch's cache controls cannot release allocations owned by llama.cpp.
 - Shot-aware physical chunk boundaries are not implemented. Prompt cuts are
   arbitrary integer frames, while H3 sampler windows are constrained to its
   `17k + 5` temporal grid; exact alignment requires a validated padding and
@@ -1232,6 +1237,19 @@ Completed checks include:
   interactive graph-step preview selection with a synchronized vertical marker;
 - static WebP frame-group creation, sorted cache restoration, and exact
   124-frame/119-frame playback durations at 24 FPS.
+- Gemma worker startup through ComfyUI's exact Python executable, ComfyUI-root
+  import-path injection, result-envelope parsing, nonzero worker status, and
+  propagation of a worker-side observation error back to the sampler process.
+- independent continuation-control validation for pure Video1
+  (`context_frames=0`, `guide_overlap=0`, `video_continuation=22`),
+  overlap-only, partial five-frame keyframe context inside a 22-frame guide
+  overlap, full keyframe context with a separately sized Video1, rejection of
+  keyframe context longer than its physical overlap, and migration of the
+  former combo and Boolean widget values;
+- partial-keyframe placement at the end of physical overlap: with
+  `guide_overlap=22` and `context_frames=5`, video keyframes begin at local
+  frame 17 and the synchronized audio
+  guide terminates at the context boundary.
 
 Manual GPU/log observations also established:
 
@@ -1244,6 +1262,24 @@ Manual GPU/log observations also established:
   video latent positions rather than an unfinished per-step overlap;
 - the tested scheduled Hook LoRA path attached zero H3 patches, while the known
   working ordinary loader attached 208.
+- in the failing 56-frame + 22-frame-guide run, chunk 1 peaked at 13,848.2 MiB
+  physical VRAM with 2,088.9 MiB free. After the first Gemma handoff,
+  `Llama.close()` released the 6,637.69 MiB model buffer, 2,688 MiB of KV
+  buffers, and its MTMD projector, but the next pre-sampler baseline was about
+  518 MiB higher. That closely matched llama.cpp's reported 527 MiB CUDA
+  compute buffer. PyTorch itself was down to 21.3 MiB active and 128 MiB
+  reserved, and ComfyUI's managed-model registry was empty, so another
+  `torch.cuda.empty_cache()` could not recover the missing memory.
+- the same failing chunk 2 reached 15,904.2 MiB physical VRAM with only 32.9 MiB
+  free and failed in the eager quantized `int8_linear` temporary
+  `torch.cat`. This is a peak-workspace failure, not evidence that the complete
+  H3 model, latent, or attention state was intentionally retained between
+  chunks.
+- llama.cpp's public `llama_backend_free()` is documented as an end-of-program
+  backend call and does not provide a supported per-observation CUDA-pool flush.
+  Resetting a CUDA device inside ComfyUI would also invalidate PyTorch and other
+  live CUDA owners. Gemma therefore remains local Python/llama.cpp but is now
+  process-isolated so worker exit authoritatively returns all of its CUDA memory.
 
 A full MiniMax H3 GPU render was not run as part of the lightweight automated
 verification. The mocked path exercised chunk planning, prompt replacement,
@@ -1282,6 +1318,9 @@ shape assembly without loading the large model.
 - `llama-cpp-python`, whose 0.3.35 generic MTMD vision handler is required for
   the Gemma integration:
   <https://github.com/abetlen/llama-cpp-python>
+- llama.cpp's CUDA backend source, consulted for the lifetime of CUDA/VMM buffer
+  pools and the absence of a safe public per-context pool reset:
+  <https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/ggml-cuda.cu>
 - NVIDIA Unified Memory reference consulted for the rejected idea of keeping
   active H3 attention/reference tensors in system RAM:
   <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/unified-memory.html>

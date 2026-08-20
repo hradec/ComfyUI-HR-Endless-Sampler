@@ -343,6 +343,7 @@ class _AccumulatedPreviewWrapper:
             "chunk_ranges": chunk_ranges,
             "shot_ranges": shot_ranges,
             "total_frames": max((int(item.get("end", -1)) for item in chunk_ranges), default=-1) + 1,
+            "fps": self.fps,
             "elapsed_ms": 0.0,
         })
         return self.execution_id
@@ -546,7 +547,7 @@ class MiniMaxH3UnlimitedPreview(io.ComfyNode):
                 io.Int.Input("max_resolution", default=0, min=0, max=8192, step=8,
                              tooltip="Maximum preview side in pixels. 0 keeps the decoder's native output resolution."),
                 io.Int.Input("quality", default=75, min=30, max=100, step=1),
-                io.Float.Input("fps", default=24.0, min=1.0, max=60.0, step=1.0,
+                io.Float.Input("fps", default=24.0, min=1.0, step=1.0,
                                tooltip="Preview playback FPS. The browser applies changes immediately while a preview is playing."),
                 io.Int.Input("frame_stride", default=1, min=1, max=16, step=1,
                              tooltip="Preview every Nth H3 latent frame while preserving its playback duration."),
