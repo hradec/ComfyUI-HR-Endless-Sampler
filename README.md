@@ -9,8 +9,8 @@
 
 ### How is this possible?
 1. The new Sampler node samples at most `chunk_frames` at a time.
-2. After the first chunk, `guide_overlap` controls the repeated latent interval and `context_frames` controls how much of its ending is supplied through H3's native keyframe conditioning.
-3. The repeated latent prefix is removed before the chunks are joined, so both output latents have the same video and audio shapes requested by the upstream H3 conditioning node.
+2. After the first chunk, `context_keyframes` anchors a bounded completed tail as native H3 keyframe conditioning over the same opening target frames. Those frames form a truthful physical overlap and are removed when chunks are joined. `guide_overlap` is a separate experimental retained latent warm-start: it copies the previous tail into the first retained target positions, fully denoises them, and keeps them.
+3. With context keyframes disabled, only H3's mandatory five-frame packing prefix is removed before chunks are joined.
 4. The video/audio decoding stage just decodes the latent as usual, creating a longer than 15secs video and/or higher resolution than possible with low-vram. 
 
 ## Use
@@ -25,16 +25,18 @@
    image in its original order. T2VA and audio-only Ref2VA need no images.
 6. Set `chunk_frames` to the largest chunk that fits in VRAM. `124` is the
    conservative default; the value is snapped down to H3's `17k + 5` grid.
-7. Set `guide_overlap` independently to `0, 5, 22, 39, 56, ...`. This is only
-   the physical repeated overlap and trim interval. `0` uses no previous global
-   interval; a generated local five-frame packing prefix is discarded so the
-   combined output remains a valid H3 latent.
-8. Set `context_frames` independently to `0, 5, 22, 39, 56, ...`. This selects
-   how many completed frames at the end of `guide_overlap` become native H3
-   video/audio keyframes. `0` disables all carried keyframes. A nonzero guide
-   context cannot exceed `guide_overlap`.
-9. Set `video_continuation` independently to `0, 5, 22, 39, 56, ...`. `0`
-   disables this experimental Ref2VA path. A nonzero value decodes exactly that
+7. Use `guide_overlap_enable` and set `guide_overlap` to `5, 22, 39, 56, ...`.
+   It copies that bounded previous latent tail into the first retained target
+   positions of every later chunk. Those positions keep fresh target noise, are
+   fully denoised, remain in the output, and are not described as overlap in the prompt.
+8. Use `context_keyframes_enable` and set `context_keyframes` to
+   `5, 22, 39, 56, ...`. This adds the completed video/audio tail as separate
+   native H3 keyframe conditioning over the matching opening target interval.
+   The interval is sampled again and trimmed, so `39` chunk frames with `22`
+   context keyframes produces `17` new frames on each later call. Disabling the
+   toggle supplies no keyframes and falls back to the five-frame packing prefix.
+9. Use `video_continuation_enable` and set `video_continuation` to
+   `5, 22, 39, 56, ...`. When enabled, this experimental Ref2VA path decodes exactly that
    bounded previous tail for Qwen, adds it as the next
    synchronized `<Audio N>` + `<Video N>` reference for the DiT, and adds the
    documented `[video continuation]` sections to later chunk prompts. Connect
@@ -43,16 +45,22 @@
    tokenizer represents audio references as labels rather than waveform input,
    so no audio VAE or temporary audio decode is needed.
 
+   When `context_keyframes_enable` is off, Video1 continuation also supplies the
+   previous chunk's exact final five-frame latent tail as one native video
+   keyframe clip. It anchors that clip across local frames 0-4, the mandatory
+   discarded packing prefix. This adds two video-latent conditioning time steps
+   but no target frames, physical-overlap allocation, VAE re-encode, or separate
+   audio keyframe; synchronized audio remains available through Video1.
+
    The controls can now be tested independently:
 
-   | `context_frames` | `guide_overlap` | `video_continuation` | Previous-result mechanism |
-   |---:|---:|---:|---|
-   | 0 | 0 | 0 | None; local packing prefix only |
-   | 0 | 22 | 0 | Physical overlap only, re-denoised and trimmed |
-   | 5 | 22 | 0 | 22-frame overlap with only its final 5 frames keyframed |
-   | 22 | 22 | 0 | Full 22-frame native guide + overlap |
-   | 0 | 0 | 22 | Pure bounded Video1/Audio1 continuation |
-   | 5 | 22 | 22 | All three mechanisms together |
+   | Context enabled | Warm-start enabled | Video1 enabled | Previous-result mechanism |
+   |:---:|:---:|:---:|---|
+   | no | no | no | None; mandatory local packing prefix only |
+   | no | yes | no | Retained, fully denoised latent warm-start |
+   | yes | no | no | Native video/audio keyframes over a matching trimmed physical overlap |
+   | no | no | yes | Bounded Video1/Audio1 plus one five-frame visual boundary keyframe clip |
+   | yes | yes | yes | All three mechanisms together |
 
    Serialized values from the former guide combo and Video1 Boolean are
    translated to their equivalent frame counts. After restarting ComfyUI,
@@ -62,13 +70,17 @@
     Qwen sees decoded 2 FPS frames from all completed output so far. It does not
     rewrite the prompt or add that history as a DiT reference. Connect the H3
     `vae`.
-11. Gemma 4 automatically directs a later chunk only when its new frames begin
-    inside an already generated source shot. It observes the immediately
-    previous sampled chunk at 2 FPS, compares it with an immutable action
-    ledger made from the original shot, and writes H3-ready prose for only the
-    next short continuation. It does not run for Chunk 1 or for a new shot that
-    starts exactly at a chunk boundary. Connect the H3 video `vae` whenever a
-    long shot will cross a chunk boundary, and install this node's requirements:
+11. Gemma 4 directs the complete local `detailed_description` for every sampled
+    chunk, including Chunk 1 and chunks containing two source shots. It receives
+    the unchanged full user prompt, complete unsplit source bodies for every
+    relevant shot, exact global/current/previous frame ranges, required local
+    `[Shot N] At MM:SS.mmm,` cut markers, the continuation conditioning actually
+    available to H3, and chronological 2 FPS stills plus the exact final frame
+    from the previous sampled chunk. Gemma freely interprets visual progress,
+    rephrases and enhances the source intent for MiniMax, and selects only what
+    fits the current slice. There is no sentence splitter or immutable action
+    ledger. Connect the H3 video `vae` for a multi-chunk render, and install this
+    node's requirements:
 
     ```bash
     ~/comfyui/tools/python.sh -m pip install -r /NVME/comfyui/ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-Sampler-Unlimited/requirements.txt
@@ -82,15 +94,36 @@
     cache manager cannot own or flush. The current observation is visual only:
     it does not decode or judge the generated soundtrack.
 
-    The actual editable Gemma system and observation messages are in
+    The editable Gemma system and chunk-request messages are in
     [`gemma4_prompts.txt`](gemma4_prompts.txt). The sampler rereads that file
-    before every Gemma handoff, so changing and saving it affects the next
-    eligible chunk without a Python-code edit. Keep its `[SYSTEM]` and
+    before every chunk, so changing and saving it affects the next chunk
+    without a Python-code edit. Keep its `[SYSTEM]` and
     `[OBSERVATION]` section headers and the documented `{{lowercase_placeholders}}`.
-    Gemma returns a validated action-progress record plus short H3 continuation
-    prose; the actual text it gave H3 is included in `chunk_prompts` when the
-    handoff occurs. `prompt_preview_only` intentionally shows the static
-    canonical plan because no generated chunk exists for Gemma to observe.
+    Its instructions distill the official H3 base/full-reference rules for shot
+    markers, concrete playback-order description, camera language, speaker IDs,
+    exact `<d>` dialogue, audio continuity, and stable reference labels. Gemma
+    returns a factual progress summary plus the complete H3-facing local shot
+    sequence. The sampler validates exact required cut markers and rejects
+    altered/invented dialogue. `prompt_preview_only` intentionally shows the
+    static canonical plan because it promises not to load Gemma or generate the
+    previous footage Gemma would need.
+
+    With `debug` enabled, the node also creates a temporary directory such as
+    `/tmp/minimax-h3-gemma4-...` and logs its path. Every chunk gets a
+    `prompt_NNN_chunk_NNN` fixture containing the exact base64-JPEG worker
+    request, separate inspectable JPEGs, rendered system/observation prompts,
+    and Gemma response or error. Move useful fixtures into `tests/fixtures/`
+    and replay them after editing `gemma4_prompts.txt`, without running H3:
+
+    ```bash
+    ~/comfyui/tools/python.sh tests/replay_gemma_capture.py tests/fixtures/<fixture-directory>
+    ```
+
+    Replay deliberately uses the current editable prompt templates while
+    preserving the captured images, exact frame map, complete source intent,
+    chunk/shot ranges, conditioning facts, and worker generation settings. This
+    makes prompt iterations take one Gemma request
+    instead of another complete video render.
 12. Enable `prompt_preview_only` to return every exact planned prompt and frame
    range through `chunk_prompts` without generating noise, rebuilding per-chunk
    conditioning, loading the DiT/VAE for this node, or running inference. Noise,
@@ -102,12 +135,16 @@
    The report includes physical free memory, PyTorch allocation/cache/peaks,
    known model residency, and visible GPU tensor payloads. A failed evaluation
    emits an abbreviated CUDA allocator summary before re-raising the error.
-   Gemma-directed chunks include the accepted action IDs, observation summary,
-   confidence, and raw JSON in the same output.
-   Every sampling run also ends with a compact timing and memory report: H3
-   denoising, Qwen encoding, each VAE decode purpose, and Gemma 4 time, plus
-   peak ComfyUI-process/system RAM and GPU VRAM. The VRAM line distinguishes
-   sampled whole-GPU use from PyTorch's allocator high-water mark.
+   Gemma-directed chunks include its factual visual-progress summary,
+   confidence, accepted chunk-local description, and raw JSON in the same
+   output.
+   Every sampling run, even with `debug` disabled, ends with a structured timing
+   and memory baseline: configuration, rendered range, H3 denoising, Qwen
+   encoding, each VAE purpose, Gemma 4, per-chunk timing, peak
+   ComfyUI-process/system RAM, average/peak whole-device VRAM, and PyTorch's
+   allocator high-water mark. `Peak Time`, printed immediately after `Peak`, is
+   the estimated wall time for which device VRAM was closer to the run's peak
+   than its average (above the midpoint between those two values).
 14. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
    number. `0` is the normal setting and samples the complete video.
 15. Decode the returned AV latent normally.
@@ -165,8 +202,10 @@ frames even when `frame_stride` is one.
 
 The console also displays a chunk progress line above the stock sampler's step
 progress. A later chunk starts only after the previous chunk has completed, so
-when `context_frames` is greater than zero its native H3 guide contains exactly
-that many finished frames at the end of the physical `guide_overlap` interval.
+when `context_keyframes_enable` is true its native H3 guide contains exactly
+the selected completed tail. A guide warm-start begins after the truthful
+keyframe overlap, or after the required synthetic packing prefix when context
+keyframes are disabled.
 
 ## Shot timing
 
@@ -208,33 +247,38 @@ The parser recognizes both `integrated_multimodal_description:` and
 - Video Ref2VA sources cannot be reconstructed from an image input. Image and
   audio Ref2VA presentations are supported; a conditioning containing a video
   reference fails clearly instead of silently dropping its Qwen video tokens.
-- A long source shot that crosses a chunk boundary needs the H3 video `vae`.
-  Gemma observes the last sampled chunk and writes only the next short H3
-  continuation description; it does not ask H3 to infer its location in a
-  repeated full-shot prompt.
-- Longer `guide_overlap` uses more of each chunk for repeated context,
-  increasing the number of sampler calls and total runtime.
+- A multi-chunk render needs the H3 video `vae`. Gemma directs Chunk 1 from
+  text, then observes the last sampled chunk and writes the next short H3
+  description; it does not ask H3 to infer its location in a repeated
+  full-shot prompt.
+- Longer `context_keyframes` adds more native H3 conditioning/attention rows
+  and a matching physical overlap. That overlap is trimmed, so it reduces each
+  later chunk's retained output duration.
 - Active `video_continuation` (`video_continuation > 0`) and `qwen_full_history` require image/audio Ref2VA
   conditioning that this node can reconstruct plus the MiniMax H3 video VAE.
   They are ignored for the first chunk because no generated history exists yet.
-- Native `video_continuation` adds only the bounded synchronized video/audio
-  tail to DiT attention.
+- Native `video_continuation` adds the bounded synchronized video/audio tail to
+  DiT attention. With context keyframes disabled it also adds the previous
+  final five-frame video tail as a visual keyframe across the discarded packing
+  prefix, without adding a separate audio keyframe.
   `qwen_full_history` adds no DiT reference, but its Qwen token and temporary
   VAE-decode cost grows with the completed duration. Dynamic Qwen video frames
   are downscaled by area before encoding; original Ref2VA images are unchanged.
-- `context_frames: 0`, `guide_overlap: 0` is the clean native-continuation experiment: the
+- Disabling both `context_keyframes_enable` and `guide_overlap_enable` is the clean native-continuation experiment: the
   previous result reaches the next chunk only through `video_continuation`
   and/or `qwen_full_history`, according to those independent switches.
-- Automatic Gemma continuation needs `llama-cpp-python==0.3.35`, built with the
+- Gemma chunk directing needs `llama-cpp-python==0.3.35`, built with the
   CUDA wheel in `requirements.txt`. It loads a separate 7 GB model only between
   relevant chunks in a disposable worker process, then exits that worker before
   H3 sampling. This gives stronger VRAM isolation at the cost of Python startup
   time per handoff. Dependency/download failures stop clearly; a malformed
   observation falls back to the canonical source-shot prompt for that chunk.
-  The immutable source ledger is currently sentence/semicolon based, so write
-  long sequential shots as clear individual sentences. Audio observation and
-  shot-aware physical chunk boundaries remain future work.
+  Gemma receives complete unsplit source-shot prose and is free to rephrase it
+  while preserving intent, exact dialogue, explicit sound effects, and real
+  cuts. Audio observation and shot-aware physical chunk boundaries remain
+  future work.
 - Chunked denoise masks are not supported.
 
-Prompt format references: [MiniMax base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
+Prompt format references: [MiniMax H3 prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md),
+[MiniMax base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md),
 and [MiniMax full-reference guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).

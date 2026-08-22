@@ -15,18 +15,22 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `prompt`: the original MiniMax-formatted prompt;
 - `fps`: the frame rate used to convert prompt timestamps to global frames;
 - `chunk_frames`: the maximum number of H3 frames sampled at once;
-- `guide_overlap`: the independent physical repeated/trimmed overlap; `0`
-  disables it and `5` is the default;
-- `context_frames`: the independent completed tail inside `guide_overlap` that
-  becomes native H3 video/audio keyframes; `0` disables keyframes and `5` is
-  the default;
-- `video_continuation`: the independent bounded previous AV tail exposed as a
-  new native `<Audio N>` + `<Video N>` Ref2VA reference; `0` disables it;
+- `guide_overlap_enable` + `guide_overlap`: an independent retained latent
+  warm-start. The previous tail initializes the first new target positions;
+  those positions are fully denoised, kept, and omitted from prompt wording;
+- `context_keyframes_enable` + `context_keyframes`: the completed tail supplied
+  as native H3 video/audio keyframe conditioning over the same truthful opening
+  target overlap, which is trimmed after sampling;
+- `video_continuation_enable` + `video_continuation`: the independent bounded
+  previous AV tail exposed as a new native `<Audio N>` + `<Video N>` reference;
+  when context keyframes are disabled it also adds the previous exact final
+  five-frame latent tail as one visual keyframe clip across the discarded
+  packing prefix;
 - `qwen_full_history`: experimental Qwen-only view of every completed frame,
   sampled at 2 FPS, without adding that history to DiT reference attention;
-- automatic Gemma 4 semantic continuation: when a later chunk begins within
-  an already generated source shot, it observes the previous sampler chunk and
-  writes only that shot's next short H3 continuation prose;
+- automatic Gemma 4 chunk directing: it directs Chunk 1 from the complete
+  source prompt, then observes chronological stills from each previous sampler
+  chunk and writes the complete H3 description for the next local slice;
 - `prompt_preview_only`: returns the canonical prompt plan without noise,
   per-chunk conditioning, VAE/DiT loading, or diffusion;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
@@ -37,7 +41,7 @@ the stock `SamplerCustomAdvanced`. It adds:
   boundary diagnostics; zero keeps the normal complete run;
 - optional `images`: pixel images needed to rebuild Qwen visual conditioning;
 - optional `vae`: the H3 video VAE, required by decoded-video modes and by
-  automatic Gemma continuation when a long shot crosses a chunk boundary.
+  Gemma visual directing after Chunk 1.
 
 The sampler node id and display name are both:
 
@@ -59,11 +63,18 @@ MiniMaxH3UnlimitedPreview -> MiniMax H3 Unlimited Preview
   rebuilding, continuation guides, sampling, output assembly, and the narrow
   preview-session calls around each stock sampler invocation.
 - `gemma4.py` owns the self-downloading Gemma model paths, MTMD vision runtime,
-  immutable source-action ledger, strict JSON observation validation, image
-  conversion, and source-constrained H3 continuation-prose generation.
+  official MiniMax prompt-guide loading, strict JSON response validation,
+  image conversion, capture/replay, and free chunk-local H3 prompt directing.
 - `gemma4_prompts.txt` contains the editable runtime `[SYSTEM]` and
   `[OBSERVATION]` messages passed to Gemma. It documents its supported
   placeholders and includes the relevant H3 structured-prompt conventions.
+- `vendor/minimax-h3-prompt-writing/` contains reviewed byte-for-byte copies of
+  MiniMax's official skill and its base/Ref2VA reference guides, which are fed
+  to Gemma at runtime.
+- `dependency.md` records the mutable upstream URLs, reviewed hashes, mode
+  routing, and manual update procedure for those vendored prompt dependencies.
+- `AGENTS.md` requires a new development session to read this file and the
+  dependency record before changing the integration.
 - `preview.py` contains the H3 preview model wrapper, Latent2RGB and optional
   tiny-VAE decoding, asynchronous static-WebP frame-group encoding, bounded
   server-side history, exact output-frame metadata, and local preview
@@ -105,7 +116,7 @@ The restored path was compared directly with serial commit `4be0ad9`: prompt
 rewriting, completed-tail conditioning, trimming, and stock sampler delegation
 were unchanged when the serial path was restored. Later sampler additions are
 `debug_stop_chunk`, the outer chunk progress bar, and configurable
-`context_frames`. The experimental global-window commit remains on the separate
+`context_keyframes` (then named `context_frames`). The experimental global-window commit remains on the separate
 `improve-windowed-sampling` branch and an associated stash is inert; neither is
 part of the active `restore-serial-continuation` branch.
 
@@ -183,20 +194,23 @@ incorrectly synchronized latent.
 `chunk_frames` is snapped down to H3's `17k + 5` grid. The default is 124
 frames, or 37 video latent steps.
 
-The first chunk contributes its complete latent. When `guide_overlap` is
-nonzero, every later chunk contains that completed continuation prefix followed
-by new frames. Valid nonzero values are 5, 22, 39, 56, and so on. They
-correspond to 2, 7, 12, 17, and so on video latent steps. Both nonzero
-`guide_overlap` and `context_frames` must be smaller than the effective snapped
-`chunk_frames` value, but only `guide_overlap` changes chunk geometry and
-`context_frames` cannot exceed it.
+The first chunk contributes its complete latent. In later chunks,
+`context_keyframes` supplies a separate native H3 video/audio keyframe condition
+over a matching physical target overlap. Valid enabled values are 5, 22, 39,
+56, and so on, corresponding to 2, 7, 12, 17, and so on video latent steps.
+Those opening frames are sampled again at their truthful timeline positions and
+discarded after sampling. When context keyframes are disabled, later chunks use
+the minimum synthetic five-frame packing prefix needed to preserve H3's
+temporal phase, and only that prefix is discarded.
 
 `chunk_frames` remains the total amount sampled in one stock call, including
-the repeated prefix. Increasing `guide_overlap` therefore reduces the new
-content produced by later chunks and can increase the number of sampler calls;
-it does not silently increase the temporal VRAM cap.
+the physical context overlap or mandatory packing prefix. Increasing
+`context_keyframes` adds separate H3 conditioning/attention rows and increases
+the trimmed physical overlap, reducing the new content produced by a later
+call. `guide_overlap` does not change geometry: it replaces retained target
+latent values inside the existing allocation.
 
-With the default five-frame guide overlap, two 124-frame chunks deliver:
+With the default five-frame context-keyframe overlap, two 124-frame chunks deliver:
 
 ```text
 124 + (124 - 5) = 243 frames
@@ -208,13 +222,13 @@ In latent steps this is:
 37 + (37 - 2) = 72 video latent steps
 ```
 
-The configured guide-overlap latent steps are removed before final assembly. This
+The configured context-keyframe overlap latent steps are removed before final assembly. This
 keeps the result on H3's native grid and makes the returned video latent exactly
 the same shape as the upstream requested latent.
 
 ### Audio rounding at boundaries
 
-The configured guide-overlap duration normally corresponds to a fractional number of
+The configured context-keyframe overlap duration normally corresponds to a fractional number of
 40 Hz audio steps. For the default five frames it is 8.333 steps, so a join uses
 eight or nine context steps. The planner calculates cumulative global audio
 boundaries and chooses the matching integer length for every boundary. This
@@ -247,7 +261,7 @@ The node does not use the first frame of the previous generation. It uses the
 previous sampled chunk's final latent tail:
 
 ```text
-context_video_steps = ((context_frames - 5) // 17) * 5 + 2
+context_video_steps = ((context_keyframes - 5) // 17) * 5 + 2
 video_context = previous_video[:, :, -context_video_steps:]
 audio_context = previous_audio[..., -context_audio_steps:]
 ```
@@ -330,38 +344,45 @@ invented detail such as a tiara can drift if it is absent or unclear in those
 inputs.
 
 H3-compatible temporal inputs use its `17k + 5` frame grid: 5, 22, 39, 56
-frames, and so on. The three independent length controls also accept `0`.
-The planner derives video latent steps and synchronized audio tails separately:
-`guide_overlap` owns repeated output geometry, `context_frames` owns only the
-completed keyframe tail inside that geometry, and `video_continuation` owns only
-the native AV reference. Longer physical context repeats more computation and
-creates more chunks for a fixed `chunk_frames`; longer guide or Video1 inputs
-can use more attention/conditioning memory.
+frames, and so on. Each numeric control retains that native grid and has a
+separate Boolean enable; runtime multiplies `int(enable) * value` to obtain zero
+when disabled. `context_keyframes` owns native keyframe conditioning,
+`guide_overlap` owns retained latent warm-start initialization, and
+`video_continuation` owns the native AV reference.
 
 ### Independent continuation experiments
 
 Four sampler controls isolate the continuation mechanisms so GPU tests can
-compare them without silently coupling their effects. Their defaults are
-`guide_overlap=5`, `context_frames=5`, `video_continuation=0`, and
-`qwen_full_history=false`.
+compare them without silently coupling their effects. Context and warm-start
+default to enabled at 5 frames; Video1 defaults to disabled with 5 selected.
 
-`guide_overlap` is the independent physical overlap/trim length. A nonzero
-value samples that previous global interval again and removes it during output
-assembly. `guide_overlap=0` carries no previous global latent/noise interval;
-H3's temporal phase still requires each local sample to begin on its `17k + 5`
-grid, so the node prepends a newly allocated empty five-frame AV packing prefix
-and discards it. This prefix contains no previous generated result.
+`guide_overlap` is now a retained latent warm-start, despite its legacy name.
+For each later chunk, the selected previous video-latent tail is copied into
+the first retained target positions after the mandatory context/packing prefix.
+Fresh target noise is unchanged, the copied positions are fully denoised and
+kept, and neither the prompt nor native keyframes identify them as overlap.
+This deliberately tests whether latent initialization carries grading and
+other state without spending target duration on repeated output.
 
-`context_frames` independently selects how much of the ending of that physical
-context is replaced by completed video/audio keyframes. `0` adds no native
-guide. A nonzero context must be no longer than `guide_overlap`; for example,
-`guide_overlap=22, context_frames=5` places the previous final five frames at
-local frames 17-21 of the overlap, rather than incorrectly placing them at its
-beginning.
+`context_keyframes` selects the real completed video/audio keyframe-condition
+tail. It is packed as native `minimax_keyframes` at the opening local timeline,
+while the same global frames occupy the physical target interval. That truthful
+overlap is trimmed from output. The warm-start begins after the keyframe
+overlap—or after the mandatory synthetic five-frame prefix when keyframes are
+disabled—so copied warm-start positions survive.
+
+An attempted optimization temporarily removed that matching physical overlap:
+a 22-frame completed tail was still anchored as `minimax_keyframes` at local
+frame zero, but only the five-frame packing prefix was trimmed. A real GPU
+preview showed the previous chunk reconstructed through most of the next chunk.
+Inspection of ComfyUI's `PackedLayout` confirmed why: native keyframes are fixed
+anchors on the target timeline, not detached historical memory. The experiment
+was reverted. A contiguous multi-frame context keyframe must now have an equal
+physical target overlap that is trimmed after sampling.
 
 `video_continuation` is a third independent frame count. When nonzero, the
 full-reference continuation experiment clones exactly that final AV tail from
-the completed previous chunk. It does not change physical context or keyframes.
+the completed previous chunk. It does not change physical target geometry.
 The H3 VAE decodes that bounded tail, and Qwen is
 shown frames sampled at the same 2 FPS cadence used by ComfyUI's stock H3
 Ref2VA node. The matching generated-audio tail is selected using cumulative
@@ -370,6 +391,22 @@ an occasional one-step AV error for fractional durations such as 22/24 second.
 The clean bounded pair is independently appended to `minimax_refs` as a native
 `video_audio` block, so the DiT can attend to both continuation streams without
 merging them into the noisy target latent.
+
+When `video_continuation` is enabled while `context_keyframes` is disabled, the
+node also clones the previous sampler chunk's exact final two video-latent
+tokens, which represent its final five pixel frames, as one native video
+keyframe clip anchored at local frame 0. The clip spans local frames 0-4: the
+complete mandatory five-frame synthetic packing prefix immediately before
+retained local frame 5. That prefix was already required and is still
+discarded, so the boundary clip adds two video-latent conditioning time steps but no
+physical overlap, target-frame allocation, or VAE re-encode. No separate audio
+keyframe is added; the synchronized bounded `<Audio N>` latent remains in the
+Video1 reference block. This replaced a failed one-image experiment: a real GPU
+test showed that the single final-frame keyframe could preserve a chunk 2-to-3
+camera join but did not prevent chunk 2 from choosing a different opening camera
+state. Two separate runs with ordinary five-frame video/audio context keyframes
+plus a 22-frame Video1 reference did preserve the first chunk boundary, which
+motivated isolating the five-frame visual trajectory here.
 
 The generated video and synchronized soundtrack labels use the next available
 video and audio ordinals. Following ComfyUI's native ordering, Qwen receives the
@@ -430,7 +467,8 @@ the bounded one is referenced by the prompt and DiT.
 
 ### Conditioning-model eviction and the Qwen token wall
 
-A 1920x1088 diagnostic using `chunk_frames=56`, `context_frames=22`, native
+A 1920x1088 diagnostic using `chunk_frames=56`, `context_keyframes=22` (then
+implemented as a repeated physical prefix), native
 video continuation, and no Qwen full history completed chunk one but OOMed at
 chunk two's first DiT QKV projection. The decoded video and Qwen prompt had
 already completed. The console immediately before the failure reported
@@ -493,21 +531,37 @@ logical GPU payload sizes. Those payload values can overlap when tensors are
 views or are reachable under more than one conditioning field; the
 PyTorch/device totals remain the authoritative allocation figures.
 
-The monitor is installed only while a debug execution is active and is removed
-in the same `finally` cleanup that restores the guider conditioning. Non-debug
-sampling therefore keeps the stock model-call path and logging volume.
+The lightweight model-call monitor is installed for every sampling execution
+and is removed in the same `finally` cleanup that restores the guider
+conditioning. With `debug` disabled it only records silent before/after-DiT
+memory observations; detailed model/tensor residency logs and allocator failure
+summaries remain debug-only.
 
 Every sampler execution, including non-debug runs and partial/error exits,
-also writes one compact final timing and high-water report. It separately
-accumulates H3 sampling, Qwen encoding/tokenization, VAE decoding of the prior
-chunk for Gemma, VAE decoding of bounded continuation context, VAE decoding of
-Qwen full history, and Gemma 4's whole local handoff. It records peak ComfyUI
-process RSS and system RAM use, along with sampled whole-device VRAM use and
-PyTorch allocated/reserved high-water. PyTorch's native peak counter can be
-reset by the per-chunk debug monitor, so the final report retains the largest
-value observed after each timed phase as well. This is intended for quickly
-comparing which optional continuation path consumes time or memory without
-reading every debug snapshot.
+writes a structured final timing and memory baseline. It includes the effective
+continuation configuration, rendered and planned ranges, resolution, step count,
+sampler wall time, completed-chunk average, projected full-run time after a debug
+stop, and a component table. The table separately accumulates H3 sampling, Qwen
+encoding/tokenization, VAE decoding of the prior chunk for Gemma, continuation
+Video1 VAE decode, VAE decoding of Qwen full history, and Gemma 4's
+whole local handoff.
+
+Physical VRAM is sampled device-wide once per second, as well as at sampler
+stage boundaries and immediately before and after each DiT evaluation. The
+report shows the average of the explicit stage/DiT snapshots, H3-specific and
+later-chunk H3 averages, the device-wide peak, and PyTorch allocated/reserved
+high-water. `Peak Time` appears immediately after `Peak`: it estimates the
+wall-clock time for which physical VRAM was closer to Peak than Average, which
+is precisely usage above `(Average + Peak) / 2`. Threshold crossings are
+linearly interpolated between adjacent samples. This timeline also observes
+GPU allocations made by the isolated Gemma worker, which PyTorch's allocator
+statistics inside ComfyUI cannot see. Peak ComfyUI-process RSS and system RAM
+usage are reported separately.
+
+Each multi-line debug VRAM snapshot immediately redraws active tqdm bars after
+it is printed. The sampler's outer `chunk` bar is redrawn before ComfyUI's
+inner `steps` bar, leaving the current sampling step visible below the memory
+report instead of several terminal screens above it.
 
 An initial four-step diagnostic passed the previously failing second-chunk
 first evaluation while the GPU stayed near its physical capacity, but that
@@ -590,8 +644,9 @@ For each physical chunk, the current parser:
    start so a cut lands after any carried guide prefix;
 4. uses only a compact preservation line for a predecessor represented solely
    by carried frames, rather than replaying its completed source action;
-5. uses the original source body for a new shot, and Gemma-authored semantic
-   continuation prose for a shot that began in a previous chunk.
+5. uses original source bodies in its deterministic preview/fallback output.
+   During a normal render, Gemma instead directs the complete local description
+   for every chunk from the same shot/frame facts.
 
 For example, at 24 FPS:
 
@@ -602,12 +657,13 @@ local cut frame: 50
 local cut time: 00:02.083
 ```
 
-When a chunk begins in the middle of a long shot, it no longer receives the
-complete source shot, a custom time range, a reference-endpoint clock, or a
-synthetic `shot ends` command. Gemma observes the previously generated video
-and writes only the next H3-ready continuation description. The sampler itself
-keeps canonical timecodes only for genuine source cuts that physically occur in
-the current chunk.
+During normal sampling, H3 no longer receives the deterministic repeated source
+shot, a custom time range, a reference-endpoint clock, or a synthetic `shot
+ends` command. Gemma directs every chunk—including Chunk 1—from the complete
+source intent and exact slice facts. On later chunks it also observes retained
+frames from the previous generated output and writes only events appropriate to
+the new slice. The sampler itself owns canonical timecodes only for genuine
+source cuts that physically occur in the current chunk.
 
 Proportional sentence and clause slicing was removed after practical tests
 showed that word position does not represent action timing. It could leave a
@@ -758,58 +814,82 @@ short visual reference and can choose a different action on each continuation.
 Complete-shot repetition is therefore insufficient for a shot that spans
 several chunks and contains multiple sequential actions.
 
-### Implemented default: Gemma 4 semantic continuation director
+### Retired Gemma action ledger and implemented free chunk-prompt director
 
-There is no `gemma4_continuity` toggle, continuation-format selector, or
-Gemma GPU-layer widget. Gemma is automatic when a later chunk's new output
-begins inside an existing source shot. It uses `n_gpu_layers=-1` while H3 and
-Qwen are explicitly unloaded, in a disposable Python worker process that exits
-before H3 sampling resumes. A new shot that starts exactly at a chunk output
-boundary is left to its original author-written prompt because no footage of
-that shot has yet been generated.
+The first Gemma implementation mechanically split an original source shot at
+sentences, semicolons, and newlines and labeled the resulting pieces
+`S<shot>.A<action>`. Gemma had to report an ordered completed prefix and rewrite
+only the first unfinished ledger item. This was too restrictive and the split
+was not semantic. For example, one ledger item combined camera zooming, Heman
+dismounting, and Heman walking. Gemma could correctly see Heman already on the
+ground while the compound item remained in progress, then reintroduce “begins
+to dismount” and make H3 reset his pose. The action ledger, stable IDs,
+completed-prefix state, and algorithmic prose splitting are removed.
 
-For one eligible handoff, the sampler:
+Gemma is now the free prompt director for every normal sampled chunk, including
+Chunk 1, a chunk starting exactly at a new source shot, and a chunk containing
+parts of two or more shots. It uses `n_gpu_layers=-1` while H3, Qwen, and the
+VAE are explicitly unloaded, in a disposable worker that exits before H3
+resumes. Later chunks require the H3 video VAE to decode visual evidence; the
+first chunk is a text-only Gemma request.
 
-1. builds an immutable action ledger from the original source shot, splitting
-   only at sentence and semicolon boundaries; each item receives a stable
-   `S<shot>.A<action>` identifier;
-2. decodes the immediately preceding *sampled* chunk with the H3 VAE and sends
-   its chronological 2 FPS stills to Gemma, rather than only the five or
-   twenty-two carried guide frames;
-3. supplies the source shot range, FPS, accepted action prefix, and number and
-   approximate duration of the new frames that belong to this source shot;
-4. receives JSON containing the ordered completed prefix, first unfinished ID,
-   confidence, factual final-state observation, and a one-to-four-sentence
-   `continuation_description` written in H3's concrete playback-order style;
-5. validates that action IDs are a non-regressing ordered source prefix, then
-   substitutes only `continuation_description` as the active shot body.
+Every request contains the complete unchanged user prompt plus deterministic
+facts that only the sampler should own:
 
-Thus H3 receives canonical source-shot markers and only the next semantic
-action prose. It is no longer asked to map a complete long-shot prompt onto a
-custom master clock or to infer action progress from `ONLY GENERATE THE
-TIMESLICE` wording. Source cuts are still deterministic sampler calculations
-and remain normal `[Shot N] At ...` H3 markers; Gemma must not emit markers,
-timestamps, cuts, reference labels, or `shot ends` text in its continuation
-body. The original source prompt remains the authority: Gemma is instructed not
-to invent actions, camera work, dialogue, characters, objects, or outcomes.
+- current physical sampled range and retained output range in exact global
+  frames;
+- previous physical sampled/retained ranges;
+- the exact global frame number of every chronological attached still;
+- 2 FPS stills from the complete previous sampled chunk plus its exact final
+  decoded frame;
+- all source shots intersecting the previous and current ranges, with complete
+  original shot bodies preserved unsplit;
+- the portion of each source shot assigned to this chunk;
+- exact required local `[Shot 1]` and `[Shot N] At MM:SS.mmm,` markers for real
+  source cuts; and
+- the actual opening conditioning available to H3: keyframe prefix, bounded
+  `<Video N>`/`<Audio N>`, fully denoised latent warm-start, or none.
 
-An unavailable/mismatched `llama-cpp-python` runtime or a failed model download
-stops explicitly. A malformed Gemma response is logged and falls back to the
-canonical source-shot continuation for that chunk. Debug `chunk_prompts`
-includes the ledger state, observation, confidence, Gemma's actual H3
-continuation prose, and raw validated JSON immediately before the actual H3
-prompt.
+Gemma interprets what the previous generated sequence already accomplished,
+retains the source shot's complete intent rather than its exact wording, and
+freely rephrases, reorganizes, clarifies, or enhances concrete H3 instructions
+for only the current frame slice. It must not compress a whole continuing shot
+into one chunk, replay a visibly completed action, change dialogue or explicit
+sound events, invent cuts/outcomes, or contradict reference meanings. For a
+multi-shot chunk it writes the complete local sequence itself, including every
+required real-cut marker. The response JSON contains `confidence`, a factual
+`analysis` summary, and the complete chunk-local `detailed_description` value.
+The sampler preserves all other structured prompt sections and replaces only
+the description value. It validates marker count/numbers/timestamps and rejects
+altered or invented `<d>` dialogue before H3 sees the result. Recoverable Gemma
+format failures use the canonical static chunk prompt fallback.
 
-The Gemma instructions are deliberately not embedded in `gemma4.py`.
-`gemma4_prompts.txt` has a `[SYSTEM]` message and an `[OBSERVATION]` template;
-the latter receives source-shot number/range/FPS, immutable ledger, accepted
-action IDs, and new-continuation frame/duration through documented
-`{{lowercase_placeholders}}`. The file is reparsed before every Gemma handoff,
-so an experimenter can edit and save it while ComfyUI is running and the next
-eligible chunk will use the new wording. It validates both section headers and
-every placeholder; an invalid template is reported as a recoverable observation
-failure and that chunk uses the canonical source fallback. The system message
-includes H3 phrasing rules because Gemma now authors the H3-facing body.
+`gemma4_prompts.txt` remains editable and is reread for every request. In
+addition, the official MiniMax-maintained H3 prompt-writing `SKILL.md` and one
+mode-specific reference are vendored under `vendor/minimax-h3-prompt-writing/`
+and appended directly to Gemma's system message: base modes receive
+`references/base-en.txt`; Ref2VA receives `references/ref-en.txt`. The
+chunk-local contract takes precedence over their full-video examples. Their
+mutable upstream URLs, reviewed hashes, and update procedure are recorded in
+`dependency.md`; render-time network fetching is intentionally forbidden for
+reproducibility. `AGENTS.md` requires future development sessions to read both
+this memory and the dependency record.
+
+The llama context was raised from 8192 to 16384 for the official guide, full
+source prompt, visual tokens, and response. This is intentionally not 256K on
+the 16 GB RTX 4070 Ti SUPER: the real llama.cpp debug log showed an 8192-cell
+F16 KV allocation of 2560 MiB, so this backend scales to roughly 5 GiB at 16K
+before adding the 6638 MiB model and approximately 527 MiB compute buffer. A
+256K allocation would not fit even though the GGUF metadata declares a native
+262144-token context.
+
+Debug captures now use schema v2 and directories named
+`prompt_NNN_chunk_NNN`. Each stores the exact request/base64 JPEGs, JPEG files
+named by global frame, rendered messages, manifest, and result/error. Replay
+uses the current editable prompts and vendored MiniMax guide against identical
+frames and chunk facts. Old `observation_NNN_shot_NN` schema-v1 action-ledger
+captures remain useful historical evidence but cannot reproduce the new input
+contract and are rejected with an explicit migration message.
 
 `gemma4.py` downloads the exact files from
 `https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf` to the persistent
@@ -823,9 +903,8 @@ enough.
 
 The required binding is exactly `llama-cpp-python==0.3.35`: it exposes the
 generic MTMD Python handler used for Gemma 4's `mmproj`. The development
-environment currently has 0.3.16, which is deliberately rejected with an
-installation message until `requirements.txt` is installed using ComfyUI's
-isolated `tools/python.sh` interpreter.
+environment has 0.3.35 installed through ComfyUI's isolated
+`tools/python.sh` interpreter.
 
 ### Planned experiment: align chunks to shot boundaries
 
@@ -847,10 +926,10 @@ across those segments so the final remainder is not pathologically short.
 Gemma's adaptive AV observation would run only at those intra-shot joins.
 
 This design must use effective *new-output* capacity, not blindly compare shot
-duration with the `chunk_frames` widget. Later calls spend part of their sampled
-window on the physical `guide_overlap`, or on the minimum local packing prefix
-when `guide_overlap=0`. The complete sampled window must still stay at or
-below the requested VRAM cap.
+duration with the `chunk_frames` widget. Later calls currently spend only the
+minimum five-frame local packing prefix; a future restored physical guide
+overlap would consume additional new-output capacity. The complete sampled
+window must still stay at or below the requested VRAM cap.
 
 There is also an unresolved H3-grid constraint. Valid H3 sampling windows use
 the `17k + 5` pixel-frame grid, and the output advance between ordinary
@@ -1154,13 +1233,13 @@ line confirms that the LoRA actually attached.
 - Prompt cut timing remains generative guidance. Rewriting a cut to the correct
   local timestamp does not make diffusion frame-exact in the way a deterministic
   video editor would be.
-- Automatic Gemma continuation observes only 2 FPS stills from the immediately
-  preceding sampled chunk, uses sentence/semicolon action units, and has no
-  generated-audio input. It can therefore misjudge fine motion, rapid dialogue,
-  or an action whose relevant beginning is no longer visible. Strict ID
-  validation prevents malformed responses from corrupting the action plan, and
-  a failure uses the canonical original source-shot body for that chunk. Quality
-  must still be tested against the known Tila-pointing/zoom-out case.
+- Gemma visual direction observes 2 FPS stills plus the exact final frame from
+  the immediately preceding sampled chunk and has no generated-audio input. It
+  can therefore misjudge fine motion, rapid dialogue, or an action whose
+  relevant beginning is no longer visible. Marker/dialogue validation prevents
+  malformed responses from reaching H3, and a recoverable failure uses the
+  canonical static chunk prompt. Quality must still be tested against the known
+  Tila-pointing/zoom-out case.
 - Gemma observations now run in a disposable child process. This adds Python
   startup overhead at each observation, but process exit is the only reliable
   way to reclaim llama.cpp/ggml CUDA backend state before Qwen and H3 resume;
@@ -1178,6 +1257,97 @@ line confirms that the LoRA actually attached.
 - Full-reference prefix analysis sections remain present even when their
   detailed shots are outside the current chunk. They preserve label meanings,
   but may still describe the overall video rather than only the local window.
+
+## Future experiments (not implemented)
+
+Keep deferred ideas in this section so exploratory discussion is not mistaken
+for current sampler behavior. None of the items below should be implemented
+without an explicit decision and a checkpoint of the working version.
+
+1. **Gemma-selected sparse continuity keyframes.** Decode the completed
+   previous chunk once, let Gemma compare its frame-indexed visual history with
+   the original reference images, and ask it to identify sharp frames that best
+   preserve generated details such as hair ornaments, costume changes, props,
+   character arrangement, pose, and environment state. The current Gemma path
+   observes only 2 FPS stills, so this experiment needs an all-frame or
+   carefully designed indexed-contact-sheet presentation. Gemma should return
+   validated frame numbers and reasons, with a configurable small keyframe
+   budget.
+
+   Native `minimax_keyframes` remain target-timeline anchors. Therefore only a
+   selected source frame that lies inside the next chunk's physical context can
+   be placed at its truthful global/local time. Each sparse frame must be
+   decoded and VAE-encoded as its own one-frame keyframe entry; combining sparse
+   images into one video latent would falsely describe them as consecutive.
+   The final eligible overlap frame should normally remain a mandatory boundary
+   anchor. A useful UI could be `keyframe_mode: contiguous | gemma_sparse` plus
+   `gemma_keyframe_count`.
+
+2. **Gemma-selected dynamic appearance reference.** If Gemma finds an important
+   continuity frame earlier than the physical context overlap, do not misplace it as a
+   timeline keyframe. Test exposing one such frame as a new image reference and
+   adding its persistent details to Gemma's continuation prose instead. This
+   would be a semantic/appearance reference, not a statement that the old frame
+   occurs again in the new target interval. Its Qwen and DiT token/VRAM cost
+   must be measured.
+
+3. **Shot-boundary-aware chunk planning.** Prefer whole-shot sampler calls when
+   a shot fits, and split only overlong shots into balanced segments so a
+   one-to-five-frame remainder never becomes a nearly empty final call. The
+   detailed design and unresolved H3-grid ownership problem are documented in
+   `Planned experiment: align chunks to shot boundaries` above.
+
+4. **Audio-aware Gemma continuity.** Give Gemma a representation of generated
+   audio so it can judge completed dialogue, interrupted speech, sound effects,
+   and synchronized action rather than relying on visuals and text alone. This
+   requires an explicit audio decode/presentation design and careful model
+   swapping; sparse visual keyframes must not silently imply sparse audio
+   anchors.
+
+5. **Longer semantic state memory.** Let Gemma maintain a compact validated
+   state summary across the complete current shot, rather than inferring all
+   persistent state from only the immediately previous chunk. Track invented
+   appearance details, object state, spatial relationships, completed actions,
+   dialogue progress, and camera state without feeding the complete latent
+   history to H3.
+
+6. **Action-level micro-timing fallback.** If semantic continuation prose still
+   causes H3 to compress or replay a long action, test having Gemma convert only
+   the current slice into a few short local timed beats. Keep this optional: the
+   earlier hand-written global/local timecode formats were retired because H3
+   frequently ignored endpoints or replayed complete shot descriptions.
+
+7. **Continuation-mechanism quality/VRAM matrix.** Use the independent numeric
+   controls to compare overlap-only, contiguous keyframes,
+   Video1-plus-five-frame-visual-boundary, and combined modes at identical seeds, chunk
+   sizes, resolutions, and prompts.
+   Record continuity quality, new-output frames per call, peak VRAM, and total
+   runtime before choosing stronger defaults.
+
+8. **Model-generic Endless Sampler.** Investigate reliable runtime detection of
+   H3, LTX, Wan, and other model families, then expose only continuation methods
+   that their conditioning and temporal latent formats actually support. Do not
+   generalize H3's `17k + 5` grid, AV nesting, keyframes, or Ref2VA conventions
+   to another architecture without model-specific adapters and tests.
+
+9. **Preview saving.** Preserve the sampler preview's timeline data with the
+   finished video so a saved render can later reopen in the same interactive
+   player with colored chunk ranges, shot brackets, frame/shot/chunk labels,
+   prompts, and available timing graphs. Do not use VHS Video Combine's
+   `meta_batch` input for this: `VHS_BatchManager` controls batched execution and
+   the persistent FFmpeg process; it is not a general metadata payload.
+
+   Proposed design: have the sampler output a versioned `H3_TIMELINE` object;
+   pass the completed VHS filename and that object to a downstream metadata
+   node; stream-copy/remux the video with compact JSON in a dedicated
+   `minimax_h3_timeline` container tag; and always write an adjacent
+   `.h3timeline.json` sidecar because container metadata can be stripped. Add a
+   finished-video player/load node that reads the embedded tag, falls back to
+   the sidecar, and reuses the preview timeline UI. Store structural metadata,
+   prompts, and small numeric series—not preview images, since the finished
+   video already contains the frames. Loading a saved video should preserve
+   seeking, play/pause, arrow-key frame stepping, chunk colors, shot brackets,
+   and browser-refresh recovery.
 
 ## Verification performed
 
@@ -1204,9 +1374,10 @@ Completed checks include:
   alignment, correct timestamps, and unchanged DiT reference dimensions;
 - native continuation insertion into subject definitions, combined summary
   task types, retention analysis, and the local first-shot instruction;
-- context lengths of 5, 22, 39, 56, and 107 frames with exact reconstructed
-  output sizes and synchronized audio trimming;
-- mocked `context_frames=22` serial execution proving that later chunks receive
+- native keyframe lengths of 5, 22, 39, 56, and 107 frames smaller than their
+  corresponding chunk, with exact reconstructed output sizes and synchronized
+  audio conditioning;
+- mocked `context_keyframes=22` serial execution proving that later chunks receive
   the previous completed seven-step video tail and matching audio tail;
 - restoration of the guider's original conditioning after sampling;
 - serial proof with the default five-frame context that chunk two receives
@@ -1240,16 +1411,31 @@ Completed checks include:
 - Gemma worker startup through ComfyUI's exact Python executable, ComfyUI-root
   import-path injection, result-envelope parsing, nonzero worker status, and
   propagation of a worker-side observation error back to the sampler process.
-- independent continuation-control validation for pure Video1
-  (`context_frames=0`, `guide_overlap=0`, `video_continuation=22`),
-  overlap-only, partial five-frame keyframe context inside a 22-frame guide
-  overlap, full keyframe context with a separately sized Video1, rejection of
-  keyframe context longer than its physical overlap, and migration of the
-  former combo and Boolean widget values;
-- partial-keyframe placement at the end of physical overlap: with
-  `guide_overlap=22` and `context_frames=5`, video keyframes begin at local
-  frame 17 and the synchronized audio
-  guide terminates at the context boundary.
+- exact Gemma debug-fixture request, JPEG, rendered-prompt, response, and replay
+  serialization without loading the real model;
+- independent continuation-control validation for disabled/enabled keyframe,
+  retained warm-start, and Video1 paths;
+- native numeric widget schemas restored to `min=5, step=17`, each paired with
+  a Boolean enable whose runtime value is `int(enable) * frames`;
+- retained warm-start placement after the context/packing trim boundary for
+  disabled context, five-frame context, and 22-frame context, proving that the
+  copied latent positions survive output assembly.
+- Gemma capture schema v2 serialization with exact global frame filenames,
+  complete chunk/shot facts, current editable prompt templates, and response
+  replay data;
+- selection of the vendored official Ref2VA guide without also injecting the
+  base-mode guide, plus byte-for-byte SHA-256 agreement between all three
+  vendored files and their upstream sources on 2026-08-21;
+- strict multi-shot marker/timestamp and dialogue validation for Gemma's
+  complete chunk-local description; and
+- retained-output-only visual observation: a 39-frame previous physical window
+  with a five-frame trimmed prefix yields exact chronological frames
+  `5, 17, 29, 38`, rather than showing Gemma the trimmed prefix; and
+- no-context Video1 boundary layout: the exact final two video-latent tokens
+  are cloned as a five-frame visual keyframe clip across discarded local frames
+  0-4, while enabling ordinary context keyframes suppresses that special
+  boundary clip. The earlier one-image local-frame-4 experiment remains recorded
+  as a failed visual-continuity test above.
 
 Manual GPU/log observations also established:
 
@@ -1288,6 +1474,17 @@ shape assembly without loading the large model.
 
 ## Documentation used
 
+- MiniMax-maintained H3 prompt-writing skill now vendored and fed directly to
+  Gemma at runtime:
+  <https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md>
+- Direct MiniMax base-mode dependency referenced by that skill:
+  <https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt>
+- Direct MiniMax Ref2VA dependency referenced by that skill:
+  <https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt>
+- MiniMax H3 team Reddit AMA preserved as an informal source of team comments
+  and future research leads; individual claims should be verified against code
+  or official documentation before becoming implementation assumptions:
+  <https://www.reddit.com/r/StableDiffusion/comments/1vh9rtw/ama_minimax_h3_team_ask_us_anything_about_our/>
 - MiniMax base video prompt guide:
   <https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md>
 - MiniMax full-reference prompt guide:
@@ -1302,7 +1499,7 @@ shape assembly without loading the large model.
   `<Video N>` and `<Audio N>` ordinals independent, uses the six-section Ref2VA
   brief, and recommends short sequential timed beats with observable end
   states. The current sampler behavior was not changed from this source; its
-  beat guidance is relevant to future Gemma action-ledger segmentation.
+  beat guidance remains relevant to the optional micro-timing experiment.
 - deAPI's third-party T2VA-oriented prompting article:
   <https://deapi.ai/blog/minimax-h3-prompting-guide-how-to-write-structured-prompts-for-text-to-video>.
   It is a practical restatement of the structured fields, increasing

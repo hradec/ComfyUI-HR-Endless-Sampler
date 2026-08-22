@@ -1,6 +1,7 @@
 import logging
 import math
 import re
+import threading
 import time
 
 import psutil
@@ -15,12 +16,12 @@ from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 from comfy_api.latest import io
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from tqdm.auto import tqdm
+from tqdm import tqdm as _cli_tqdm
 
 from .gemma4 import (
     Gemma4ContinuityDirector,
     Gemma4DependencyError,
     Gemma4ObservationError,
-    action_ledger,
 )
 from .preview import begin_preview_execution
 
@@ -57,47 +58,43 @@ def _audio_steps(frames):
     return round(frames * AUDIO_LATENT_FPS / VIDEO_FPS)
 
 
-def _bounded_video_steps(frame_count, max_chunk_frames, field_name):
+def _bounded_video_steps(frame_count, max_chunk_frames, field_name, allow_equal=False):
     if frame_count == 0:
         return 0
     if frame_count < 5 or (frame_count - 5) % 17:
         raise ValueError(f"{field_name} must be 0 or use MiniMax H3's 17k+5 frame grid: 5, 22, 39, 56, ...")
-    if frame_count >= max_chunk_frames:
-        raise ValueError(f"{field_name} ({frame_count}) must be smaller than the effective chunk size ({max_chunk_frames})")
+    if frame_count > max_chunk_frames or (frame_count == max_chunk_frames and not allow_equal):
+        comparison = "no greater than" if allow_equal else "smaller than"
+        raise ValueError(f"{field_name} ({frame_count}) must be {comparison} the effective chunk size ({max_chunk_frames})")
     return _video_steps(frame_count)
 
 
-def _continuation_controls(context_frames, guide_overlap, video_continuation, max_chunk_frames):
+def _continuation_controls(context_keyframes, guide_overlap, video_continuation, max_chunk_frames):
     """Normalize legacy widgets, then validate overlap, keyframe, and Video1 lengths."""
-    legacy_context_frames = context_frames
+    legacy_context_keyframes = context_keyframes
     if video_continuation is True:
-        video_continuation = legacy_context_frames
+        video_continuation = legacy_context_keyframes
     elif video_continuation is False:
         video_continuation = 0
-    if guide_overlap is True or guide_overlap == "context_frames":
-        guide_overlap = legacy_context_frames
+    if guide_overlap is True or guide_overlap in ("context_frames", "context_keyframes"):
+        guide_overlap = legacy_context_keyframes
     elif guide_overlap is False or guide_overlap == "5 frames":
-        context_frames = 5
+        context_keyframes = 5
         guide_overlap = 5
     elif guide_overlap == "off":
-        context_frames = 0
+        context_keyframes = 0
         guide_overlap = 0
 
     values = {
-        "context_frames": context_frames,
-        "guide_overlap": guide_overlap,
-        "video_continuation": video_continuation,
+        "context_keyframes": (context_keyframes, False),
+        "guide_overlap": (guide_overlap, False),
+        "video_continuation": (video_continuation, False),
     }
-    for name, value in values.items():
+    for name, (value, allow_equal) in values.items():
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer: 0, 5, 22, 39, 56, ...")
-        _bounded_video_steps(value, max_chunk_frames, name)
-    if context_frames > guide_overlap:
-        raise ValueError(
-            f"context_frames ({context_frames}) cannot exceed guide_overlap ({guide_overlap}); "
-            "keyframed context must exist inside the physical overlap"
-        )
-    return context_frames, guide_overlap, video_continuation, _video_steps(context_frames) if context_frames else 0
+        _bounded_video_steps(value, max_chunk_frames, name, allow_equal=allow_equal)
+    return context_keyframes, guide_overlap, video_continuation, _video_steps(context_keyframes) if context_keyframes else 0
 
 
 def _timestamp_frame(minutes, seconds, milliseconds, fps):
@@ -227,8 +224,8 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
     Source cuts remain ordinary documented ``[Shot N] At MM:SS.mmm,`` markers
     on the physical chunk timeline.  We deliberately do not give H3 our former
     master-range, timeslice, reference-range, or synthetic shot-end language.
-    Gemma replaces only an ongoing shot's body after observing its real prior
-    output; new shots still use the original author-written source body.
+    This remains the deterministic preview/fallback planner. During normal
+    sampling, Gemma replaces the complete local description for every chunk.
     """
     content_start = frame_start if content_start is None else content_start
     if drop_picture_anchors:
@@ -314,27 +311,92 @@ def _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report=
     )
 
 
-def _gemma_continuing_shot(shots, content_start, frame_end):
-    """Return the one source shot that began before this chunk's new output."""
-    for shot in shots:
-        _shot_index, shot_start, shot_end, _body = shot
-        if shot_start < content_start < shot_end and shot_start < frame_end:
-            return shot
-    return None
+def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, target):
+    selected = [shot for shot in shots if shot[1] < range_end and shot[2] > range_start]
+    records = []
+    for local_index, (shot_index, shot_start, shot_end, body) in enumerate(selected):
+        record = {
+            "shot_number": shot_index + 1,
+            "shot_start": shot_start,
+            "shot_end": shot_end,
+            "source_body": body,
+        }
+        if target:
+            record.update({
+                "target_start": max(range_start, shot_start),
+                "target_end": min(range_end, shot_end),
+                "required_marker": (
+                    "[Shot 1]" if local_index == 0
+                    else f"[Shot {local_index + 1}] At {_frame_timestamp(shot_start - sampled_start, fps)},"
+                ),
+            })
+        else:
+            record.update({
+                "covered_start": max(range_start, shot_start),
+                "covered_end": min(range_end, shot_end),
+            })
+        records.append(record)
+    return records
 
 
-def _gemma_report(shot_number, ledger, observation):
-    completed = [action.action_id for action in ledger[:observation.completed_count]]
-    remaining = [action.action_id for action in ledger[observation.completed_count:]]
+def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, video_continuation,
+                                video_label, audio_label):
+    if not continuation:
+        return "First chunk: original image/reference conditioning only; there is no previous generated chunk."
+    sources = []
+    if context_keyframes:
+        sources.append(
+            f"native fixed video/audio opening keyframes covering {context_keyframes} completed frames"
+        )
+    if video_continuation:
+        sources.append(
+            f"a bounded {video_continuation}-frame continuation reference as {video_label} "
+            f"with synchronized {audio_label}"
+        )
+        if not context_keyframes:
+            sources.append(
+                "one fixed five-frame video keyframe clip made from the previous chunk's exact final tail, "
+                "anchored across the discarded packing prefix; it has no separate audio keyframe"
+            )
+    if guide_overlap:
+        sources.append(
+            f"a {guide_overlap}-frame latent warm-start that is fully denoised and retained, not a fixed keyframe"
+        )
+    return "; ".join(sources) if sources else "No fixed opening frames or native Video/Audio continuation reference."
+
+
+def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=False,
+                                   continuation_video_label=None, continuation_audio_label=None):
+    if drop_picture_anchors:
+        prompt = _drop_picture_anchors(prompt)
+    field = _description_field(prompt)
+    description_start = field.end() if field is not None else 0
+    description_end_match = DESCRIPTION_END.search(prompt, description_start)
+    description_end = description_end_match.start() if description_end_match is not None else len(prompt)
+    if field is None:
+        marker = SHOT_MARKER.search(prompt, description_start, description_end)
+        if marker is None:
+            raise ValueError("MiniMax prompt has no description field or [Shot 1] marker")
+        replace_start = marker.start()
+    else:
+        replace_start = description_start
+    rewritten = prompt[:replace_start] + " " + description.strip() + " " + prompt[description_end:]
+    if continuation_video_label is not None:
+        rewritten = _video_continuation_prompt(
+            rewritten,
+            continuation_video_label,
+            continuation_audio_label,
+        )
+    return rewritten
+
+
+def _gemma_report(chunk_number, result):
     return (
-        f"=== Gemma 4 continuity: Shot {shot_number} ===\n"
-        f"completed: {completed or 'none'}\n"
-        f"in progress: {observation.in_progress_action_id or 'none'}\n"
-        f"remaining: {remaining or 'none'}\n"
-        f"confidence: {observation.confidence}\n"
-        f"observation: {observation.observation or 'none'}\n"
-        f"H3 continuation: {observation.continuation_description}\n"
-        f"raw JSON: {observation.raw_json}"
+        f"=== Gemma 4 chunk prompt director: Chunk {chunk_number} ===\n"
+        f"confidence: {result.confidence}\n"
+        f"progress summary: {result.analysis or 'none'}\n"
+        f"H3 detailed_description: {result.detailed_description}\n"
+        f"raw JSON: {result.raw_json}"
     )
 
 
@@ -393,7 +455,7 @@ def _encode_prompt(clip, prompt, images, positive, width, height, continuation, 
 def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
     max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
     max_chunk_t = _video_steps(max_chunk_frames)
-    context_video_t = _bounded_video_steps(overlap_frames, max_chunk_frames, "guide_overlap")
+    context_video_t = _bounded_video_steps(overlap_frames, max_chunk_frames, "physical_overlap")
 
     if video_t < MIN_VIDEO_STEPS or (video_t - MIN_VIDEO_STEPS) % 5:
         raise ValueError("SamplerCustomAdvanced-Unlimited expects a MiniMax H3 video latent on the 17k+5 frame grid")
@@ -455,6 +517,17 @@ def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames):
     return plan
 
 
+def _video_continuation_boundary_guide(previous_video, chunk, context_keyframes, use_video_continuation):
+    if not use_video_continuation or context_keyframes:
+        return None, 0
+    if not chunk.get("synthetic_prefix") or chunk.get("output_trim_frames") != 5:
+        raise ValueError("Video1 boundary keyframe needs the five-frame discarded packing prefix")
+    guide_t = _video_steps(chunk["output_trim_frames"])
+    if previous_video.shape[2] < guide_t:
+        raise ValueError("Previous chunk is too short for the five-frame Video1 boundary keyframe")
+    return previous_video[:, :, -guide_t:].clone(), 0
+
+
 def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prompt, video_context=None,
                             audio_context=None, audio_end_frame=5.0, video_refs=(), video_context_start=0):
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
@@ -492,18 +565,36 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
     return conds
 
 
-def _decoded_video_item(vae, latent):
+def _decode_video_frames(vae, latent):
     frames = vae.decode(latent)
     if frames.ndim == 5:
         frames = frames.reshape(-1, *frames.shape[-3:])
-    sample_indices = list(range(0, frames.shape[0], VIDEO_FPS // 2))
-    qwen_frames = frames[sample_indices]
-    height, width = qwen_frames.shape[1:3]
+    if not frames.shape[0]:
+        raise ValueError("MiniMax H3 video VAE decoded no frames")
+    return frames
+
+
+def _decoded_video_frames(vae, latent, include_final=False, start_frame=0, return_final_frame=False):
+    frames = _decode_video_frames(vae, latent)
+    final_frame = frames[-1:].detach().to(device="cpu", copy=True) if return_final_frame else None
+    start_frame = max(0, min(int(start_frame), frames.shape[0]))
+    sample_indices = list(range(start_frame, frames.shape[0], VIDEO_FPS // 2))
+    if include_final and frames.shape[0] > start_frame and sample_indices[-1] != frames.shape[0] - 1:
+        sample_indices.append(frames.shape[0] - 1)
+    sampled_frames = frames[sample_indices]
+    height, width = sampled_frames.shape[1:3]
     if height * width > QWEN_VIDEO_MAX_PIXELS:
         scale = math.sqrt(QWEN_VIDEO_MAX_PIXELS / (height * width))
         target_width = max(CANVAS_MULTIPLE, round(width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
         target_height = max(CANVAS_MULTIPLE, round(height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-        qwen_frames = _resize(qwen_frames, target_width, target_height, "disabled")
+        sampled_frames = _resize(sampled_frames, target_width, target_height, "disabled")
+    if return_final_frame:
+        return sampled_frames, sample_indices, final_frame
+    return sampled_frames, sample_indices
+
+
+def _decoded_video_item(vae, latent):
+    qwen_frames, sample_indices = _decoded_video_frames(vae, latent)
     return {
         "type": "video",
         "data": qwen_frames,
@@ -602,11 +693,39 @@ def _vram_report(stage, device, components=(), tensors=None):
     logging.info("\n".join(lines))
 
 
-class _VRAMDebugMonitor:
-    def __init__(self, device, components, chunk_count):
+def _refresh_console_progress():
+    """Redraw live tqdm bars after a multi-line debug log snapshot.
+
+    ComfyUI's CLI progress handler owns the sampling ``steps`` bar while this
+    node owns the outer ``chunk`` bar. A logging call moves the terminal cursor
+    below both bars, so without a redraw the next visible progress line can be
+    far above a long VRAM report. Refresh chunk bars first and step bars last.
+    ``tqdm.auto`` and ComfyUI's plain ``tqdm`` can expose different classes,
+    hence both instance registries are checked.
+    """
+    bars = []
+    seen = set()
+    for tqdm_class in (tqdm, _cli_tqdm):
+        for bar in tuple(getattr(tqdm_class, "_instances", ())):
+            if id(bar) not in seen and not getattr(bar, "disable", False):
+                seen.add(id(bar))
+                bars.append(bar)
+    for bar in sorted(bars, key=lambda item: getattr(item, "unit", "") != "chunk"):
+        try:
+            bar.refresh()
+        except (AttributeError, OSError, ValueError):
+            # A tqdm instance can be closed while ComfyUI is handling an
+            # interrupt; a cosmetic redraw must never affect sampling.
+            pass
+
+
+class _VRAMMonitor:
+    def __init__(self, timing, device, components, chunk_count, debug=False):
+        self.timing = timing
         self.device = device
         self.components = components
         self.chunk_count = chunk_count
+        self.debug = debug
         self.chunk = 0
         self.call = 0
 
@@ -614,25 +733,28 @@ class _VRAMDebugMonitor:
         self.chunk = index
         self.call = 0
         backend = _memory_backend(self.device)
-        if self.device.type == "cuda" and backend is not None:
+        if self.debug and self.device.type == "cuda" and backend is not None:
             backend.reset_peak_memory_stats(self.device)
 
-    def report(self, stage, tensors=None):
-        _vram_report(stage, self.device, self.components, tensors)
+    def report(self, stage, tensors=None, sample_group="all"):
+        self.timing.observe_memory(sample_group=sample_group, chunk_index=self.chunk)
+        if self.debug:
+            _vram_report(stage, self.device, self.components, tensors)
+            _refresh_console_progress()
 
     def __call__(self, executor, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options=None, **kwargs):
         self.call += 1
         label = f"chunk {self.chunk + 1}/{self.chunk_count} DiT evaluation {self.call}"
         tensors = {"model input": x, "cross attention": c_crossattn, "model conditions": kwargs}
-        self.report(label + " before", tensors)
+        self.report(label + " before", tensors, sample_group="dit")
         try:
             result = executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
         except Exception:
-            self.report(label + " FAILED", tensors)
-            if self.device.type == "cuda":
+            self.report(label + " FAILED", tensors, sample_group="dit")
+            if self.debug and self.device.type == "cuda":
                 logging.info("SamplerCustomAdvanced-Unlimited CUDA allocator after failure:\n%s", torch.cuda.memory_summary(self.device, abbreviated=True))
             raise
-        self.report(label + " after", {"model output": result})
+        self.report(label + " after", {"model output": result}, sample_group="dit")
         return result
 
 
@@ -675,22 +797,33 @@ class _ChunkProgress:
 
 
 class _SamplerTiming:
-    """Accumulate wall-clock work and high-water memory use for one run."""
+    """Accumulate wall-clock work and an always-on physical-memory timeline."""
 
     _ORDER = (
         ("H3 sampling", "h3_sampling"),
         ("Qwen encode/tokenize", "qwen"),
-        ("VAE decode: previous chunk for Gemma", "vae_previous_chunk"),
-        ("VAE decode: bounded continuation context", "vae_context"),
-        ("VAE decode: Qwen full history", "vae_history"),
         ("Gemma 4", "gemma4"),
+        ("VAE decode: previous chunk for Gemma", "vae_previous_chunk"),
+        ("VAE continuation decode", "vae_context"),
+        ("VAE decode: Qwen full history", "vae_history"),
     )
 
-    def __init__(self, device):
+    _REPORT_LABELS = {
+        "h3_sampling": "H3 sampling",
+        "qwen": "Qwen",
+        "gemma4": "Gemma 4",
+        "vae_previous_chunk": "Previous-chunk VAE decode",
+        "vae_context": "Video1 VAE decode",
+        "vae_history": "Qwen full-history VAE decode",
+    }
+
+    def __init__(self, device, poll_interval=1.0):
         self.started = time.perf_counter()
         self.device = torch.device(device)
         self.seconds = {key: 0.0 for _label, key in self._ORDER}
         self.calls = {key: 0 for _label, key in self._ORDER}
+        self.chunk_started = {}
+        self.chunk_seconds = {}
         self.max_process_rss = 0
         self.max_system_ram_used = 0
         self.system_ram_total = 0
@@ -701,57 +834,127 @@ class _SamplerTiming:
         self.max_torch_allocator_peak = 0
         self.max_torch_reserved_peak = 0
         self._process = psutil.Process()
+        self._backend = _memory_backend(self.device)
+        self._memory_lock = threading.Lock()
+        self._physical_samples = []
+        self._snapshot_count = 0
+        self._snapshot_sum = 0
+        self._dit_snapshot_count = 0
+        self._dit_snapshot_sum = 0
+        self._later_dit_snapshot_count = 0
+        self._later_dit_snapshot_sum = 0
+        self._poll_interval = max(0.25, float(poll_interval))
+        self._poll_stop = threading.Event()
+        self._poll_thread = None
 
         # This high-water mark is scoped to this sampler execution. The debug
         # wrapper may reset PyTorch's native counter per chunk, so we retain
         # the largest value observed after every timed phase as well.
-        backend = _memory_backend(self.device)
-        if backend is not None:
+        if self._backend is not None:
             try:
-                backend.reset_peak_memory_stats(self.device)
+                self._backend.reset_peak_memory_stats(self.device)
             except (AttributeError, RuntimeError):
                 pass
         self.observe_memory()
+
+    def start_memory_poll(self):
+        if self._backend is not None and self._poll_thread is None:
+            self._poll_stop.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_memory,
+                name="minimax-h3-unlimited-memory",
+                daemon=True,
+            )
+            self._poll_thread.start()
+
+    def start_chunk(self, index):
+        self.chunk_started[index] = time.perf_counter()
+
+    def finish_chunk(self, index):
+        started = self.chunk_started.pop(index, None)
+        if started is not None:
+            self.chunk_seconds[index] = time.perf_counter() - started
 
     def add(self, key, started):
         self.seconds[key] += time.perf_counter() - started
         self.calls[key] += 1
         self.observe_memory()
 
-    def observe_memory(self):
-        """Best-effort memory snapshot; monitoring must never affect sampling."""
+    def _observe_ram(self):
         try:
             memory = psutil.virtual_memory()
-            self.max_process_rss = max(self.max_process_rss, self._process.memory_info().rss)
-            self.max_system_ram_used = max(self.max_system_ram_used, memory.used)
-            self.system_ram_total = max(self.system_ram_total, memory.total)
+            process_rss = self._process.memory_info().rss
+            with self._memory_lock:
+                self.max_process_rss = max(self.max_process_rss, process_rss)
+                self.max_system_ram_used = max(self.max_system_ram_used, memory.used)
+                self.system_ram_total = max(self.system_ram_total, memory.total)
         except (OSError, psutil.Error):
             pass
 
-        backend = _memory_backend(self.device)
-        if backend is None:
+    def _record_physical(self, used, total, sample_group=None, chunk_index=None):
+        now = time.perf_counter()
+        with self._memory_lock:
+            self._physical_samples.append((now, used))
+            self.max_device_used = max(self.max_device_used, used)
+            self.device_total = max(self.device_total, total)
+            if sample_group is not None:
+                self._snapshot_count += 1
+                self._snapshot_sum += used
+                if sample_group == "dit":
+                    self._dit_snapshot_count += 1
+                    self._dit_snapshot_sum += used
+                    if chunk_index is not None and chunk_index > 0:
+                        self._later_dit_snapshot_count += 1
+                        self._later_dit_snapshot_sum += used
+
+    def _observe_physical(self, sample_group=None, chunk_index=None):
+        if self._backend is None:
             return
         try:
-            stats = backend.memory_stats(self.device)
+            if self.device.type == "cuda":
+                physical_free, physical_total = self._backend.mem_get_info(self.device)
+            else:
+                physical_total = comfy.model_management.get_total_memory(self.device)
+                physical_free = comfy.model_management.get_free_memory(self.device)
+            self._record_physical(
+                physical_total - physical_free,
+                physical_total,
+                sample_group=sample_group,
+                chunk_index=chunk_index,
+            )
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _poll_memory(self):
+        while not self._poll_stop.wait(self._poll_interval):
+            self._observe_ram()
+            self._observe_physical()
+
+    def _stop_memory_poll(self):
+        if self._poll_thread is not None:
+            self._poll_stop.set()
+            self._poll_thread.join(timeout=max(2.0, self._poll_interval * 2.0))
+            self._poll_thread = None
+
+    def observe_memory(self, sample_group=None, chunk_index=None):
+        """Best-effort memory snapshot; monitoring must never affect sampling."""
+        self._observe_ram()
+        if self._backend is None:
+            return
+        try:
+            stats = self._backend.memory_stats(self.device)
             allocated = stats.get("allocated_bytes.all.current", stats.get("active_bytes.all.current", 0))
             reserved = stats.get("reserved_bytes.all.current", 0)
             allocator_peak = stats.get("allocated_bytes.all.peak", allocated)
             reserved_peak = stats.get("reserved_bytes.all.peak", reserved)
-            self.max_torch_allocated = max(self.max_torch_allocated, allocated)
-            self.max_torch_reserved = max(self.max_torch_reserved, reserved)
-            self.max_torch_allocator_peak = max(self.max_torch_allocator_peak, allocator_peak)
-            self.max_torch_reserved_peak = max(self.max_torch_reserved_peak, reserved_peak)
-            if self.device.type == "cuda":
-                physical_free, physical_total = backend.mem_get_info(self.device)
-                self.max_device_used = max(self.max_device_used, physical_total - physical_free)
-                self.device_total = max(self.device_total, physical_total)
-            else:
-                total = comfy.model_management.get_total_memory(self.device)
-                free = comfy.model_management.get_free_memory(self.device)
-                self.max_device_used = max(self.max_device_used, total - free)
-                self.device_total = max(self.device_total, total)
+            with self._memory_lock:
+                self.max_torch_allocated = max(self.max_torch_allocated, allocated)
+                self.max_torch_reserved = max(self.max_torch_reserved, reserved)
+                self.max_torch_allocator_peak = max(self.max_torch_allocator_peak, allocator_peak)
+                self.max_torch_reserved_peak = max(self.max_torch_reserved_peak, reserved_peak)
         except (AttributeError, RuntimeError):
             pass
+        self._observe_physical(sample_group=sample_group, chunk_index=chunk_index)
 
     @staticmethod
     def _duration(seconds):
@@ -764,34 +967,154 @@ class _SamplerTiming:
     def _memory_size(value):
         return f"{value / (1024 ** 3):.2f} GiB"
 
-    def report(self, status, completed_chunks, planned_chunks):
+    @staticmethod
+    def _clock_duration(seconds):
+        rounded = max(0, round(seconds))
+        hours, remainder = divmod(rounded, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
+
+    @staticmethod
+    def _peak_interval(v0, v1, duration, threshold):
+        if duration <= 0:
+            return 0.0
+        above0 = v0 > threshold
+        above1 = v1 > threshold
+        if above0 == above1:
+            return duration if above0 else 0.0
+        if v1 == v0:
+            return 0.0
+        crossing = max(0.0, min(1.0, (threshold - v0) / (v1 - v0)))
+        return duration * (crossing if above0 else 1.0 - crossing)
+
+    def _physical_summary(self):
+        with self._memory_lock:
+            samples = sorted(self._physical_samples)
+            snapshot_count = self._snapshot_count
+            snapshot_sum = self._snapshot_sum
+            dit_count = self._dit_snapshot_count
+            dit_sum = self._dit_snapshot_sum
+            later_count = self._later_dit_snapshot_count
+            later_sum = self._later_dit_snapshot_sum
+            peak = self.max_device_used
+            total = self.device_total
+        if snapshot_count:
+            average = snapshot_sum / snapshot_count
+        elif samples:
+            average = sum(value for _timestamp, value in samples) / len(samples)
+        else:
+            average = 0
+        threshold = (average + peak) / 2.0
+        peak_time = 0.0
+        if peak > average:
+            for (t0, v0), (t1, v1) in zip(samples, samples[1:]):
+                peak_time += self._peak_interval(v0, v1, t1 - t0, threshold)
+        return {
+            "average": average,
+            "snapshot_count": snapshot_count or len(samples),
+            "dit_average": dit_sum / dit_count if dit_count else 0,
+            "dit_count": dit_count,
+            "later_dit_average": later_sum / later_count if later_count else 0,
+            "later_dit_count": later_count,
+            "peak": peak,
+            "total": total,
+            "threshold": threshold,
+            "peak_time": peak_time,
+        }
+
+    def _projected_time(self, full_chunks):
+        completed = sorted(self.chunk_seconds)
+        if not completed or full_chunks <= len(completed):
+            return None
+        first = self.chunk_seconds[completed[0]]
+        later = [self.chunk_seconds[index] for index in completed if index != completed[0]]
+        later_average = sum(later) / len(later) if later else first
+        return first + later_average * max(0, full_chunks - 1)
+
+    def report(self, status, completed_chunks, run):
+        self._stop_memory_poll()
         self.observe_memory()
         total = time.perf_counter() - self.started
         measured = sum(self.seconds.values())
+        physical = self._physical_summary()
+        rendered_frames = run["rendered_frames"]
+        rendered = "none" if rendered_frames <= 0 else f"frames 0-{rendered_frames - 1}"
+        configuration = (
+            f"chunk_frames={run['chunk_frames']}, context_keyframes={run['context_keyframes']}, "
+            f"guide_overlap={run['guide_overlap']}, video_continuation={run['video_continuation']}"
+        )
         lines = [
-            "SamplerCustomAdvanced-Unlimited timing and memory report "
-            f"({status}; {completed_chunks}/{planned_chunks} chunk{'s' if planned_chunks != 1 else ''}):",
-            f"  total chunking wall time: {self._duration(total)}",
+            "SamplerCustomAdvanced-Unlimited run report:",
+            "",
+            "Baseline from this run:",
+            f"  Configuration: {configuration}",
+            f"  Rendered: {completed_chunks} chunk{'s' if completed_chunks != 1 else ''}, {rendered} ({status})",
+            f"  Resolution: {run['width']}x{run['height']}",
+            f"  Sampling: {run['sampling_steps']} steps",
+            f"  Full planned sequence: {run['full_frames']} frames, {run['full_chunks']} chunks"
+            + ("; completed" if completed_chunks == run["full_chunks"] and status == "complete" else f"; stopped after chunk {completed_chunks}"),
+            "",
+            "VRAM baseline:",
         ]
-        for label, key in self._ORDER:
-            lines.append(f"  {label}: {self._duration(self.seconds[key])} ({self.calls[key]} call{'s' if self.calls[key] != 1 else ''})")
-        lines.append(f"  other sampler overhead: {self._duration(max(0.0, total - measured))}")
-        if self.system_ram_total:
+        if physical["total"]:
+            average_percent = 100.0 * physical["average"] / physical["total"]
+            peak_percent = 100.0 * physical["peak"] / physical["total"]
             lines.append(
-                "  peak RAM (sampled): "
-                f"ComfyUI process RSS {self._memory_size(self.max_process_rss)}; "
-                f"system {self._memory_size(self.max_system_ram_used)} / {self._memory_size(self.system_ram_total)} used"
+                f"  Average across all {physical['snapshot_count']} physical-VRAM snapshots: "
+                f"{self._memory_size(physical['average'])} / {self._memory_size(physical['total'])} - {average_percent:.1f}%"
             )
-        if self.device_total:
+            if physical["dit_count"]:
+                lines.append(
+                    f"  Average during H3 DiT evaluations: {self._memory_size(physical['dit_average'])} - "
+                    f"{100.0 * physical['dit_average'] / physical['total']:.1f}%"
+                )
+            if physical["later_dit_count"]:
+                lines.append(
+                    f"  Average during later-chunk DiT evaluations: {self._memory_size(physical['later_dit_average'])} - "
+                    f"{100.0 * physical['later_dit_average'] / physical['total']:.1f}%"
+                )
             lines.append(
-                f"  peak VRAM on {self.device} (sampled): "
-                f"all processes {self._memory_size(self.max_device_used)} / {self._memory_size(self.device_total)} used; "
-                f"PyTorch allocated {self._memory_size(self.max_torch_allocated)}, "
-                f"reserved {self._memory_size(self.max_torch_reserved)}"
+                f"  Peak: {self._memory_size(physical['peak'])} - {peak_percent:.1f}%"
+            )
+            lines.append(
+                f"  Peak Time: {self._duration(physical['peak_time'])} "
+                f"(VRAM closer to Peak than Average; above {self._memory_size(physical['threshold'])})"
             )
             lines.append(
                 f"  PyTorch VRAM high-water: allocated {self._memory_size(self.max_torch_allocator_peak)}, "
                 f"reserved {self._memory_size(self.max_torch_reserved_peak)}"
+            )
+        if self.system_ram_total:
+            lines.append(
+                "  Peak RAM: "
+                f"ComfyUI process RSS {self._memory_size(self.max_process_rss)}; "
+                f"system {self._memory_size(self.max_system_ram_used)} / {self._memory_size(self.system_ram_total)} used"
+            )
+        lines.extend([
+            "",
+            "Time baseline:",
+            f"  Unlimited sampler wall time: {self._clock_duration(total)}",
+            f"  Average per completed chunk: {self._duration(total / completed_chunks) if completed_chunks else 'n/a'}",
+            "",
+            "Breakdown:",
+            "  Component                                  Total         Average/call",
+            "  -----------------------------------------  ------------  ------------",
+        ])
+        for _label, key in self._ORDER:
+            calls = self.calls[key]
+            if calls:
+                lines.append(
+                    f"  {self._REPORT_LABELS[key]:<41}  {self._duration(self.seconds[key]):>12}  "
+                    f"{self._duration(self.seconds[key] / calls):>12}"
+                )
+        lines.append(f"  Other sampler overhead: {self._duration(max(0.0, total - measured))}")
+        projection = self._projected_time(run["full_chunks"])
+        if projection is not None:
+            lines.append(
+                f"  Projected full-sequence sampler time: approximately {self._clock_duration(projection)} "
+                f"for {run['full_chunks']} chunks"
             )
         logging.info("\n".join(lines))
 
@@ -817,24 +1140,30 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                tooltip="FPS used to convert source-prompt cut timestamps to exact frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
-                io.Int.Input("context_frames", default=5, min=0, max=3600, step=1,
-                             tooltip="Independent completed-frame native keyframe context inside guide_overlap. 0 disables keyframes. Other valid values are 5, 22, 39, 56, ... and cannot exceed guide_overlap."),
+                io.Boolean.Input("context_keyframes_enable", default=True,
+                                 tooltip="Enable native completed-frame keyframes. When disabled, the effective context_keyframes value is 0."),
+                io.Int.Input("context_keyframes", default=5, min=5, max=3600, step=17,
+                             tooltip="Completed video/audio tail anchored over the same opening target frames: 5, 22, 39, 56, ... Those truthful overlap frames are sampled again and trimmed before assembly."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots to the console. chunk_prompts is returned whether debug is enabled or not."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
-                io.Int.Input("guide_overlap", default=5, min=0, max=3600, step=1,
-                             tooltip="Independent physical guide overlap and trim length. 0 disables overlap. Other valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames."),
-                io.Int.Input("video_continuation", default=0, min=0, max=3600, step=1,
-                             tooltip="Independent synchronized native Ref2VA <Audio N> + <Video N> tail length. 0 disables Video1. Other valid values are 5, 22, 39, 56, ... and must be smaller than chunk_frames. Requires the video vae."),
+                io.Boolean.Input("guide_overlap_enable", default=True,
+                                 tooltip="Enable retained latent warm-starting from the previous chunk. When disabled, the effective guide_overlap value is 0."),
+                io.Int.Input("guide_overlap", default=5, min=5, max=3600, step=17,
+                             tooltip="Previous-tail latent used to initialize the first retained positions of each new chunk: 5, 22, 39, 56, ... The positions are fully denoised, kept in the output, and not described as overlap in the prompt."),
+                io.Boolean.Input("video_continuation_enable", default=False,
+                                 tooltip="Enable the synchronized native Ref2VA <Audio N> + <Video N> tail. With context keyframes off, also anchor the previous final five-frame video tail across the discarded packing prefix. When disabled, the effective value is 0."),
+                io.Int.Input("video_continuation", default=5, min=5, max=3600, step=17,
+                             tooltip="Synchronized native Ref2VA <Audio N> + <Video N> tail length: 5, 22, 39, 56, ... and must be smaller than chunk_frames. With context keyframes off, its exact final five-frame latent tail becomes a visual-only keyframe over the discarded packing prefix. Requires the video vae."),
                 io.Boolean.Input("qwen_full_history", default=False,
                                  tooltip="Experimental: show Qwen 2 FPS frames decoded from all completed output before each chunk. Does not add a DiT video reference or rewrite the prompt. Requires vae."),
                 io.Boolean.Input("prompt_preview_only", default=False, optional=True,
                                  tooltip="Build and return every chunk prompt without generating noise, encoding per-chunk conditioning, loading the DiT/VAE, or running inference. Latent outputs are unchanged placeholders while enabled."),
                 io.Vae.Input("vae", optional=True,
-                             tooltip="MiniMax H3 video VAE. Required for video_continuation, qwen_full_history, and automatic Gemma continuation when a chunk begins within an already generated shot. Continuation audio remains latent."),
+                             tooltip="MiniMax H3 video VAE. Required for video_continuation, qwen_full_history, and Gemma visual directing after Chunk 1. Gemma directs Chunk 1 from text alone. Continuation audio remains latent."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -852,8 +1181,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
-                prompt_preview_only=False, debug_stop_chunk=0, images=None, context_frames=5,
-                guide_overlap=5, video_continuation=0, qwen_full_history=False, vae=None,
+                prompt_preview_only=False, debug_stop_chunk=0, images=None,
+                context_keyframes_enable=True, context_keyframes=5,
+                guide_overlap_enable=True, guide_overlap=5,
+                video_continuation_enable=False, video_continuation=5,
+                qwen_full_history=False, vae=None,
                 **_deprecated_inputs):
         samples = latent_image["samples"]
         if not samples.is_nested:
@@ -870,32 +1202,39 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             return io.NodeOutput(sampled[0], sampled[1], "")
 
         video, audio = streams
+        # Workflows saved before this rename still call the old widgets. Accept
+        # them once, but expose only the clearer context_keyframes controls.
+        if "context_frames_enable" in _deprecated_inputs:
+            context_keyframes_enable = _deprecated_inputs["context_frames_enable"]
+        if "context_frames" in _deprecated_inputs:
+            context_keyframes = _deprecated_inputs["context_frames"]
+        context_keyframes = int(context_keyframes_enable) * context_keyframes
+        guide_overlap = int(guide_overlap_enable) * guide_overlap
+        video_continuation = int(video_continuation_enable) * video_continuation
         max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
-        context_frames, guide_overlap, video_continuation, guide_video_t = _continuation_controls(
-            context_frames,
+        context_keyframes, guide_overlap, video_continuation, guide_video_t = _continuation_controls(
+            context_keyframes,
             guide_overlap,
             video_continuation,
             max_chunk_frames,
         )
-        overlap_frames = guide_overlap
+        warm_start_video_t = _video_steps(guide_overlap) if guide_overlap else 0
+        keyframe_duration_frames = context_keyframes
         use_video_continuation = video_continuation > 0
-        if overlap_frames == 0:
-            plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)
+        # A multi-frame MiniMax keyframe is anchored on the target timeline; it
+        # is not detached historical memory. Keep the same completed frames in
+        # the opening physical target interval and trim that truthful overlap
+        # after sampling. With keyframes disabled, retain the minimum synthetic
+        # five-frame prefix needed to preserve H3's temporal packing phase.
+        if context_keyframes:
+            plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_keyframes)
         else:
-            plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, overlap_frames)
+            plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)
         if debug_stop_chunk > len(plan):
             raise ValueError(f"debug_stop_chunk is {debug_stop_chunk}, but this latent has only {len(plan)} chunks")
         active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
         _gemma_markers, gemma_shots, _gemma_description_end = _parse_prompt_shots(prompt, plan[-1]["frame_end"], fps)
-        gemma_handoff_needed = any(
-            _gemma_continuing_shot(
-                gemma_shots,
-                chunk["frame_start"] + chunk.get("output_trim_frames", 0),
-                chunk["frame_end"],
-            ) is not None
-            for index, chunk in enumerate(active_plan)
-            if index
-        )
+        gemma_director_needed = bool(gemma_shots)
 
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
@@ -912,7 +1251,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             plan,
             active_plan,
             fps,
-            context_frames,
+            context_keyframes,
             use_video_continuation,
             ref2va,
             video_number,
@@ -921,8 +1260,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         if debug:
             logging.info(
                 "SamplerCustomAdvanced-Unlimited independent continuation controls: "
-                "context_frames=%d, guide_overlap=%d, video_continuation=%d",
-                context_frames,
+                "context_keyframes=%d, guide_overlap=%d, video_continuation=%d",
+                context_keyframes,
                 guide_overlap,
                 video_continuation,
             )
@@ -937,9 +1276,9 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
 
         if len(active_plan) > 1 and "noise_mask" in latent_image:
             raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
-        if len(active_plan) > 1 and (use_video_continuation or qwen_full_history or gemma_handoff_needed):
+        if len(active_plan) > 1 and (use_video_continuation or qwen_full_history or gemma_director_needed):
             if vae is None:
-                raise ValueError("video_continuation, qwen_full_history, and automatic Gemma continuation require a MiniMax H3 video VAE")
+                raise ValueError("video_continuation, qwen_full_history, and Gemma chunk directing require a MiniMax H3 video VAE")
 
         timing = _SamplerTiming(guider.model_patcher.load_device)
         fixed_latent = latent_image.copy()
@@ -969,14 +1308,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         sampling_completed = False
         debug_prompts = []
         return_prompts = True
-        gemma_director = Gemma4ContinuityDirector(debug=debug) if gemma_handoff_needed else None
-        gemma_ledgers = {}
-        gemma_completed = {}
-        if gemma_director is not None:
-            gemma_ledgers = {
-                shot_index: action_ledger(shot_index + 1, body)
-                for shot_index, _shot_start, _shot_end, body in gemma_shots
-            }
+        gemma_director = Gemma4ContinuityDirector(debug=debug) if gemma_director_needed else None
         preview_chunk_ranges = [
             {
                 "chunk": index + 1,
@@ -993,109 +1325,163 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             preview_shot_ranges,
         )
         chunk_progress = _ChunkProgress(len(active_plan))
-        vram_monitor = None
-        if debug:
-            components = [
-                ("MiniMax H3 DiT", guider.model_patcher),
-                ("Qwen/CLIP", clip.patcher),
-                ("H3 video VAE", vae.patcher if vae is not None else None),
-            ]
-            vram_monitor = _VRAMDebugMonitor(guider.model_patcher.load_device, components, len(active_plan))
-            guider.model_patcher.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.APPLY_MODEL, VRAM_DEBUG_WRAPPER_KEY)
-            guider.model_patcher.add_wrapper_with_key(
-                comfy.patcher_extension.WrappersMP.APPLY_MODEL,
-                VRAM_DEBUG_WRAPPER_KEY,
-                vram_monitor,
-            )
-            vram_monitor.report("execution prepared", {"full latent": samples, "full noise": full_noise})
+        components = [
+            ("MiniMax H3 DiT", guider.model_patcher),
+            ("Qwen/CLIP", clip.patcher),
+            ("H3 video VAE", vae.patcher if vae is not None else None),
+        ]
+        vram_monitor = _VRAMMonitor(
+            timing,
+            guider.model_patcher.load_device,
+            components,
+            len(active_plan),
+            debug=debug,
+        )
+        guider.model_patcher.remove_wrappers_with_key(
+            comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+            VRAM_DEBUG_WRAPPER_KEY,
+        )
+        guider.model_patcher.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+            VRAM_DEBUG_WRAPPER_KEY,
+            vram_monitor,
+        )
+        timing.start_memory_poll()
+        vram_monitor.report("execution prepared", {"full latent": samples, "full noise": full_noise})
 
         try:
             for index, chunk in enumerate(active_plan):
                 timing.observe_memory()
-                if vram_monitor is not None:
-                    vram_monitor.set_chunk(index)
-                    vram_monitor.report(
-                        f"chunk {index + 1}/{len(active_plan)} start",
-                        {
-                            "full latent": samples,
-                            "full noise": full_noise,
-                            "completed output": (output_video, output_audio),
-                            "completed denoised output": (denoised_video, denoised_audio),
-                            "previous chunk": (previous_video, previous_audio),
-                        },
-                    )
+                timing.start_chunk(index)
+                vram_monitor.set_chunk(index)
+                vram_monitor.report(
+                    f"chunk {index + 1}/{len(active_plan)} start",
+                    {
+                        "full latent": samples,
+                        "full noise": full_noise,
+                        "completed output": (output_video, output_audio),
+                        "completed denoised output": (denoised_video, denoised_audio),
+                        "previous chunk": (previous_video, previous_audio),
+                    },
+                )
                 continuation = index > 0
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
-                gemma_body_overrides = {}
+                gemma_description = None
                 gemma_report = None
-                if gemma_director is not None and continuation:
-                    continuing_shot = _gemma_continuing_shot(
-                        gemma_shots,
-                        content_start,
-                        chunk["frame_end"],
-                    )
-                    if continuing_shot is not None:
-                        shot_index, shot_start, shot_end, _shot_body = continuing_shot
-                        ledger = gemma_ledgers[shot_index]
-                        known_completed = gemma_completed.get(shot_index, 0)
-                        observation_item = None
-                        try:
-                            # H3 must be out of VRAM before VAE decode and the
-                            # temporary fully-GPU Gemma load. Gemma is released
-                            # by its director before this chunk's Qwen/DiT work.
-                            comfy.model_management.unload_model_and_clones(guider.model_patcher)
-                            comfy.model_management.unload_model_and_clones(clip.patcher)
-                            comfy.model_management.soft_empty_cache(force=True)
-                            if vram_monitor is not None:
-                                vram_monitor.report(
-                                    f"chunk {index + 1}/{len(active_plan)} before Gemma 4 observation",
-                                    {"previous chunk": previous_video},
-                                )
+                if gemma_director is not None:
+                    observation_frames = None
+                    try:
+                        # H3 and Qwen must be out of VRAM before the optional
+                        # VAE decode and temporary fully-GPU Gemma load.
+                        comfy.model_management.unload_model_and_clones(guider.model_patcher)
+                        comfy.model_management.unload_model_and_clones(clip.patcher)
+                        comfy.model_management.soft_empty_cache(force=True)
+                        if vram_monitor is not None:
+                            vram_monitor.report(
+                                f"chunk {index + 1}/{len(active_plan)} before Gemma 4 prompt directing",
+                                {"previous chunk": previous_video},
+                            )
+
+                        previous_chunk = None
+                        previous_shots = []
+                        observation_frame_numbers = []
+                        if continuation:
+                            previous_plan = active_plan[index - 1]
+                            previous_output_start = previous_plan["frame_start"] + previous_plan.get("output_trim_frames", 0)
+                            previous_chunk = {
+                                "sampled_start": previous_plan["frame_start"],
+                                "sampled_end": previous_plan["frame_end"],
+                                "output_start": previous_output_start,
+                                "output_end": previous_plan["frame_end"],
+                            }
+                            previous_shots = _gemma_shot_records(
+                                gemma_shots,
+                                previous_output_start,
+                                previous_plan["frame_end"],
+                                previous_output_start,
+                                fps,
+                                target=False,
+                            )
                             timer_started = time.perf_counter()
                             try:
-                                observation_item = _decoded_video_item(vae, previous_video)
+                                observation_frames, observation_indices = _decoded_video_frames(
+                                    vae,
+                                    previous_video,
+                                    include_final=True,
+                                    start_frame=previous_plan.get("output_trim_frames", 0),
+                                )
                             finally:
                                 timing.add("vae_previous_chunk", timer_started)
+                            observation_frame_numbers = [
+                                previous_plan["frame_start"] + frame_index
+                                for frame_index in observation_indices
+                            ]
+
+                        continuation_video_label = f"<Video {video_number}>"
+                        continuation_audio_label = f"<Audio {audio_number}>"
+                        request = {
+                            "chunk_number": index + 1,
+                            "chunk_count": len(active_plan),
+                            "fps": fps,
+                            "prompt_mode": "ref" if ref2va else "base",
+                            "current_chunk": {
+                                "sampled_start": chunk["frame_start"],
+                                "sampled_end": chunk["frame_end"],
+                                "output_start": content_start,
+                                "output_end": chunk["frame_end"],
+                            },
+                            "previous_chunk": previous_chunk,
+                            "previous_shots": previous_shots,
+                            "observation_frame_numbers": observation_frame_numbers,
+                            "target_shots": _gemma_shot_records(
+                                gemma_shots,
+                                content_start,
+                                chunk["frame_end"],
+                                chunk["frame_start"],
+                                fps,
+                                target=True,
+                            ),
+                            "conditioning_context": _gemma_conditioning_context(
+                                continuation,
+                                context_keyframes,
+                                guide_overlap,
+                                video_continuation,
+                                continuation_video_label,
+                                continuation_audio_label,
+                            ),
+                            "original_prompt": prompt,
+                        }
+                        if vae is not None:
                             comfy.model_management.unload_model_and_clones(vae.patcher)
-                            comfy.model_management.soft_empty_cache(force=True)
-                            timer_started = time.perf_counter()
-                            try:
-                                observation = gemma_director.observe(
-                                    shot_index + 1,
-                                    shot_start,
-                                    shot_end,
-                                    fps,
-                                    ledger,
-                                    known_completed,
-                                    observation_item["data"],
-                                    min(chunk["frame_end"], shot_end) - content_start,
-                                )
-                            finally:
-                                timing.add("gemma4", timer_started)
-                            gemma_completed[shot_index] = observation.completed_count
-                            gemma_body_overrides[shot_index] = observation.continuation_description
-                            gemma_report = _gemma_report(shot_index + 1, ledger, observation)
-                            if vram_monitor is not None:
-                                vram_monitor.report(
-                                    f"chunk {index + 1}/{len(active_plan)} after Gemma 4 release",
-                                )
-                        except Gemma4DependencyError:
-                            raise
-                        except Gemma4ObservationError as error:
-                            logging.warning(
-                                "SamplerCustomAdvanced-Unlimited Gemma 4 observation for chunk %d/%d failed; "
-                                "using the canonical source-prompt fallback: %s",
-                                index + 1,
-                                len(active_plan),
-                                error,
-                            )
-                            gemma_report = (
-                                f"=== Gemma 4 continuity: Shot {shot_index + 1} ===\n"
-                                f"observation failed; unchanged canonical source-prompt fallback: {error}"
-                            )
+                        comfy.model_management.soft_empty_cache(force=True)
+                        timer_started = time.perf_counter()
+                        try:
+                            result = gemma_director.direct(request, observation_frames)
                         finally:
-                            if observation_item is not None:
-                                del observation_item
+                            timing.add("gemma4", timer_started)
+                        gemma_description = result.detailed_description
+                        gemma_report = _gemma_report(index + 1, result)
+                        if vram_monitor is not None:
+                            vram_monitor.report(
+                                f"chunk {index + 1}/{len(active_plan)} after Gemma 4 release",
+                            )
+                    except Gemma4DependencyError:
+                        raise
+                    except Gemma4ObservationError as error:
+                        logging.warning(
+                            "SamplerCustomAdvanced-Unlimited Gemma 4 prompt directing for chunk %d/%d failed; "
+                            "using the canonical source-prompt fallback: %s",
+                            index + 1,
+                            len(active_plan),
+                            error,
+                        )
+                        gemma_report = (
+                            f"=== Gemma 4 chunk prompt director: Chunk {index + 1} ===\n"
+                            f"directing failed; canonical source-prompt fallback: {error}"
+                        )
+                    finally:
+                        observation_frames = None
+                        if vae is not None:
                             comfy.model_management.unload_model_and_clones(vae.patcher)
                 vs, ve = chunk["video_start"], chunk["video_end"]
                 aus, aue = chunk["audio_start"], chunk["audio_end"]
@@ -1120,25 +1506,67 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     chunk_video_noise = torch.cat((prefix_video_noise, chunk_video_noise), dim=2)
                     chunk_audio_noise = torch.cat((prefix_audio_noise, chunk_audio_noise), dim=-1)
 
+                if continuation and warm_start_video_t:
+                    warm_start = context_video_t
+                    warm_count = min(
+                        warm_start_video_t,
+                        chunk_video.shape[2] - warm_start,
+                        previous_video.shape[2],
+                    )
+                    warm_end = warm_start + warm_count
+                    # This is deliberately not a keyframe or physical overlap.
+                    # Initialize retained target positions from the completed
+                    # tail, keep their fresh target noise, fully denoise them,
+                    # and retain them in the assembled output.
+                    if warm_count:
+                        chunk_video = chunk_video.clone()
+                        chunk_video[:, :, warm_start:warm_end] = previous_video[:, :, -warm_count:]
+                        if debug:
+                            logging.info(
+                                "SamplerCustomAdvanced-Unlimited chunk %d/%d retained latent warm-start: "
+                                "%d previous-tail video tokens copied to kept local tokens %d-%d",
+                                index + 1,
+                                len(active_plan),
+                                warm_count,
+                                warm_start,
+                                warm_end - 1,
+                            )
+
                 chunk_latent = fixed_latent.copy()
                 chunk_latent["samples"] = comfy.nested_tensor.NestedTensor((chunk_video, chunk_audio))
                 chunk_noise = comfy.nested_tensor.NestedTensor((chunk_video_noise, chunk_audio_noise))
 
-                guide_enabled = context_frames > 0
+                guide_enabled = context_keyframes > 0
                 guide_audio_t = (
                     0 if not guide_enabled
-                    else _audio_steps(content_start) - _audio_steps(content_start - context_frames)
+                    else _audio_steps(content_start) - _audio_steps(content_start - context_keyframes)
                 )
                 video_context = None if previous_video is None or not guide_enabled else previous_video[:, :, -guide_video_t:].clone()
                 audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -guide_audio_t:].clone()
-                video_context_start = guide_overlap - context_frames
-                audio_end_frame = float(overlap_frames)
+                video_context_start = 0
+                audio_end_frame = float(keyframe_duration_frames)
                 if audio_context is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
                 video_items = []
                 video_refs = []
                 if continuation and use_video_continuation:
+                    boundary_video_context, boundary_keyframe_index = _video_continuation_boundary_guide(
+                        previous_video,
+                        chunk,
+                        context_keyframes,
+                        use_video_continuation,
+                    )
+                    if boundary_video_context is not None:
+                        video_context = boundary_video_context
+                        video_context_start = boundary_keyframe_index
+                        if debug:
+                            logging.info(
+                                "SamplerCustomAdvanced-Unlimited chunk %d/%d Video1 boundary keyframe: "
+                                "previous final five-frame latent tail anchored across discarded local frames 0-4",
+                                index + 1,
+                                len(active_plan),
+                            )
                     reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
                     reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - video_continuation)
                     reference_audio = previous_audio[..., -reference_audio_t:].clone()
@@ -1183,22 +1611,15 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         len(active_plan),
                         presentations,
                     )
-                if gemma_body_overrides:
+                if gemma_description is not None:
                     continuation_video_label = f"<Video {video_number}>" if continuation and use_video_continuation else None
                     continuation_audio_label = f"<Audio {audio_number}>" if continuation and use_video_continuation else None
-                    chunk_prompt = _prompt_for_chunk(
+                    chunk_prompt = _prompt_with_gemma_description(
                         prompt,
-                        chunk["frame_start"],
-                        chunk["frame_end"],
-                        plan[-1]["frame_end"],
-                        fps,
-                        content_start=content_start,
-                        continuation=continuation,
+                        gemma_description,
                         drop_picture_anchors=continuation and not ref2va,
                         continuation_video_label=continuation_video_label,
                         continuation_audio_label=continuation_audio_label,
-                        has_opening_frames=guide_enabled,
-                        body_overrides=gemma_body_overrides,
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
@@ -1240,10 +1661,10 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         index + 1,
                         len(active_plan),
                     )
-                    vram_monitor.report(
-                        f"chunk {index + 1}/{len(active_plan)} after Qwen/VAE release",
-                        {"encoded prompt": encoded_prompt, "DiT video references": video_refs},
-                    )
+                vram_monitor.report(
+                    f"chunk {index + 1}/{len(active_plan)} after Qwen/VAE release",
+                    {"encoded prompt": encoded_prompt, "DiT video references": video_refs},
+                )
                 guider.original_conds = _conditioning_for_chunk(
                     original_conds,
                     chunk["frame_start"],
@@ -1322,6 +1743,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 denoised_audio.append(denoised_chunk_audio[..., audio_trim:].clone())
                 chunk_progress.finish(index)
                 completed_chunks = index + 1
+                timing.finish_chunk(index)
 
                 # The next chunk needs only previous_video/previous_audio and
                 # the accumulated trimmed outputs. Release this chunk's input,
@@ -1364,7 +1786,22 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             status = "complete" if sampling_completed and debug_stop_chunk == 0 else "debug stop"
             if not sampling_completed:
                 status = "incomplete"
-            timing.report(status, completed_chunks, len(active_plan))
+            timing.report(
+                status,
+                completed_chunks,
+                {
+                    "chunk_frames": max_chunk_frames,
+                    "context_keyframes": context_keyframes,
+                    "guide_overlap": guide_overlap,
+                    "video_continuation": video_continuation,
+                    "width": width,
+                    "height": height,
+                    "sampling_steps": max(0, len(sigmas) - 1),
+                    "rendered_frames": active_plan[completed_chunks - 1]["frame_end"] if completed_chunks else 0,
+                    "full_frames": plan[-1]["frame_end"],
+                    "full_chunks": len(plan),
+                },
+            )
 
         output_template["samples"] = comfy.nested_tensor.NestedTensor((
             torch.cat(output_video, dim=2),
