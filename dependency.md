@@ -48,3 +48,27 @@ curl -Ls https://raw.githubusercontent.com/MiniMax-AI/MiniMax-H3/main/skills/h3-
 
 Do not automatically refresh these mutable `main` URLs at render time. A
 reviewed repository update is required for reproducible prompt behavior.
+
+## Gemma 4 MTMD runtime
+
+The local director pins `llama-cpp-python==0.3.35` and Google's official
+`google/gemma-4-12B-it-qat-q4_0-gguf` model/projector pair. Runtime integration
+was reviewed on 2026-08-22 against:
+
+- <https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf>, especially
+  image-before-text modality ordering and the supported 70, 140, 280, 560, and
+  1120 visual-token budgets;
+- <https://github.com/ggml-org/llama.cpp/blob/master/tools/mtmd/mtmd.h>, which
+  defines the MTMD image-token budget and media batching fields;
+- <https://github.com/ggml-org/llama.cpp/issues/21550>, which records evaluation
+  failures encountered with high Gemma 4 image budgets.
+
+The pinned Python handler binds the MTMD fields but does not expose them in its
+constructor. `gemma4.py` therefore owns a narrow subclass that sets the dynamic
+70-1120 budget and keeps MTMD, logical, and physical batch capacities at least
+1120. It also sends chronological images before the observation text. Before
+updating `llama-cpp-python`, verify that the high-level handler's constructor,
+`_init_mtmd_context`, cleanup callback, MTMD structure layout, and non-causal
+image batching behavior remain compatible. Prefer an upstream public budget
+API when one becomes available, then remove the local override and rerun the
+real model plus unit tests.

@@ -30,8 +30,20 @@ def main() -> int:
             {
                 "confidence": result.confidence,
                 "analysis": result.analysis,
+                "timing_plan": result.timing_plan,
+                "end_state": result.end_state,
                 "detailed_description": result.detailed_description,
                 "raw_json": result.raw_json,
+                "validation_warnings": list(result.validation_warnings),
+                "attempts": [
+                    {
+                        "kind": attempt.kind,
+                        "raw_json": attempt.raw_json,
+                        "validation_warnings": list(attempt.validation_warnings),
+                        "correction_prompt": attempt.correction_prompt,
+                    }
+                    for attempt in result.attempts
+                ],
             },
             ensure_ascii=False,
             indent=2,

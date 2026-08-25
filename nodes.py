@@ -1,8 +1,11 @@
 import logging
 import math
 import re
+import shutil
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import psutil
 import torch
@@ -32,6 +35,13 @@ MIN_VIDEO_STEPS = 2
 CANVAS_MULTIPLE = 32
 QWEN_VIDEO_MAX_PIXELS = 512 * 512
 VRAM_DEBUG_WRAPPER_KEY = "minimax_h3_unlimited_vram_debug"
+# Set this to False only for the isolation experiment that retains the
+# five-frame visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
+# DiT references, and prompt text.
+INCLUDE_VIDEO1_REFERENCE = True
+GEMMA_PROMPT_LOG_DIRNAME = "comfyui-minimax-h3-unlimited"
+GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
+GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 DETAILED_DESCRIPTION_FIELD = re.compile(r"detailed_description\s*:", re.IGNORECASE)
 INTEGRATED_DESCRIPTION_FIELD = re.compile(r"integrated_multimodal_description\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
@@ -44,6 +54,72 @@ PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
 
 def _description_field(prompt, start=0):
     return DETAILED_DESCRIPTION_FIELD.search(prompt, start) or INTEGRATED_DESCRIPTION_FIELD.search(prompt, start)
+
+
+def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
+                                 video_continuation, fps, chunk_count):
+    """Replace the fixed temp capture so it always represents the latest run."""
+    path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / GEMMA_PROMPT_LOG_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "SamplerCustomAdvanced-Unlimited last-run Gemma chunk prompts\n"
+            f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"Configuration: chunk_frames={chunk_frames}, context_keyframes={context_keyframes}, "
+            f"guide_overlap={guide_overlap}, video_continuation={video_continuation}, "
+            f"fps={fps:g}, chunks={chunk_count}\n\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        logging.warning("SamplerCustomAdvanced-Unlimited could not initialize Gemma prompt log %s: %s", path, error)
+        return None
+    logging.info("SamplerCustomAdvanced-Unlimited writing last-run Gemma prompts to %s", path)
+    return path
+
+
+def _append_last_gemma_prompt(path, chunk_header, chunk_prompt, *, system_prompt=None,
+                              observation_prompt=None, gemma_response=None,
+                              validation_warnings=()):
+    """Flush one complete Gemma-to-H3 transcript entry immediately."""
+    if path is None:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as prompt_file:
+            if system_prompt:
+                prompt_file.write("=== GEMMA SYSTEM PROMPT ===\n")
+                prompt_file.write(system_prompt.rstrip())
+                prompt_file.write("\n\n")
+            prompt_file.write("=" * 200)
+            prompt_file.write("\n")
+            prompt_file.write(chunk_header.rstrip())
+            prompt_file.write("\n\n=== GEMMA REQUEST ===\n")
+            prompt_file.write((observation_prompt or "not available").rstrip())
+            prompt_file.write("\n\n=== GEMMA RESPONSE ===\n")
+            prompt_file.write((gemma_response or "not available").rstrip())
+            if validation_warnings:
+                prompt_file.write("\n\n=== GEMMA VALIDATION WARNINGS ===\n")
+                prompt_file.write("\n".join(f"- {warning}" for warning in validation_warnings))
+            prompt_file.write("\n\n=== FINAL H3 PROMPT ===\n")
+            prompt_file.write((chunk_prompt or "not sampled: Gemma returned no usable detailed_description; no algorithmic fallback was applied.").rstrip())
+            prompt_file.write("\n\n")
+    except OSError as error:
+        logging.warning("SamplerCustomAdvanced-Unlimited could not append Gemma prompt log %s: %s", path, error)
+
+
+def _reset_last_gemma_image_log():
+    """Replace only the fixed image subdirectory for the latest sampled run."""
+    path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / GEMMA_IMAGE_LOG_DIRNAME
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        logging.warning("SamplerCustomAdvanced-Unlimited could not reset Gemma image log %s: %s", path, error)
+        return None
+    logging.info("SamplerCustomAdvanced-Unlimited writing last-run Gemma images to %s", path)
+    return path
 
 
 def _pixel_frames(latent_t):
@@ -303,12 +379,16 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
     return planned
 
 
-def _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report=None):
-    report = "" if not gemma_report else f"\n\n{gemma_report}"
+def _debug_chunk_header(index, chunk, content_start):
     return (
         f"=== Chunk {index + 1}: sampled frames {chunk['frame_start']}-{chunk['frame_end'] - 1}; "
-        f"output frames {content_start}-{chunk['frame_end'] - 1} ==={report}\n{chunk_prompt}"
+        f"output frames {content_start}-{chunk['frame_end'] - 1} ==="
     )
+
+
+def _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report=None):
+    report = "" if not gemma_report else f"\n\n{gemma_report}"
+    return f"{_debug_chunk_header(index, chunk, content_start)}{report}\n{chunk_prompt}"
 
 
 def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, target):
@@ -340,7 +420,7 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
 
 
 def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, video_continuation,
-                                video_label, audio_label):
+                                video_label, audio_label, include_video1_reference=True):
     if not continuation:
         return "First chunk: original image/reference conditioning only; there is no previous generated chunk."
     sources = []
@@ -349,10 +429,11 @@ def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, 
             f"native fixed video/audio opening keyframes covering {context_keyframes} completed frames"
         )
     if video_continuation:
-        sources.append(
-            f"a bounded {video_continuation}-frame continuation reference as {video_label} "
-            f"with synchronized {audio_label}"
-        )
+        if include_video1_reference:
+            sources.append(
+                f"a bounded {video_continuation}-frame continuation reference as {video_label} "
+                f"with synchronized {audio_label}"
+            )
         if not context_keyframes:
             sources.append(
                 "one fixed five-frame video keyframe clip made from the previous chunk's exact final tail, "
@@ -391,13 +472,42 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
 
 
 def _gemma_report(chunk_number, result):
-    return (
+    report = (
         f"=== Gemma 4 chunk prompt director: Chunk {chunk_number} ===\n"
         f"confidence: {result.confidence}\n"
         f"progress summary: {result.analysis or 'none'}\n"
+        f"timing plan: {result.timing_plan or 'none'}\n"
+        f"Gemma-only end state: {result.end_state or 'none'}\n"
         f"H3 detailed_description: {result.detailed_description}\n"
-        f"raw JSON: {result.raw_json}"
+        f"Gemma JSON attempts:\n{_gemma_response_transcript(result)}"
     )
+    if len(result.attempts) > 1:
+        report += (
+            f"\nGemma local-marker correction: attempt 1 had marker validation errors; "
+            f"H3 uses Gemma's attempt {len(result.attempts)} response."
+        )
+    if result.validation_warnings:
+        report += "\nvalidation warnings:\n- " + "\n- ".join(result.validation_warnings)
+    return report
+
+
+def _gemma_response_transcript(result):
+    """Keep every model JSON response, including a local-marker correction."""
+    attempts = tuple(result.attempts)
+    if not attempts:
+        return result.raw_json
+    sections = []
+    for index, attempt in enumerate(attempts, 1):
+        if attempt.correction_prompt:
+            sections.append(
+                "=== GEMMA MARKER CORRECTION REQUEST ===\n"
+                + attempt.correction_prompt.rstrip()
+            )
+        section = f"=== GEMMA ATTEMPT {index}: {attempt.kind} ===\n{attempt.raw_json.rstrip()}"
+        if attempt.validation_warnings:
+            section += "\nmarker/validation findings:\n- " + "\n- ".join(attempt.validation_warnings)
+        sections.append(section)
+    return "\n\n".join(sections)
 
 
 def _resize(image, width, height, crop):
@@ -1221,6 +1331,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         warm_start_video_t = _video_steps(guide_overlap) if guide_overlap else 0
         keyframe_duration_frames = context_keyframes
         use_video_continuation = video_continuation > 0
+        include_video1_reference = use_video_continuation and INCLUDE_VIDEO1_REFERENCE
         # A multi-frame MiniMax keyframe is anchored on the target timeline; it
         # is not detached historical memory. Keep the same completed frames in
         # the opening physical target interval and trim that truthful overlap
@@ -1252,7 +1363,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             active_plan,
             fps,
             context_keyframes,
-            use_video_continuation,
+            include_video1_reference,
             ref2va,
             video_number,
             audio_number,
@@ -1265,6 +1376,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 guide_overlap,
                 video_continuation,
             )
+            if use_video_continuation and not include_video1_reference:
+                logging.info(
+                    "SamplerCustomAdvanced-Unlimited Video1 isolation experiment: "
+                    "five-frame visual boundary keyframe enabled; Qwen/DiT/prompt Video1 reference disabled"
+                )
         if prompt_preview_only:
             prompt_preview = "\n\n".join(debug_prompt for _chunk_prompt, debug_prompt in planned_prompts)
             if debug:
@@ -1280,6 +1396,15 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             if vae is None:
                 raise ValueError("video_continuation, qwen_full_history, and Gemma chunk directing require a MiniMax H3 video VAE")
 
+        gemma_prompt_log = _begin_last_gemma_prompt_log(
+            max_chunk_frames,
+            context_keyframes,
+            guide_overlap,
+            video_continuation,
+            fps,
+            len(active_plan),
+        )
+        gemma_image_log = _reset_last_gemma_image_log()
         timing = _SamplerTiming(guider.model_patcher.load_device)
         fixed_latent = latent_image.copy()
         fixed_latent["samples"] = comfy.sample.fix_empty_latent_channels(
@@ -1302,13 +1427,23 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         previous_video = None
         previous_audio = None
         previous_frame_count = None
+        # Only promote this after a stock sampler call succeeds. The next
+        # Gemma request can then pair the exact prior directed description with
+        # stills from the same rendered chunk, never with an unsampled plan.
+        previous_gemma_description = None
+        previous_gemma_timing_plan = None
+        previous_gemma_end_state = None
         output_template = None
         denoised_template = None
         completed_chunks = 0
         sampling_completed = False
         debug_prompts = []
         return_prompts = True
-        gemma_director = Gemma4ContinuityDirector(debug=debug) if gemma_director_needed else None
+        gemma_director = (
+            Gemma4ContinuityDirector(debug=debug, observation_image_directory=gemma_image_log)
+            if gemma_director_needed else None
+        )
+        gemma_system_logged = False
         preview_chunk_ranges = [
             {
                 "chunk": index + 1,
@@ -1368,6 +1503,10 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
                 gemma_description = None
                 gemma_report = None
+                gemma_system_prompt = None
+                gemma_observation_prompt = None
+                gemma_response = None
+                gemma_validation_warnings = ()
                 if gemma_director is not None:
                     observation_frames = None
                     try:
@@ -1417,8 +1556,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                 for frame_index in observation_indices
                             ]
 
-                        continuation_video_label = f"<Video {video_number}>"
-                        continuation_audio_label = f"<Audio {audio_number}>"
+                        continuation_video_label = f"<Video {video_number}>" if include_video1_reference else None
+                        continuation_audio_label = f"<Audio {audio_number}>" if include_video1_reference else None
                         request = {
                             "chunk_number": index + 1,
                             "chunk_count": len(active_plan),
@@ -1433,6 +1572,9 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                             "previous_chunk": previous_chunk,
                             "previous_shots": previous_shots,
                             "observation_frame_numbers": observation_frame_numbers,
+                            "previous_gemma_description": previous_gemma_description,
+                            "previous_gemma_timing_plan": previous_gemma_timing_plan,
+                            "previous_gemma_end_state": previous_gemma_end_state,
                             "target_shots": _gemma_shot_records(
                                 gemma_shots,
                                 content_start,
@@ -1448,6 +1590,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                 video_continuation,
                                 continuation_video_label,
                                 continuation_audio_label,
+                                include_video1_reference,
                             ),
                             "original_prompt": prompt,
                         }
@@ -1459,7 +1602,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                             result = gemma_director.direct(request, observation_frames)
                         finally:
                             timing.add("gemma4", timer_started)
+                        gemma_system_prompt = result.system_prompt or gemma_director.last_system_prompt
+                        gemma_observation_prompt = result.observation_prompt or gemma_director.last_observation_prompt
+                        gemma_response = _gemma_response_transcript(result)
                         gemma_description = result.detailed_description
+                        gemma_validation_warnings = result.validation_warnings
                         gemma_report = _gemma_report(index + 1, result)
                         if vram_monitor is not None:
                             vram_monitor.report(
@@ -1468,17 +1615,26 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     except Gemma4DependencyError:
                         raise
                     except Gemma4ObservationError as error:
+                        gemma_system_prompt = gemma_director.last_system_prompt
+                        gemma_observation_prompt = gemma_director.last_observation_prompt
+                        gemma_response = error.raw_json or f"{type(error).__name__}: {error}"
                         logging.warning(
                             "SamplerCustomAdvanced-Unlimited Gemma 4 prompt directing for chunk %d/%d failed; "
-                            "using the canonical source-prompt fallback: %s",
+                            "sampling is stopping and no algorithmic source-prompt fallback will be used: %s",
                             index + 1,
                             len(active_plan),
                             error,
                         )
-                        gemma_report = (
-                            f"=== Gemma 4 chunk prompt director: Chunk {index + 1} ===\n"
-                            f"directing failed; canonical source-prompt fallback: {error}"
+                        _append_last_gemma_prompt(
+                            gemma_prompt_log,
+                            _debug_chunk_header(index, chunk, content_start),
+                            None,
+                            system_prompt=gemma_system_prompt if not gemma_system_logged else None,
+                            observation_prompt=gemma_observation_prompt,
+                            gemma_response=gemma_response,
+                            validation_warnings=(str(error),),
                         )
+                        raise
                     finally:
                         observation_frames = None
                         if vae is not None:
@@ -1567,26 +1723,27 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                                 index + 1,
                                 len(active_plan),
                             )
-                    reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
-                    reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - video_continuation)
-                    reference_audio = previous_audio[..., -reference_audio_t:].clone()
-                    if vram_monitor is not None:
-                        vram_monitor.report(
-                            f"chunk {index + 1}/{len(active_plan)} before continuation VAE decode",
-                            {
-                                "continuation video latent": reference_latent,
-                                "continuation audio latent": reference_audio,
-                            },
-                        )
-                    # ComfyUI's native video+soundtrack presentation emits the
-                    # audio label immediately before the matching video label.
-                    video_items.append({"type": "audio"})
-                    timer_started = time.perf_counter()
-                    try:
-                        video_items.append(_decoded_video_item(vae, reference_latent))
-                    finally:
-                        timing.add("vae_context", timer_started)
-                    video_refs.append(_video_ref_block(reference_latent, reference_audio))
+                    if include_video1_reference:
+                        reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
+                        reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - video_continuation)
+                        reference_audio = previous_audio[..., -reference_audio_t:].clone()
+                        if vram_monitor is not None:
+                            vram_monitor.report(
+                                f"chunk {index + 1}/{len(active_plan)} before continuation VAE decode",
+                                {
+                                    "continuation video latent": reference_latent,
+                                    "continuation audio latent": reference_audio,
+                                },
+                            )
+                        # ComfyUI's native video+soundtrack presentation emits the
+                        # audio label immediately before the matching video label.
+                        video_items.append({"type": "audio"})
+                        timer_started = time.perf_counter()
+                        try:
+                            video_items.append(_decoded_video_item(vae, reference_latent))
+                        finally:
+                            timing.add("vae_context", timer_started)
+                        video_refs.append(_video_ref_block(reference_latent, reference_audio))
                 if continuation and qwen_full_history:
                     history_latent = torch.cat(output_video, dim=2)
                     if vram_monitor is not None:
@@ -1611,9 +1768,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         len(active_plan),
                         presentations,
                     )
-                if gemma_description is not None:
-                    continuation_video_label = f"<Video {video_number}>" if continuation and use_video_continuation else None
-                    continuation_audio_label = f"<Audio {audio_number}>" if continuation and use_video_continuation else None
+                if gemma_director is not None:
+                    if gemma_description is None:
+                        raise RuntimeError("Gemma director completed without a detailed_description")
+                    continuation_video_label = f"<Video {video_number}>" if continuation and include_video1_reference else None
+                    continuation_audio_label = f"<Audio {audio_number}>" if continuation and include_video1_reference else None
                     chunk_prompt = _prompt_with_gemma_description(
                         prompt,
                         gemma_description,
@@ -1628,6 +1787,20 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 if return_prompts:
                     debug_prompts.append(debug_prompt)
+                if gemma_director is not None:
+                    # Keep an exact, immediately flushed transcript of Gemma's
+                    # request/response and the structured prompt encoded for H3.
+                    _append_last_gemma_prompt(
+                        gemma_prompt_log,
+                        _debug_chunk_header(index, chunk, content_start),
+                        chunk_prompt,
+                        system_prompt=gemma_system_prompt if not gemma_system_logged else None,
+                        observation_prompt=gemma_observation_prompt,
+                        gemma_response=gemma_response,
+                        validation_warnings=gemma_validation_warnings,
+                    )
+                    if gemma_system_prompt:
+                        gemma_system_logged = True
                 if debug:
                     logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
                 if vram_monitor is not None:
@@ -1744,6 +1917,10 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 chunk_progress.finish(index)
                 completed_chunks = index + 1
                 timing.finish_chunk(index)
+                if gemma_director is not None:
+                    previous_gemma_description = gemma_description
+                    previous_gemma_timing_plan = result.timing_plan
+                    previous_gemma_end_state = result.end_state
 
                 # The next chunk needs only previous_video/previous_audio and
                 # the accumulated trimmed outputs. Release this chunk's input,

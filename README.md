@@ -3,6 +3,35 @@
 `SamplerCustomAdvanced-Unlimited` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long MiniMax H3 video/audio latents.
 
+## Version 0.9.0
+
+Version 0.9 is the MiniMax H3 serial-continuation release. It keeps the normal
+ComfyUI sampler workflow while sampling one deterministic full video/audio
+latent as H3-grid-aligned chunks, then returns one correctly assembled AV
+latent. It includes:
+
+- independent native H3 context-keyframes, retained latent warm-start, and
+  bounded synchronized Video1/Audio1 continuation controls, plus Qwen-only
+  full-history conditioning for experimentation;
+- automatic Gemma 4 visual chunk directing, using the full source prompt,
+  precise chunk/shot timing, prior rendered stills, prior prompt state, and a
+  local-marker correction pass so H3 receives chunk-local—not full-video—cut
+  times;
+- a self-managed local Gemma 4 12B QAT GGUF runtime with high-detail vision,
+  deterministic capture/replay fixtures, persistent last-run prompts/images,
+  and process-isolated GPU cleanup before H3 resumes;
+- chunk and sampling progress, debug prompt/VRAM diagnostics, a final H3/Qwen/
+  VAE/Gemma timing and RAM/VRAM report, and an optional stop-after-chunk
+  diagnostic control; and
+- `MiniMax H3 Unlimited Preview`: a browser-refresh-safe, ordered accumulated
+  preview with Tiny-VAE or Latent2RGB decoding, chunk colors, shot brackets,
+  frame/shot/chunk labels, timeline transport, keyboard frame stepping, and
+  interactive sampling graphs.
+
+The node is currently purpose-built for MiniMax H3; its temporal grid,
+joint-video/audio latent layout, and continuation mechanisms must not be
+assumed to apply to Wan, LTX, or other video models.
+
 ### Why this exists?
 1. by replacing just the Sampler node, Minimax H3 now produces longer than 15secs videos using the same amount of VRAM seamlessly. No complicated loop workflows and video clip concatenations. Just use a normal workflow with the new node and it just works!
 2. since we can now do longer videos with the same VRAM, why not SAVE VRAM with smaller chunks and use the left over to increase the resolution? Yep, we can do that now! We can do 2K video inference with only 16GB of VRAM now. No upscale necessary... just render 2K straight. 
@@ -76,11 +105,12 @@
     relevant shot, exact global/current/previous frame ranges, required local
     `[Shot N] At MM:SS.mmm,` cut markers, the continuation conditioning actually
     available to H3, and chronological 2 FPS stills plus the exact final frame
-    from the previous sampled chunk. Gemma freely interprets visual progress,
-    rephrases and enhances the source intent for MiniMax, and selects only what
-    fits the current slice. There is no sentence splitter or immutable action
-    ledger. Connect the H3 video `vae` for a multi-chunk render, and install this
-    node's requirements:
+    from the previous sampled chunk. Each local shot also includes its complete
+    source duration and the precise source-relative range owned by this chunk,
+    so Gemma can pace actions across the full shot and explicitly defer later
+    events. There is no sentence splitter or immutable action ledger. Connect
+    the H3 video `vae` for a multi-chunk render, and install this node's
+    requirements:
 
     ```bash
     ~/comfyui/tools/python.sh -m pip install -r /NVME/comfyui/ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-Sampler-Unlimited/requirements.txt
@@ -94,6 +124,15 @@
     cache manager cannot own or flush. The current observation is visual only:
     it does not decode or judge the generated soundtrack.
 
+    Observation images are placed in chronological order before the user text,
+    as required by Gemma 4's recommended modality order. A project-local MTMD
+    handler enables Gemma 4's dynamic visual-token range from 70 through the
+    official 1120-token maximum; `n_batch` and `n_ubatch` are both 1120 so one
+    maximum-detail non-causal image block fits intact. This preserves up to
+    2,580,480 source pixels per still instead of llama.cpp's 280-token/default
+    645,120-pixel ceiling. Smaller observation frames are not forced to the
+    maximum budget.
+
     The editable Gemma system and chunk-request messages are in
     [`gemma4_prompts.txt`](gemma4_prompts.txt). The sampler rereads that file
     before every chunk, so changing and saving it affects the next chunk
@@ -102,11 +141,27 @@
     Its instructions distill the official H3 base/full-reference rules for shot
     markers, concrete playback-order description, camera language, speaker IDs,
     exact `<d>` dialogue, audio continuity, and stable reference labels. Gemma
-    returns a factual progress summary plus the complete H3-facing local shot
-    sequence. The sampler validates exact required cut markers and rejects
-    altered/invented dialogue. `prompt_preview_only` intentionally shows the
-    static canonical plan because it promises not to load Gemma or generate the
-    previous footage Gemma would need.
+    returns a factual progress summary, a per-shot `timing_plan`, a Gemma-only
+    `end_state`, and the complete H3-facing local shot sequence. For every later
+    chunk, Gemma receives all three prior values alongside the chronological
+    stills from the same chunk. The rendered stills remain authoritative for
+    what H3 actually accomplished. Only `detailed_description` reaches H3;
+    Gemma-only metadata is withheld. A legacy `[end state]` paragraph inside a
+    returned description is extracted and logged before H3 encoding. The exact
+    sampler-calculated local shot markers are also presented in a separate
+    copy-only block; full-video/source timecodes are explicitly forbidden as
+    H3 markers. If Gemma nevertheless returns a wrong/missing/renumbered
+    marker, the sampler gives Gemma one correction request containing the
+    literal required tokens and uses that second, complete Gemma JSON response.
+    Both model responses and the correction request remain in the capture and
+    console report. If the correction is still invalid, marker, formatting, and
+    dialogue findings remain warnings: the sampler logs them and still sends
+    Gemma's usable final description unchanged to H3. It never substitutes a
+    static algorithmic prompt for a usable Gemma response. A response with no
+    usable description stops sampling instead.
+    `prompt_preview_only` intentionally shows the static canonical plan because
+    it promises not to load Gemma or generate the previous footage Gemma would
+    need.
 
     With `debug` enabled, the node also creates a temporary directory such as
     `/tmp/minimax-h3-gemma4-...` and logs its path. Every chunk gets a
@@ -136,8 +191,21 @@
    known model residency, and visible GPU tensor payloads. A failed evaluation
    emits an abbreviated CUDA allocator summary before re-raising the error.
    Gemma-directed chunks include its factual visual-progress summary,
-   confidence, accepted chunk-local description, and raw JSON in the same
-   output.
+   confidence, chunk-local description, raw JSON, and any validation warnings
+   in the same output.
+   Independently of `debug`, every normal sampler run replaces
+   `${TMPDIR}/comfyui-minimax-h3-unlimited/last_gemma_chunk_prompts.txt` and
+   flushes a readable Gemma-to-H3 transcript before each chunk samples. The
+   exact system prompt (including the vendored MiniMax guide) appears once at
+   the top. Each 200-character-separated chunk records the exact user request
+    sent beside its observation images, every raw Gemma JSON response and any
+    local-marker correction request, validation warnings, and the exact finalized
+    structured prompt subsequently encoded for H3.
+   The sibling `last_gemma_images/` directory is also deleted and recreated at
+   run start. It receives the exact JPEG payload of every chronological still
+   passed to Gemma, named by target chunk and exact global source frame.
+   An interrupted or failed run therefore retains every prompt reached so far.
+   `prompt_preview_only` does not replace either last sampled-run capture.
    Every sampling run, even with `debug` disabled, ends with a structured timing
    and memory baseline: configuration, rendered range, H3 denoising, Qwen
    encoding, each VAE purpose, Gemma 4, per-chunk timing, peak

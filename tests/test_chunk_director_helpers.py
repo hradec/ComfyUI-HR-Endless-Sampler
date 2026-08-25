@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,55 @@ class _IndexedFakeVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_last_gemma_prompt_log_is_replaced_then_flushed_per_chunk(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes.logging, "info"):
+            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, 24.0, 3)
+            nodes._append_last_gemma_prompt(
+                path,
+                "=== Chunk 1 ===",
+                "first H3 prompt",
+                system_prompt="system instructions",
+                observation_prompt="first Gemma request",
+                gemma_response='{"detailed_description":"first response"}',
+            )
+            nodes._append_last_gemma_prompt(
+                path,
+                "=== Chunk 2 ===",
+                "second H3 prompt",
+                observation_prompt="second Gemma request",
+                gemma_response='{"detailed_description":"second response"}',
+                validation_warnings=("Gemma 4 returned 2 shot markers; this chunk requires 3",),
+            )
+
+            self.assertEqual(path.name, nodes.GEMMA_PROMPT_LOG_FILENAME)
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("Configuration: chunk_frames=39, context_keyframes=0", content)
+            self.assertEqual(content.count("=== GEMMA SYSTEM PROMPT ==="), 1)
+            self.assertIn("=== GEMMA SYSTEM PROMPT ===\nsystem instructions", content)
+            separator = "=" * 200
+            self.assertIn(f"{separator}\n=== Chunk 1 ===", content)
+            self.assertIn(f"{separator}\n=== Chunk 2 ===", content)
+            self.assertLess(content.index("first Gemma request"), content.index("first response"))
+            self.assertLess(content.index("first response"), content.index("first H3 prompt"))
+            self.assertLess(content.index("second Gemma request"), content.index("second response"))
+            self.assertLess(content.index("second response"), content.index("second H3 prompt"))
+            self.assertIn("=== GEMMA VALIDATION WARNINGS ===", content)
+            self.assertIn("Gemma 4 returned 2 shot markers; this chunk requires 3", content)
+
+            replacement = nodes._begin_last_gemma_prompt_log(56, 5, 0, 0, 24.0, 2)
+            replacement_content = replacement.read_text(encoding="utf-8")
+            self.assertIn("Configuration: chunk_frames=56, context_keyframes=5", replacement_content)
+            self.assertNotIn("first Gemma request", replacement_content)
+
+            image_directory = nodes._reset_last_gemma_image_log()
+            stale_image = image_directory / "stale.jpg"
+            stale_image.write_bytes(b"stale")
+            replacement_image_directory = nodes._reset_last_gemma_image_log()
+            self.assertEqual(replacement_image_directory, image_directory)
+            self.assertFalse(stale_image.exists())
+
     def test_observation_samples_only_retained_previous_output(self):
         frames, indices = nodes._decoded_video_frames(
             _FakeVAE(),
