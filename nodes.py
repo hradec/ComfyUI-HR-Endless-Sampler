@@ -34,12 +34,12 @@ VIDEO_FPS = 24
 MIN_VIDEO_STEPS = 2
 CANVAS_MULTIPLE = 32
 QWEN_VIDEO_MAX_PIXELS = 512 * 512
-VRAM_DEBUG_WRAPPER_KEY = "minimax_h3_unlimited_vram_debug"
+VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
 # Set this to False only for the isolation experiment that retains the
 # five-frame visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
 # DiT references, and prompt text.
 INCLUDE_VIDEO1_REFERENCE = True
-GEMMA_PROMPT_LOG_DIRNAME = "comfyui-minimax-h3-unlimited"
+GEMMA_PROMPT_LOG_DIRNAME = "comfyui-hr-endless-sampler"
 GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 DETAILED_DESCRIPTION_FIELD = re.compile(r"detailed_description\s*:", re.IGNORECASE)
@@ -63,7 +63,7 @@ def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "SamplerCustomAdvanced-Unlimited last-run Gemma chunk prompts\n"
+            "HR Endless Sampler last-run Gemma chunk prompts\n"
             f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
             f"Configuration: chunk_frames={chunk_frames}, context_keyframes={context_keyframes}, "
             f"guide_overlap={guide_overlap}, video_continuation={video_continuation}, "
@@ -71,9 +71,9 @@ def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
             encoding="utf-8",
         )
     except OSError as error:
-        logging.warning("SamplerCustomAdvanced-Unlimited could not initialize Gemma prompt log %s: %s", path, error)
+        logging.warning("HR Endless Sampler could not initialize Gemma prompt log %s: %s", path, error)
         return None
-    logging.info("SamplerCustomAdvanced-Unlimited writing last-run Gemma prompts to %s", path)
+    logging.info("HR Endless Sampler writing last-run Gemma prompts to %s", path)
     return path
 
 
@@ -103,7 +103,7 @@ def _append_last_gemma_prompt(path, chunk_header, chunk_prompt, *, system_prompt
             prompt_file.write((chunk_prompt or "not sampled: Gemma returned no usable detailed_description; no algorithmic fallback was applied.").rstrip())
             prompt_file.write("\n\n")
     except OSError as error:
-        logging.warning("SamplerCustomAdvanced-Unlimited could not append Gemma prompt log %s: %s", path, error)
+        logging.warning("HR Endless Sampler could not append Gemma prompt log %s: %s", path, error)
 
 
 def _append_gemma_timing_plan(path, timing_plan, *, system_prompt=None,
@@ -131,7 +131,7 @@ def _append_gemma_timing_plan(path, timing_plan, *, system_prompt=None,
             prompt_file.write((timing_plan or "not available: sampling stopped before Chunk 1.").rstrip())
             prompt_file.write("\n\n")
     except OSError as error:
-        logging.warning("SamplerCustomAdvanced-Unlimited could not append Gemma timing plan log %s: %s", path, error)
+        logging.warning("HR Endless Sampler could not append Gemma timing plan log %s: %s", path, error)
 
 
 def _reset_last_gemma_image_log():
@@ -144,9 +144,9 @@ def _reset_last_gemma_image_log():
             shutil.rmtree(path)
         path.mkdir(parents=True, exist_ok=False)
     except OSError as error:
-        logging.warning("SamplerCustomAdvanced-Unlimited could not reset Gemma image log %s: %s", path, error)
+        logging.warning("HR Endless Sampler could not reset Gemma image log %s: %s", path, error)
         return None
-    logging.info("SamplerCustomAdvanced-Unlimited writing last-run Gemma images to %s", path)
+    logging.info("HR Endless Sampler writing last-run Gemma images to %s", path)
     return path
 
 
@@ -637,15 +637,15 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
             kind = ref["kind"]
             if kind == "image":
                 if image_index >= len(image_list):
-                    raise ValueError("SamplerCustomAdvanced-Unlimited needs every Ref2VA reference image in the images input")
+                    raise ValueError("HR Endless Sampler needs every Ref2VA reference image in the images input")
                 ref_items.append({"type": "image", "data": _reference_image(image_list[image_index], width, height)})
                 image_index += 1
             elif kind == "audio":
                 ref_items.append({"type": "audio"})
             elif kind in ("video", "video_audio"):
-                raise ValueError("SamplerCustomAdvanced-Unlimited cannot rebuild video Ref2VA conditioning from an images input")
+                raise ValueError("HR Endless Sampler cannot rebuild video Ref2VA conditioning from an images input")
         if image_index != len(image_list):
-            raise ValueError("SamplerCustomAdvanced-Unlimited received more images than the Ref2VA conditioning uses")
+            raise ValueError("HR Endless Sampler received more images than the Ref2VA conditioning uses")
         ref_items.extend(video_items)
         return clip.tokenize(prompt, minimax_ref_items=ref_items)
 
@@ -661,7 +661,7 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
 def _encode_prompt(clip, prompt, images, positive, width, height, continuation, video_items=()):
     conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items))
     if len(conditioning) != 1:
-        raise ValueError("SamplerCustomAdvanced-Unlimited expects one MiniMax H3 conditioning segment")
+        raise ValueError("HR Endless Sampler expects one MiniMax H3 conditioning segment")
     return conditioning[0]
 
 
@@ -671,11 +671,11 @@ def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
     context_video_t = _bounded_video_steps(overlap_frames, max_chunk_frames, "physical_overlap")
 
     if video_t < MIN_VIDEO_STEPS or (video_t - MIN_VIDEO_STEPS) % 5:
-        raise ValueError("SamplerCustomAdvanced-Unlimited expects a MiniMax H3 video latent on the 17k+5 frame grid")
+        raise ValueError("HR Endless Sampler expects a MiniMax H3 video latent on the 17k+5 frame grid")
 
     total_frames = _pixel_frames(video_t)
     if audio_t != _audio_steps(total_frames):
-        raise ValueError("SamplerCustomAdvanced-Unlimited expects a MiniMax H3 audio latent matching the video duration")
+        raise ValueError("HR Endless Sampler expects a MiniMax H3 audio latent matching the video duration")
 
     plan = []
     video_end = 0
@@ -746,7 +746,7 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
     positive = conds.get("positive")
     if positive is None:
-        raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
+        raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
 
     cross_attn, prompt_metadata = encoded_prompt
     for cond in positive:
@@ -852,7 +852,7 @@ def _vram_report(stage, device, components=(), tensors=None):
     mib = 1024 ** 2
     total = comfy.model_management.get_total_memory(device)
     comfy_free, torch_cache_free = comfy.model_management.get_free_memory(device, torch_free_too=True)
-    lines = [f"SamplerCustomAdvanced-Unlimited VRAM [{stage}] on {device}:"]
+    lines = [f"HR Endless Sampler VRAM [{stage}] on {device}:"]
     backend = _memory_backend(device)
     if backend is not None:
         stats = backend.memory_stats(device)
@@ -965,7 +965,7 @@ class _VRAMMonitor:
         except Exception:
             self.report(label + " FAILED", tensors, sample_group="dit")
             if self.debug and self.device.type == "cuda":
-                logging.info("SamplerCustomAdvanced-Unlimited CUDA allocator after failure:\n%s", torch.cuda.memory_summary(self.device, abbreviated=True))
+                logging.info("HR Endless Sampler CUDA allocator after failure:\n%s", torch.cuda.memory_summary(self.device, abbreviated=True))
             raise
         self.report(label + " after", {"model output": result}, sample_group="dit")
         return result
@@ -1075,7 +1075,7 @@ class _SamplerTiming:
             self._poll_stop.clear()
             self._poll_thread = threading.Thread(
                 target=self._poll_memory,
-                name="minimax-h3-unlimited-memory",
+                name="hr-endless-sampler-memory",
                 daemon=True,
             )
             self._poll_thread.start()
@@ -1259,7 +1259,7 @@ class _SamplerTiming:
             f"guide_overlap={run['guide_overlap']}, video_continuation={run['video_continuation']}"
         )
         lines = [
-            "SamplerCustomAdvanced-Unlimited run report:",
+            "HR Endless Sampler run report:",
             "",
             "Baseline from this run:",
             f"  Configuration: {configuration}",
@@ -1332,51 +1332,37 @@ class _SamplerTiming:
         logging.info("\n".join(lines))
 
 
-class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
+class HREndlessSampler(SamplerCustomAdvanced):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="SamplerCustomAdvanced-Unlimited",
-            display_name="SamplerCustomAdvanced-Unlimited",
+            node_id="HREndlessSampler",
+            display_name="HR Endless Sampler",
             category="model/sampling/custom",
-            description="Samples a long MiniMax H3 AV latent as continuation-guided temporal chunks. Replace SamplerCustomAdvanced and set the largest chunk that fits in VRAM.",
+            description="Samples a long video latent as continuation-guided temporal chunks. Replace SamplerCustomAdvanced and set the largest chunk that fits in VRAM. The current chunking backend is MiniMax H3.",
             inputs=[
                 io.Noise.Input("noise", lazy=True),
                 io.Guider.Input("guider"),
                 io.Sampler.Input("sampler", lazy=True),
                 io.Sigmas.Input("sigmas", lazy=True),
                 io.Latent.Input("latent_image"),
-                io.Clip.Input("clip", lazy=True, tooltip="The same MiniMax H3 CLIP used to encode the original conditioning."),
+                io.Clip.Input("clip", lazy=True, tooltip="The CLIP used to encode the original conditioning for the current model backend."),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True,
-                                tooltip="MiniMax prompt using [Shot 1] and [Shot N] At MM:SS.mmm, markers."),
+                                tooltip="The original model prompt. MiniMax H3 currently uses [Shot 1] and [Shot N] At MM:SS.mmm, markers."),
                 io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.001,
                                tooltip="FPS used to convert source-prompt cut timestamps to exact frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
-                             tooltip="Maximum H3 frames sampled at once. Values are snapped down to the 17k+5 frame grid."),
-                io.Boolean.Input("context_keyframes_enable", default=True,
-                                 tooltip="Enable native completed-frame keyframes. When disabled, the effective context_keyframes value is 0."),
-                io.Int.Input("context_keyframes", default=5, min=5, max=3600, step=17,
-                             tooltip="Completed video/audio tail anchored over the same opening target frames: 5, 22, 39, 56, ... Those truthful overlap frames are sampled again and trimmed before assembly."),
+                             tooltip="Maximum frames sampled at once. MiniMax H3 values are snapped down to its 17k+5 frame grid."),
+                io.Image.Input("images", optional=True,
+                               tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
+                io.Int.Input("video_continuation", default=5, min=5, max=3600, step=17,
+                             tooltip="Completed continuation tail length. MiniMax H3 currently uses the synchronized Ref2VA <Audio N> + <Video N> continuation path; it must be smaller than chunk_frames."),
+                io.Vae.Input("vae", optional=True,
+                             tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots to the console. chunk_prompts is returned whether debug is enabled or not."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
-                io.Image.Input("images", optional=True,
-                               tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
-                io.Boolean.Input("guide_overlap_enable", default=True,
-                                 tooltip="Enable retained latent warm-starting from the previous chunk. When disabled, the effective guide_overlap value is 0."),
-                io.Int.Input("guide_overlap", default=5, min=5, max=3600, step=17,
-                             tooltip="Previous-tail latent used to initialize the first retained positions of each new chunk: 5, 22, 39, 56, ... The positions are fully denoised, kept in the output, and not described as overlap in the prompt."),
-                io.Boolean.Input("video_continuation_enable", default=False,
-                                 tooltip="Enable the synchronized native Ref2VA <Audio N> + <Video N> tail. With context keyframes off, also anchor the previous final five-frame video tail across the discarded packing prefix. When disabled, the effective value is 0."),
-                io.Int.Input("video_continuation", default=5, min=5, max=3600, step=17,
-                             tooltip="Synchronized native Ref2VA <Audio N> + <Video N> tail length: 5, 22, 39, 56, ... and must be smaller than chunk_frames. With context keyframes off, its exact final five-frame latent tail becomes a visual-only keyframe over the discarded packing prefix. Requires the video vae."),
-                io.Boolean.Input("qwen_full_history", default=False,
-                                 tooltip="Experimental: show Qwen 2 FPS frames decoded from all completed output before each chunk. Does not add a DiT video reference or rewrite the prompt. Requires vae."),
-                io.Boolean.Input("prompt_preview_only", default=False, optional=True,
-                                 tooltip="Build and return every chunk prompt without generating noise, encoding per-chunk conditioning, loading the DiT/VAE, or running inference. Latent outputs are unchanged placeholders while enabled."),
-                io.Vae.Input("vae", optional=True,
-                             tooltip="MiniMax H3 video VAE. Required for video_continuation, qwen_full_history, and Gemma visual directing after Chunk 1. Gemma directs Chunk 1 from text alone. Continuation audio remains latent."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -1386,20 +1372,25 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         )
 
     @classmethod
-    def check_lazy_status(cls, prompt_preview_only=False, noise=None, sampler=None, sigmas=None, clip=None, **_kwargs):
-        if prompt_preview_only:
-            return []
+    def check_lazy_status(cls, noise=None, sampler=None, sigmas=None, clip=None, **_kwargs):
         lazy_inputs = {"noise": noise, "sampler": sampler, "sigmas": sigmas, "clip": clip}
         return [name for name, value in lazy_inputs.items() if value is None]
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
-                prompt_preview_only=False, debug_stop_chunk=0, images=None,
-                context_keyframes_enable=True, context_keyframes=5,
-                guide_overlap_enable=True, guide_overlap=5,
-                video_continuation_enable=False, video_continuation=5,
-                qwen_full_history=False, vae=None,
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
+                video_continuation=5, vae=None, debug=False, debug_stop_chunk=0,
                 **_deprecated_inputs):
+        # Keep the former experiment code available for development, but make
+        # the released UI a single, unambiguous continuation method. Ignore
+        # serialized legacy values too: an old workflow must not quietly enable
+        # an experimental overlap, keyframe, Qwen-history, or preview-only path.
+        prompt_preview_only = False
+        context_keyframes_enable = False
+        context_keyframes = 5
+        guide_overlap_enable = False
+        guide_overlap = 5
+        video_continuation_enable = True
+        qwen_full_history = False
         samples = latent_image["samples"]
         if not samples.is_nested:
             if prompt_preview_only:
@@ -1415,12 +1406,6 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             return io.NodeOutput(sampled[0], sampled[1], "")
 
         video, audio = streams
-        # Workflows saved before this rename still call the old widgets. Accept
-        # them once, but expose only the clearer context_keyframes controls.
-        if "context_frames_enable" in _deprecated_inputs:
-            context_keyframes_enable = _deprecated_inputs["context_frames_enable"]
-        if "context_frames" in _deprecated_inputs:
-            context_keyframes = _deprecated_inputs["context_frames"]
         context_keyframes = int(context_keyframes_enable) * context_keyframes
         guide_overlap = int(guide_overlap_enable) * guide_overlap
         video_continuation = int(video_continuation_enable) * video_continuation
@@ -1453,7 +1438,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
         if positive is None:
-            raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
+            raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
         if len(active_plan) > 1 and (use_video_continuation or qwen_full_history) and not ref2va:
             raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
@@ -1473,7 +1458,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         )
         if debug:
             logging.info(
-                "SamplerCustomAdvanced-Unlimited independent continuation controls: "
+                "HR Endless Sampler independent continuation controls: "
                 "context_keyframes=%d, guide_overlap=%d, video_continuation=%d",
                 context_keyframes,
                 guide_overlap,
@@ -1481,20 +1466,20 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             )
             if use_video_continuation and not include_video1_reference:
                 logging.info(
-                    "SamplerCustomAdvanced-Unlimited Video1 isolation experiment: "
+                    "HR Endless Sampler Video1 isolation experiment: "
                     "five-frame visual boundary keyframe enabled; Qwen/DiT/prompt Video1 reference disabled"
                 )
         if prompt_preview_only:
             prompt_preview = "\n\n".join(debug_prompt for _chunk_prompt, debug_prompt in planned_prompts)
             if debug:
                 logging.info(
-                    "SamplerCustomAdvanced-Unlimited prompt-preview-only execution; sampling skipped:\n%s",
+                    "HR Endless Sampler prompt-preview-only execution; sampling skipped:\n%s",
                     prompt_preview,
                 )
             return io.NodeOutput(latent_image, latent_image, prompt_preview)
 
         if len(active_plan) > 1 and "noise_mask" in latent_image:
-            raise ValueError("SamplerCustomAdvanced-Unlimited does not support denoise masks when chunking")
+            raise ValueError("HR Endless Sampler does not support denoise masks when chunking")
         if len(active_plan) > 1 and (use_video_continuation or qwen_full_history or gemma_director_needed):
             if vae is None:
                 raise ValueError("video_continuation, qwen_full_history, and Gemma chunk directing require a MiniMax H3 video VAE")
@@ -1518,7 +1503,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         )
         full_noise = noise.generate_noise(fixed_latent)
         if not full_noise.is_nested or len(full_noise.unbind()) != 2:
-            raise ValueError("SamplerCustomAdvanced-Unlimited expected nested video and audio noise")
+            raise ValueError("HR Endless Sampler expected nested video and audio noise")
         video_noise, audio_noise = full_noise.unbind()
 
         width = int(video.shape[4]) * 16
@@ -1633,7 +1618,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         validation_warnings=gemma_preproduction_timing_plan.validation_warnings,
                     )
                     logging.info(
-                        "SamplerCustomAdvanced-Unlimited Gemma 4 preproduction timing plan is ready for %d source shots.",
+                        "HR Endless Sampler Gemma 4 preproduction timing plan is ready for %d source shots.",
                         len(gemma_preproduction_timing_plan.shots),
                     )
                     vram_monitor.report("after Gemma 4 shot-timing preproduction release")
@@ -1641,7 +1626,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     raise
                 except Gemma4ObservationError as error:
                     logging.warning(
-                        "SamplerCustomAdvanced-Unlimited Gemma 4 shot-timing preproduction failed; "
+                        "HR Endless Sampler Gemma 4 shot-timing preproduction failed; "
                         "sampling is stopping before Chunk 1 and no sampler-authored timing fallback will be used: %s",
                         error,
                     )
@@ -1797,7 +1782,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         gemma_observation_prompt = gemma_director.last_observation_prompt
                         gemma_response = error.raw_json or f"{type(error).__name__}: {error}"
                         logging.warning(
-                            "SamplerCustomAdvanced-Unlimited Gemma 4 prompt directing for chunk %d/%d failed; "
+                            "HR Endless Sampler Gemma 4 prompt directing for chunk %d/%d failed; "
                             "sampling is stopping and no algorithmic source-prompt fallback will be used: %s",
                             index + 1,
                             len(active_plan),
@@ -1833,7 +1818,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     prefix_latent["samples"] = comfy.nested_tensor.NestedTensor((prefix_video, prefix_audio))
                     prefix_noise = noise.generate_noise(prefix_latent)
                     if not prefix_noise.is_nested or len(prefix_noise.unbind()) != 2:
-                        raise ValueError("SamplerCustomAdvanced-Unlimited expected nested video and audio prefix noise")
+                        raise ValueError("HR Endless Sampler expected nested video and audio prefix noise")
                     prefix_video_noise, prefix_audio_noise = prefix_noise.unbind()
                     chunk_video = torch.cat((prefix_video, chunk_video), dim=2)
                     chunk_audio = torch.cat((prefix_audio, chunk_audio), dim=-1)
@@ -1857,7 +1842,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         chunk_video[:, :, warm_start:warm_end] = previous_video[:, :, -warm_count:]
                         if debug:
                             logging.info(
-                                "SamplerCustomAdvanced-Unlimited chunk %d/%d retained latent warm-start: "
+                                "HR Endless Sampler chunk %d/%d retained latent warm-start: "
                                 "%d previous-tail video tokens copied to kept local tokens %d-%d",
                                 index + 1,
                                 len(active_plan),
@@ -1896,7 +1881,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         video_context_start = boundary_keyframe_index
                         if debug:
                             logging.info(
-                                "SamplerCustomAdvanced-Unlimited chunk %d/%d Video1 boundary keyframe: "
+                                "HR Endless Sampler chunk %d/%d Video1 boundary keyframe: "
                                 "previous final five-frame latent tail anchored across discarded local frames 0-4",
                                 index + 1,
                                 len(active_plan),
@@ -1941,7 +1926,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         for item in video_items if item["type"] == "video"
                     )
                     logging.info(
-                        "SamplerCustomAdvanced-Unlimited chunk %d/%d Qwen video presentation: %s",
+                        "HR Endless Sampler chunk %d/%d Qwen video presentation: %s",
                         index + 1,
                         len(active_plan),
                         presentations,
@@ -1980,7 +1965,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     if gemma_system_prompt:
                         gemma_system_logged = True
                 if debug:
-                    logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
+                    logging.info("HR Endless Sampler debug:\n%s", debug_prompt)
                 if vram_monitor is not None:
                     vram_monitor.report(
                         f"chunk {index + 1}/{len(active_plan)} before Qwen encode",
@@ -2007,7 +1992,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     comfy.model_management.unload_model_and_clones(vae.patcher)
                 if debug:
                     logging.info(
-                        "SamplerCustomAdvanced-Unlimited released Qwen%s before chunk %d/%d",
+                        "HR Endless Sampler released Qwen%s before chunk %d/%d",
                         " and the H3 video VAE" if vae is not None else "",
                         index + 1,
                         len(active_plan),

@@ -124,17 +124,17 @@ function formatEta(seconds) {
 }
 
 
-api.addEventListener("minimax_h3_unlimited_preview", event => {
+api.addEventListener("hr_endless_sampler_preview", event => {
     const data = event.detail;
     const node = data?.node_id == null ? null : findNode(app.graph, data.node_id);
-    node?._minimaxUnlimitedPreview?.(data);
+    node?._hrEndlessSamplerPreview?.(data);
 });
 
 
 app.registerExtension({
-    name: "MiniMaxH3.UnlimitedPreview",
+    name: "HREndlessSampler.Preview",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData?.name !== "MiniMaxH3UnlimitedPreview") return;
+        if (nodeData?.name !== "HREndlessSamplerPreview") return;
 
         const previousCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -192,7 +192,7 @@ app.registerExtension({
 
             const status = document.createElement("div");
             status.style.cssText = "box-sizing:border-box;padding:7px 9px 3px;background:#1b1b1b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-            status.textContent = "Waiting for SamplerCustomAdvanced-Unlimited…";
+            status.textContent = "Waiting for HR Endless Sampler…";
             root.appendChild(status);
 
             const graphs = document.createElement("div");
@@ -731,7 +731,7 @@ app.registerExtension({
                 redrawGraphs();
             }
 
-            node._minimaxUnlimitedPreview = data => {
+            node._hrEndlessSamplerPreview = data => {
                 if (data.action === "reset") {
                     if (execution !== null && Number(data.execution) < Number(execution)) return;
                     resetExecution(data);
@@ -840,25 +840,25 @@ app.registerExtension({
                     // so restored playback starts at the visible FPS value.
                     setPlaybackFps(fpsWidget?.value, false);
                     const response = await api.fetchApi(
-                        `/minimax_h3_unlimited_preview/state?node_id=${encodeURIComponent(node.id)}`,
+                        `/hr_endless_sampler_preview/state?node_id=${encodeURIComponent(node.id)}`,
                         { cache: "no-store" },
                     );
                     if (!response.ok) return;
                     const snapshot = await response.json();
                     if (!snapshot?.reset) return;
                     if (execution !== null && Number(snapshot.execution) < Number(execution)) return;
-                    node._minimaxUnlimitedPreview(snapshot.reset);
-                    if (snapshot.sample_start) node._minimaxUnlimitedPreview(snapshot.sample_start);
-                    if (snapshot.progress) node._minimaxUnlimitedPreview(snapshot.progress);
-                    for (const chunk of snapshot.chunks || []) node._minimaxUnlimitedPreview(chunk);
+                    node._hrEndlessSamplerPreview(snapshot.reset);
+                    if (snapshot.sample_start) node._hrEndlessSamplerPreview(snapshot.sample_start);
+                    if (snapshot.progress) node._hrEndlessSamplerPreview(snapshot.progress);
+                    for (const chunk of snapshot.chunks || []) node._hrEndlessSamplerPreview(chunk);
                     if (Array.isArray(snapshot.deltas)) deltas = snapshot.deltas.slice();
                     if (Array.isArray(snapshot.step_times)) stepTimes = snapshot.step_times.slice();
                     renderStatus();
                     redrawGraphs();
-                    if (snapshot.complete) node._minimaxUnlimitedPreview(snapshot.complete);
+                    if (snapshot.complete) node._hrEndlessSamplerPreview(snapshot.complete);
                     if (hoverStep == null && timer == null && !framePending) restorePlayback();
                 } catch (error) {
-                    console.warn("MiniMax H3 preview history restore failed", error);
+                    console.warn("HR Endless Sampler preview history restore failed", error);
                 }
             }
 
@@ -925,7 +925,7 @@ app.registerExtension({
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);
-            node.addDOMWidget("preview", "minimax_h3_unlimited_preview", root, { serialize: false });
+            node.addDOMWidget("preview", "hr_endless_sampler_preview", root, { serialize: false });
             node.setSize([Math.max(node.size?.[0] || 460, 460), Math.max(node.size?.[1] || 540, 540)]);
 
             fpsWidget = node.widgets?.find(widget => widget.name === "fps");
@@ -945,7 +945,7 @@ app.registerExtension({
                 stop();
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 resizeObserver.disconnect();
-                node._minimaxUnlimitedPreview = null;
+                node._hrEndlessSamplerPreview = null;
                 previousRemoved?.apply(this, arguments);
             };
         };

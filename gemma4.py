@@ -366,7 +366,7 @@ def _ensure_model_files() -> tuple[Path, Path]:
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     logging.info(
-        "MiniMax H3 Unlimited is downloading the Gemma 4 continuity model to %s. "
+        "HR Endless Sampler is downloading the Gemma 4 continuity model to %s. "
         "This one-time download is about 7.2 GB.",
         model_path.parent,
     )
@@ -1529,7 +1529,7 @@ def _capture_observation_request(capture_root: Path, sequence: int, request: dic
         _capture_data_url(str(image_url), capture_dir / filename)
         image_files.append(filename)
     manifest = {
-        "format": "minimax-h3-gemma4-capture-v2",
+        "format": "hr-endless-sampler-gemma4-capture-v2",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "chunk_number": chunk_number,
         "image_files": image_files,
@@ -1904,10 +1904,10 @@ class Gemma4ContinuityDirector:
             self.observation_image_directory.mkdir(parents=True, exist_ok=True)
         if debug:
             if capture_directory is None:
-                capture_directory = tempfile.mkdtemp(prefix="minimax-h3-gemma4-")
+                capture_directory = tempfile.mkdtemp(prefix="hr-endless-sampler-gemma4-")
             self.capture_directory = Path(capture_directory)
             self.capture_directory.mkdir(parents=True, exist_ok=True)
-            logging.info("SamplerCustomAdvanced-Unlimited Gemma capture directory: %s", self.capture_directory)
+            logging.info("HR Endless Sampler Gemma capture directory: %s", self.capture_directory)
 
     def plan_timing(self, request: dict[str, Any]) -> GemmaShotTimingPlan:
         """Create the immutable Gemma action schedule before any H3 chunk runs."""
@@ -1921,7 +1921,7 @@ class Gemma4ContinuityDirector:
         self.last_timing_planning_prompt = result.planning_prompt or self.last_timing_planning_prompt
         if len(result.attempts) > 1:
             logging.warning(
-                "SamplerCustomAdvanced-Unlimited Gemma 4 preproduction timing plan needed one model-authored correction; "
+                "HR Endless Sampler Gemma 4 preproduction timing plan needed one model-authored correction; "
                 "the corrected complete schedule will be used."
             )
         return result
@@ -1957,7 +1957,7 @@ class Gemma4ContinuityDirector:
                 )
             except (OSError, Gemma4ObservationError, ValueError) as error:
                 logging.warning(
-                    "SamplerCustomAdvanced-Unlimited could not save last-run Gemma images to %s: %s",
+                    "HR Endless Sampler could not save last-run Gemma images to %s: %s",
                     self.observation_image_directory,
                     error,
                 )
@@ -1977,12 +1977,12 @@ class Gemma4ContinuityDirector:
             raise
         if capture_dir is not None:
             _write_capture_result(capture_dir, result)
-            logging.info("SamplerCustomAdvanced-Unlimited saved Gemma fixture: %s", capture_dir)
+            logging.info("HR Endless Sampler saved Gemma fixture: %s", capture_dir)
         if len(result.attempts) > 1:
             initial_contract_warnings = _contract_validation_warnings(result.attempts[0].validation_warnings)
             if initial_contract_warnings:
                 logging.warning(
-                    "SamplerCustomAdvanced-Unlimited Gemma 4 initial response for chunk %d violated "
+                    "HR Endless Sampler Gemma 4 initial response for chunk %d violated "
                     "the H3 local marker/current-slice coverage contract; requested one Gemma-generated correction and will use "
                     "that response:\n- %s",
                     chunk_number,
@@ -1992,7 +1992,7 @@ class Gemma4ContinuityDirector:
         self.last_observation_prompt = result.observation_prompt or self.last_observation_prompt
         if result.validation_warnings:
             logging.warning(
-                "SamplerCustomAdvanced-Unlimited Gemma 4 response for chunk %d has validation warning(s); "
+                "HR Endless Sampler Gemma 4 response for chunk %d has validation warning(s); "
                 "using Gemma's detailed_description unchanged:\n- %s",
                 chunk_number,
                 "\n- ".join(result.validation_warnings),

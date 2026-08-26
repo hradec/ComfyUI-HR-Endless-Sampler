@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,31 @@ class _IndexedFakeVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_hr_endless_sampler_schema_hides_retired_experiments_and_puts_debug_last(self):
+        schema = nodes.HREndlessSampler.define_schema()
+        input_ids = [item.id for item in schema.inputs]
+
+        self.assertEqual(schema.node_id, "HREndlessSampler")
+        self.assertEqual(schema.display_name, "HR Endless Sampler")
+        self.assertIn("video_continuation", input_ids)
+        self.assertNotIn("video_continuation_enable", input_ids)
+        self.assertFalse({
+            "context_keyframes_enable",
+            "context_keyframes",
+            "guide_overlap_enable",
+            "guide_overlap",
+            "qwen_full_history",
+            "prompt_preview_only",
+        } & set(input_ids))
+        self.assertEqual(input_ids[-2:], ["debug", "debug_stop_chunk"])
+
+        execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
+        self.assertNotIn("video_continuation_enable", execute_params)
+        self.assertNotIn("context_keyframes_enable", execute_params)
+        self.assertNotIn("guide_overlap_enable", execute_params)
+        self.assertNotIn("qwen_full_history", execute_params)
+        self.assertNotIn("prompt_preview_only", execute_params)
+
     def test_preview_chunk_metadata_survives_a_server_state_restore(self):
         node_id = "preview-tooltip-test"
         with preview._PREVIEW_CACHE_LOCK:
@@ -377,7 +403,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             timing.report("complete", 2, run)
 
         report = log_info.call_args.args[0]
-        self.assertIn("SamplerCustomAdvanced-Unlimited run report:", report)
+        self.assertIn("HR Endless Sampler run report:", report)
         self.assertIn("Baseline from this run:", report)
         self.assertIn("VRAM baseline:", report)
         self.assertIn("  Peak Time: 20.00s (VRAM closer to Peak than Average; above 11.00 GiB)", report)

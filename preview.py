@@ -26,7 +26,7 @@ except ImportError:
     PromptServer = None
 
 
-PREVIEW_WRAPPER_KEY = "minimax_h3_unlimited_preview"
+PREVIEW_WRAPPER_KEY = "hr_endless_sampler_preview"
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _PREVIEW_CACHE_LIMIT = 8
 _PREVIEW_CACHE = OrderedDict()
@@ -122,8 +122,8 @@ def _cached_snapshot(node_id):
 
 _PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instance", None)
 if _PROMPT_SERVER is not None:
-    @_PROMPT_SERVER.routes.get("/minimax_h3_unlimited_preview/state")
-    async def minimax_h3_unlimited_preview_state(request):
+    @_PROMPT_SERVER.routes.get("/hr_endless_sampler_preview/state")
+    async def hr_endless_sampler_preview_state(request):
         snapshot = _cached_snapshot(request.rel_url.query.get("node_id", ""))
         return web.json_response(snapshot or {}, headers={"Cache-Control": "no-store"})
 
@@ -132,7 +132,7 @@ class _LatestEncoder:
     def __init__(self):
         self.tasks = queue.Queue(maxsize=1)
         self.stopping = False
-        self.thread = threading.Thread(target=self._run, name="minimax_h3_preview_encoder", daemon=True)
+        self.thread = threading.Thread(target=self._run, name="hr_endless_sampler_preview_encoder", daemon=True)
         self.thread.start()
 
     def submit(self, task):
@@ -159,7 +159,7 @@ class _LatestEncoder:
             try:
                 task()
             except Exception:
-                logging.exception("MiniMax H3 accumulated preview encoding failed")
+                logging.exception("HR Endless Sampler preview encoding failed")
             if self.stopping and self.tasks.empty():
                 return
 
@@ -263,7 +263,7 @@ def _latent_rgb_frames(video, latent_format, indices, max_resolution):
 
 def _tiny_frames(video, decoder, indices, max_resolution):
     if decoder.latent_channels != video.shape[1]:
-        raise ValueError(f"tiny VAE expects {decoder.latent_channels} latent channels, but MiniMax H3 uses {video.shape[1]}")
+        raise ValueError(f"tiny VAE expects {decoder.latent_channels} latent channels, but the active video latent uses {video.shape[1]}")
     return [_tensor_image(decoder.decode_frame(video[0, :, index].unsqueeze(0)), max_resolution) for index in indices]
 
 
@@ -295,9 +295,9 @@ def _send(payload):
     prompt_server = None if PromptServer is None else getattr(PromptServer, "instance", None)
     if prompt_server is not None:
         try:
-            prompt_server.send_sync("minimax_h3_unlimited_preview", payload, prompt_server.client_id)
+            prompt_server.send_sync("hr_endless_sampler_preview", payload, prompt_server.client_id)
         except Exception as error:
-            logging.warning(f"MiniMax H3 accumulated preview could not send an update: {error}")
+            logging.warning(f"HR Endless Sampler preview could not send an update: {error}")
 
 
 class _PreviewExecution:
@@ -420,9 +420,9 @@ class _AccumulatedPreviewWrapper:
         if self.decoder is None:
             try:
                 self.decoder = _TinyDecoder(self.tiny_vae_name)
-                logging.info(f"MiniMax H3 preview is using tiny VAE '{self.tiny_vae_name}'.")
+                logging.info(f"HR Endless Sampler preview is using tiny VAE '{self.tiny_vae_name}'.")
             except Exception as error:
-                logging.warning(f"MiniMax H3 accumulated preview could not load '{self.tiny_vae_name}', using Latent2RGB: {error}")
+                logging.warning(f"HR Endless Sampler preview could not load '{self.tiny_vae_name}', using Latent2RGB: {error}")
                 self.decoder_failed = True
         return self.decoder
 
@@ -442,7 +442,7 @@ class _AccumulatedPreviewWrapper:
         previewer_name = f"Tiny VAE: {self.tiny_vae_name}" if decoder is not None else "Latent2RGB"
         if decoder is not None and latent_shapes and decoder.latent_channels != int(latent_shapes[0][1]):
             logging.warning(
-                f"MiniMax H3 preview ignored '{self.tiny_vae_name}': it expects {decoder.latent_channels} "
+                f"HR Endless Sampler preview ignored '{self.tiny_vae_name}': it expects {decoder.latent_channels} "
                 f"latent channels, but the video latent has {latent_shapes[0][1]}."
             )
             self.decoder = None
@@ -456,7 +456,7 @@ class _AccumulatedPreviewWrapper:
                 sigma = sigmas[0].to(noise.device) if hasattr(sigmas[0], "to") else sigmas[0]
                 initial_signature = _latent_signature(_packed_video(noise * sigma, latent_shapes))
         except Exception as error:
-            logging.warning(f"MiniMax H3 preview could not initialize the latent-change graph: {error}")
+            logging.warning(f"HR Endless Sampler preview could not initialize the latent-change graph: {error}")
         timing = {"last_time": time.perf_counter(), "step_ms": [], "signature": initial_signature}
         _send({
             "node_id": self.node_id,
@@ -521,7 +521,7 @@ class _AccumulatedPreviewWrapper:
                         try:
                             frames = _tiny_frames(video, decoder, indices, self.max_resolution)
                         except Exception as error:
-                            logging.warning(f"MiniMax H3 tiny VAE preview failed, using Latent2RGB: {error}")
+                            logging.warning(f"HR Endless Sampler tiny VAE preview failed, using Latent2RGB: {error}")
                             self.decoder = None
                             self.decoder_failed = True
                             decoder = None
@@ -563,7 +563,7 @@ class _AccumulatedPreviewWrapper:
 
                         encoder.submit(encode_and_send)
             except Exception as error:
-                logging.warning(f"MiniMax H3 accumulated preview failed for chunk {chunk_index + 1}: {error}")
+                logging.warning(f"HR Endless Sampler preview failed for chunk {chunk_index + 1}: {error}")
             if original_callback is not None:
                 original_callback(step, x0, x, callback_total)
 
@@ -573,14 +573,14 @@ class _AccumulatedPreviewWrapper:
             encoder.close()
 
 
-class MiniMaxH3UnlimitedPreview(io.ComfyNode):
+class HREndlessSamplerPreview(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="MiniMaxH3UnlimitedPreview",
-            display_name="MiniMax H3 Unlimited Preview",
+            node_id="HREndlessSamplerPreview",
+            display_name="HR Endless Sampler Preview",
             category="model/sampling/custom",
-            description="Accumulates live MiniMax H3 previews across SamplerCustomAdvanced-Unlimited chunks.",
+            description="Accumulates live previews across HR Endless Sampler chunks.",
             inputs=[
                 io.Model.Input("model"),
                 io.Int.Input("max_resolution", default=0, min=0, max=8192, step=8,

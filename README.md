@@ -19,14 +19,13 @@ by holding the mouse pointer over a chunk bar.
 
 ## Version 0.9.0
 
-Version 0.9 is the MiniMax H3 serial-continuation release. It keeps the normal
-ComfyUI sampler workflow while sampling one deterministic full video/audio
-latent as H3-grid-aligned chunks, then returns one correctly assembled AV
-latent. It includes:
+Version 0.9 introduces the serial-continuation architecture. It keeps the
+normal ComfyUI sampler workflow while sampling one deterministic video/audio
+latent as model-aligned chunks, then returns one correctly assembled result.
+It includes:
 
-- independent native H3 context-keyframes, retained latent warm-start, and
-  bounded synchronized Video1/Audio1 continuation controls, plus Qwen-only
-  full-history conditioning for experimentation;
+- bounded synchronized Video1/Audio1 continuation in the current H3 backend,
+  with additional continuation experiments retained for development;
 - a one-time Gemma 4 preproduction action schedule for every complete source
   shot, followed by visual chunk directing using that schedule, the full source
   prompt, prior rendered stills, prior prompt state, and a local-marker
@@ -37,49 +36,38 @@ latent. It includes:
 - chunk and sampling progress, debug prompt/VRAM diagnostics, a final H3/Qwen/
   VAE/Gemma timing and RAM/VRAM report, and an optional stop-after-chunk
   diagnostic control; and
-- `MiniMax H3 Unlimited Preview`: a browser-refresh-safe, ordered accumulated
+- `HR Endless Sampler Preview`: a browser-refresh-safe, ordered accumulated
   preview with Tiny-VAE or Latent2RGB decoding, chunk colors, shot brackets,
   frame/shot/chunk labels, timeline transport, keyboard frame stepping, and
   interactive sampling graphs.
 
-The node is currently purpose-built for MiniMax H3; its temporal grid,
-joint-video/audio latent layout, and continuation mechanisms must not be
-assumed to apply to Wan, LTX, or other video models.
+The architecture is intended for video models with a continuable temporal
+latent. This release implements the MiniMax H3 backend; LTX support is planned.
+The H3-specific grid, joint-video/audio layout, and continuation rules below
+are backend details, not limits on the sampler's intended scope.
 
 ### Why this exists?
-1. by replacing just the Sampler node, Minimax H3 now produces longer than 15secs videos using the same amount of VRAM seamlessly. No complicated loop workflows and video clip concatenations. Just use a normal workflow with the new node and it just works!
-2. since we can now do longer videos with the same VRAM, why not SAVE VRAM with smaller chunks and use the left over to increase the resolution? Yep, we can do that now! We can do 2K video inference with only 16GB of VRAM now. No upscale necessary... just render 2K straight. 
+1. Replace one sampler node to render longer videos without loop workflows or manual clip concatenation.
+2. Use smaller temporal chunks to trade unused temporal VRAM for higher resolution, where the active backend supports it.
 
 ### How is this possible?
-1. The new Sampler node samples at most `chunk_frames` at a time.
-2. After the first chunk, `context_keyframes` anchors a bounded completed tail as native H3 keyframe conditioning over the same opening target frames. Those frames form a truthful physical overlap and are removed when chunks are joined. `guide_overlap` is a separate experimental retained latent warm-start: it copies the previous tail into the first retained target positions, fully denoises them, and keeps them.
-3. With context keyframes disabled, only H3's mandatory five-frame packing prefix is removed before chunks are joined.
-4. The video/audio decoding stage just decodes the latent as usual, creating a longer than 15secs video and/or higher resolution than possible with low-vram. 
+1. The sampler samples at most `chunk_frames` at once.
+2. Its current H3 backend carries a bounded completed tail through the native Video1/Audio1 continuation mechanism, while Gemma maintains prompt and action continuity.
+3. The assembled latent is decoded normally after the final chunk, producing one continuous result.
 
 ## Use
 
-1. Replace `SamplerCustomAdvanced` with `SamplerCustomAdvanced-Unlimited`.
+1. Replace `SamplerCustomAdvanced` with `HR Endless Sampler`.
 2. Reconnect the same noise, guider, sampler, sigmas, and latent inputs.
-3. Connect the same MiniMax H3 `clip` used by the original conditioning node,
-   and paste/connect its original `prompt`.
-4. Set `fps` to the prompt timeline's frame rate. MiniMax H3 normally uses 24.
+3. For the current H3 backend, connect the same H3 `clip` used by the original conditioning node and paste/connect its original `prompt`.
+4. Set `fps` to the prompt timeline's frame rate. H3 normally uses 24.
 5. For I2VA/FL2VA, connect the original first frame followed by the optional
    last frame as one image batch. For image-only Ref2VA, connect every reference
    image in its original order. T2VA and audio-only Ref2VA need no images.
 6. Set `chunk_frames` to the largest chunk that fits in VRAM. `124` is the
    conservative default; the value is snapped down to H3's `17k + 5` grid.
-7. Use `guide_overlap_enable` and set `guide_overlap` to `5, 22, 39, 56, ...`.
-   It copies that bounded previous latent tail into the first retained target
-   positions of every later chunk. Those positions keep fresh target noise, are
-   fully denoised, remain in the output, and are not described as overlap in the prompt.
-8. Use `context_keyframes_enable` and set `context_keyframes` to
-   `5, 22, 39, 56, ...`. This adds the completed video/audio tail as separate
-   native H3 keyframe conditioning over the matching opening target interval.
-   The interval is sampled again and trimmed, so `39` chunk frames with `22`
-   context keyframes produces `17` new frames on each later call. Disabling the
-   toggle supplies no keyframes and falls back to the five-frame packing prefix.
-9. Use `video_continuation_enable` and set `video_continuation` to
-   `5, 22, 39, 56, ...`. When enabled, this experimental Ref2VA path decodes exactly that
+7. Set `video_continuation` to `5, 22, 39, 56, ...`. The current H3 backend
+   always uses this Ref2VA path. It decodes exactly that
    bounded previous tail for Qwen, adds it as the next
    synchronized `<Audio N>` + `<Video N>` reference for the DiT, and adds the
    documented `[video continuation]` sections to later chunk prompts. Connect
@@ -88,32 +76,13 @@ assumed to apply to Wan, LTX, or other video models.
    tokenizer represents audio references as labels rather than waveform input,
    so no audio VAE or temporary audio decode is needed.
 
-   When `context_keyframes_enable` is off, Video1 continuation also supplies the
-   previous chunk's exact final five-frame latent tail as one native video
+   Video1 continuation also supplies the previous chunk's exact final five-frame latent tail as one native video
    keyframe clip. It anchors that clip across local frames 0-4, the mandatory
    discarded packing prefix. This adds two video-latent conditioning time steps
    but no target frames, physical-overlap allocation, VAE re-encode, or separate
    audio keyframe; synchronized audio remains available through Video1.
 
-   The controls can now be tested independently:
-
-   | Context enabled | Warm-start enabled | Video1 enabled | Previous-result mechanism |
-   |:---:|:---:|:---:|---|
-   | no | no | no | None; mandatory local packing prefix only |
-   | no | yes | no | Retained, fully denoised latent warm-start |
-   | yes | no | no | Native video/audio keyframes over a matching trimmed physical overlap |
-   | no | no | yes | Bounded Video1/Audio1 plus one five-frame visual boundary keyframe clip |
-   | yes | yes | yes | All three mechanisms together |
-
-   Serialized values from the former guide combo and Video1 Boolean are
-   translated to their equivalent frame counts. After restarting ComfyUI,
-   recreate the sampler node if the browser keeps stale widget types.
-
-10. `qwen_full_history` is an independent experiment. Before each later chunk,
-    Qwen sees decoded 2 FPS frames from all completed output so far. It does not
-    rewrite the prompt or add that history as a DiT reference. Connect the H3
-    `vae`.
-11. Before Chunk 1, Gemma 4 performs one text-only preproduction pass over the
+8. Before Chunk 1, Gemma 4 performs one text-only preproduction pass over the
     complete unsplit source shots and the exact retained output ownership of all
     physical chunks. It writes a compact source-relative schedule for every
     shot: contiguous serial `visual_beats` covering the complete duration plus
@@ -206,12 +175,8 @@ assumed to apply to Wan, LTX, or other video models.
     Gemma's usable final description unchanged to H3. It never substitutes a
     static algorithmic prompt for a usable Gemma response. A response with no
     usable description stops sampling instead.
-    `prompt_preview_only` intentionally shows the static canonical plan because
-    it promises not to load Gemma or generate the previous footage Gemma would
-    need.
-
     With `debug` enabled, the node also creates a temporary directory such as
-    `/tmp/minimax-h3-gemma4-...` and logs its path. Every chunk gets a
+    `/tmp/hr-endless-sampler-gemma4-...` and logs its path. Every chunk gets a
     `prompt_NNN_chunk_NNN` fixture containing the exact base64-JPEG worker
     request, separate inspectable JPEGs, rendered system/observation prompts,
     and Gemma response or error. Move useful fixtures into `tests/fixtures/`
@@ -226,12 +191,7 @@ assumed to apply to Wan, LTX, or other video models.
     chunk/shot ranges, conditioning facts, and worker generation settings. This
     makes prompt iterations take one Gemma request
     instead of another complete video render.
-12. Enable `prompt_preview_only` to return every exact planned prompt and frame
-   range through `chunk_prompts` without generating noise, rebuilding per-chunk
-   conditioning, loading the DiT/VAE for this node, or running inference. Noise,
-   sampler, sigmas, and CLIP are lazy in this mode. The two latent outputs are
-   unchanged placeholders and should not be used while this toggle is enabled.
-13. `chunk_prompts` is populated during normal sampling too. Enable `debug` to
+9. `chunk_prompts` is populated during normal sampling too. Enable `debug` to
    additionally print those prompts in the ComfyUI console and log VRAM at each
    VAE/Qwen/DiT boundary and immediately before and after every DiT evaluation.
    The report includes physical free memory, PyTorch allocation/cache/peaks,
@@ -241,7 +201,7 @@ assumed to apply to Wan, LTX, or other video models.
    confidence, chunk-local description, raw JSON, and any validation warnings
    in the same output.
    Independently of `debug`, every normal sampler run replaces
-   `${TMPDIR}/comfyui-minimax-h3-unlimited/last_gemma_chunk_prompts.txt` and
+   `${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_chunk_prompts.txt` and
    flushes a readable Gemma-to-H3 transcript before each chunk samples. The
    preproduction system/request/JSON/action schedule is recorded before Chunk 1.
    Each 200-character-separated chunk then records the exact user request sent
@@ -252,7 +212,6 @@ assumed to apply to Wan, LTX, or other video models.
    run start. It receives the exact JPEG payload of every chronological still
    passed to Gemma, named by target chunk and exact global source frame.
    An interrupted or failed run therefore retains every prompt reached so far.
-   `prompt_preview_only` does not replace either last sampled-run capture.
    Every sampling run, even with `debug` disabled, ends with a structured timing
    and memory baseline: configuration, rendered range, H3 denoising, Qwen
    encoding, each VAE purpose, Gemma 4, per-chunk timing, peak
@@ -260,9 +219,9 @@ assumed to apply to Wan, LTX, or other video models.
    allocator high-water mark. `Peak Time`, printed immediately after `Peak`, is
    the estimated wall time for which device VRAM was closer to the run's peak
    than its average (above the midpoint between those two values).
-14. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
+10. For a short diagnostic render, set `debug_stop_chunk` to a 1-based chunk
    number. `0` is the normal setting and samples the complete video.
-15. Decode the returned AV latent normally.
+11. Decode the returned AV latent normally.
 
 Existing H3 first/last-frame guides are assigned to the chunk containing their
 frame. Ref2VA references remain attached to every chunk.
@@ -275,8 +234,8 @@ This cleanup trades model reload time for maximum sampling headroom.
 
 ## Accumulated live preview
 
-Add `MiniMax H3 Unlimited Preview` between the model loader/model patches and
-the guider used by `SamplerCustomAdvanced-Unlimited`. Its widget plays the
+Add `HR Endless Sampler Preview` between the model loader/model patches and
+the guider used by `HR Endless Sampler`. Its widget plays the
 chunks generated so far as one growing preview. Each sampler callback replaces
 one complete, ordered frame group for the active chunk. A single browser
 playhead finishes every frame in chunk 1 before entering chunk 2, and so on;
@@ -316,11 +275,9 @@ latent preview images, so frame stepping and the label usually advance by four
 frames even when `frame_stride` is one.
 
 The console also displays a chunk progress line above the stock sampler's step
-progress. A later chunk starts only after the previous chunk has completed, so
-when `context_keyframes_enable` is true its native H3 guide contains exactly
-the selected completed tail. A guide warm-start begins after the truthful
-keyframe overlap, or after the required synthetic packing prefix when context
-keyframes are disabled.
+progress. A later chunk starts only after the previous chunk has completed; the
+current H3 backend supplies its completed continuation tail through Video1 and
+the five-frame boundary keyframe clip.
 
 ## Shot timing
 
@@ -366,22 +323,16 @@ The parser recognizes both `integrated_multimodal_description:` and
   text, then observes the last sampled chunk and writes the next short H3
   description; it does not ask H3 to infer its location in a repeated
   full-shot prompt.
-- Longer `context_keyframes` adds more native H3 conditioning/attention rows
-  and a matching physical overlap. That overlap is trimmed, so it reduces each
-  later chunk's retained output duration.
-- Active `video_continuation` (`video_continuation > 0`) and `qwen_full_history` require image/audio Ref2VA
-  conditioning that this node can reconstruct plus the MiniMax H3 video VAE.
-  They are ignored for the first chunk because no generated history exists yet.
+- The current H3 Video1 continuation path requires image/audio Ref2VA
+  conditioning that this node can reconstruct plus the H3 video VAE. It is
+  ignored for the first chunk because no generated history exists yet.
 - Native `video_continuation` adds the bounded synchronized video/audio tail to
-  DiT attention. With context keyframes disabled it also adds the previous
-  final five-frame video tail as a visual keyframe across the discarded packing
-  prefix, without adding a separate audio keyframe.
-  `qwen_full_history` adds no DiT reference, but its Qwen token and temporary
-  VAE-decode cost grows with the completed duration. Dynamic Qwen video frames
-  are downscaled by area before encoding; original Ref2VA images are unchanged.
-- Disabling both `context_keyframes_enable` and `guide_overlap_enable` is the clean native-continuation experiment: the
-  previous result reaches the next chunk only through `video_continuation`
-  and/or `qwen_full_history`, according to those independent switches.
+  DiT attention and the previous final five-frame video tail as a visual
+  keyframe across the discarded packing prefix, without adding a separate
+  audio keyframe.
+- Earlier keyframe-overlap, latent warm-start, Qwen-history, and prompt-only
+  branches remain in source for development experiments but are deliberately
+  hidden from the released node UI while Video1 continuation is evaluated.
 - Gemma chunk directing needs `llama-cpp-python==0.3.35`, built with the
   CUDA wheel in `requirements.txt`. It loads a separate 7 GB model only between
   relevant chunks in a disposable worker process, then exits that worker before

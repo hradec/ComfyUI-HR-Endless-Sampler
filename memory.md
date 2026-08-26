@@ -1,38 +1,27 @@
-# SamplerCustomAdvanced-Unlimited development memory
+# HR Endless Sampler development memory
 
 ## Goal
 
-This custom node adds `SamplerCustomAdvanced-Unlimited`, a MiniMax H3-specific
-replacement for ComfyUI's stock `SamplerCustomAdvanced`. Its purpose is to
-sample a long joint video/audio latent as smaller temporal chunks so the H3 DiT
-does not have to hold the complete video sequence in VRAM at once.
+This custom node adds `HR Endless Sampler`, an extensible replacement for
+ComfyUI's stock `SamplerCustomAdvanced`. Its purpose is to sample a long video
+latent as smaller temporal chunks so the active model backend does not have to
+hold the complete sequence in VRAM at once. MiniMax H3 is the currently
+implemented backend; LTX support is planned.
 
 The node keeps the stock sampler inputs and delegates every individual chunk to
 the stock `SamplerCustomAdvanced`. It adds:
 
-- `clip`: the same MiniMax H3 CLIP/Qwen model used by the upstream conditioning
+- `clip`: the CLIP/Qwen model used by the active backend's upstream conditioning
   node;
-- `prompt`: the original MiniMax-formatted prompt;
+- `prompt`: the original backend-formatted prompt;
 - `fps`: the frame rate used to convert prompt timestamps to global frames;
-- `chunk_frames`: the maximum number of H3 frames sampled at once;
-- `guide_overlap_enable` + `guide_overlap`: an independent retained latent
-  warm-start. The previous tail initializes the first new target positions;
-  those positions are fully denoised, kept, and omitted from prompt wording;
-- `context_keyframes_enable` + `context_keyframes`: the completed tail supplied
-  as native H3 video/audio keyframe conditioning over the same truthful opening
-  target overlap, which is trimmed after sampling;
-- `video_continuation_enable` + `video_continuation`: the independent bounded
-  previous AV tail exposed as a new native `<Audio N>` + `<Video N>` reference;
-  when context keyframes are disabled it also adds the previous exact final
-  five-frame latent tail as one visual keyframe clip across the discarded
-  packing prefix;
-- `qwen_full_history`: experimental Qwen-only view of every completed frame,
-  sampled at 2 FPS, without adding that history to DiT reference attention;
+- `chunk_frames`: the maximum number of backend frames sampled at once;
+- `video_continuation`: the current H3 backend's bounded previous AV tail
+  exposed as native `<Audio N>` + `<Video N>` reference, plus its exact final
+  five-frame visual boundary keyframe clip across the discarded packing prefix;
 - automatic Gemma 4 chunk directing: it directs Chunk 1 from the complete
   source prompt, then observes chronological stills from each previous sampler
   chunk and writes the complete H3 description for the next local slice;
-- `prompt_preview_only`: returns the canonical prompt plan without noise,
-  per-chunk conditioning, VAE/DiT loading, or diffusion;
 - `debug`: logs each chunk's rewritten prompt and frame ranges to the ComfyUI
   console and enables detailed VRAM snapshots around conditioning and sampling;
 - an always-on final report: reports wall time for H3, Qwen, each VAE decode
@@ -40,19 +29,23 @@ the stock `SamplerCustomAdvanced`. It adds:
 - `debug_stop_chunk`: returns after the selected 1-based serial chunk for fast
   boundary diagnostics; zero keeps the normal complete run;
 - optional `images`: pixel images needed to rebuild Qwen visual conditioning;
-- optional `vae`: the H3 video VAE, required by decoded-video modes and by
-  Gemma visual directing after Chunk 1.
+- optional `vae`: the active backend video VAE; the current H3 implementation
+  needs it for Video1 and Gemma visual directing after Chunk 1.
+
+Native context-keyframe, retained guide-overlap, Qwen full-history, and
+prompt-preview-only branches remain in source for development, but are hidden
+and forced off in the released UI. Video1 continuation is hidden-and-forced on.
 
 The sampler node id and display name are both:
 
 ```text
-SamplerCustomAdvanced-Unlimited
+HREndlessSampler -> HR Endless Sampler
 ```
 
 An optional model-patch node provides the accumulated live preview:
 
 ```text
-MiniMaxH3UnlimitedPreview -> MiniMax H3 Unlimited Preview
+HREndlessSamplerPreview -> HR Endless Sampler Preview
 ```
 
 ## Files
@@ -1351,13 +1344,13 @@ Non-H3 or non-nested latents fall through to the stock sampler unchanged.
 
 ## Accumulated live preview
 
-`MiniMax H3 Unlimited Preview` is a separate model-patch node. Its MODEL output
-must feed the guider passed to `SamplerCustomAdvanced-Unlimited`. Keeping the
+`HR Endless Sampler Preview` is a separate model-patch node. Its MODEL output
+must feed the guider passed to `HR Endless Sampler`. Keeping the
 preview at the model boundary follows ComfyUI's existing outer-sampler wrapper
 contract and avoids adding UI or transport behavior to the sampler itself.
 
 At the start of one Unlimited execution, `nodes.py` finds wrappers registered
-under the private `minimax_h3_unlimited_preview` key and opens a short-lived
+under the private `hr_endless_sampler_preview` key and opens a short-lived
 preview session. Before each stock sampler call it supplies:
 
 ```text
@@ -1666,7 +1659,7 @@ without an explicit decision and a checkpoint of the working version.
 
     Store Gemma's candidate prompts, evidence, verdicts, and successful/failed
     phrasing in a reset-per-render, inspectable retry journal such as
-    `${TMPDIR}/comfyui-minimax-h3-unlimited/last_gemma_retry_memory.md`.
+    `${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_retry_memory.md`.
     Do not let runtime Gemma mutate this repository's `memory.md`: that file is
     the human-maintained development handoff. The review remains visual-only
     until an explicit audio-observation design exists, and existing code must
@@ -1818,6 +1811,27 @@ A full MiniMax H3 GPU render was not run as part of the lightweight automated
 verification. The mocked path exercised chunk planning, prompt replacement,
 conditioning mutation, continuation guide construction, trimming, and final
 shape assembly without loading the large model.
+
+## HR Endless Sampler naming and released UI
+
+The public sampler is now named **HR Endless Sampler** (`HREndlessSampler`),
+and its paired live widget is **HR Endless Sampler Preview**
+(`HREndlessSamplerPreview`). The preview's browser event, restore endpoint,
+wrapper key, and web-extension identity were renamed together, so a ComfyUI
+restart is required after this change. The architecture is intentionally
+model-extensible: MiniMax H3 is the current backend, while LTX support is
+planned; H3-specific latent, prompt, and reference rules remain backend code
+rather than the product identity.
+
+The released sampler UI now exposes only the stable Video1 continuation path:
+`video_continuation` remains visible and is always enabled internally. The
+former `video_continuation_enable` widget is hidden and forced true. The
+experimental native context-keyframe, retained guide-overlap, Qwen full-history,
+and prompt-preview-only widgets are hidden and forcibly disabled, including for
+serialized values from an old workflow. Their implementation remains in source
+for controlled development experiments, but it cannot change normal render
+behavior through the current node UI. `debug` and `debug_stop_chunk` are the
+last UI controls.
 
 ## Documentation used
 

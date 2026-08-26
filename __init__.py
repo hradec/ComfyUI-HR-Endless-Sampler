@@ -1,17 +1,17 @@
-from .nodes import MiniMaxH3SamplerCustomAdvancedUnlimited
-from .preview import MiniMaxH3UnlimitedPreview
+from .nodes import HREndlessSampler
+from .preview import HREndlessSamplerPreview
 
 __version__ = "0.9.0"
 
 
 NODE_CLASS_MAPPINGS = {
-    "SamplerCustomAdvanced-Unlimited": MiniMaxH3SamplerCustomAdvancedUnlimited,
-    "MiniMaxH3UnlimitedPreview": MiniMaxH3UnlimitedPreview,
+    "HREndlessSampler": HREndlessSampler,
+    "HREndlessSamplerPreview": HREndlessSamplerPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SamplerCustomAdvanced-Unlimited": "SamplerCustomAdvanced-Unlimited",
-    "MiniMaxH3UnlimitedPreview": "MiniMax H3 Unlimited Preview",
+    "HREndlessSampler": "HR Endless Sampler",
+    "HREndlessSamplerPreview": "HR Endless Sampler Preview",
 }
 
 WEB_DIRECTORY = "./web"
