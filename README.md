@@ -17,6 +17,26 @@ allows to visualize the whole video as it is infered, with a timeslider that dis
 the video shots and each chunk. You can even visualize each chunk prompt Gemma created
 by holding the mouse pointer over a chunk bar. 
 
+## Quick HELP as I don't have a workflow template yet!
+The way to use is pretty straight forward - just replace the normal "Sampler" node by this one, and add the preview node behind it so it can show the preview as the inference happens. You just have to add the extra inputs:
+- clip - just connect the model clip
+- vae - just connect the video vae model
+- images - connect the images you used with minimax guiding - for ref2va, those would be the reference images
+- prompt - connect the text of the full prompt you are using with minimax
+- fps - should always be 24, but if you have a node that sets the fps, you can connect it here too.
+<img width="349" height="422" alt="Image" src="https://github.com/user-attachments/assets/ebb106f4-804b-4465-8ffd-6a26a94ef6a2" />
+
+The `chunk_frames parameter` is the number of frames you want each chunk to have. You probably want to use the max you can that fits in your vram. If you get OOM, just reduce it. With 16GB of VRAM, I have to use 39 frames to render full 1080p videos.
+
+The `video_continuation` is the number of frames you want to use for minimax to "see" from the previous chunk. 5 is the minimum, but from my tests 22 seems to be the one that works best. The more the better, but this will add to your VRAM. In my 16GB VRAM setup, for 1080p render I have to use `video_continuation`=22 with `chunk_frames`=39.
+
+`debug` just shows a bunch of memory and gemma prompt debugging in the console.
+
+`debug_stop_chunk` allows you to stop a render at a certain chunk. It's good if you want to quickly render just the start of the video for testing, without changing anything in the workflow. 
+
+That's pretty much it. 
+
+
 ## Version 0.9.0
 
 Version 0.9 introduces the serial-continuation architecture. It keeps the
