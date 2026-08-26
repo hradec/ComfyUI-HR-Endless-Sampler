@@ -1,4 +1,5 @@
-# ComfyUI-HR-Endless-Sampler (the older ComfyUI MiniMax H3 Sampler Unlimited)
+# ComfyUI-HR-Endless-Sampler 
+##(the older ComfyUI MiniMax H3 Sampler Unlimited)
 
 `SamplerCustomAdvanced-Unlimited` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long MiniMax H3 video/audio latents.
