@@ -1,8 +1,21 @@
 # ComfyUI-HR-Endless-Sampler 
-##(the older ComfyUI MiniMax H3 Sampler Unlimited)
+## (the older ComfyUI MiniMax H3 Sampler Unlimited)
 
-`SamplerCustomAdvanced-Unlimited` is a chunked replacement for ComfyUI's
-`SamplerCustomAdvanced` for long MiniMax H3 video/audio latents.
+`HR Endless Sampler` is a chunked replacement for ComfyUI's
+`SamplerCustomAdvanced` for long video/audio latents, currently supports 
+Minimax H3 only. The plan is to add support to LTX 2.5 in the near future.
+
+`HR Endless Sampler` is able to render videos of any length by automatically 
+splitting the inference into small chunks of the same long latent. It uses 
+Gemma4 12B QAT internally to analyze the original prompt and all references, 
+plan the action-timing for each shot and each chunk, then analyzes previous 
+rendered frames and writes new small prompts for each chunk, maintaining 
+the continuity and coherence of the entire video. 
+
+Using `HR Endless Sampler Preview` node (based on the amazing KJ Live preview node) 
+allows to visualize the whole video as it is infered, with a timeslider that displays
+the video shots and each chunk. You can even visualize each chunk prompt Gemma created
+by holding the mouse pointer over a chunk bar. 
 
 ## Version 0.9.0
 
