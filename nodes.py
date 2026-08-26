@@ -106,6 +106,34 @@ def _append_last_gemma_prompt(path, chunk_header, chunk_prompt, *, system_prompt
         logging.warning("SamplerCustomAdvanced-Unlimited could not append Gemma prompt log %s: %s", path, error)
 
 
+def _append_gemma_timing_plan(path, timing_plan, *, system_prompt=None,
+                              planning_prompt=None, gemma_response=None,
+                              validation_warnings=()):
+    """Flush the one-time preproduction request before the first chunk entry."""
+    if path is None:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as prompt_file:
+            if system_prompt:
+                prompt_file.write("=== GEMMA PREPRODUCTION SYSTEM PROMPT ===\n")
+                prompt_file.write(system_prompt.rstrip())
+                prompt_file.write("\n\n")
+            prompt_file.write("=" * 200)
+            prompt_file.write("\n=== GEMMA SHOT TIMING PREPRODUCTION ===\n\n")
+            prompt_file.write("=== GEMMA REQUEST ===\n")
+            prompt_file.write((planning_prompt or "not available").rstrip())
+            prompt_file.write("\n\n=== GEMMA RESPONSE ===\n")
+            prompt_file.write((gemma_response or "not available").rstrip())
+            if validation_warnings:
+                prompt_file.write("\n\n=== GEMMA VALIDATION WARNINGS ===\n")
+                prompt_file.write("\n".join(f"- {warning}" for warning in validation_warnings))
+            prompt_file.write("\n\n=== VALIDATED SHOT TIMING PLAN ===\n")
+            prompt_file.write((timing_plan or "not available: sampling stopped before Chunk 1.").rstrip())
+            prompt_file.write("\n\n")
+    except OSError as error:
+        logging.warning("SamplerCustomAdvanced-Unlimited could not append Gemma timing plan log %s: %s", path, error)
+
+
 def _reset_last_gemma_image_log():
     """Replace only the fixed image subdirectory for the latest sampled run."""
     path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / GEMMA_IMAGE_LOG_DIRNAME
@@ -229,7 +257,11 @@ def _video_continuation_prompt(prompt, video_label, audio_label=None, storyboard
         insert_at = retention.start() if retention is not None else field.start() if field is not None else len(prompt)
         prompt = prompt[:insert_at].rstrip() + f"\n\nsummary: {summary_text}\n\n" + prompt[insert_at:].lstrip()
 
-    continuation_location = "the opening storyboard block" if storyboard else "[Shot 1]"
+    # A continuation chunk can begin in the middle of a source shot.  Do not
+    # mention ``[Shot 1]`` in a non-description field: H3 can still interpret
+    # that token as a fresh-shot cue even when Gemma correctly begins its
+    # detailed description with plain continuation prose.
+    continuation_location = "the opening storyboard block" if storyboard else "the opening local continuation sequence"
     retention_line = f"{video_label} (appears in {continuation_location}): fully_preserved - its ending is used as the continuation starting point for this chunk."
     if audio_label is not None:
         retention_line += f"\n{audio_label} (synchronized with {video_label}): fully_preserved - its ending is used as the audio continuation starting point."
@@ -322,9 +354,21 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
 
     rewritten = []
     for index, (shot_index, shot_start, shot_end, body) in enumerate(selected):
-        marker_text = f"[Shot {index + 1}]"
-        if index:
-            marker_text += f" At {_frame_timestamp(shot_start - frame_start, fps)},"
+        # ``[Shot 1]`` is not generic chunk syntax.  It is H3's actual
+        # shot-opening cue, so a physical window that begins inside a source
+        # shot must start with ordinary continuation prose.  A later real cut
+        # still uses the local ordinal it has on the physical timeline.  This
+        # planner is normally preview-only, but keeping it consistent with the
+        # Gemma path prevents misleading previews and fallback prompts.
+        if index == 0:
+            if shot_start == frame_start:
+                marker_text = "[Shot 1]"
+            elif shot_start > frame_start:
+                marker_text = f"[Shot 2] At {_frame_timestamp(shot_start - frame_start, fps)},"
+            else:
+                marker_text = ""
+        else:
+            marker_text = f"[Shot {index + 1}] At {_frame_timestamp(shot_start - frame_start, fps)},"
 
         if shot_end <= content_start:
             # This block represents only carried guide/reference frames from a
@@ -340,7 +384,7 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
                     f" Continue directly from the {opening}; do not restart or replay earlier actions. "
                     + body.lstrip()
                 )
-        rewritten.append(marker_text + body.rstrip() + " ")
+        rewritten.append((marker_text + " " if marker_text else "") + body.rstrip() + " ")
     rewritten_prompt = prompt[:markers[0].start()] + "".join(rewritten) + prompt[description_end:]
     if continuation_video_label is not None:
         rewritten_prompt = _video_continuation_prompt(
@@ -402,13 +446,26 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
             "source_body": body,
         }
         if target:
+            target_start = max(range_start, shot_start)
+            if local_index == 0:
+                # [Shot 1] is a genuine shot-opening signal to H3.  Never
+                # synthesize it merely because a new physical sampler chunk
+                # starts in the middle of a source shot.  When a real cut
+                # occurs after carried physical-prefix frames, the implied
+                # continuing source material is local Shot 1 and the new
+                # source shot is explicitly local Shot 2 at that real cut.
+                if shot_start == sampled_start:
+                    required_marker = "[Shot 1]"
+                elif shot_start > sampled_start:
+                    required_marker = f"[Shot 2] At {_frame_timestamp(shot_start - sampled_start, fps)},"
+                else:
+                    required_marker = None
+            else:
+                required_marker = f"[Shot {local_index + 1}] At {_frame_timestamp(shot_start - sampled_start, fps)},"
             record.update({
-                "target_start": max(range_start, shot_start),
+                "target_start": target_start,
                 "target_end": min(range_end, shot_end),
-                "required_marker": (
-                    "[Shot 1]" if local_index == 0
-                    else f"[Shot {local_index + 1}] At {_frame_timestamp(shot_start - sampled_start, fps)},"
-                ),
+                "required_marker": required_marker,
             })
         else:
             record.update({
@@ -417,6 +474,33 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
             })
         records.append(record)
     return records
+
+
+def _gemma_source_shot_records(shots, range_start, range_end):
+    """Return complete source-shot facts for Gemma's preproduction pass."""
+    return [
+        {
+            "shot_number": shot_index + 1,
+            "shot_start": shot_start,
+            "shot_end": shot_end,
+            "source_body": body,
+        }
+        for shot_index, shot_start, shot_end, body in shots
+        if shot_start < range_end and shot_end > range_start
+    ]
+
+
+def _gemma_preproduction_chunks(active_plan):
+    """Use only final output ownership, never synthetic/trimmed source frames."""
+    return [
+        {
+            "sampled_start": chunk["frame_start"],
+            "sampled_end": chunk["frame_end"],
+            "output_start": chunk["frame_start"] + chunk.get("output_trim_frames", 0),
+            "output_end": chunk["frame_end"],
+        }
+        for chunk in active_plan
+    ]
 
 
 def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, video_continuation,
@@ -483,7 +567,7 @@ def _gemma_report(chunk_number, result):
     )
     if len(result.attempts) > 1:
         report += (
-            f"\nGemma local-marker correction: attempt 1 had marker validation errors; "
+            f"\nGemma chunk-contract correction: attempt 1 had local-marker or current-slice coverage validation errors; "
             f"H3 uses Gemma's attempt {len(result.attempts)} response."
         )
     if result.validation_warnings:
@@ -492,7 +576,7 @@ def _gemma_report(chunk_number, result):
 
 
 def _gemma_response_transcript(result):
-    """Keep every model JSON response, including a local-marker correction."""
+    """Keep every model JSON response, including a model-authored contract correction."""
     attempts = tuple(result.attempts)
     if not attempts:
         return result.raw_json
@@ -500,12 +584,31 @@ def _gemma_response_transcript(result):
     for index, attempt in enumerate(attempts, 1):
         if attempt.correction_prompt:
             sections.append(
-                "=== GEMMA MARKER CORRECTION REQUEST ===\n"
+                "=== GEMMA CHUNK-CONTRACT CORRECTION REQUEST ===\n"
                 + attempt.correction_prompt.rstrip()
             )
         section = f"=== GEMMA ATTEMPT {index}: {attempt.kind} ===\n{attempt.raw_json.rstrip()}"
         if attempt.validation_warnings:
-            section += "\nmarker/validation findings:\n- " + "\n- ".join(attempt.validation_warnings)
+            section += "\nvalidation findings:\n- " + "\n- ".join(attempt.validation_warnings)
+        sections.append(section)
+    return "\n\n".join(sections)
+
+
+def _gemma_timing_plan_transcript(result):
+    """Keep raw preproduction JSON and any full-model correction visible."""
+    attempts = tuple(result.attempts)
+    if not attempts:
+        return result.raw_json
+    sections = []
+    for index, attempt in enumerate(attempts, 1):
+        if attempt.correction_prompt:
+            sections.append(
+                "=== GEMMA TIMING-PLAN CORRECTION REQUEST ===\n"
+                + attempt.correction_prompt.rstrip()
+            )
+        section = f"=== GEMMA TIMING-PLAN ATTEMPT {index}: {attempt.kind} ===\n{attempt.raw_json.rstrip()}"
+        if attempt.validation_warnings:
+            section += "\nvalidation findings:\n- " + "\n- ".join(attempt.validation_warnings)
         sections.append(section)
     return "\n\n".join(sections)
 
@@ -1443,6 +1546,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
             Gemma4ContinuityDirector(debug=debug, observation_image_directory=gemma_image_log)
             if gemma_director_needed else None
         )
+        gemma_preproduction_timing_plan = None
         gemma_system_logged = False
         preview_chunk_ranges = [
             {
@@ -1485,6 +1589,71 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         vram_monitor.report("execution prepared", {"full latent": samples, "full noise": full_noise})
 
         try:
+            if gemma_director is not None:
+                preproduction_shots = _gemma_source_shot_records(
+                    gemma_shots,
+                    active_plan[0]["frame_start"],
+                    active_plan[-1]["frame_end"],
+                )
+                preproduction_request = {
+                    "chunk_count": len(active_plan),
+                    "fps": fps,
+                    "prompt_mode": "ref" if ref2va else "base",
+                    "source_shots": preproduction_shots,
+                    "chunks": _gemma_preproduction_chunks(active_plan),
+                    "original_prompt": prompt,
+                }
+                try:
+                    # No VAE decode is needed for the text-only pass, but the
+                    # temporary Gemma worker still needs H3/Qwen/VAE gone so
+                    # its full-GPU model can load and exit cleanly.
+                    comfy.model_management.unload_model_and_clones(guider.model_patcher)
+                    comfy.model_management.unload_model_and_clones(clip.patcher)
+                    if vae is not None:
+                        comfy.model_management.unload_model_and_clones(vae.patcher)
+                    comfy.model_management.soft_empty_cache(force=True)
+                    vram_monitor.report("before Gemma 4 shot-timing preproduction")
+                    timer_started = time.perf_counter()
+                    try:
+                        gemma_preproduction_timing_plan = gemma_director.plan_timing(preproduction_request)
+                    finally:
+                        timing.add("gemma4", timer_started)
+                    _append_gemma_timing_plan(
+                        gemma_prompt_log,
+                        "Character-name table:\n"
+                        + gemma_preproduction_timing_plan.character_name_table_text()
+                        + "\n\n"
+                        + gemma_preproduction_timing_plan.for_target_shots(preproduction_shots, fps),
+                        system_prompt=gemma_preproduction_timing_plan.system_prompt or gemma_director.last_timing_system_prompt,
+                        planning_prompt=(
+                            gemma_preproduction_timing_plan.planning_prompt
+                            or gemma_director.last_timing_planning_prompt
+                        ),
+                        gemma_response=_gemma_timing_plan_transcript(gemma_preproduction_timing_plan),
+                        validation_warnings=gemma_preproduction_timing_plan.validation_warnings,
+                    )
+                    logging.info(
+                        "SamplerCustomAdvanced-Unlimited Gemma 4 preproduction timing plan is ready for %d source shots.",
+                        len(gemma_preproduction_timing_plan.shots),
+                    )
+                    vram_monitor.report("after Gemma 4 shot-timing preproduction release")
+                except Gemma4DependencyError:
+                    raise
+                except Gemma4ObservationError as error:
+                    logging.warning(
+                        "SamplerCustomAdvanced-Unlimited Gemma 4 shot-timing preproduction failed; "
+                        "sampling is stopping before Chunk 1 and no sampler-authored timing fallback will be used: %s",
+                        error,
+                    )
+                    _append_gemma_timing_plan(
+                        gemma_prompt_log,
+                        None,
+                        system_prompt=gemma_director.last_timing_system_prompt,
+                        planning_prompt=gemma_director.last_timing_planning_prompt,
+                        gemma_response=error.raw_json or f"{type(error).__name__}: {error}",
+                        validation_warnings=(str(error),),
+                    )
+                    raise
             for index, chunk in enumerate(active_plan):
                 timing.observe_memory()
                 timing.start_chunk(index)
@@ -1558,6 +1727,14 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
 
                         continuation_video_label = f"<Video {video_number}>" if include_video1_reference else None
                         continuation_audio_label = f"<Audio {audio_number}>" if include_video1_reference else None
+                        target_shots = _gemma_shot_records(
+                            gemma_shots,
+                            content_start,
+                            chunk["frame_end"],
+                            chunk["frame_start"],
+                            fps,
+                            target=True,
+                        )
                         request = {
                             "chunk_number": index + 1,
                             "chunk_count": len(active_plan),
@@ -1575,14 +1752,15 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                             "previous_gemma_description": previous_gemma_description,
                             "previous_gemma_timing_plan": previous_gemma_timing_plan,
                             "previous_gemma_end_state": previous_gemma_end_state,
-                            "target_shots": _gemma_shot_records(
-                                gemma_shots,
-                                content_start,
-                                chunk["frame_end"],
-                                chunk["frame_start"],
+                            "target_shots": target_shots,
+                            "preproduction_timing_plan": gemma_preproduction_timing_plan.for_target_shots(
+                                target_shots,
                                 fps,
-                                target=True,
                             ),
+                            "mandatory_coverage": gemma_preproduction_timing_plan.mandatory_coverage(
+                                target_shots,
+                            ),
+                            "character_name_table": gemma_preproduction_timing_plan.character_name_table_text(),
                             "conditioning_context": _gemma_conditioning_context(
                                 continuation,
                                 context_keyframes,
@@ -1868,6 +2046,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                         content_start,
                         chunk["frame_end"] - 1,
                         context_video_t,
+                        gemma_description,
                     )
                 try:
                     chunk_progress.start(index)

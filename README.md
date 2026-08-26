@@ -13,10 +13,10 @@ latent. It includes:
 - independent native H3 context-keyframes, retained latent warm-start, and
   bounded synchronized Video1/Audio1 continuation controls, plus Qwen-only
   full-history conditioning for experimentation;
-- automatic Gemma 4 visual chunk directing, using the full source prompt,
-  precise chunk/shot timing, prior rendered stills, prior prompt state, and a
-  local-marker correction pass so H3 receives chunk-local—not full-video—cut
-  times;
+- a one-time Gemma 4 preproduction action schedule for every complete source
+  shot, followed by visual chunk directing using that schedule, the full source
+  prompt, prior rendered stills, prior prompt state, and a local-marker
+  correction pass so H3 receives chunk-local—not full-video—cut times;
 - a self-managed local Gemma 4 12B QAT GGUF runtime with high-detail vision,
   deterministic capture/replay fixtures, persistent last-run prompts/images,
   and process-isolated GPU cleanup before H3 resumes;
@@ -99,17 +99,40 @@ assumed to apply to Wan, LTX, or other video models.
     Qwen sees decoded 2 FPS frames from all completed output so far. It does not
     rewrite the prompt or add that history as a DiT reference. Connect the H3
     `vae`.
-11. Gemma 4 directs the complete local `detailed_description` for every sampled
-    chunk, including Chunk 1 and chunks containing two source shots. It receives
-    the unchanged full user prompt, complete unsplit source bodies for every
-    relevant shot, exact global/current/previous frame ranges, required local
-    `[Shot N] At MM:SS.mmm,` cut markers, the continuation conditioning actually
+11. Before Chunk 1, Gemma 4 performs one text-only preproduction pass over the
+    complete unsplit source shots and the exact retained output ownership of all
+    physical chunks. It writes a compact source-relative schedule for every
+    shot: contiguous serial `visual_beats` covering the complete duration plus
+    optional overlapping dialogue, sound, and sustained-action `overlays`.
+    Gemma defaults to concurrency within a shot; it uses serial visual beats
+    only for an explicitly ordered, causal, or state-dependent progression.
+    This gives Gemma the whole action and every future chunk boundary at once,
+    rather than asking it to invent timing independently at every handoff. The
+    same pass creates a stable table of only the character names
+    explicitly mapped to existing `<Subject N>` labels in the original prompt.
+    The sampler validates the shot identities, table shape, and interval coverage;
+    an invalid plan receives one complete Gemma correction request, then stops
+    before sampling if it remains unusable. It never invents a timing fallback.
+
+    Gemma then directs the complete local `detailed_description` for every
+    sampled chunk, including Chunk 1 and chunks containing two source shots. It
+    receives a front-loaded list of the relevant visual beats and concurrent
+    overlays that actually intersect its retained frames, followed by the complete relevant
+    schedule, unchanged full user prompt,
+    complete unsplit source bodies for every relevant shot, exact
+    global/current/previous frame ranges, only the required local real-cut
+    `[Shot N] At MM:SS.mmm,` markers, the continuation conditioning actually
     available to H3, and chronological 2 FPS stills plus the exact final frame
-    from the previous sampled chunk. Each local shot also includes its complete
-    source duration and the precise source-relative range owned by this chunk,
-    so Gemma can pace actions across the full shot and explicitly defer later
-    events. There is no sentence splitter or immutable action ledger. Connect
-    the H3 video `vae` for a multi-chunk render, and install this node's
+    from the previous sampled chunk. A physical chunk that begins in the middle
+    of a source shot starts with plain continuation prose—never a synthetic
+    `[Shot 1]` cue. The real rendered stills stay authoritative if H3
+    has drifted from the plan: Gemma should continue the next unfinished
+    immediate beat rather than replay completed action or compress every later
+    beat. The immutable character table is supplied to every chunk: whenever
+    Gemma writes a listed name into H3 descriptive prose, it writes `Name
+    (<Subject N>)` beside it. It never changes dialogue to add those labels.
+    There is no sentence splitter or immutable action ledger. Connect the
+    H3 video `vae` for a multi-chunk render, and install this node's
     requirements:
 
     ```bash
@@ -135,13 +158,20 @@ assumed to apply to Wan, LTX, or other video models.
 
     The editable Gemma system and chunk-request messages are in
     [`gemma4_prompts.txt`](gemma4_prompts.txt). The sampler rereads that file
-    before every chunk, so changing and saving it affects the next chunk
-    without a Python-code edit. Keep its `[SYSTEM]` and
-    `[OBSERVATION]` section headers and the documented `{{lowercase_placeholders}}`.
+    before the preproduction pass and every chunk, so changing and saving it
+    affects the next run/chunk without a Python-code edit. Keep its `[SYSTEM]`,
+    `[OBSERVATION]`, `[PREPRODUCTION_SYSTEM]`, and `[PREPRODUCTION]` section
+    headers and the documented `{{lowercase_placeholders}}`.
     Its instructions distill the official H3 base/full-reference rules for shot
     markers, concrete playback-order description, camera language, speaker IDs,
     exact `<d>` dialogue, audio continuity, and stable reference labels. Gemma
-    returns a factual progress summary, a per-shot `timing_plan`, a Gemma-only
+    uses the documented mapped-speaker form `<Subject N> (Sx) says,
+    <d>...</d>`—never `Name (<Subject N>) (Sx)`—so the speaker token remains
+    visible to H3. It may add a modest non-cut camera movement when it supports
+    the original intent, but must introduce every such move with `In a
+    continuous movement,` and continue the established view; it may not invent
+    a fresh angle, setup, framing, perspective, transition, or cut.
+    It returns a factual progress summary, a per-shot `timing_plan`, a Gemma-only
     `end_state`, and the complete H3-facing local shot sequence. For every later
     chunk, Gemma receives all three prior values alongside the chronological
     stills from the same chunk. The rendered stills remain authoritative for
@@ -151,11 +181,14 @@ assumed to apply to Wan, LTX, or other video models.
     sampler-calculated local shot markers are also presented in a separate
     copy-only block; full-video/source timecodes are explicitly forbidden as
     H3 markers. If Gemma nevertheless returns a wrong/missing/renumbered
-    marker, the sampler gives Gemma one correction request containing the
-    literal required tokens and uses that second, complete Gemma JSON response.
+    marker, or tries to defer a current scheduled beat, the sampler gives Gemma
+    one correction request containing the literal required tokens and current
+    beat IDs, and uses that second, complete Gemma JSON response. Each response
+    attests to current-beat coverage with quoted evidence from its own H3
+    description; a current dialogue overlay must include its exact `<d>` line.
     Both model responses and the correction request remain in the capture and
-    console report. If the correction is still invalid, marker, formatting, and
-    dialogue findings remain warnings: the sampler logs them and still sends
+    console report. If the correction is still invalid, marker, coverage,
+    formatting, and dialogue findings remain warnings: the sampler logs them and still sends
     Gemma's usable final description unchanged to H3. It never substitutes a
     static algorithmic prompt for a usable Gemma response. A response with no
     usable description stops sampling instead.
@@ -196,9 +229,9 @@ assumed to apply to Wan, LTX, or other video models.
    Independently of `debug`, every normal sampler run replaces
    `${TMPDIR}/comfyui-minimax-h3-unlimited/last_gemma_chunk_prompts.txt` and
    flushes a readable Gemma-to-H3 transcript before each chunk samples. The
-   exact system prompt (including the vendored MiniMax guide) appears once at
-   the top. Each 200-character-separated chunk records the exact user request
-    sent beside its observation images, every raw Gemma JSON response and any
+   preproduction system/request/JSON/action schedule is recorded before Chunk 1.
+   Each 200-character-separated chunk then records the exact user request sent
+    beside its observation images, every raw Gemma JSON response and any
     local-marker correction request, validation warnings, and the exact finalized
     structured prompt subsequently encoded for H3.
    The sibling `last_gemma_images/` directory is also deleted and recreated at

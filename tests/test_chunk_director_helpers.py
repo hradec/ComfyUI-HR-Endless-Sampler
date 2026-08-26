@@ -16,6 +16,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT.parent))
 
 nodes = importlib.import_module(PLUGIN_ROOT.name + ".nodes")
+preview = importlib.import_module(PLUGIN_ROOT.name + ".preview")
 
 
 class _FakeVAE:
@@ -29,6 +30,62 @@ class _IndexedFakeVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_preview_chunk_metadata_survives_a_server_state_restore(self):
+        node_id = "preview-tooltip-test"
+        with preview._PREVIEW_CACHE_LOCK:
+            preview._PREVIEW_CACHE.pop(node_id, None)
+        try:
+            preview._cache_payload({
+                "node_id": node_id,
+                "execution": 1,
+                "action": "reset",
+                "chunk_ranges": [
+                    {"chunk": 1, "start": 0, "end": 38},
+                    {"chunk": 2, "start": 39, "end": 72},
+                ],
+            })
+            preview._cache_payload({
+                "node_id": node_id,
+                "execution": 1,
+                "action": "chunk_metadata",
+                "chunk": 0,
+                "gemma_detailed_description": "  [Shot 1] The tiger runs.  ",
+            })
+            snapshot = preview._cached_snapshot(node_id)
+            self.assertEqual(
+                snapshot["reset"]["chunk_ranges"][0]["gemma_detailed_description"],
+                "[Shot 1] The tiger runs.",
+            )
+            self.assertNotIn("gemma_detailed_description", snapshot["reset"]["chunk_ranges"][1])
+        finally:
+            with preview._PREVIEW_CACHE_LOCK:
+                preview._PREVIEW_CACHE.pop(node_id, None)
+
+    def test_timing_preproduction_is_logged_before_chunk_transcripts(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes.logging, "info"):
+            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, 24.0, 3)
+            nodes._append_gemma_timing_plan(
+                path,
+                "Source Shot 1: immutable preproduction timing schedule",
+                system_prompt="preproduction system",
+                planning_prompt="preproduction request",
+                gemma_response='{"shots": []}',
+            )
+            nodes._append_last_gemma_prompt(
+                path,
+                "=== Chunk 1 ===",
+                "first H3 prompt",
+                observation_prompt="first Gemma request",
+                gemma_response='{"detailed_description":"first response"}',
+            )
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("=== GEMMA PREPRODUCTION SYSTEM PROMPT ===", content)
+            self.assertIn("=== GEMMA SHOT TIMING PREPRODUCTION ===", content)
+            self.assertLess(content.index("preproduction request"), content.index("=== Chunk 1 ==="))
+            self.assertLess(content.index("Source Shot 1: immutable"), content.index("=== Chunk 1 ==="))
+
     def test_last_gemma_prompt_log_is_replaced_then_flushed_per_chunk(self):
         with tempfile.TemporaryDirectory() as temp_root, \
                 patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
@@ -102,7 +159,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertTrue(torch.all(final_frame == 38))
         self.assertEqual(final_frame.device.type, "cpu")
 
-    def test_target_shots_keep_complete_bodies_and_exact_local_cut(self):
+    def test_target_shots_omit_opening_marker_for_mid_shot_and_keep_real_local_cut(self):
         shots = [
             (0, 0, 68, "Tiger approaches the temple."),
             (1, 68, 117, "Tiger enters the temple and stops."),
@@ -116,8 +173,60 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             target=True,
         )
         self.assertEqual([record["source_body"] for record in records], [shot[3] for shot in shots])
-        self.assertEqual(records[0]["required_marker"], "[Shot 1]")
+        self.assertIsNone(records[0]["required_marker"])
         self.assertEqual(records[1]["required_marker"], "[Shot 2] At 00:00.750,")
+
+    def test_target_shots_use_opening_marker_only_at_real_physical_shot_start(self):
+        shots = [
+            (0, 0, 68, "Tiger approaches the temple."),
+            (1, 68, 117, "Tiger enters the temple and stops."),
+        ]
+        at_real_start = nodes._gemma_shot_records(
+            shots,
+            range_start=68,
+            range_end=107,
+            sampled_start=68,
+            fps=24.0,
+            target=True,
+        )
+        self.assertEqual(at_real_start[0]["required_marker"], "[Shot 1]")
+
+        after_carried_prefix = nodes._gemma_shot_records(
+            shots,
+            range_start=68,
+            range_end=107,
+            sampled_start=63,
+            fps=24.0,
+            target=True,
+        )
+        self.assertEqual(after_carried_prefix[0]["required_marker"], "[Shot 2] At 00:00.208,")
+
+    def test_prompt_preview_omits_shot_one_for_mid_shot_continuation(self):
+        prompt = (
+            "detailed_description: [Shot 1] The tiger runs through the jungle. "
+            "[Shot 2] At 00:02.833, The tiger enters the temple."
+        )
+        rewritten = nodes._prompt_for_chunk(
+            prompt,
+            frame_start=34,
+            frame_end=73,
+            total_frames=73,
+            fps=24.0,
+            content_start=39,
+            continuation=True,
+        )
+        description = rewritten.split("detailed_description:", 1)[1]
+        self.assertNotIn("[Shot 1]", description)
+        self.assertIn("[Shot 2] At 00:01.417,", description)
+
+        boundary = nodes._prompt_for_chunk(
+            prompt,
+            frame_start=0,
+            frame_end=39,
+            total_frames=73,
+            fps=24.0,
+        )
+        self.assertIn("[Shot 1]", boundary)
 
     def test_keyframes_use_truthful_physical_overlap_geometry(self):
         total_frames = 56

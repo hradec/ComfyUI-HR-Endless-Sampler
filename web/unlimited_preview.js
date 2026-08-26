@@ -168,9 +168,10 @@ app.registerExtension({
             playButton.title = "Play/pause (Space). Use Left/Right arrows for one preview frame.";
             transport.appendChild(playButton);
 
+            const timelineHelp = "Click or drag to seek; colors identify chunks";
             const timelineShell = document.createElement("div");
             timelineShell.style.cssText = "position:relative;flex:1;height:33px;cursor:pointer;touch-action:none;";
-            timelineShell.title = "Click or drag to seek; colors identify chunks";
+            timelineShell.title = timelineHelp;
             transport.appendChild(timelineShell);
 
             const timelineTrack = document.createElement("div");
@@ -344,6 +345,32 @@ app.registerExtension({
                 const spans = Array.from({ length: chunkCount }, (_, index) => chunkSpan(index, estimate));
                 const total = Math.max(1, spans.reduce((sum, value) => sum + value, 0));
                 return { spans, total };
+            }
+
+            function chunkIndexAtTimelinePointer(event) {
+                const rect = timelineTrack.getBoundingClientRect();
+                if (!rect.width || event.clientY < rect.top || event.clientY > rect.bottom) return null;
+                const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const { spans, total } = timelineLayout();
+                let offset = 0;
+                for (let index = 0; index < spans.length; index++) {
+                    offset += spans[index];
+                    if (fraction * total <= offset || index === spans.length - 1) return index;
+                }
+                return null;
+            }
+
+            function setChunkTooltip(index) {
+                if (!Number.isInteger(index) || !chunkRanges[index]) {
+                    timelineShell.title = timelineHelp;
+                    return;
+                }
+                const range = chunkRanges[index];
+                const chunkNumber = Number(range.chunk) || index + 1;
+                const description = String(range.gemma_detailed_description || "").trim();
+                timelineShell.title = description
+                    ? `${timelineHelp}\n\nChunk ${chunkNumber}\nGemma detailed_description:\n${description}`
+                    : `${timelineHelp}\n\nChunk ${chunkNumber}\nGemma detailed_description: waiting for this chunk's Gemma direction.`;
             }
 
             function renderShotBrackets() {
@@ -670,7 +697,7 @@ app.registerExtension({
                 chunkCount = data.chunk_count || 0;
                 activeChunk = data.chunk ?? 0;
                 chunks = new Array(chunkCount);
-                chunkRanges = Array.isArray(data.chunk_ranges) ? data.chunk_ranges.slice() : [];
+                chunkRanges = Array.isArray(data.chunk_ranges) ? data.chunk_ranges.map(range => ({ ...range })) : [];
                 shotRanges = Array.isArray(data.shot_ranges) ? data.shot_ranges.slice() : [];
                 timelineTotalFrames = Number.isFinite(Number(data.total_frames)) ? Number(data.total_frames) : 0;
                 shotBracketKey = null;
@@ -693,6 +720,7 @@ app.registerExtension({
                 startedAt = performance.now() - elapsedMs;
                 completedElapsed = null;
                 complete = false;
+                timelineShell.title = timelineHelp;
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 elapsedTimer = setInterval(renderStatus, 1000);
                 stop();
@@ -710,8 +738,21 @@ app.registerExtension({
                     return;
                 }
                 if (data.execution !== execution) {
-                    if (execution !== null) return;
+                    // A newly mounted widget can receive this lightweight
+                    // metadata event before its asynchronous state restore has
+                    // supplied the required reset timeline. Ignore it until
+                    // that reset arrives instead of replacing the playlist
+                    // with an incomplete event.
+                    if (execution !== null || data.action === "chunk_metadata") return;
                     resetExecution(data);
+                }
+                if (data.action === "chunk_metadata") {
+                    const index = Number(data.chunk);
+                    const range = chunkRanges[index];
+                    if (range && typeof data.gemma_detailed_description === "string") {
+                        range.gemma_detailed_description = data.gemma_detailed_description;
+                    }
+                    return;
                 }
                 if (data.action === "sample_start") {
                     activeChunk = data.chunk ?? activeChunk;
@@ -774,6 +815,9 @@ app.registerExtension({
                     sourceFps: data.fps,
                     step: currentStep,
                 };
+                if (typeof data.gemma_detailed_description === "string" && chunkRanges[index]) {
+                    chunkRanges[index].gemma_detailed_description = data.gemma_detailed_description;
+                }
                 chunks[index] = group;
                 stepPreviews[currentStep] = group;
                 previewWidth = data.width;
@@ -875,6 +919,9 @@ app.registerExtension({
                 canvas.addEventListener("mouseleave", stopInspecting);
                 canvas.addEventListener("mousedown", event => event.stopPropagation());
             }
+
+            timelineShell.addEventListener("mousemove", event => setChunkTooltip(chunkIndexAtTimelinePointer(event)));
+            timelineShell.addEventListener("mouseleave", () => { timelineShell.title = timelineHelp; });
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);

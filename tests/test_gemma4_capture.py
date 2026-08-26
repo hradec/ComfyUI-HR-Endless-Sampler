@@ -64,7 +64,7 @@ class GemmaCaptureTest(unittest.TestCase):
                     "shot_end": 220,
                     "target_start": 209,
                     "target_end": 220,
-                    "required_marker": "[Shot 1]",
+                    "required_marker": None,
                     "source_body": "Heman dismounts the tiger and walks right.",
                 },
                 {
@@ -84,12 +84,75 @@ class GemmaCaptureTest(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def timing_request():
+        return {
+            "chunk_count": 4,
+            "fps": 24.0,
+            "prompt_mode": "ref",
+            "source_shots": [
+                {
+                    "shot_number": 1,
+                    "shot_start": 0,
+                    "shot_end": 68,
+                    "source_body": "The tiger runs toward the temple, then enters it.",
+                },
+                {
+                    "shot_number": 2,
+                    "shot_start": 68,
+                    "shot_end": 148,
+                    "source_body": "Heman pulls the harness; the tiger skids to a stop and they inspect the room.",
+                },
+            ],
+            "chunks": [
+                {"sampled_start": 0, "sampled_end": 39, "output_start": 0, "output_end": 39},
+                {"sampled_start": 34, "sampled_end": 73, "output_start": 39, "output_end": 73},
+                {"sampled_start": 68, "sampled_end": 107, "output_start": 73, "output_end": 107},
+                {"sampled_start": 102, "sampled_end": 148, "output_start": 107, "output_end": 148},
+            ],
+            "original_prompt": (
+                "detailed_description: [Shot 1] The tiger runs toward the temple, then enters it. "
+                "[Shot 2] At 00:02.833, Heman pulls the harness; the tiger skids to a stop and they inspect the room."
+            ),
+        }
+
+    @staticmethod
+    def timing_response():
+        return {
+            "confidence": "high",
+            "analysis": "The run, entrance, braking, skid, stop, and inspection are distributed across both shots.",
+            "character_name_table": [
+                {"character_name": "Heman", "subject": "<Subject 1>"},
+                {"character_name": "Tila", "subject": "<Subject 2>"},
+            ],
+            "shots": [
+                {
+                    "source_shot": 1,
+                    "visual_beats": [
+                        {"start_frame": 0, "end_frame": 39, "action": "Tiger runs through the jungle toward the temple."},
+                        {"start_frame": 39, "end_frame": 68, "action": "Tiger reaches and enters the temple."},
+                    ],
+                    "overlays": [],
+                },
+                {
+                    "source_shot": 2,
+                    "visual_beats": [
+                        {"start_frame": 0, "end_frame": 24, "action": "The heroes continue inside at speed."},
+                        {"start_frame": 24, "end_frame": 48, "action": "Heman pulls the harness and the tiger begins a hard skid."},
+                        {"start_frame": 48, "end_frame": 68, "action": "The tiger settles to a stop."},
+                        {"start_frame": 68, "end_frame": 80, "action": "The riders inspect the temple room."},
+                    ],
+                    "overlays": [],
+                },
+            ],
+        }
+
     def test_debug_capture_preserves_exact_request_images_prompts_and_response(self):
         result = gemma4.GemmaChunkPrompt(
             confidence="high",
             analysis="Heman is already on the ground and moving right.",
             detailed_description=(
-                "[Shot 1] Heman continues walking toward the right. "
+                "Heman continues walking toward the right. "
                 "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
             ),
             raw_json='{"confidence":"high"}',
@@ -216,7 +279,7 @@ class GemmaCaptureTest(unittest.TestCase):
                     "timing_plan": "[Shot 1]: continue walking; [Shot 2]: defer dialogue until the cut.",
                     "end_state": "Heman continues walking toward the right.",
                     "detailed_description": (
-                        "[Shot 1] Heman continues walking toward the right. "
+                        "Heman continues walking toward the right. "
                         "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
                     ),
                 }
@@ -239,6 +302,154 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(captured["llama_kwargs"]["n_ubatch"], 1120)
         self.assertTrue(captured["closed"])
         self.assertEqual(result.confidence, "high")
+
+    def test_preproduction_timing_plan_covers_each_source_shot_and_feeds_relevant_schedule(self):
+        request = self.timing_request()
+        _system, planning_prompt = gemma4._render_timing_plan_messages(request)
+        self.assertIn("Source Shot 2: global frames 68-147", planning_prompt)
+        self.assertIn("Chunk 3: sampled global frames 68-106; retains global frames 73-106", planning_prompt)
+
+        plan = gemma4._validate_timing_plan(
+            self.timing_response(), request, json.dumps(self.timing_response())
+        )
+        self.assertEqual([shot.source_shot for shot in plan.shots], [1, 2])
+        self.assertEqual([(beat.start_frame, beat.end_frame) for beat in plan.shots[1].visual_beats], [(0, 24), (24, 48), (48, 68), (68, 80)])
+        self.assertEqual(
+            plan.character_name_table_text(),
+            "- Heman -> <Subject 1>\n- Tila -> <Subject 2>",
+        )
+        self.assertEqual(gemma4._timing_plan_from_payload(gemma4._timing_plan_payload(plan)), plan)
+        preproduction_log = plan.for_target_shots(request["source_shots"], 24.0)
+        self.assertIn("Source Shot 1: immutable preproduction timing schedule", preproduction_log)
+        self.assertIn("Source Shot 2: immutable preproduction timing schedule", preproduction_log)
+        self.assertNotIn("MANDATORY CURRENT-SLICE BEAT COVERAGE", preproduction_log)
+
+        relevant = plan.for_target_shots([
+            {
+                "shot_number": 2,
+                "shot_start": 68,
+                "shot_end": 148,
+                "target_start": 73,
+                "target_end": 107,
+                "required_marker": "[Shot 1]",
+                "source_body": request["source_shots"][1]["source_body"],
+            },
+        ], 24.0)
+        self.assertIn("Source Shot 2: immutable preproduction timing schedule", relevant)
+        self.assertNotIn("Source Shot 1:", relevant)
+        self.assertIn("MANDATORY CURRENT-SLICE BEAT COVERAGE", relevant)
+        self.assertIn(
+            "Required now [S2.V1], visual, source-relative frames 5-23: this planned beat continues here",
+            relevant,
+        )
+        self.assertIn(
+            "Required now [S2.V2], visual, source-relative frames 24-38: this planned beat begins here",
+            relevant,
+        )
+        self.assertIn("source-relative frames 24-47", relevant)
+
+        chunk_request = self.request()
+        chunk_request["preproduction_timing_plan"] = relevant
+        chunk_request["character_name_table"] = plan.character_name_table_text()
+        _system, observation = gemma4._render_observation_messages(chunk_request)
+        self.assertIn("complete immutable preproduction timing schedule", observation)
+        self.assertIn("MANDATORY CURRENT-SLICE BEAT COVERAGE", observation)
+        self.assertIn("Source Shot 2: immutable preproduction timing schedule", observation)
+        self.assertIn("Heman -> <Subject 1>", observation)
+
+    def test_preproduction_allows_dialogue_overlay_and_exposes_it_as_current_coverage(self):
+        response = self.timing_response()
+        response["shots"] = json.loads(json.dumps(response["shots"]))
+        response["shots"][1]["overlays"] = [{
+            "start_frame": 24,
+            "end_frame": 48,
+            "type": "dialogue",
+            "content": "Heman says: <d>[English] Stay back!</d>",
+        }]
+        plan = gemma4._validate_timing_plan(response, self.timing_request(), json.dumps(response))
+        target = [{
+            "shot_number": 2,
+            "shot_start": 68,
+            "shot_end": 148,
+            "target_start": 73,
+            "target_end": 107,
+        }]
+        coverage = plan.mandatory_coverage(target)
+        dialogue = next(item for item in coverage if item["id"] == "S2.O1")
+        self.assertEqual(dialogue["kind"], "overlay")
+        self.assertEqual(dialogue["overlay_type"], "dialogue")
+        self.assertEqual((dialogue["overlap_start_frame"], dialogue["overlap_end_frame"]), (24, 39))
+        rendered = plan.for_target_shots(target, 24.0)
+        self.assertIn("[S2.O1] dialogue at source-relative frames 24-47", rendered)
+        self.assertIn("Required now [S2.O1], overlay/dialogue", rendered)
+
+    def test_preproduction_retries_one_complete_json_when_visual_beats_do_not_cover_a_shot(self):
+        captured = {"messages": []}
+        invalid = self.timing_response()
+        invalid["shots"] = json.loads(json.dumps(invalid["shots"]))
+        invalid["shots"][1]["visual_beats"][-1]["end_frame"] = 78
+        corrected = self.timing_response()
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [invalid, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                captured.setdefault("max_tokens", []).append(kwargs["max_tokens"])
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._plan_timing_in_process(self.timing_request(), debug=False)
+
+        self.assertEqual(len(result.attempts), 2)
+        self.assertIn("TIMING-PLAN CORRECTION REQUIRED", result.attempts[1].correction_prompt)
+        self.assertEqual(captured["max_tokens"], [2048, 2048])
+        self.assertEqual([message["role"] for message in captured["messages"][0]], ["system", "user"])
+        self.assertIsInstance(captured["messages"][0][1]["content"], str)
+        self.assertTrue(captured["closed"])
+
+    def test_preproduction_rejects_gapped_schedule_without_sampler_fallback(self):
+        invalid = self.timing_response()
+        invalid["shots"] = json.loads(json.dumps(invalid["shots"]))
+        invalid["shots"][0]["visual_beats"][1]["start_frame"] = 40
+        with self.assertRaisesRegex(gemma4.Gemma4ObservationError, "contiguous"):
+            gemma4._validate_timing_plan(invalid, self.timing_request(), json.dumps(invalid))
+
+    def test_preproduction_uses_sampler_owned_global_boundaries_not_ambiguous_model_echoes(self):
+        response = self.timing_response()
+        response["shots"] = json.loads(json.dumps(response["shots"]))
+        # A model may echo a human-readable inclusive endpoint. It must not
+        # invalidate otherwise complete source-relative action beats.
+        response["shots"][1]["shot_start_frame"] = 68
+        response["shots"][1]["shot_end_frame"] = 148
+        plan = gemma4._validate_timing_plan(response, self.timing_request(), json.dumps(response))
+        self.assertEqual((plan.shots[1].shot_start_frame, plan.shots[1].shot_end_frame), (68, 148))
+
+    def test_preproduction_normalizes_only_the_final_inclusive_frame_spelling(self):
+        response = self.timing_response()
+        response["shots"] = json.loads(json.dumps(response["shots"]))
+        response["shots"][0]["visual_beats"][-1]["end_frame"] = 67
+        plan = gemma4._validate_timing_plan(response, self.timing_request(), json.dumps(response))
+        self.assertEqual(plan.shots[0].visual_beats[-1].end_frame, 68)
+
+    def test_preproduction_rejects_invalid_or_duplicate_character_subject_table(self):
+        invalid = self.timing_response()
+        invalid["character_name_table"] = [
+            {"character_name": "Heman", "subject": "<Subject 1>"},
+            {"character_name": "Heman", "subject": "<Subject 2>"},
+        ]
+        with self.assertRaisesRegex(gemma4.Gemma4ObservationError, "repeats character name"):
+            gemma4._validate_timing_plan(invalid, self.timing_request(), json.dumps(invalid))
 
     def test_previous_gemma_description_is_explicitly_linked_to_prior_stills(self):
         request = self.request()
@@ -292,6 +503,8 @@ class GemmaCaptureTest(unittest.TestCase):
             observation,
         )
         self.assertIn("IMMUTABLE H3-LOCAL SHOT MARKERS", observation)
+        self.assertIn("begin it as unmarked continuation prose", observation)
+        self.assertNotIn('exact token: "[Shot 1]"', observation)
         self.assertIn('exact token: "[Shot 2] At 00:00.667,"', observation)
 
     def test_retries_once_with_literal_local_markers_when_initial_json_uses_global_timecodes(self):
@@ -302,7 +515,7 @@ class GemmaCaptureTest(unittest.TestCase):
             "timing_plan": "[Shot 1]: walking; [Shot 2]: the warning after the cut.",
             "end_state": "Heman has delivered the warning.",
             "detailed_description": (
-                "[Shot 1] Heman continues walking right. "
+                "Heman continues walking right. "
                 "[Shot 2] At 00:09.167, Heman says: <d>[English] Stay back!</d>"
             ),
         }
@@ -335,14 +548,145 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(result.attempts[0].raw_json, json.dumps(wrong))
         self.assertTrue(any("required marker" in warning for warning in result.attempts[0].validation_warnings))
         self.assertEqual(result.attempts[1].raw_json, json.dumps(corrected))
-        self.assertIn("MARKER CORRECTION REQUIRED", result.attempts[1].correction_prompt)
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", result.attempts[1].correction_prompt)
         self.assertIn('[Shot 2] At 00:00.667,', result.attempts[1].correction_prompt)
         self.assertEqual(len(captured["messages"]), 2)
         retry_messages = captured["messages"][1]
         self.assertEqual([message["role"] for message in retry_messages], ["system", "user", "assistant", "user"])
         self.assertEqual(retry_messages[2]["content"], json.dumps(wrong))
-        self.assertIn("MARKER CORRECTION REQUIRED", retry_messages[3]["content"])
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", retry_messages[3]["content"])
         self.assertTrue(captured["closed"])
+
+    def test_retries_with_a_gemma_authored_coverage_correction_when_current_dialogue_is_deferred(self):
+        request = self.request()
+        request["mandatory_coverage"] = [{
+            "id": "S5.O1",
+            "kind": "overlay",
+            "overlay_type": "dialogue",
+            "source_shot": 5,
+            "source_start_frame": 0,
+            "source_end_frame": 23,
+            "overlap_start_frame": 0,
+            "overlap_end_frame": 23,
+            "action": "Heman says: <d>[English] Stay back!</d>",
+        }]
+        deferred = {
+            "confidence": "high",
+            "analysis": "The dialogue belongs after the ongoing action.",
+            "timing_plan": "S5.O1 deferred until the next chunk.",
+            "end_state": "Heman has not spoken yet.",
+            "coverage": [{
+                "id": "S5.O1",
+                "status": "deferred",
+                "evidence": "Heman continues walking right.",
+            }],
+            "detailed_description": "Heman continues walking right.",
+        }
+        corrected = {
+            "confidence": "high",
+            "analysis": "The dialogue begins during the current action.",
+            "timing_plan": "S5.O1 begins now while Heman continues walking.",
+            "end_state": "Heman is still walking after delivering the warning.",
+            "coverage": [{
+                "id": "S5.O1",
+                "status": "begins",
+                "evidence": "Heman says: <d>[English] Stay back!</d>",
+            }],
+            "detailed_description": "Heman says: <d>[English] Stay back!</d> while continuing to walk right.",
+        }
+        captured = {"messages": []}
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [deferred, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(request, [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(len(result.attempts), 2)
+        self.assertIn("status 'deferred'", "\n".join(result.attempts[0].validation_warnings))
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", result.attempts[1].correction_prompt)
+        self.assertIn("S5.O1", result.attempts[1].correction_prompt)
+        self.assertEqual(len(captured["messages"]), 2)
+        self.assertTrue(captured["closed"])
+
+    def test_retries_with_official_subject_speaker_form_for_mapped_dialogue(self):
+        request = self.request()
+        request["character_name_table"] = "- Heman -> <Subject 1>"
+        request["original_prompt"] = (
+            "detailed_description: [Shot 4] Heman walks right. "
+            "[Shot 5] At 00:09.167, Heman (S1) says: <d>[English] Stay back!</d>"
+        )
+        malformed = {
+            "confidence": "high",
+            "analysis": "The warning is delivered after the cut.",
+            "timing_plan": "Heman gives the warning in the current slice.",
+            "end_state": "Heman has delivered the warning.",
+            "detailed_description": (
+                "Heman continues walking right. "
+                "[Shot 2] At 00:00.667, Heman (<Subject 1>) (S1) says, "
+                "<d>[English] Stay back!</d>"
+            ),
+        }
+        corrected = dict(malformed)
+        corrected["detailed_description"] = malformed["detailed_description"].replace(
+            "Heman (<Subject 1>) (S1)", "<Subject 1> (S1)"
+        )
+        captured = {"messages": []}
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [malformed, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(request, [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(len(result.attempts), 2)
+        self.assertTrue(any(
+            "dialogue speaker form" in warning
+            for warning in result.attempts[0].validation_warnings
+        ))
+        self.assertIn("<Subject 1> (S1) must introduce", result.attempts[1].correction_prompt)
+        self.assertIn("not Name (<Subject N>) (Sx)", result.attempts[1].correction_prompt)
+        self.assertEqual(len(captured["messages"]), 2)
+        self.assertTrue(captured["closed"])
+
+    def test_system_requires_continuity_prefix_for_non_cut_camera_motion(self):
+        system = gemma4._gemma_prompt_templates()["SYSTEM"]
+        planning_system = gemma4._gemma_prompt_templates()["PREPRODUCTION_SYSTEM"]
+
+        self.assertIn("Every camera movement, follow, pan, zoom, track, shake, or reposition", system)
+        self.assertIn("`In a continuous movement,`", system)
+        self.assertIn("never turn it into an undocumented cut", system)
+        self.assertIn("`In a continuous movement,`", planning_system)
 
     def test_reports_marker_and_dialogue_warnings_without_replacing_gemma_text(self):
         request = self.request()
@@ -352,7 +696,7 @@ class GemmaCaptureTest(unittest.TestCase):
             "timing_plan": "[Shot 1]: walk right now; [Shot 2]: defer dialogue until the cut.",
             "end_state": "Heman is walking right.",
             "detailed_description": (
-                "[Shot 1] Heman continues walking right. "
+                "Heman continues walking right. "
                 "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
             ),
         }
@@ -381,6 +725,44 @@ class GemmaCaptureTest(unittest.TestCase):
             marker_result,
         )
 
+        spurious_opening = dict(value)
+        spurious_opening["detailed_description"] = (
+            "[Shot 1] " + value["detailed_description"]
+        )
+        spurious_result = gemma4._validate_chunk_prompt(
+            spurious_opening,
+            request,
+            json.dumps(spurious_opening),
+        )
+        self.assertEqual(spurious_result.detailed_description, spurious_opening["detailed_description"])
+        self.assertIn(
+            "Gemma 4 returned 2 shot markers; this chunk requires 1",
+            spurious_result.validation_warnings,
+        )
+
+        mid_shot_only_request = dict(request)
+        mid_shot_only_request["target_shots"] = [dict(request["target_shots"][0])]
+        plain_mid_shot = dict(value)
+        plain_mid_shot["detailed_description"] = "Heman continues walking right."
+        plain_result = gemma4._validate_chunk_prompt(
+            plain_mid_shot,
+            mid_shot_only_request,
+            json.dumps(plain_mid_shot),
+        )
+        self.assertEqual(plain_result.validation_warnings, ())
+
+        marked_mid_shot = dict(plain_mid_shot)
+        marked_mid_shot["detailed_description"] = "[Shot 1] Heman continues walking right."
+        marked_result = gemma4._validate_chunk_prompt(
+            marked_mid_shot,
+            mid_shot_only_request,
+            json.dumps(marked_mid_shot),
+        )
+        self.assertIn(
+            "Gemma 4 returned 1 shot markers; this chunk requires 0",
+            marked_result.validation_warnings,
+        )
+
         changed_dialogue = dict(value)
         changed_dialogue["detailed_description"] = value["detailed_description"].replace("Stay back!", "Run away!")
         dialogue_result = gemma4._validate_chunk_prompt(changed_dialogue, request, json.dumps(changed_dialogue))
@@ -395,7 +777,7 @@ class GemmaCaptureTest(unittest.TestCase):
         missing_result = gemma4._validate_chunk_prompt(missing_marker, request, json.dumps(missing_marker))
         self.assertEqual(missing_result.detailed_description, missing_marker["detailed_description"])
         self.assertIn(
-            "Gemma 4 returned 1 shot markers; this chunk requires 2",
+            "Gemma 4 returned 0 shot markers; this chunk requires 1",
             missing_result.validation_warnings,
         )
 
@@ -419,7 +801,7 @@ class GemmaCaptureTest(unittest.TestCase):
             confidence="high",
             analysis="The prior action is visible.",
             detailed_description=(
-                "[Shot 1] Heman continues walking toward the right. "
+                "Heman continues walking toward the right. "
                 "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
             ),
             raw_json='{"confidence":"high"}',

@@ -77,6 +77,22 @@ def _cache_payload(payload):
                     values[step - 1] = payload.get(source)
         elif action == "chunk":
             state["chunks"][int(payload["chunk"])] = payload.copy()
+        elif action == "chunk_metadata":
+            # Metadata is sent as soon as Gemma has directed a chunk, before
+            # the first preview image is encoded. Keep it inside reset's
+            # durable timeline payload so a browser refresh restores tooltip
+            # text for both completed and currently sampling chunks.
+            try:
+                chunk_index = int(payload["chunk"])
+            except (KeyError, TypeError, ValueError):
+                return
+            chunk_ranges = state["reset"].get("chunk_ranges", ())
+            # Preview payloads index chunks from zero, while the human-facing
+            # ``chunk`` number stored in each range starts at one.
+            if 0 <= chunk_index < len(chunk_ranges):
+                description = payload.get("gemma_detailed_description")
+                if isinstance(description, str) and description.strip():
+                    chunk_ranges[chunk_index]["gemma_detailed_description"] = description.strip()
         elif action == "complete":
             state["complete"] = payload.copy()
 
@@ -288,9 +304,19 @@ class _PreviewExecution:
     def __init__(self, wrappers, chunk_ranges, shot_ranges):
         self.items = [(wrapper, wrapper.begin(chunk_ranges, shot_ranges)) for wrapper in wrappers]
 
-    def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
+    def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
+                  gemma_detailed_description=None):
         for wrapper, execution_id in self.items:
-            wrapper.set_chunk(execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps)
+            wrapper.set_chunk(
+                execution_id,
+                index,
+                sampled_start,
+                sampled_end,
+                output_start,
+                output_end,
+                trim_steps,
+                gemma_detailed_description,
+            )
 
     def clear_chunk(self):
         for wrapper, execution_id in self.items:
@@ -348,7 +374,8 @@ class _AccumulatedPreviewWrapper:
         })
         return self.execution_id
 
-    def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps):
+    def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
+                  gemma_detailed_description=None):
         if execution_id == self.execution_id:
             self.current_chunk = {
                 "index": index,
@@ -358,6 +385,16 @@ class _AccumulatedPreviewWrapper:
                 "output_end": output_end,
                 "trim_steps": trim_steps,
             }
+            if isinstance(gemma_detailed_description, str) and gemma_detailed_description.strip():
+                description = gemma_detailed_description.strip()
+                self.current_chunk["gemma_detailed_description"] = description
+                _send({
+                    "node_id": self.node_id,
+                    "action": "chunk_metadata",
+                    "execution": execution_id,
+                    "chunk": index,
+                    "gemma_detailed_description": description,
+                })
 
     def clear_chunk(self, execution_id):
         if execution_id == self.execution_id:
@@ -514,6 +551,8 @@ class _AccumulatedPreviewWrapper:
                             "previewer": previewer_name,
                             "elapsed_ms": self._elapsed_ms(),
                         }
+                        if chunk.get("gemma_detailed_description"):
+                            payload["gemma_detailed_description"] = chunk["gemma_detailed_description"]
 
                         def encode_and_send(frames=frames, durations=durations, payload=payload):
                             encoded, frame_durations = _encode_frame_group(frames, durations, self.quality)

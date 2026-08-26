@@ -652,9 +652,12 @@ For each physical chunk, the current parser:
 2. keeps only source shots whose intervals intersect the *sampled* physical
    window, including an already-completed predecessor when carried guide frames
    straddle a source cut;
-3. renumbers those selected shots locally and writes the documented H3 form
-   `[Shot N] At MM:SS.mmm, ...`, with the time measured from the physical chunk
-   start so a cut lands after any carried guide prefix;
+3. treats `[Shot 1]` as a real opening-shot cue, not generic chunk syntax. It
+   writes it only if a source shot genuinely begins at physical local frame
+   zero. A physical chunk that begins inside an already-running source shot
+   starts with unmarked continuation prose; later real cuts retain their local
+   `[Shot N] At MM:SS.mmm,` form, with the time measured from the physical
+   chunk start so a cut lands after any carried guide prefix;
 4. uses only a compact preservation line for a predecessor represented solely
    by carried frames, rather than replaying its completed source action;
 5. uses original source bodies in its deterministic preview/fallback output.
@@ -870,11 +873,150 @@ facts that only the sampler should own:
 - all source shots intersecting the previous and current ranges, with complete
   original shot bodies preserved unsplit;
 - the portion of each source shot assigned to this chunk;
-- exact required local `[Shot 1]` and `[Shot N] At MM:SS.mmm,` markers for real
-  source cuts, repeated in an explicit copy-only H3-local marker block that
-  distinguishes them from the full-video/global source timestamps; and
+- only the required local markers for real source boundaries, repeated in an
+  explicit copy-only H3-local marker block that distinguishes them from the
+  full-video/global source timestamps. `[Shot 1]` is included only when a
+  source shot truly starts at the physical chunk's first frame; a middle-shot
+  chunk begins as unmarked continuation prose; and
 - the actual opening conditioning available to H3: keyframe prefix, bounded
   `<Video N>`/`<Audio N>`, fully denoised latent warm-start, or none.
+
+### Implemented preproduction shot-timing director
+
+Per-chunk visual direction can preserve continuity while still making a poor
+long-shot pacing decision. A 39-frame diagnostic showed this clearly: the
+second source shot lasted 81 frames, but the director assigned its first 48
+percent solely to entering/running, then asked H3 to perform the harness pull,
+sudden deceleration, full skid, roar, and complete stop in the next 34 frames.
+The images passed into Chunk 5 showed that the tiger was still sliding, yet the
+next request trusted the earlier planned `end_state` that said the stop was
+complete. The interval arithmetic, source coverage, and image selection were
+correct; the timing decision was not. Giving each physical chunk the complete
+shot prose and an isolated percentage was insufficient for Gemma to see the
+whole action as one plan.
+
+The sampler now makes one additional **text-only Gemma preproduction request
+before Chunk 1**. It receives every complete source shot that will be rendered,
+the complete unchanged user prompt, and every active physical chunk's sampled
+and retained output ranges. It returns a compact JSON schedule per source shot:
+
+```json
+{
+  "source_shot": 2,
+  "shot_start_frame": 68,
+  "shot_end_frame": 148,
+  "visual_beats": [
+    {"start_frame": 0, "end_frame": 24, "action": "..."},
+    {"start_frame": 24, "end_frame": 48, "action": "..."}
+  ],
+  "overlays": [
+    {"start_frame": 20, "end_frame": 44, "type": "dialogue", "content": "..."}
+  ]
+}
+```
+
+The same preproduction JSON owns an immutable `character_name_table`, for
+example `{"character_name": "Heman", "subject": "<Subject 1>"}`. Gemma
+may add a row only when the original prompt explicitly maps that character name
+to the existing label; it must not infer a label from image appearance,
+reference order, actor name, or a generic noun. The table can be empty, aliases
+may point to one subject label, and duplicate character-name rows are rejected.
+It is rendered into every later chunk-director request. Gemma must preserve the
+table and write each listed name in H3 descriptive prose as `Name (<Subject
+N>)`, but never put the label inside `<d>...</d>` because that would alter the
+immutable spoken dialogue. The table itself remains Gemma-only metadata; H3
+receives it only through those natural parenthetical name bindings in the final
+Gemma-authored `detailed_description`.
+
+The normal descriptive-name binding has one essential H3 dialogue exception:
+when a mapped character speaks, the final H3-facing clause must use the
+official immediate speaker token `<Subject N> (Sx) says, <d>...</d>`, not
+`Name (<Subject N>) (Sx) says`. The latter can hide the Subject-plus-speaker
+grammar that H3 expects and was observed in a run where Heman's Shot 5 dialogue
+did not render. The response validator detects the malformed nested form and
+gives Gemma one model-authored correction request; sampler code never rewrites
+the dialogue itself. The same run showed that an invented phrase such as
+`The camera follows the chase` can be interpreted by H3 as a new camera cut.
+Gemma may still add modest camera movement, but every non-source-cut movement,
+follow, pan, zoom, track, shake, or reposition must begin exactly `In a
+continuous movement,` and explicitly continue the established view. It must
+not invent a new angle, camera setup, framing, perspective, transition, or
+cut. The actual Chunk 2 cut in that run was independently confirmed to be the
+genuine source Shot 1-to-Shot 2 boundary at global frame 68; Gemma's prompt
+did not request the five-headed-dragon visual seen after it.
+
+`start_frame` and `end_frame` are source-shot-relative and end-exclusive.
+`visual_beats` are the one serial timeline: validation requires each shot to
+have at least one non-empty visual beat, with an exact contiguous cover from
+relative frame zero through the complete source-shot duration. `overlays` are
+optional non-empty dialogue, sound, or sustained-action intervals that fit
+inside the shot but may overlap the visual timeline and one another. This is
+intentional: a prompt that says a frightened character shields themselves while
+the room collapses, a roar is heard, and they speak describes one concurrent
+moment unless it supplies genuine sequencing language. The Gemma system prompt
+now defaults to concurrency; it makes a serial visual progression only for an
+explicit connector (`then`, `after`, `once`, `only then`, `finally`, `a moment
+passes`), a causal/state dependency, or a required camera progression. Mere
+description order is not sequencing. Dialogue receives a realistic overlapping
+interval rather than being automatically scheduled after all visible action.
+
+The sampler attaches the known global source boundary to a validated schedule;
+Gemma does not echo it, because an inclusive/exclusive endpoint echo caused an
+otherwise valid real schedule to be rejected. Gemma sometimes likewise writes
+the final source-relative frame index where the JSON contract wants the
+exclusive endpoint, while still using matching half-open boundaries between all
+earlier visual beats. The validator accepts only that unambiguous final
+one-frame spelling and extends the same final Gemma-authored visual action
+through the known final source frame; it does not invent or replace action
+text. A malformed first response receives one full Gemma correction turn
+containing the error and literal schema; sampler code never fills missing
+visual beats or writes a synthetic schedule. If the correction still fails,
+sampling stops before Chunk 1 because there is no truthful algorithmic timing
+fallback.
+
+The validated schedule is Gemma-only data. Before every later visual directing
+call, the sampler renders only the complete schedule(s) relevant to that
+chunk's target source shot(s) and supplies them next to the ordinary
+source-relative timing contract. The same text now begins with a derived
+**mandatory current-slice beat coverage** section: it intersects every
+Gemma-authored visual beat and overlay with the retained output frame interval,
+labels each as `S#.V#` or `S#.O#`, and says whether it begins or continues in
+this chunk. Gemma must explicitly include every listed action in its H3-facing
+description, even when its start is only a few frames before the chunk ends; it
+may defer only the later outcome outside the slice. Every response now includes
+a `coverage` JSON array with one status (`begins`, `continues`, or `completes`)
+and one exact description-evidence phrase for each current ID. `deferred` is
+invalid for an ID in the current slice. A dialogue overlay additionally must
+include its exact `<d>...</d>` line in the H3 description. Failure triggers one
+complete Gemma-authored **chunk-contract correction** turn; both raw JSON
+attempts and the correction are logged, and no algorithmic prompt replacement
+is ever used.
+
+This was added after two real pacing failures: first, a Chunk 1 request
+contained Shot 1's planned camera-arc beat at frames 32-49, while Gemma
+incorrectly deferred frames 32-67 and omitted the arc from the final 0-38
+prompt. Later, Shot 6 correctly assigned global frames 379-412 to a collapse,
+roar, and the start of Tila's dialogue, but Gemma marked the dialogue deferred
+and waited for the one remaining Shot 6 frame in Chunk 13. The assignment math
+was correct; the serial-only schedule encouraged Gemma to treat speech as an
+after-action. The overlay model and correction contract address that failure.
+H3 never receives the JSON, beat labels, or planning prose directly; it still
+receives only the final Gemma-authored local `detailed_description`. The visual
+director uses the schedule to keep actions on pace, but chronological rendered
+stills remain authoritative when H3 has drifted. It should identify the drift
+and continue the immediate unfinished beat rather than replaying a completed
+beat or cramming every remaining outcome into the current slice.
+
+The preproduction pass reuses the existing process-isolated full-GPU Gemma
+worker and the reviewed vendored H3 rule set. It uses a 2048-token JSON budget
+(ordinary local prompt direction remains at 1024), is included in the existing
+Gemma timing total, and has no VAE decode/observation images. H3, Qwen, and the
+video VAE are explicitly unloaded before it runs. The temp
+`last_gemma_chunk_prompts.txt` capture now starts with the exact preproduction
+system prompt, request, raw JSON attempts/correction, and validated readable
+schedule, followed by the existing per-chunk transcripts. `gemma4_prompts.txt`
+therefore owns four editable sections: `[PREPRODUCTION_SYSTEM]`,
+`[PREPRODUCTION]`, `[SYSTEM]`, and `[OBSERVATION]`.
 
 Gemma interprets what the previous generated sequence already accomplished,
 retains the source shot's complete intent rather than its exact wording, and
@@ -993,6 +1135,25 @@ The required binding is exactly `llama-cpp-python==0.3.35`: it exposes the
 generic MTMD Python handler used for Gemma 4's `mmproj`. The development
 environment has 0.3.35 installed through ComfyUI's isolated
 `tools/python.sh` interpreter.
+
+### Mid-shot marker correction
+
+An August 2026 prompt review identified that every chunk-local description was
+being prefixed with `[Shot 1]`, including chunks whose first retained frame lay
+inside an existing source shot. Although the marker was intended merely as a
+local index, it is documented H3 shot-opening syntax and could tell MiniMax to
+restart the shot at each sampler handoff. The marker contract now represents
+actual source boundaries instead: the first source shot receives `[Shot 1]`
+only when its start equals the physical sampled-window start. If that source
+shot started earlier, Gemma must begin with ordinary continuation prose and no
+marker. If carried prefix frames contain the end of a preceding source shot and
+a new source shot starts later in the physical window, the new cut remains
+`[Shot 2] At MM:SS.mmm,`; the unmarked opening continuation is its implicit
+local Shot 1. Marker validation counts and compares only explicitly required
+tokens, so it also catches a spurious model-authored `[Shot 1]`. The same rule
+is applied to the deterministic `prompt_preview_only` planner and to the
+Video1 retention wording, which previously mentioned `[Shot 1]` outside the
+description.
 
 ### Planned experiment: align chunks to shot boundaries
 
@@ -1282,6 +1443,16 @@ refresh performs one snapshot transfer containing the retained latest groups;
 normal live events do not resend earlier chunks. A reset event clears stale
 media at the next execution, and a completion event leaves the assembled
 preview playing.
+
+The chunk-color transport bar keeps its original click/drag help in the native
+hover tooltip. When the pointer is over one colored chunk segment, the same
+tooltip appends that chunk's human number and the exact Gemma-authored final
+`detailed_description` sent to H3. The sampler sends this metadata immediately
+after Gemma directs a chunk and before its DiT call begins, rather than waiting
+for the first encoded preview image. The preview cache folds it into the reset
+timeline state, so a browser refresh retains the descriptions for completed
+and currently sampling chunks. Chunks not directed yet explicitly say that
+their Gemma direction is still pending.
 
 Preview loading, decoding, encoding, and event-send errors are non-fatal. An
 invalid tiny decoder is disabled for that execution and falls back to
