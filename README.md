@@ -26,6 +26,21 @@ The way to use is pretty straight forward - just replace the normal "Sampler" no
 - `fps` - should always be 24, but if you have a node that sets the fps, you can connect it here too.
 <img width="349" height="422" alt="Image" src="https://github.com/user-attachments/assets/ebb106f4-804b-4465-8ffd-6a26a94ef6a2" />
 
+## Included nodes
+
+The extension installs four nodes:
+
+| Node | Purpose |
+| --- | --- |
+| `HR Endless Sampler` | Samples a long latent serially, asks Gemma to plan the complete production and direct each chunk, and outputs the finished latent, chunk prompts, and timeline metadata. |
+| `HR Endless Sampler Preview` | Patches the model with the live accumulated preview, ordered chunk playback, shot brackets, prompt/timing tooltips, frame stepping, performance graphs, and browser-refresh recovery. |
+| `HR Endless Sampler Save Video` | Saves ordinary video, animated VHS formats, or float EXR sequences while preserving the Endless timeline, prompts, shot/chunk mapping, render timing, and optional audio. |
+| `HR Endless Sampler Load Video` | Browses or uploads finished media, restores its interactive timeline immediately in the browser, and outputs decoded video/images, audio, dimensions, FPS, frame count, filename, and timeline to a queued workflow. |
+
+The Save and Load players use the same colored chunk timeline and shot brackets
+as the live Preview node, but omit the live sampling graphs. Hovering a chunk
+shows its H3 prompt and the sampler/Gemma/miscellaneous timing breakdown.
+
 ## Main settings
 
 `chunk_frames` is the number of frames sampled in one H3 call. Use the largest
@@ -48,6 +63,14 @@ need the full source prompt and shot plan again. Linux uses `/dev/shm` when it
 has enough free RAM; otherwise the normal temporary directory is used. The
 cache uses several GiB of RAM, never VRAM. It is optional and does not change
 the generated video.
+
+`gemma4_mtp` enables Gemma's native four-token draft-MTP decoder. Turn it off
+to run the original non-MTP decoder and compare speed on the same workflow.
+The console reports generated tokens/second and, in MTP mode, the assistant's
+draft-token acceptance rate, proposal count, verification work, rollback
+replays, and checkpoint time. This is real speculative decoding: the matching
+Gemma assistant proposes as many as four tokens and the 12B target verifies
+them together.
 
 `debug` adds detailed prompt and memory information to the console.
 
@@ -105,13 +128,16 @@ image directory contains the stills that Gemma saw. A new render replaces both.
 ## Gemma 4 setup
 
 The sampler uses the official Google Gemma 4 12B QAT Q4 GGUF model through
-`llama-cpp-python`. Install the dependencies with ComfyUI's Python:
+`llama-cpp-python`. When `gemma4_mtp` is enabled, the matching native MTP
+assistant proposes up to four tokens at a time. Install the CUDA 12.5
+dependencies with ComfyUI's Python:
 
 ```bash
 ~/comfyui/tools/python.sh -m pip install -r requirements.txt
 ```
 
-On first use, the sampler downloads Gemma and its projector to:
+On first use, the sampler downloads Gemma, its projector, and the matching
+465 MB Q8 MTP assistant to:
 
 ```text
 models/llama_cpp/gemma-4-12b-it-qat-q4_0/
@@ -120,7 +146,20 @@ models/llama_cpp/gemma-4-12b-it-qat-q4_0/
 Gemma runs in a separate process between H3 chunks. H3, Qwen, and the video VAE
 are unloaded before Gemma runs, and the Gemma process exits before H3 sampling
 resumes. This is intentional: it releases Gemma's CUDA allocations before H3
-needs VRAM again.
+needs VRAM again. If native MTP is enabled but the platform wheel lacks its
+required symbols, the Gemma pass stops with an explicit error; it never
+silently labels ordinary decoding as MTP. Disable `gemma4_mtp` to deliberately
+use the original decoder.
+
+The fast MTP checkpoint path is currently experimental in upstream llama.cpp.
+Gemma therefore runs inside a disposable worker. If native MTP aborts that
+worker, the sampler preserves the exact request and retries **only that failed
+Gemma operation once** with the original non-MTP decoder. It does not disable
+MTP for the rest of the render, and it does not discard the preproduction KV
+cache or any other request data: the next Gemma operation attempts MTP again.
+Ordinary prompt/schema errors remain visible and are not mistaken for an MTP
+crash. The upstream failure is tracked in
+[llama.cpp issue #27439](https://github.com/ggml-org/llama.cpp/issues/27439).
 
 The editable Gemma instructions are in
 [`gemma4_prompts.txt`](gemma4_prompts.txt). The sampler reads this file again
@@ -136,7 +175,9 @@ model output for the guider and sampler.
 The preview plays every completed chunk in order. It can restore the current
 preview after a browser refresh. Its timeline uses a different color for each
 chunk and shows brackets for source shots. Hover a chunk color to see Gemma's
-H3 prompt for that chunk.
+H3 prompt, H3 render time, Gemma processing time, and total processing time for
+that chunk. Only the prompt prose is colored: each shot section uses the same
+color as its shot bracket, including prompts containing a single shot.
 
 Use the small play/pause button, Space, or the timeline to control playback.
 Focus the preview and use Left/Right for frame stepping. The lower-right label
@@ -146,6 +187,77 @@ shows the output frame and, when available, the shot and chunk number.
 `taeh3.safetensors` for a more representative preview. Tiny-VAE preview costs
 more time and VRAM. `max_resolution: 0` keeps the latent preview resolution.
 The preview FPS can be changed while it is playing and does not affect sampling.
+
+## Save and load finished videos
+
+`HR Endless Sampler` now has a fourth `timeline` output. Connect it, together
+with decoded `images`, to `HR Endless Sampler Save Video`. The Save node has
+its own lighter version of the preview player: it plays the finished render,
+keeps the colored chunk bar and shot brackets, shows each chunk's Gemma prompt
+and saved timing details on hover, and colors each prompt's shot sections to
+match the shot brackets. It supports play/pause, timeline seeking, and
+Left/Right frame stepping. The status line also shows the full sampler render
+time saved with the video. It intentionally has no sampler graphs.
+
+`video/h264-mp4` uses ComfyUI's native video encoder and does not require Video
+Helper Suite. It supports the Save node's CRF, 8/10-bit pixel-format choice,
+audio muxing, and embedded timeline metadata. The other ordinary formats call
+the installed **Video Combine 🎥🅥🅗🅢** encoder directly. Their `pixel_format`
+uses the corresponding VHS options (`auto` keeps the format's VHS default),
+and `crf` is passed through whenever that encoder supports CRF. Other VHS
+format-specific settings retain their VHS defaults. Connect decoded `audio`
+to mux its soundtrack into ordinary video output. When VHS is installed, the
+format menu includes every Video Combine choice, including animated GIF and
+WebP, plus native H.264 and the Endless-only EXR option.
+
+`video/exr` writes an OpenEXR image sequence. Choose `half` for 16-bit float
+or `float` for 32-bit float, plus `none`, `rle`, `zip1`, or `zip16`
+compression. `exr_gamma` exposes the encoder's remaining gamma option; leave
+it at `1.0` for raw values. EXR saving never clamps the tensor it receives. For the H3 VAE's
+actual decoder values—including values below 0 or above 1—connect the sampler
+`output` latent and the H3 `vae` to the optional Save-node `latent` and `vae`
+inputs. That path bypasses only H3's final display clamp before writing EXR.
+The resulting EXR contains those raw VAE RGB values; it does not silently apply
+an sRGB-to-linear color conversion. An EXR sequence cannot contain audio, so a
+connected `audio` input is written beside it as a 32-bit float WAV sidecar and is
+included in the Save/Load node's browser preview.
+
+Native H.264 and VHS formats that support container metadata write the compact
+timeline to the `hr_endless_sampler_timeline` tag. Every export also receives an
+adjacent sidecar:
+
+```text
+your_render.mp4.hr_endless_sampler_timeline.json
+```
+
+The sidecar is always written because transcoding services can remove custom
+video metadata. EXR uses the same sidecar for the full sequence manifest and
+also embeds the timeline in its first EXR frame. `HR Endless Sampler Load
+Video` opens a saved video or the first EXR frame/sidecar in the same player;
+it prefers the sidecar and falls back to embedded video metadata. Its `fps` is
+only a playback-rate override; `0` uses the rate stored with the render.
+
+The Load node includes **Browse output…** and **Upload video…** controls.
+Browse output opens a folder dialog rooted at ComfyUI's `output` directory; it
+can navigate subfolders, lists supported video files and standalone EXRs, and
+shows each saved Endless EXR sequence as one item instead of hundreds of frame
+files. Small Name, Size, and Date buttons change the ordering; Date is the
+default, with the newest item first. Upload video copies a file from the browser machine into
+`output/hr_endless_sampler_uploads/` using 16 MiB chunks, then fills the node's
+path automatically. Choosing or uploading immediately probes the media, reads
+its timeline metadata, and fills the player without queueing the workflow.
+Queue the node when downstream nodes need its timeline, filename, FPS, native
+ComfyUI `VIDEO`, decoded `IMAGE` frame batch, `AUDIO`, frame count, width, or
+height outputs. The browser-only preview remains lightweight; the full frame
+and audio decode happens when the workflow queues the Load node.
+
+Both Save and Load also have a **Matching videos ▾** dropdown, ordered newest
+first. On Save it lists `filename_prefix*` from the matching output folder. On
+Load it derives the prefix from the current `video` path by removing the
+generated `_<number>_…` suffix—for example,
+`video/render_00042_.mp4` searches for `video/render*`. Selecting an entry
+switches the player immediately; on Load it also replaces the serialized
+`video` value.
 
 ## Prompt format
 
@@ -176,8 +288,8 @@ Chunking reduces the temporal part of H3's memory use. It cannot make an
 arbitrary resolution fit: one full-resolution H3 sampling step must still fit
 in VRAM.
 
-The console shows chunk progress, H3 step progress, Gemma preparation progress,
-and an end-of-run report. The report includes H3, Qwen, VAE, and Gemma time,
+The console shows chunk progress, H3 step progress, and Gemma preparation
+progress with live generated tokens/second. The end-of-run report includes H3, Qwen, VAE, and Gemma time,
 plus peak RAM and VRAM use.
 
 ## Current limits

@@ -14,6 +14,151 @@ function findNode(rootGraph, qualifiedId) {
 }
 
 
+function formatChunkClock(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return null;
+    const rounded = Math.round(seconds);
+    const minutes = Math.floor(rounded / 60);
+    const remainder = rounded % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+
+function chunkTimingLines(range) {
+    const lines = [];
+    const totalSeconds = Number(range.chunk_total_seconds);
+    const samplerSeconds = Math.max(0, Number(range.h3_render_seconds) || 0);
+    const gemmaSeconds = Math.max(0, Number(range.gemma_seconds) || 0);
+    if (Number.isFinite(totalSeconds) && totalSeconds >= 0) {
+        const miscSeconds = Math.max(0, totalSeconds - samplerSeconds - gemmaSeconds);
+        lines.push(
+            `Chunk processing: ${formatChunkClock(totalSeconds)} `
+            + `( sampler:${formatChunkClock(samplerSeconds)} + gemma4:${formatChunkClock(gemmaSeconds)} `
+            + `+ misc:${formatChunkClock(miscSeconds)} )`
+        );
+    }
+    const preproduction = formatChunkClock(range.gemma_preproduction_seconds);
+    if (preproduction && Number(range.gemma_preproduction_seconds) > 0) {
+        lines.push(`Gemma4 preproduction included above: ${preproduction}`);
+    }
+    return lines;
+}
+
+
+function shotsOverlappingChunk(chunk, shotRanges) {
+    const start = Number(chunk?.start);
+    const end = Number(chunk?.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
+    return shotRanges
+        .filter(shot => Number(shot.end) >= start && Number(shot.start) <= end)
+        .sort((left, right) => Number(left.start) - Number(right.start));
+}
+
+
+function coloredShotPromptSegments(description, chunk, shotRanges, colors) {
+    const text = String(description || "");
+    if (!text) return [];
+    const overlapping = shotsOverlappingChunk(chunk, shotRanges);
+    const colorFor = shot => shot
+        ? colors[(Math.max(1, Number(shot.shot) || 1) - 1) % colors.length]
+        : null;
+    const markers = [...text.matchAll(/\[Shot\s+(\d+)\]/gi)];
+    if (!markers.length) {
+        return [{ text, color: colorFor(overlapping[0]) || colors[0] }];
+    }
+
+    const segments = [];
+    const hasPrefix = markers[0].index > 0;
+    if (hasPrefix) {
+        segments.push({
+            text: text.slice(0, markers[0].index),
+            color: colorFor(overlapping[0]) || colors[0],
+        });
+    }
+    // Gemma's markers are physical-chunk-local shot numbers, while the
+    // timeline colors represent source/global shots. Map them by chronological
+    // overlap, not by equal numbers. If continuation prose precedes the first
+    // marker, it belongs to the already-active first source shot and that
+    // marker begins the next overlapping shot.
+    const sequentialOffset = hasPrefix ? 1 : 0;
+    for (let index = 0; index < markers.length; index++) {
+        const marker = markers[index];
+        const next = markers[index + 1];
+        const shot = overlapping[index + sequentialOffset];
+        const fallbackNumber = Number(marker[1]) || index + 1;
+        segments.push({
+            text: text.slice(marker.index, next ? next.index : text.length),
+            color: colorFor(shot) || colors[(fallbackNumber - 1) % colors.length],
+        });
+    }
+    return segments;
+}
+
+
+function createColoredChunkTooltip() {
+    const tooltip = document.createElement("div");
+    tooltip.style.cssText = "position:fixed;z-index:100001;display:none;box-sizing:border-box;max-width:min(760px,calc(100vw - 24px));max-height:min(70vh,640px);overflow:hidden;padding:9px 11px;border:1px solid #555;border-radius:5px;background:rgba(18,18,18,.97);color:#ddd;box-shadow:0 7px 24px rgba(0,0,0,.75);font:11px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;pointer-events:none;user-select:none;";
+    document.body.appendChild(tooltip);
+
+    function line(text, style="") {
+        const element = document.createElement("div");
+        element.textContent = text;
+        if (style) element.style.cssText = style;
+        tooltip.appendChild(element);
+        return element;
+    }
+
+    function position(event) {
+        const margin = 12;
+        const gap = 14;
+        const rect = tooltip.getBoundingClientRect();
+        let left = event.clientX + gap;
+        let top = event.clientY + gap;
+        if (left + rect.width > window.innerWidth - margin) left = event.clientX - rect.width - gap;
+        if (top + rect.height > window.innerHeight - margin) top = event.clientY - rect.height - gap;
+        tooltip.style.left = `${Math.max(margin, left)}px`;
+        tooltip.style.top = `${Math.max(margin, top)}px`;
+    }
+
+    return {
+        show(event, { help, chunk, timing, description, shotRanges, colors, waitingText }) {
+            tooltip.replaceChildren();
+            line(help, "color:#999;margin-bottom:6px;");
+            const chunkNumber = Number(chunk.chunk) || 1;
+            const chunkColor = colors[(Math.max(1, chunkNumber) - 1) % colors.length] || "#fff";
+            line(`Chunk ${chunkNumber}`, `color:${chunkColor};font-weight:700;`);
+            if (timing.length) {
+                for (const item of timing) line(item, "color:#bbb;");
+            } else {
+                line("Timing: waiting for this chunk to finish.", "color:#888;");
+            }
+            line("Gemma detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+            if (description) {
+                const prompt = document.createElement("div");
+                for (const segment of coloredShotPromptSegments(description, chunk, shotRanges, colors)) {
+                    const span = document.createElement("span");
+                    span.textContent = segment.text;
+                    span.style.color = segment.color;
+                    prompt.appendChild(span);
+                }
+                tooltip.appendChild(prompt);
+            } else {
+                line(waitingText, "color:#888;");
+            }
+            tooltip.style.display = "block";
+            position(event);
+        },
+        move: position,
+        hide() {
+            tooltip.style.display = "none";
+        },
+        remove() {
+            tooltip.remove();
+        },
+    };
+}
+
+
 function canvasContext(canvas) {
     const ratio = window.devicePixelRatio || 1;
     const width = canvas.clientWidth || 1;
@@ -171,8 +316,8 @@ app.registerExtension({
             const timelineHelp = "Click or drag to seek; colors identify chunks";
             const timelineShell = document.createElement("div");
             timelineShell.style.cssText = "position:relative;flex:1;height:33px;cursor:pointer;touch-action:none;";
-            timelineShell.title = timelineHelp;
             transport.appendChild(timelineShell);
+            const chunkTooltip = createColoredChunkTooltip();
 
             const timelineTrack = document.createElement("div");
             timelineTrack.style.cssText = "position:absolute;left:0;right:0;top:3px;height:5px;border-radius:3px;background:#333;box-shadow:0 0 0 1px #080808,0 1px 2px #000;overflow:hidden;";
@@ -247,6 +392,7 @@ app.registerExtension({
             let averageStepMs = null;
             let previewWidth = null;
             let previewHeight = null;
+            let phase = "Preparing sampler";
             // `sourceFps` is the rate used by the backend to make the stored
             // frame durations. `playbackFps` follows the live node widget and
             // may differ while an inference is already in progress.
@@ -257,6 +403,8 @@ app.registerExtension({
             let completedElapsed = null;
             let elapsedTimer = null;
             let complete = false;
+            let tooltipChunkIndex = null;
+            let tooltipSignature = null;
 
             function stop() {
                 if (timer != null) clearTimeout(timer);
@@ -348,8 +496,8 @@ app.registerExtension({
             }
 
             function chunkIndexAtTimelinePointer(event) {
-                const rect = timelineTrack.getBoundingClientRect();
-                if (!rect.width || event.clientY < rect.top || event.clientY > rect.bottom) return null;
+                const rect = timelineShell.getBoundingClientRect();
+                if (!rect.width) return null;
                 const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
                 const { spans, total } = timelineLayout();
                 let offset = 0;
@@ -360,17 +508,32 @@ app.registerExtension({
                 return null;
             }
 
-            function setChunkTooltip(index) {
+            function setChunkTooltip(index, event) {
                 if (!Number.isInteger(index) || !chunkRanges[index]) {
-                    timelineShell.title = timelineHelp;
+                    tooltipChunkIndex = null;
+                    tooltipSignature = null;
+                    chunkTooltip.hide();
                     return;
                 }
                 const range = chunkRanges[index];
-                const chunkNumber = Number(range.chunk) || index + 1;
                 const description = String(range.gemma_detailed_description || "").trim();
-                timelineShell.title = description
-                    ? `${timelineHelp}\n\nChunk ${chunkNumber}\nGemma detailed_description:\n${description}`
-                    : `${timelineHelp}\n\nChunk ${chunkNumber}\nGemma detailed_description: waiting for this chunk's Gemma direction.`;
+                const timing = chunkTimingLines(range);
+                const signature = JSON.stringify([description, timing, shotRanges]);
+                if (tooltipChunkIndex === index && tooltipSignature === signature) {
+                    chunkTooltip.move(event);
+                    return;
+                }
+                tooltipChunkIndex = index;
+                tooltipSignature = signature;
+                chunkTooltip.show(event, {
+                    help: timelineHelp,
+                    chunk: range,
+                    timing,
+                    description,
+                    shotRanges,
+                    colors: chunkColors,
+                    waitingText: "Waiting for this chunk's Gemma direction.",
+                });
             }
 
             function renderShotBrackets() {
@@ -682,7 +845,8 @@ app.registerExtension({
                 const chunk = chunkCount ? `Chunk ${activeChunk + 1}/${chunkCount}` : "Chunk —/—";
                 const displayStep = hoverStep ?? currentStep;
                 const inspecting = hoverStep == null ? "" : "inspect ";
-                status.textContent = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}${chunk} · ${resolution} · ${fps} · ${inspecting}step ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · Elapsed ${elapsed} · ETA ${eta}`;
+                const phasePrefix = phase ? `${phase} · ` : "";
+                status.textContent = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}${phasePrefix}${chunk} · ${resolution} · ${fps} · ${inspecting}step ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · Elapsed ${elapsed} · ETA ${eta}`;
                 sigmaGraph.value.textContent = Number.isFinite(deltas[displayStep - 1]) ? deltas[displayStep - 1].toFixed(3) : "—";
                 timeGraph.value.textContent = Number.isFinite(stepTimes[displayStep - 1]) ? `${(stepTimes[displayStep - 1] / 1000).toFixed(2)}s` : "—";
             }
@@ -715,12 +879,15 @@ app.registerExtension({
                 averageStepMs = null;
                 previewWidth = null;
                 previewHeight = null;
+                phase = typeof data.phase === "string" ? data.phase : "Preparing sampler";
                 setSourceFps(data.fps);
                 const elapsedMs = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms : 0;
                 startedAt = performance.now() - elapsedMs;
                 completedElapsed = null;
                 complete = false;
-                timelineShell.title = timelineHelp;
+                chunkTooltip.hide();
+                tooltipChunkIndex = null;
+                tooltipSignature = null;
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 elapsedTimer = setInterval(renderStatus, 1000);
                 stop();
@@ -752,10 +919,24 @@ app.registerExtension({
                     if (range && typeof data.gemma_detailed_description === "string") {
                         range.gemma_detailed_description = data.gemma_detailed_description;
                     }
+                    if (range) {
+                        for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds"]) {
+                            const value = Number(data[key]);
+                            if (Number.isFinite(value) && value >= 0) range[key] = value;
+                        }
+                    }
+                    return;
+                }
+                if (data.action === "phase") {
+                    if (typeof data.phase === "string") phase = data.phase;
+                    if (data.chunk != null) activeChunk = data.chunk;
+                    renderStatus();
+                    renderTransport();
                     return;
                 }
                 if (data.action === "sample_start") {
                     activeChunk = data.chunk ?? activeChunk;
+                    phase = "H3 sampling";
                     sigmas = Array.isArray(data.sigmas) ? data.sigmas : [];
                     deltas = [];
                     stepTimes = [];
@@ -777,6 +958,7 @@ app.registerExtension({
                     if (elapsedTimer != null) clearInterval(elapsedTimer);
                     elapsedTimer = null;
                     complete = true;
+                    phase = "Complete";
                     renderStatus();
                     renderTransport();
                     if (hoverStep == null && timer == null && !framePending) restorePlayback();
@@ -818,6 +1000,12 @@ app.registerExtension({
                 if (typeof data.gemma_detailed_description === "string" && chunkRanges[index]) {
                     chunkRanges[index].gemma_detailed_description = data.gemma_detailed_description;
                 }
+                if (chunkRanges[index]) {
+                    for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds"]) {
+                        const value = Number(data[key]);
+                        if (Number.isFinite(value) && value >= 0) chunkRanges[index][key] = value;
+                    }
+                }
                 chunks[index] = group;
                 stepPreviews[currentStep] = group;
                 previewWidth = data.width;
@@ -848,6 +1036,7 @@ app.registerExtension({
                     if (!snapshot?.reset) return;
                     if (execution !== null && Number(snapshot.execution) < Number(execution)) return;
                     node._hrEndlessSamplerPreview(snapshot.reset);
+                    if (snapshot.phase) node._hrEndlessSamplerPreview(snapshot.phase);
                     if (snapshot.sample_start) node._hrEndlessSamplerPreview(snapshot.sample_start);
                     if (snapshot.progress) node._hrEndlessSamplerPreview(snapshot.progress);
                     for (const chunk of snapshot.chunks || []) node._hrEndlessSamplerPreview(chunk);
@@ -920,8 +1109,12 @@ app.registerExtension({
                 canvas.addEventListener("mousedown", event => event.stopPropagation());
             }
 
-            timelineShell.addEventListener("mousemove", event => setChunkTooltip(chunkIndexAtTimelinePointer(event)));
-            timelineShell.addEventListener("mouseleave", () => { timelineShell.title = timelineHelp; });
+            timelineShell.addEventListener("mousemove", event => setChunkTooltip(chunkIndexAtTimelinePointer(event), event));
+            timelineShell.addEventListener("mouseleave", () => {
+                tooltipChunkIndex = null;
+                tooltipSignature = null;
+                chunkTooltip.hide();
+            });
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);
@@ -945,6 +1138,7 @@ app.registerExtension({
                 stop();
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 resizeObserver.disconnect();
+                chunkTooltip.remove();
                 node._hrEndlessSamplerPreview = null;
                 previousRemoved?.apply(this, arguments);
             };

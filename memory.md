@@ -75,6 +75,13 @@ HREndlessSamplerPreview -> HR Endless Sampler Preview
 - `web/unlimited_preview.js` owns the preview widget and the browser-side chunk
   playlist, colored transport, prompt-shot range brackets, keyboard stepping,
   and frame-number overlay.
+- `video_io.py` owns the versioned `HRENDLESS_TIMELINE` transport type, finished
+  video/EXR export, metadata sidecars and container tags, and the persistent
+  state endpoint used by the finished-video player.
+- `web/finished_video_player.js` provides the graph-free finished-media player
+  used by `HR Endless Sampler Save Video` and `HR Endless Sampler Load Video`.
+  It reuses the preview's chunk/shot timeline language without retaining live
+  sampler frame groups in the browser.
 - `README.md` contains concise user-facing setup and limitations.
 - `memory.md` is this implementation and design handoff.
 
@@ -117,6 +124,121 @@ The accumulated preview subsequently gained real Tiny-VAE selection,
 native-resolution mode, sampling telemetry, two graphs, live elapsed time, and
 paired chunk/step visibility. The separate `Previewer: ...` browser row was
 removed; decoder selection and fallback are still reported in the ComfyUI log.
+
+## Finished-video timeline save/load
+
+`HREndlessSampler` now has an additive fourth `HRENDLESS_TIMELINE` output. It
+contains only JSON-safe structural render metadata: source FPS, exact output
+frame count, completed chunk ranges, source-shot ranges, and the final
+Gemma-authored `detailed_description` for each chunk. The range objects are
+the same objects used by the live preview, so a saved timeline cannot drift
+from the interactive chunk colors, brackets, or hover prompt that were shown
+during the render. Replay-restored chunks carry their saved Gemma description
+into the finished timeline as well. A prompt-preview-only execution creates a
+structural planned timeline but it must not be confused with a sampled result.
+
+`HR Endless Sampler Save Video` receives decoded `IMAGE` frames plus the
+optional timeline. `video/h264-mp4` uses ComfyUI's native
+`VideoFromComponents`/`save_to` API, including its H.264 MP4 encoder, AAC audio
+mux, 8/10-bit output, CRF, and container-metadata path; this default format has
+no Video Helper Suite dependency. Other ordinary formats delegate directly to
+the installed `Video Combine 🎥🅥🅗🅢` implementation. This reuses its format
+discovery, FFmpeg invocation, format defaults, metadata route, and
+codec-specific pixel-format/CRF handling. The node presents the union of VHS
+pixel formats; `auto` does not override the selected VHS format's own default,
+while an explicit `pixel_format` is forwarded as VHS's `pix_fmt` widget value.
+`crf` is forwarded when the selected VHS JSON format uses it; other VHS
+format-specific widgets retain their upstream defaults.
+
+Save also accepts an optional standard ComfyUI `AUDIO` input. For ordinary
+VHS video formats, it is passed straight through as VHS's `audio` argument so
+VHS performs the final synchronized FFmpeg mux and returns its audio-bearing
+file. The format list includes both animated image formats that Video Combine
+adds itself (`image/gif`, `image/webp`) and every current entry returned by
+VHS's `get_video_formats()`, followed by Endless's extra `video/exr` entry.
+GIF/WebP do not have an audio container and therefore cannot carry that input.
+
+The video encoder receives the timeline as the `hr_endless_sampler_timeline`
+metadata field. Native ComfyUI writes it for H.264; VHS writes it through the
+FFmpeg container metadata path for formats that enable VHS metadata. Save
+always also writes an adjacent versioned JSON sidecar named
+`<media>.hr_endless_sampler_timeline.json`. The sidecar is authoritative on
+load because websites, editors, and remuxers can strip arbitrary MP4/MKV/WebM
+metadata. The Load node prefers it and falls back to the container tag. The
+new finished-media player uses a normal browser `<video>` element, so it seeks
+and plays the actual final media rather than retaining every decoded image. It
+keeps the colored chunk transport, shot brackets, hover prompt, play/pause,
+keyboard arrow stepping, and frame/shot/chunk overlay, but deliberately omits
+the live sampler's sigma and step-time graphs.
+
+`video/exr` is an EXR image sequence rather than a video container. The node
+uses ComfyUI's installed PyAV/FFmpeg `exr` encoder because it exposes every
+available local option: 16-bit `half` or 32-bit `float`, and `none`, `rle`,
+`zip1`, or `zip16` compression, plus its `gamma` control (default `1.0`). Each EXR is emitted from `float32` tensor
+values with no normalization, gamma conversion, or `0..1` clamp. The primary
+first EXR receives the same timeline string header when ComfyUI's EXR metadata
+helper is available; the mandatory adjacent sidecar holds the full ordered
+frame manifest. A temporary H.264 proxy is made only for the Save/Load browser
+player because browsers cannot display EXR directly; the EXR sequence remains
+the raw master and no proxy value is used for output data.
+
+EXR cannot embed a soundtrack. When its optional `AUDIO` input is connected,
+Save writes a sibling 32-bit float WAV from the original waveform and records its
+filename in the EXR sidecar manifest. The temporary browser proxy is muxed with
+the same audio on save; Load reads the WAV back and muxes it into a fresh
+temporary proxy after a ComfyUI/browser restart. This preserves the EXR master
+as an unclamped image sequence while keeping its soundtrack durable and
+playable.
+
+The Load node's browser UI has two explicit acquisition paths. **Browse
+output…** calls `/hr_endless_sampler_video/browse_output`, a read-only directory
+listing restricted by resolved-path containment to ComfyUI's output root. It
+supports nested folder navigation, normal video files, standalone EXRs, and
+collapses a sidecar-backed Endless EXR manifest into one sequence item while
+hiding its individual frames. The picker has Name, Size, and Date sort buttons;
+Date descending (newest first) is the initial ordering, while selecting the
+active column again reverses its direction. **Upload video…** divides the local browser file
+into 16 MiB pieces and posts them sequentially to
+`/hr_endless_sampler_video/upload_chunk`. The backend validates the upload id,
+extension, filename and chunk plan, assembles it atomically, chooses a
+non-overwriting filename, and stores it beneath
+`output/hr_endless_sampler_uploads/`. The returned output-relative path is put
+into the existing serialized `video` widget so it persists with the workflow.
+Queueing the Load node remains necessary only to produce downstream outputs.
+
+Selection no longer requires a workflow run merely to populate the player.
+The browser posts the chosen serialized path, FPS override, and node id to
+`/hr_endless_sampler_video/load_preview`. The route runs the shared
+`_load_video_payload` probe in a worker thread, stores the same player state as
+normal execution for refresh recovery, and returns it directly to the
+requesting node. This loads video playback, chunk colors, shot brackets, and
+saved Gemma prompts immediately. Normal node execution calls that same helper
+so its timeline/filename/FPS outputs cannot diverge from the immediate preview.
+
+Save and Load both expose a **Matching videos ▾** popup. The backend
+`/hr_endless_sampler_video/matching_output` endpoint resolves the requested
+prefix inside `output/`, returns video/EXR-sequence matches sorted by mtime
+descending, and never searches outside the prefix's containing folder. Save
+uses its current serialized `filename_prefix` directly. Load starts from its
+serialized `video` path and removes the final generated `_<number>_…` suffix;
+the greedy prefix capture preserves earlier numeric parts of a legitimate
+filename. Selecting a match immediately uses the shared preview-load route;
+Load also replaces its `video` widget, while Save treats the choice as a player
+preview without changing its future save prefix.
+
+EXR browser proxies now use the same native ComfyUI H.264 encoder as normal
+`video/h264-mp4` saves. They no longer require VHS merely to make a temporary
+browser-playable proxy.
+
+ComfyUI's stock MiniMax H3 VAE clamps its decoder pixels inside
+`MiniMaxH3VideoVAE._finalize_pixels` before its ordinary `IMAGE` output. To
+make a genuinely unclamped H3 EXR possible, Save additionally accepts the
+sampler's nested H3 latent and its video VAE. On `video/exr` it temporarily
+replaces only that final H3 display clamp with the same mean/std conversion
+without `clamp`, calls the normal VAE device/temporal decode path, restores the
+original method in `finally`, and writes the resulting raw float tensors. This
+is H3-specific by design and fails clearly for another VAE; it does not claim
+that raw H3 decoder RGB has automatically become scene-linear color.
 
 ## Repository state at this handoff
 
@@ -375,7 +497,10 @@ physical target overlap that is trimmed after sampling.
 
 `video_continuation` is a third independent frame count. When nonzero, the
 full-reference continuation experiment clones exactly that final AV tail from
-the completed previous chunk. It does not change physical target geometry.
+the completed previous chunk. It does not change physical target geometry. A
+request equal to or larger than the effective chunk size is clamped to that
+size: a predecessor cannot supply a longer tail than the physical chunk it
+actually sampled.
 The H3 VAE decodes that bounded tail, and Qwen is
 shown frames sampled at the same 2 FPS cadence used by ComfyUI's stock H3
 Ref2VA node. The matching generated-audio tail is selected using cumulative
@@ -922,8 +1047,8 @@ receives it only through those natural parenthetical name bindings in the final
 Gemma-authored `detailed_description`.
 
 The normal descriptive-name binding has one essential H3 dialogue exception:
-when a mapped character speaks, the final H3-facing clause must use the
-official immediate speaker token `<Subject N> (Sx) says, <d>...</d>`, not
+when a mapped character speaks in a direct clause, the final H3-facing clause
+must use the immediate speaker token `<Subject N> (Sx) says: <d>...</d>`, not
 `Name (<Subject N>) (Sx) says`. The latter can hide the Subject-plus-speaker
 grammar that H3 expects and was observed in a run where Heman's Shot 5 dialogue
 did not render. The response validator detects the malformed nested form and
@@ -1329,6 +1454,28 @@ prompt timeline has been calculated. This means a diagnostic partial result
 uses exactly the same prompt intervals and continuation data as those chunks
 would use during a full run. The default value is zero and does not truncate.
 
+`debug_start_chunk` is the companion replay control. A nonzero value activates
+the disposable last-run cache under ComfyUI's temp directory. If no compatible
+cache exists, the requested run deliberately begins at Chunk 1 and records the
+complete source AV latent, fixed full-video/audio noise, every synthetic-prefix
+noise tensor, every completed chunk's sampled AV tail and trimmed outputs, and
+the prior Gemma description/timing/end-state. Later runs with the same latent
+geometry, continuation settings, and physical chunk plan restore that exact
+state through the requested predecessor and sample only the requested suffix.
+This makes prompt-directed tests at a later chunk comparable without changing
+their noise or Video1/keyframe boundary. The cached Gemma preproduction plan is
+reused only while the main source-prompt hash is unchanged. An edited main
+prompt retains the physical replay state but deliberately invalidates its old
+Gemma production plan and stale predecessor Gemma text, then produces a new
+plan and clean KV snapshot from the edited source before Chunk 1. Because each
+sampler execution resets the clean Gemma KV snapshot, an unchanged-prompt
+replay rebuilds that snapshot from its restored timing plan without asking
+Gemma to plan the source shots again. Setting
+`debug_start_chunk` back to zero clears the whole replay cache at the start of
+the next execution. Cached earlier assembled output stays in CPU RAM while the
+new suffix samples and is moved back to the normal latent device only for final
+output assembly.
+
 Both stock outputs are collected:
 
 ```text
@@ -1558,7 +1705,20 @@ without an explicit decision and a checkpoint of the working version.
    and synchronized action rather than relying on visuals and text alone. This
    requires an explicit audio decode/presentation design and careful model
    swapping; sparse visual keyframes must not silently imply sparse audio
-   anchors.
+   anchors. In particular, attach the synchronized audio from the immediately
+   previous generated chunk beside its chronological observation frames and
+   prior Gemma description. Ask Gemma to determine, for every required speech
+   line, whether it never started, is currently in progress, finished, or was
+   cut off, and carry that factual dialogue state into the next chunk prompt.
+   Preserve the exact audio time range and its relationship to global/chunk
+   frames so Gemma does not mistake silence at one sparse visual observation
+   for evidence about the whole chunk.
+
+   Reuse the same audio evidence in the planned chunk/shot review director.
+   A missing, prematurely cut, repeated, wrong-speaker, or badly synchronized
+   line should be able to fail an otherwise visually acceptable candidate and
+   trigger the future bounded chunk-redo path with a revised prompt. This is a
+   TODO only; the current Gemma observation and retry evaluation remain visual.
 
 5. **Longer semantic state memory.** Let Gemma maintain a compact validated
    state summary across the complete current shot, rather than inferring all
@@ -1586,24 +1746,24 @@ without an explicit decision and a checkpoint of the working version.
    generalize H3's `17k + 5` grid, AV nesting, keyframes, or Ref2VA conventions
    to another architecture without model-specific adapters and tests.
 
-9. **Preview saving.** Preserve the sampler preview's timeline data with the
-   finished video so a saved render can later reopen in the same interactive
-   player with colored chunk ranges, shot brackets, frame/shot/chunk labels,
-   prompts, and available timing graphs. Do not use VHS Video Combine's
-   `meta_batch` input for this: `VHS_BatchManager` controls batched execution and
-   the persistent FFmpeg process; it is not a general metadata payload.
+9. **Preview saving — implemented.** The sampler now outputs a versioned
+   `HRENDLESS_TIMELINE` object, and the Save/Load nodes persist it in the
+   `hr_endless_sampler_timeline` container field plus a mandatory
+   `<media>.hr_endless_sampler_timeline.json` sidecar. This intentionally does
+   **not** use VHS Video Combine's `meta_batch`: `VHS_BatchManager` controls
+   batch execution and FFmpeg-process lifetime, not arbitrary metadata.
 
-   Proposed design: have the sampler output a versioned `H3_TIMELINE` object;
-   pass the completed VHS filename and that object to a downstream metadata
-   node; stream-copy/remux the video with compact JSON in a dedicated
-   `minimax_h3_timeline` container tag; and always write an adjacent
-   `.h3timeline.json` sidecar because container metadata can be stripped. Add a
-   finished-video player/load node that reads the embedded tag, falls back to
-   the sidecar, and reuses the preview timeline UI. Store structural metadata,
-   prompts, and small numeric series—not preview images, since the finished
-   video already contains the frames. Loading a saved video should preserve
-   seeking, play/pause, arrow-key frame stepping, chunk colors, shot brackets,
-   and browser-refresh recovery.
+   The finished-media player reuses the preview's structural UI—colored chunks,
+   shot brackets, hover prompt, seeking, play/pause, and arrow-key stepping—on
+   the actual saved video. It intentionally does not save the live sampler's
+   WebP preview frames or the two sampler graphs: the final media is the source
+   of pixels, and the graph samples are not meaningful after a completed
+   render. Browser-refresh state is retained server-side for the most recent
+   Save/Load nodes just like the live preview. The currently saved timeline
+   contains structural metadata and prompts, not the optional live telemetry
+   series. Extending the format with compact final timing/memory telemetry is a
+   future additive schema decision, not an excuse to reintroduce preview frame
+   storage.
 
 10. **Gemma visual-memory catalog and on-demand H3 references.** After each
     completed chunk, have Gemma update a persistent structured catalog for the
@@ -1662,9 +1822,11 @@ without an explicit decision and a checkpoint of the working version.
     `${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_retry_memory.md`.
     Do not let runtime Gemma mutate this repository's `memory.md`: that file is
     the human-maintained development handoff. The review remains visual-only
-    until an explicit audio-observation design exists, and existing code must
-    continue to enforce dialogue/cut invariants independently of Gemma's
-    judgment.
+    until the audio-aware continuity experiment above supplies synchronized
+    previous-chunk audio and validated dialogue state. Once implemented, audio
+    evidence must participate in both chunk and whole-shot acceptance; existing
+    code must continue to enforce dialogue/cut invariants independently of
+    Gemma's judgment.
 
 12. **Two-stage spatial-resolution sampling.** Experiment with sampling the
     early/high-noise portion of a joint H3 video/audio latent at a lower video
@@ -1830,13 +1992,176 @@ experimental native context-keyframe, retained guide-overlap, Qwen full-history,
 and prompt-preview-only widgets are hidden and forcibly disabled, including for
 serialized values from an old workflow. Their implementation remains in source
 for controlled development experiments, but it cannot change normal render
-behavior through the current node UI. `debug` and `debug_stop_chunk` are the
-last UI controls.
+behavior through the current node UI. `debug`, `debug_stop_chunk`, and
+`debug_start_chunk` are the diagnostic controls; `cache_gemma_preproduction`
+is the optional Gemma performance control immediately before them.
+
+Gemma's isolated preproduction planner and its first chunk-directing call can
+legitimately take several minutes before H3's first denoising step. They were
+previously silent when `debug` was off, making the sampler and preview appear
+stalled. `_PreparationProgress` now logs every preparation phase regardless of
+debug: initial chunk setup, one-time Gemma shot planning, each chunk's Gemma
+direction, Qwen conditioning encode, and the point H3 inference starts. While
+a Gemma worker is still running it emits an elapsed-time heartbeat every
+15 seconds. The accumulated preview receives durable `phase` events, shows the
+current phase beside its existing elapsed timer, and restores it after a
+browser refresh. The purpose is observability only; no scheduling, worker,
+conditioning, or sampling behavior was changed.
+
+Each per-chunk Gemma directing handoff additionally uses an indeterminate live
+tqdm console line. Gemma's isolated worker cannot expose meaningful generated
+token progress, so the line deliberately loops without a percentage or ETA and
+shows elapsed time instead. It is refreshed every second and closes before the
+normal outer chunk and inner H3-step bars begin; the existing concise
+console/preview heartbeat remains every 15 seconds.
+
+## Gemma clean-preproduction KV cache and corrective chat turns
+
+`cache_gemma_preproduction` is an opt-in, render-local acceleration path. The
+normal Gemma workflow still creates one disposable llama.cpp worker for the
+preproduction schedule and one worker per chunk so its CUDA allocations cannot
+survive into H3 sampling. Before the first chunk, when the toggle is enabled,
+the preproduction worker builds a second, clean *directorial* conversation:
+the normal chunk-director system rules, compact H3 working summary, complete
+original prompt, complete source-shot bodies, character-to-subject table,
+physical chunk map, and validated full timing plan. It acknowledges that
+memory, and its native llama.cpp state is saved immediately before Chunk 1.
+
+Each chunk worker restores that same clean state, then appends only its dynamic
+chunk request: current ownership/marker contract, current-slice timing-plan
+coverage, actual continuation inventory, prior chunk's chronological stills,
+and prior Gemma description/timing/end-state. It is intentionally not a
+rolling all-chunk conversation; rendered evidence is still passed explicitly
+per chunk, while the source intent and global plan stay stable. The cache is
+deleted/reset at every new sampler execution, so it cannot leak a previous
+render's prompt into the next one. Linux prefers `/dev/shm`; Windows and an
+unusable RAM disk fall back to the platform temporary directory. A failed
+export/restore only logs a warning and falls back to the ordinary complete
+self-contained request.
+
+The saved format contains native llama.cpp KV state plus token history, not
+`Llama.save_state()`'s large historical logits matrix. An appended user turn
+will always evaluate fresh suffix tokens before sampling, so historical logits
+are unnecessary; omitting them keeps the RAM-disk snapshot close to KV size.
+At the current 16K F16 KV configuration it is still several GiB of system RAM,
+not VRAM. Do not raise the Gemma context window casually without checking
+available RAM-disk capacity.
+
+The pinned `MTMDChatHandler` clears llama.cpp KV on every high-level
+`create_chat_completion`, which used to make a correction retry re-evaluate the
+entire original multimodal prompt and its images. The local handler now has an
+append-only method that asks its own Jinja chat template for the exact
+assistant-closing/user-opening suffix, evaluates that suffix and any new
+images without reset, then generates the correction JSON. This applies to both
+preproduction-plan corrections and chunk-contract corrections. A minimal
+runtime/test fallback retains the old full-request behavior only when that
+append capability is absent.
+
+The complete vendored MiniMax skill and base/ref guides remain the reviewed
+dependency source, but they are no longer injected into every Gemma request.
+`minimax_h3_prompt_summary.txt` is the compact editable runtime distillation.
+Update it together with a semantic review of the vendored sources whenever
+their upstream hashes change.
+
+### Native Gemma 4 MTP acceleration (2026-08-27)
+
+Gemma was decoding at roughly 58 tokens/second in the sampler while the same
+target reached about 120-150 tokens/second in llama.cpp's web chat. The web
+configuration was not equivalent: it loaded the matching Gemma 4 QAT MTP
+assistant with `draft-mtp` and proposed up to four tokens per target pass.
+The main target was already fully GPU-offloaded, so CPU fallback was not the
+cause of the gap.
+
+`llama-cpp-python==0.3.35` already contains the low-level MTP/NextN structures
+and symbols. Its advanced `examples/server/server.py` implements the complete
+native MTP provider, while the ordinary high-level `Llama` class only wires a
+simple Python draft callback. `gemma4_mtp.py` adapts the reference provider's
+linked-context, single-sequence path to the disposable Gemma worker: it exposes
+the target decode's NextN hidden rows, drives the Q8 assistant for at most four
+greedy draft tokens, and lets the target model and JSON grammar verify every
+proposal. The multi-user server scheduler is intentionally not vendored.
+
+The node automatically downloads
+`gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf` (about 465 MB) from
+`Janvitos/gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF` beside the official
+target and projector. This is a GGUF conversion of Google's matching official
+QAT assistant checkpoint, not a standalone model. This first implementation
+treated a missing symbol or initialization error as a warning and silently
+fell back to normal decoding. That policy was later retired because it made a
+controlled MTP/non-MTP speed comparison ambiguous.
+
+The isolated worker emits lightweight generated-token counters while each
+Gemma response is being decoded. The parent consumes those records live and
+adds `N tokens, X.X tokens/sec` to the Gemma preparation bar and preview phase.
+The clock starts at the first generated token, so the displayed rate measures
+decode throughput and deliberately excludes model loading, image/prompt
+prefill, and time-to-first-token. Progress records never enter Gemma's captured
+JSON or final H3 prompt.
+
+The requirements keep the Python version pinned at 0.3.35 but now use the
+`cu125` wheel channel. That release channel contains both Linux and Windows
+wheels; the earlier `cu121` channel did not publish a Windows wheel. Existing
+Gemma preproduction state files remain target-only. A restored state evaluates
+the new chunk suffix before sampling, which recreates the MTP pending hidden
+state without storing a second assistant KV snapshot.
+
+#### Native MTP correction and comparison toggle (2026-08-27)
+
+The first adapter above proved to be an invalid performance comparison. It
+attached the assistant after the ordinary high-level `Llama` target context had
+already been created. The latest run showed about 30.5 accepted output
+tokens/second even though the target itself still decoded at roughly 54.7
+tokens/second; assistant work and repeated CUDA graph resets consumed most of
+the remaining wall time. The target log also showed `n_rs_seq=0`. The first
+attempt to correct this copied the older llama-cpp-python advanced server's
+request for `n_rs_seq=4`. That was also wrong for the installed Gemma 4 model:
+llama.cpp explicitly reported that the model does not support recurrent
+partial rollback, clamped the value to zero, and the adapter stopped before
+Chunk 1 with `Gemma target context was not created for native MTP rollback`.
+
+The corrected implementation follows current llama.cpp rather than requiring
+unsupported recurrent snapshot slots. `create_native_mtp_llama()` still loads
+the target from birth with `load_mtp=true`, unified KV, and all NextN outputs,
+then creates the linked `LLAMA_CONTEXT_TYPE_MTP` Q8 assistant and proposes at
+most four tokens. The target and draft contexts deliberately use
+`n_rs_seq=0`. Before each target verification batch, the adapter exports the
+target's `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state. If the target rejects part
+of the draft, the adapter restores that SWA/recurrent checkpoint, removes the
+ordinary attention suffix, and replays only the physically accepted pending
+token plus accepted draft prefix. This is the same rollback structure used by
+current `examples/speculative-simple/speculative-simple.cpp`; merely calling
+llama-cpp-python's normal `kv_cache_seq_rm()` is unsafe for a hybrid model.
+
+The adapter also wraps the existing high-level generator rather than replacing
+the chat/sampling implementation. JSON grammar, temperature, penalties, and
+the MTMD chat handler therefore remain owned by llama-cpp-python. The wrapper
+tracks an early-stopped generator so no unaccepted speculative suffix can leak
+into the clean preproduction KV state. It forwards `Generator.send()` and
+restores the original `eval`, `generate`, draft callback, logits mode, and KV
+method during teardown.
+
+Real-GPU validation on 2026-08-27 used the official Q4 target and Q8 MTP
+assistant with a four-token draft. It generated a coherent three-sentence
+answer after accepting 32 of 100 proposed draft tokens across 25 proposals,
+which proves that real partial-rejection rollback was exercised rather than
+only testing initialization. The unit suite also has a focused rejection test
+that verifies checkpoint restore, attention trim, accepted-prefix replay,
+token counters, and proposal cleanup. Worker teardown now prints checkpoint
+time, rollback count, and replayed-token count in addition to the existing MTP
+acceptance and assistant-rate statistics.
+
+The sampler exposes `gemma4_mtp` immediately above its debug controls. It is
+enabled by default. `true` selects the native four-token path; `false` creates
+the original non-MTP high-level Gemma runtime and does not load or download the
+assistant. An enabled native setup is fail-loud: it must never silently fall
+back and contaminate a speed comparison. Both modes retain the same live
+accepted-output tokens/second display. The selected mode is recorded in the
+console and at the top of `last_gemma_chunk_prompts.txt`.
 
 ## Documentation used
 
-- MiniMax-maintained H3 prompt-writing skill now vendored and fed directly to
-  Gemma at runtime:
+- MiniMax-maintained H3 prompt-writing skill now vendored as the reviewed
+  source for the compact Gemma runtime summary:
   <https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md>
 - Direct MiniMax base-mode dependency referenced by that skill:
   <https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt>
@@ -1876,6 +2201,11 @@ last UI controls.
 - `llama-cpp-python`, whose 0.3.35 generic MTMD vision handler is required for
   the Gemma integration:
   <https://github.com/abetlen/llama-cpp-python>
+- llama-cpp-python's native MTP reference server implementation adapted for the
+  local single-sequence worker:
+  <https://github.com/abetlen/llama-cpp-python/blob/3691546f1c9e0c1bf93323dff02230bd959cf562/examples/server/server.py>
+- Matching Gemma 4 12B QAT Q8_0 MTP assistant GGUF:
+  <https://huggingface.co/Janvitos/gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF>
 - llama.cpp's CUDA backend source, consulted for the lifetime of CUDA/VMM buffer
   pools and the absence of a safe public per-context pool reset:
   <https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/ggml-cuda.cu>
@@ -1890,3 +2220,168 @@ last UI controls.
   `comfy/model_base.py`,
   `comfy/ldm/minimax/model.py`, and
   `comfy/ldm/minimax/vae.py`.
+
+## 2026-08-27 — Native Gemma MTP performance diagnosis and correction
+
+The first working four-token MTP implementation was functionally real but
+performed worse than expected: the render log showed roughly 18–22 accepted
+output tokens/second and GPU utilization usually below 30%. The Q8 assistant
+was not the bottleneck. Exact replay of captured Chunk 6 confirmed that MTP
+proposed four tokens at a time, accepted 1,191 of 1,748 proposals (68.1%), and
+generated assistant proposals at roughly 3,800–4,200 tokens/second.
+
+Two implementation costs were corrected first. The on-device checkpoint
+choice below was later retired by the 2026-08-28 stability fix documented
+after this section:
+
+- Target hybrid-state checkpoints temporarily used both
+  `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` and
+  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`. The former host checkpoint path cost
+  13–14 seconds per response; the device path reduced it to roughly
+  0.44–0.67 seconds, but was subsequently proven capable of aborting the
+  worker on a real multimodal chunk and is no longer used.
+- The MTP verifier no longer copies every target verification-logit row into
+  NumPy because the director never requests log probabilities. Sampler debug
+  no longer enables llama.cpp's native verbose diagnostics, and every MTMD
+  handler is likewise constructed with `verbose=False`.
+
+Those changes improved throughput but did not explain the remaining low GPU
+use. Fine-grained timers around the exact Chunk 6 capture found the decisive
+bottleneck:
+
+- Q8 assistant generation: 0.427 seconds;
+- batched target verification: 1.015 seconds for 437 calls / 2,185 rows;
+- accepted-prefix target replay: 0.765 seconds for 206 calls / 473 rows;
+- target synchronization: 0.026 seconds;
+- **target sampling: 45.060 seconds for 1,628 calls**.
+
+The target sampler was CPU-bound because llama-cpp-python's `json_object`
+response format installs a JSON grammar over Gemma 4's very large vocabulary
+for every generated token. This also explains why the user's native llama.cpp
+web-chat configuration reached 120–150 tokens/second: that ordinary chat did
+not apply the chunk director's strict JSON grammar.
+
+The director now uses instructed JSON with post-generation parsing and schema/
+semantic validation as its normal path. If Gemma returns malformed JSON, the
+node prints a warning and retries once using the strict `json_object` grammar.
+Chat-style semantic correction remains unchanged and also uses the fast path
+unless syntax recovery is actually needed. The node never silently substitutes
+an algorithmic prompt for Gemma's response.
+
+Replaying the same captured Chunk 6 after this change produced valid JSON
+without invoking the recovery grammar. Total wall time fell from about 65
+seconds to 24.55 seconds, including a semantic correction pass. Live accepted
+output rates were 97.2 tokens/second for the initial 879-token response and
+125.0 tokens/second for the 835-token correction. MTP accepted 1,246 of 1,868
+proposed tokens (66.7%) over 467 four-token proposals; target sampling fell to
+0.261–0.285 seconds. Short speculative verification batches and CPU
+orchestration mean GPU utilization need not match a long continuous server
+decode, so accepted tokens/second and the detailed phase timers are the useful
+comparison metrics.
+
+The implementation was validated with the project's isolated ComfyUI Python:
+32 Gemma capture tests, 22 chunk-director helper tests, and all 62 discovered
+unit tests passed. New tests guarantee that valid JSON uses no grammar and that
+malformed JSON activates the constrained recovery pass only.
+
+### 2026-08-28 — Failed host-checkpoint MTP workaround
+
+A real multimodal Chunk 2 capture reproducibly killed the disposable Gemma
+worker with status `-6`. The native stack ended at
+`ggml_backend_tensor_copy -> llama_io_write_device ->
+llama_state_seq_get_data_ext` while saving the target's speculative rollback
+checkpoint. Replaying the exact same request with `gemma4_mtp=false` succeeded,
+which isolated the failure from the prompt, observation images, MTMD encoding,
+and Gemma model itself.
+
+The crash came from using `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` for every hybrid
+target checkpoint. llama.cpp upstream removed that flag from its speculative
+server and `speculative-simple` example in PR #24108 because on-device
+checkpoints are not fully compatible with meta/device buffers and use
+unaccounted device memory. Issue #27439 also records that this path may throw or
+abort before the public C API can report a normal failure.
+
+An initial workaround changed checkpoints and restores to host-only
+`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state. It did avoid the original device
+copy stack in the captured request, but real render measurements showed
+13.5–25.5 seconds of checkpoint serialization per response and accepted output
+fell to roughly 56 tokens/second. It also did not make MTP generally stable: a
+later Chunk 2 worker still exited with status `-6` immediately after native MTP
+initialization. The host-only workaround was therefore removed.
+
+References:
+
+- <https://github.com/ggml-org/llama.cpp/pull/24108>
+- <https://github.com/ggml-org/llama.cpp/issues/27439>
+
+### 2026-08-28 — Fast MTP with operation-local process fallback
+
+The original fast `PARTIAL_ONLY | ON_DEVICE` checkpoint path is restored, but
+it remains confined to the disposable Gemma worker. Before launching an MTP
+worker, the parent retains a serialized copy of the exact request. If the
+worker aborts, exits without a result, returns a non-zero status after a result,
+or reports a native `Gemma4MTPError`, the parent prints a prominent warning and
+retries the same operation once using the original non-MTP decoder.
+
+The fallback applies only to the operation whose MTP worker failed. Its copied
+request changes only `gemma4_mtp` from true to false; the preproduction cache
+and every other request field are preserved. The director's MTP setting is not
+changed, so the next preproduction or chunk operation attempts native MTP
+again. Normal Gemma response/schema errors do not trigger the fallback; they
+remain visible and fail normally.
+
+This policy restores the previously observed 100–150 token/second fast path
+when native MTP behaves, while treating a native child-process crash as a
+recoverable acceleration failure rather than losing the entire H3 render.
+
+## 2026-08-28 — Per-chunk timing in all timeline players
+
+Each completed sampler chunk records H3 sampling/render time, Gemma directing
+time, and whole chunk-processing time. Chunk 1 additionally records the
+one-time Gemma shot-timing preproduction pass. That preproduction duration is
+attributed to both Chunk 1's Gemma total and Chunk 1's processing total, so the
+first hover exposes the real startup cost instead of beginning its clock only
+after planning is complete.
+
+The live Preview tooltip presents the breakdown on one compact clock-formatted
+line: `Chunk processing: mm:ss ( sampler:mm:ss + gemma4:mm:ss + misc:mm:ss )`.
+`misc` is the non-negative remainder after H3 and all attributed Gemma work;
+it therefore covers Qwen, VAE work, model swapping, conditioning, assembly,
+and other per-chunk overhead. Chunk 1 adds a second line identifying how much
+of its Gemma value was preproduction. The backend cache preserves all fields
+across a browser refresh.
+
+The same fields survive timeline normalization, video metadata/sidecar saving,
+and loading, so the Save Video and Load Video players display identical hover
+details. The timeline also stores the sampler's complete wall time as
+`render_total_seconds`; both finished-video players show that total in their
+bottom status line. Older videos without timing metadata remain loadable and
+simply omit the unavailable values.
+
+## 2026-08-28 — Load Video media and geometry outputs
+
+`HR Endless Sampler Load Video` retains its original timeline, filename, and
+FPS output slots and appends native ComfyUI `VIDEO`, decoded `IMAGE` batch,
+`AUDIO`, frame-count, width, and height outputs. Appending the sockets preserves
+existing workflow link indices. Ordinary video files are decoded once during
+workflow execution and their components are shared by the VIDEO and IMAGE/
+AUDIO outputs. EXR sequences retain their float image tensors and optional
+float WAV sidecar audio when producing the same outputs.
+
+Selecting a file in the custom browser still loads the timeline player without
+queueing or decoding the complete ordinary video. Full media decoding happens
+only when the Load node itself executes.
+
+## 2026-08-28 — Shot-colored chunk prompt tooltips
+
+The Preview, Save Video, and Load Video timeline players now use a styled HTML
+tooltip instead of the browser's plain-text `title`. Help and timing lines stay
+neutral. Only Gemma's `detailed_description` prose is colored, with each shot
+section using the exact palette color of its source-shot bracket. A one-shot
+prompt is still colored with that shot's bracket color.
+
+Gemma's `[Shot N]` tokens are physical-chunk-local markers, so the UI maps prompt
+sections to source/global timeline shots by chronological overlap rather than
+assuming the marker number is a global shot number. When a chunk starts in the
+middle of an existing shot, unmarked continuation prose receives the active
+shot's color and the first subsequent marker receives the next shot's color.

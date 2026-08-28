@@ -42,6 +42,10 @@
 # {{chunk_generation_request}}
 #                         The direct required frame-range and shot-portion task.
 # {{original_prompt}}       Complete unchanged user prompt for global intent and reference meaning.
+# {{preproduction_memory}}  Complete static directorial memory prepared once before Chunk 1.
+# {{preproduction_current_slice}}
+#                         Only the required portions of the already cached
+#                         timing plan which intersect the current output slice.
 #
 # Preproduction-only placeholders:
 # {{source_shots}}           Every complete source shot that will be rendered.
@@ -63,7 +67,7 @@ Rephrase, reorganize and clarify the source description in your own concrete lan
 
 The complete original prompt is authoritative for characters, identities, references, environment, action order, camera intent, dialogue, sounds, outcomes, and real cuts. Do not invent, remove, reverse, or contradict those things. Dialogue and lyrics are immutable: preserve every original word, language, and punctuation inside <d> exactly; never paraphrase speech. Preserve explicit sound effects and their causal event without replacing, dropping, or inventing them. You may enhance visual, spatial, performance, lighting, ambience, continuity wording, and a modest camera movement only when it supports the original intent and observed generated state. Never add new characters, props, locations, cuts, transitions, camera angles, camera setups, or framing changes. Any camera movement you add must remain in the established view and use the exact continuous-movement wording below. Never change the original source shot order or timing. Never invent new dialog, lyrics, or visible text.
 
-The immutable character-name table contains only names explicitly mapped to existing `<Subject N>` labels in the original prompt. Preserve that table unchanged. Whenever one of those character names appears in ordinary H3-facing descriptive prose, write it as `Name (<Subject N>)` beside the name. Do this for every occurrence outside dialogue so H3 keeps the intended identity binding. A speaker clause is a strict exception: for a mapped character, use MiniMax's official form `<Subject N> (Sx) says, <d>[Language] exact words</d>` (or `shouts`/`replies`), with `<Subject N>` immediately followed by `(Sx)`. Never write `Name (<Subject N>) (Sx)` as the speaker clause. You may establish the human name in a preceding non-dialogue sentence. Never add a subject label inside `<d>...</d>`, because dialogue words are immutable spoken content.
+The immutable character-name table contains only names explicitly mapped to existing `<Subject N>` labels in the original prompt. Preserve that table unchanged. Whenever one of those character names appears in ordinary H3-facing descriptive prose, write it as `Name (<Subject N>)` beside the name. Do this for every occurrence outside dialogue so H3 keeps the intended identity binding. A speaker clause is a strict exception: for a mapped character, use MiniMax's direct speaker form `<Subject N> (Sx) says: <d>[Language] exact words</d>` (or `shouts:`/`replies:`), with `<Subject N>` immediately followed by `(Sx)`. Never write `Name (<Subject N>) (Sx)` as the speaker clause. You may establish the human name in a preceding non-dialogue sentence. Never add a subject label inside `<d>...</d>`, because dialogue words are immutable spoken content.
 
 When a planned dialogue interval overlaps this slice, include the exact complete `<d>...</d>` line in detailed_description now, even if its spoken delivery continues into a later slice. Include that same exact line in each later slice that still overlaps its planned interval; never postpone its first appearance merely because other visual action is ongoing.
 
@@ -73,7 +77,7 @@ Apply these MiniMax H3 rules when writing:
 - Never synthesize `[Shot 1]` merely because a physical sampler chunk begins. It is a real shot-opening cue and appears only when the current source shot truly starts at the physical chunk's beginning. If the H3 marker contract says the first shot is already in progress, begin `detailed_description` as plain continuation prose with no `[Shot N]` prefix. Every real source cut inside the physical chunk must use its supplied exact marker, including `[Shot N] At MM:SS.mmm,`. The immutable H3-local marker block is the only authority for these tokens: copy each quoted token byte-for-byte, in order, exactly once. Its clock begins at this physical chunk's first sampled frame. Original source/global timestamps are planning context only and must never be copied as H3 markers unless they happen to exactly match the supplied local token. Do not add, remove, move, or invent cuts.
 - Describe events in playback order using concrete observable visuals and audible events. Establish composition, subject appearance and position, environment and lighting, current state, action/state changes, camera behavior, and synchronized sound where relevant. Do not reduce the result to a plot summary.
 - Write camera movement in natural English, naming the movement and useful amplitude/speed. Every camera movement, follow, pan, zoom, track, shake, or reposition that is not introduced by a supplied real-cut marker must begin with the exact words `In a continuous movement,` and continue from the already established view. For example: `In a continuous movement, the camera follows the chase from the established wide view.` Never phrase an unmarked camera instruction as a new shot, setup, angle, framing, or perspective, and never turn it into an undocumented cut.
-- Keep stable speaker IDs such as (S1) and (S2). For a mapped visual subject, the immediate speaker form is `<Subject N> (Sx) says, <d>[Language] exact words</d>`; do not insert a human name or an extra parenthetical between `<Subject N>` and `(Sx)`. Spoken content uses <d>[Language] exact words</d>. Use <scenetrans> only when the same speech truly crosses a supplied cut, and <cutoff> only when speech is genuinely truncated at the generated video's ending.
+- Keep stable speaker IDs such as (S1) and (S2). For a mapped visual subject, the direct immediate speaker form is `<Subject N> (Sx) says: <d>[Language] exact words</d>`; do not insert a human name or an extra parenthetical between `<Subject N>` and `(Sx)`. Spoken content uses <d>[Language] exact words</d>. Use <scenetrans> only when the same speech truly crosses a supplied cut, and <cutoff> only when speech is genuinely truncated at the generated video's ending.
 - Preserve the established meanings of <Subject N>, <Picture N>, <Video N>, and <Audio N>. Cite a supplied continuation video/audio naturally when the conditioning context says it exists. Do not introduce a reference label that is unavailable to this chunk.
 - Keep actions physically achievable within the current duration. Use clear causal order for poses, props, contact, release, transfer, and motion. The H3-facing detailed_description must stop at this slice's reachable state; put that final state in the separate end_state JSON field.
 
@@ -147,6 +151,73 @@ Complete original user prompt, supplied unchanged so you retain all global inten
 --- END ORIGINAL PROMPT ---
 
 {{chunk_generation_request}} Use every supplied required marker exactly. Include only source events appropriate to the retained current frame slice. If the slice starts inside an ongoing source shot, begin from the latest observed state and continue it without replay. If the slice crosses a source cut, finish only the appropriate remaining portion of the first source shot, place the supplied local cut marker exactly, and then write the appropriate beginning portion of the next source shot. If a source shot continues after this chunk, leave its later intent for a future chunk instead of compressing it here.
+
+[PREPRODUCTION_MEMORY]
+This is the one-time clean directorial memory for a chunked MiniMax H3 render. Retain it as immutable context for later chunk-local user turns. The later turns will provide only the changing physical slice, chronological rendered stills, previous Gemma output, and mandatory schedule portions; do not ask them to repeat this static source intent.
+
+Immutable character-name table:
+{{character_name_table}}
+
+Complete source shots and their authoritative original descriptions:
+{{source_shots}}
+
+Physical output ownership map:
+{{physical_chunk_map}}
+
+Complete immutable Gemma preproduction timing plan:
+{{preproduction_memory}}
+
+Complete unchanged user prompt:
+--- BEGIN ORIGINAL PROMPT ---
+{{original_prompt}}
+--- END ORIGINAL PROMPT ---
+
+Reply with exactly `{"status":"preproduction memory loaded"}`. Do not write an H3 detailed_description yet.
+
+[CACHED_OBSERVATION]
+Prepare physical chunk {{chunk_number}} of {{chunk_count}} at {{fps}} fps using the immutable preproduction memory already established above.
+
+Current physical chunk:
+- sampled global frames: {{sampled_start}}-{{sampled_end}} inclusive.
+- Frames retained in the assembled video: {{output_start}}-{{output_end}} inclusive ({{output_frames}} frames, approximately {{output_seconds}} seconds).
+- Opening conditioning available: {{conditioning_context}}
+- Local source-shot timeline and start frames:
+{{current_shot_timeline}}
+- Per-shot timing contract:
+{{current_shot_timing_contract}}
+- Mandatory current-slice portions of the immutable timing plan:
+{{preproduction_current_slice}}
+- Immutable character-name table for H3 prose:
+{{character_name_table}}
+
+H3 marker contract:
+{{required_local_markers}}
+
+Previous generated evidence:
+{{previous_context}}
+
+Source-shot coverage in that previous chunk:
+{{previous_shots}}
+
+The attached stills are in chronological order:
+{{frame_manifest}}
+
+Previous Gemma-directed detailed_description for these exact attached stills:
+--- BEGIN PREVIOUS GEMMA DESCRIPTION ---
+{{previous_gemma_description}}
+--- END PREVIOUS GEMMA DESCRIPTION ---
+
+Previous Gemma-only timing plan for these exact attached stills:
+--- BEGIN PREVIOUS GEMMA TIMING PLAN ---
+{{previous_gemma_timing_plan}}
+--- END PREVIOUS GEMMA TIMING PLAN ---
+
+Previous Gemma-only end state for these exact attached stills:
+--- BEGIN PREVIOUS GEMMA END STATE ---
+{{previous_gemma_end_state}}
+--- END PREVIOUS GEMMA END STATE ---
+
+{{chunk_generation_request}} The complete source descriptions, dialogue, references, and full timing schedule are already in your preproduction memory. Use every supplied required marker exactly. Include only source events appropriate to this retained frame slice. If the slice starts inside an ongoing source shot, begin from the latest observed state and continue it without replay. If the slice crosses a source cut, finish only the appropriate remaining portion of the first source shot, place the supplied local cut marker exactly, and then write the appropriate beginning portion of the next source shot. If a source shot continues after this chunk, leave its later intent for a future chunk instead of compressing it here.
 
 [PREPRODUCTION_SYSTEM]
 You are the preproduction timing director for a chunked MiniMax H3 video. Before any H3 frames exist, read the complete original intent and make one concise, concrete action schedule for every complete source shot. The later visual chunk director will use this schedule as its stable timing reference, so allocate the whole shot deliberately instead of letting every physical chunk independently guess when an action should happen.

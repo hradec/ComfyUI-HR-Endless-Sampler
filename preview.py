@@ -49,6 +49,7 @@ def _cache_payload(payload):
                 "sample_start": None,
                 "progress": None,
                 "complete": None,
+                "phase": None,
                 "chunks": {},
                 "deltas": [],
                 "step_times": [],
@@ -75,6 +76,8 @@ def _cache_payload(payload):
                     while len(values) < step:
                         values.append(None)
                     values[step - 1] = payload.get(source)
+        elif action == "phase":
+            state["phase"] = payload.copy()
         elif action == "chunk":
             state["chunks"][int(payload["chunk"])] = payload.copy()
         elif action == "chunk_metadata":
@@ -93,6 +96,15 @@ def _cache_payload(payload):
                 description = payload.get("gemma_detailed_description")
                 if isinstance(description, str) and description.strip():
                     chunk_ranges[chunk_index]["gemma_detailed_description"] = description.strip()
+                for key in (
+                    "h3_render_seconds",
+                    "gemma_seconds",
+                    "gemma_preproduction_seconds",
+                    "chunk_total_seconds",
+                ):
+                    value = payload.get(key)
+                    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                        chunk_ranges[chunk_index][key] = float(value)
         elif action == "complete":
             state["complete"] = payload.copy()
 
@@ -114,6 +126,7 @@ def _cached_snapshot(node_id):
             "sample_start": None if state["sample_start"] is None else state["sample_start"].copy(),
             "progress": None if state["progress"] is None else state["progress"].copy(),
             "complete": None if state["complete"] is None else state["complete"].copy(),
+            "phase": None if state["phase"] is None else state["phase"].copy(),
             "chunks": [state["chunks"][index].copy() for index in sorted(state["chunks"])],
             "deltas": list(state["deltas"]),
             "step_times": list(state["step_times"]),
@@ -318,6 +331,22 @@ class _PreviewExecution:
                 gemma_detailed_description,
             )
 
+    def set_phase(self, phase, *, chunk=None):
+        for wrapper, execution_id in self.items:
+            wrapper.set_phase(execution_id, phase, chunk=chunk)
+
+    def set_chunk_timing(self, index, *, h3_render_seconds, gemma_seconds,
+                         gemma_preproduction_seconds, chunk_total_seconds):
+        for wrapper, execution_id in self.items:
+            wrapper.set_chunk_timing(
+                execution_id,
+                index,
+                h3_render_seconds=h3_render_seconds,
+                gemma_seconds=gemma_seconds,
+                gemma_preproduction_seconds=gemma_preproduction_seconds,
+                chunk_total_seconds=chunk_total_seconds,
+            )
+
     def clear_chunk(self):
         for wrapper, execution_id in self.items:
             wrapper.clear_chunk(execution_id)
@@ -371,8 +400,23 @@ class _AccumulatedPreviewWrapper:
             "total_frames": max((int(item.get("end", -1)) for item in chunk_ranges), default=-1) + 1,
             "fps": self.fps,
             "elapsed_ms": 0.0,
+            "phase": "Preparing sampler",
         })
         return self.execution_id
+
+    def set_phase(self, execution_id, phase, *, chunk=None):
+        if execution_id != self.execution_id:
+            return
+        payload = {
+            "node_id": self.node_id,
+            "action": "phase",
+            "execution": execution_id,
+            "phase": str(phase),
+            "elapsed_ms": self._elapsed_ms(),
+        }
+        if chunk is not None:
+            payload["chunk"] = int(chunk)
+        _send(payload)
 
     def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
                   gemma_detailed_description=None):
@@ -399,6 +443,21 @@ class _AccumulatedPreviewWrapper:
     def clear_chunk(self, execution_id):
         if execution_id == self.execution_id:
             self.current_chunk = None
+
+    def set_chunk_timing(self, execution_id, index, *, h3_render_seconds, gemma_seconds,
+                         gemma_preproduction_seconds, chunk_total_seconds):
+        if execution_id != self.execution_id:
+            return
+        _send({
+            "node_id": self.node_id,
+            "action": "chunk_metadata",
+            "execution": execution_id,
+            "chunk": index,
+            "h3_render_seconds": float(h3_render_seconds),
+            "gemma_seconds": float(gemma_seconds),
+            "gemma_preproduction_seconds": float(gemma_preproduction_seconds),
+            "chunk_total_seconds": float(chunk_total_seconds),
+        })
 
     def finish(self, execution_id):
         if execution_id != self.execution_id:

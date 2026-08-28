@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import gemma4  # noqa: E402
+import gemma4_mtp  # noqa: E402
 
 
 class GemmaCaptureTest(unittest.TestCase):
@@ -182,13 +184,383 @@ class GemmaCaptureTest(unittest.TestCase):
             self.assertIn(request["previous_gemma_description"], observation_prompt)
             self.assertIn("attached stills", observation_prompt)
             system_prompt = (capture_dir / "system_prompt.txt").read_text()
-            self.assertIn("# H3 Prompt Writing", system_prompt)
-            self.assertIn("# Full-Reference Mode Rewrite Output Format Guide", system_prompt)
-            self.assertNotIn("# Video Prompt Writing Guide (T2VA / I2VA / FL2VA / L2VA)", system_prompt)
+            self.assertIn("# MiniMax H3 prompt-writing working summary", system_prompt)
+            self.assertNotIn("# H3 Prompt Writing", system_prompt)
+            self.assertNotIn("# Full-Reference Mode Rewrite Output Format Guide", system_prompt)
             saved_response = json.loads((capture_dir / "response.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_response["detailed_description"], result.detailed_description)
             replay_request = gemma4.load_gemma_capture(capture_dir)
             self.assertEqual(replay_request["image_urls"], saved_request["image_urls"])
+
+    def test_native_mtp_worker_abort_retries_only_failed_operation_without_mtp(self):
+        result = gemma4.GemmaChunkPrompt(
+            confidence="high",
+            analysis="The action continues.",
+            detailed_description="Heman continues walking right.",
+            raw_json='{"confidence":"high"}',
+        )
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        calls = []
+
+        def fake_worker(request):
+            calls.append({
+                "mtp": request.get("gemma4_mtp"),
+                "has_cache": "preproduction_cache" in request,
+                "has_cache_slice": "preproduction_current_slice" in request,
+            })
+            request.clear()
+            if len(calls) == 1:
+                raise gemma4.Gemma4WorkerExitError(
+                    "worker aborted",
+                    returncode=-6,
+                )
+            return result
+
+        first_request = self.request()
+        first_request["preproduction_cache"] = {"path": "/dev/shm/test-cache"}
+        first_request["preproduction_current_slice"] = "cached slice"
+        second_request = self.request()
+        second_request["preproduction_cache"] = {"path": "/dev/shm/test-cache"}
+        second_request["preproduction_current_slice"] = "cached slice"
+        with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker), \
+                self.assertLogs(level="WARNING") as warning_log:
+            self.assertIs(director.direct(first_request, frames), result)
+            self.assertIs(director.direct(second_request, frames), result)
+
+        self.assertEqual(calls, [
+            {"mtp": True, "has_cache": True, "has_cache_slice": True},
+            {"mtp": False, "has_cache": True, "has_cache_slice": True},
+            {"mtp": True, "has_cache": True, "has_cache_slice": True},
+        ])
+        self.assertTrue(director.gemma4_mtp)
+        warning_text = "\n".join(warning_log.output)
+        self.assertIn("status -6", warning_text)
+        self.assertIn("next Gemma operation will try native MTP again", warning_text)
+
+    def test_non_process_gemma_error_does_not_disable_mtp_or_retry(self):
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        with patch.object(
+            gemma4,
+            "_observe_in_worker",
+            side_effect=gemma4.Gemma4ObservationError("invalid model response"),
+        ) as worker:
+            with self.assertRaisesRegex(gemma4.Gemma4ObservationError, "invalid model response"):
+                director.direct(self.request(), frames)
+
+        self.assertEqual(worker.call_count, 1)
+        self.assertTrue(director.gemma4_mtp)
+
+    def test_runtime_direct_speaker_template_uses_documented_colon(self):
+        templates = gemma4._gemma_prompt_templates()
+        summary = gemma4._minimax_prompt_reference("ref")
+
+        expected = "<Subject N> (Sx) says: <d>[Language] exact words</d>"
+        legacy = "<Subject N> (Sx) says, <d>[Language] exact words</d>"
+        self.assertIn(expected, templates["SYSTEM"])
+        self.assertIn(expected, summary)
+        self.assertNotIn(legacy, templates["SYSTEM"])
+
+    def test_runtime_creates_native_mtp_target_when_enabled(self):
+        class FakeRealLlama:
+            __module__ = "llama_cpp.llama"
+
+        target = Path("gemma.gguf")
+        draft = Path("gemma-mtp.gguf")
+        handler = object()
+        with patch.object(gemma4, "_ensure_mtp_model_file", return_value=draft), \
+                patch("gemma4_mtp.create_native_mtp_llama", return_value=object()) as create:
+            llm = gemma4._create_runtime_llm(
+                FakeRealLlama,
+                model_path=target,
+                handler=handler,
+                debug=True,
+                gemma4_mtp=True,
+            )
+
+        self.assertIs(llm, create.return_value)
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertIs(kwargs["model_path"], target)
+        self.assertIs(kwargs["draft_model_path"], draft)
+        self.assertEqual(kwargs["num_pred_tokens"], 4)
+        self.assertIs(kwargs["chat_handler"], handler)
+        self.assertFalse(kwargs["verbose"])
+
+    def test_runtime_mtp_failure_is_not_silently_reported_as_mtp(self):
+        class FakeRealLlama:
+            __module__ = "llama_cpp.llama"
+
+            def __init__(self, **_kwargs):
+                pass
+
+        with patch.object(
+            gemma4, "_ensure_mtp_model_file", return_value=Path("gemma-mtp.gguf")
+        ), patch(
+            "gemma4_mtp.create_native_mtp_llama", side_effect=RuntimeError("unsupported")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unsupported"):
+                gemma4._create_runtime_llm(
+                    FakeRealLlama,
+                    model_path=Path("gemma.gguf"),
+                    handler=object(),
+                    debug=False,
+                    gemma4_mtp=True,
+                )
+
+    def test_runtime_false_uses_original_non_mtp_constructor(self):
+        created = {}
+
+        class FakeRealLlama:
+            __module__ = "llama_cpp.llama"
+
+            def __init__(self, **kwargs):
+                created.update(kwargs)
+
+        with patch.object(gemma4, "_ensure_mtp_model_file") as ensure:
+            llm = gemma4._create_runtime_llm(
+                FakeRealLlama,
+                model_path=Path("gemma.gguf"),
+                handler=object(),
+                debug=False,
+                gemma4_mtp=False,
+            )
+
+        self.assertIsInstance(llm, FakeRealLlama)
+        self.assertNotIn("logits_all", created)
+        ensure.assert_not_called()
+
+    def test_json_completion_uses_fast_unconstrained_path_when_gemma_returns_valid_json(self):
+        calls = []
+
+        class FakeLlama:
+            def create_chat_completion(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "choices": [
+                        {"message": {"content": '{"confidence":"high"}'}}
+                    ]
+                }
+
+        payload, raw = gemma4._gemma_chat_json(
+            FakeLlama(), [{"role": "user", "content": "Return JSON"}]
+        )
+
+        self.assertEqual(payload, {"confidence": "high"})
+        self.assertEqual(raw, '{"confidence":"high"}')
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("response_format", calls[0])
+
+    def test_json_completion_uses_grammar_only_to_recover_malformed_json(self):
+        calls = []
+        responses = iter(("not json", '{"confidence":"high"}'))
+
+        class FakeLlama:
+            def create_chat_completion(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "choices": [
+                        {"message": {"content": next(responses)}}
+                    ]
+                }
+
+        with self.assertLogs(level="WARNING") as captured:
+            payload, _raw = gemma4._gemma_chat_json(
+                FakeLlama(), [{"role": "user", "content": "Return JSON"}]
+            )
+
+        self.assertEqual(payload, {"confidence": "high"})
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("response_format", calls[0])
+        self.assertEqual(calls[1]["response_format"], {"type": "json_object"})
+        self.assertIn("malformed instructed JSON", "\n".join(captured.output))
+
+    def test_native_mtp_factory_configures_target_before_construction(self):
+        target_config = {}
+
+        def ordinary_model_defaults():
+            return SimpleNamespace(load_mtp=False)
+
+        def ordinary_context_defaults():
+            return SimpleNamespace(n_rs_seq=0, kv_unified=False)
+
+        fake_low_level = SimpleNamespace(
+            llama_model_default_params=ordinary_model_defaults,
+            llama_context_default_params=ordinary_context_defaults,
+        )
+        fake_package = SimpleNamespace(llama_cpp=fake_low_level)
+
+        class FakeTarget:
+            def __init__(self, **kwargs):
+                target_config["model_load_mtp"] = fake_low_level.llama_model_default_params().load_mtp
+                target_config["n_rs_seq"] = fake_low_level.llama_context_default_params().n_rs_seq
+                target_config["kv_unified"] = fake_low_level.llama_context_default_params().kv_unified
+                target_config["kwargs"] = kwargs
+
+            def close(self):
+                target_config["closed"] = True
+
+        owner = object()
+        with patch.dict(sys.modules, {"llama_cpp": fake_package}), patch.object(
+            gemma4_mtp, "attach_gemma4_mtp", return_value=owner
+        ) as attach:
+            target = gemma4_mtp.create_native_mtp_llama(
+                FakeTarget,
+                model_path="target.gguf",
+                draft_model_path="assistant.gguf",
+                num_pred_tokens=4,
+                n_ctx=16384,
+            )
+
+        self.assertTrue(target_config["model_load_mtp"])
+        self.assertEqual(target_config["n_rs_seq"], 0)
+        self.assertTrue(target_config["kv_unified"])
+        self.assertTrue(target_config["kwargs"]["logits_all"])
+        self.assertIs(fake_low_level.llama_model_default_params, ordinary_model_defaults)
+        self.assertIs(fake_low_level.llama_context_default_params, ordinary_context_defaults)
+        self.assertIs(target._hr_endless_mtp, owner)
+        attach.assert_called_once_with(target, "assistant.gguf", num_pred_tokens=4)
+
+    def test_native_mtp_partial_rejection_restores_and_replays_accepted_prefix(self):
+        owner = gemma4_mtp.Gemma4MTPDraft.__new__(gemma4_mtp.Gemma4MTPDraft)
+        owner._proposal_base = 10
+        owner._proposal_count = 4
+        owner._proposal_tokens = [201, 202, 203, 204]
+        owner._proposal_verified_end = 15
+        owner._proposal_sampled = [201, 999]
+        owner._checkpoint_data = object()
+        owner._checkpoint_size = 37
+        owner.accepted_tokens = 0
+        owner.rollback_count = 0
+        owner.replayed_tokens = 0
+        owner.target_ctx = object()
+        owner.target = SimpleNamespace(
+            input_ids=torch.tensor(
+                [*range(10), 101, 201, 202, 203, 204], dtype=torch.int32
+            ).numpy(),
+            n_tokens=12,
+            _requires_eval=False,
+        )
+        state_calls = []
+
+        def restore_state(ctx, data, size, seq_id, flags):
+            state_calls.append((ctx, data, size, seq_id, flags))
+            return size
+
+        owner._llama_cpp = SimpleNamespace(
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY=1,
+            LLAMA_STATE_SEQ_FLAGS_ON_DEVICE=2,
+            llama_state_seq_set_data_ext=restore_state,
+        )
+        removals = []
+        owner._original_kv_cache_seq_rm = (
+            lambda seq_id, p0, p1: removals.append((seq_id, p0, p1)) or False
+        )
+        replayed = []
+
+        def replay(tokens):
+            replayed.extend(tokens)
+            owner.target.n_tokens += len(tokens)
+
+        owner._decode_target_tokens = replay
+
+        handled = owner._kv_cache_seq_rm(None, -1, 12, -1)
+
+        self.assertTrue(handled)
+        self.assertEqual(removals, [(-1, 10, -1)])
+        self.assertEqual(replayed, [101, 201])
+        self.assertEqual(owner.target.n_tokens, 12)
+        self.assertEqual(owner.accepted_tokens, 1)
+        self.assertEqual(owner.rollback_count, 1)
+        self.assertEqual(owner.replayed_tokens, 2)
+        self.assertEqual(state_calls[0][2:], (37, 0, 3))
+        self.assertIsNone(owner._proposal_base)
+
+    def test_native_mtp_checkpoint_uses_fast_device_state_inside_worker(self):
+        owner = gemma4_mtp.Gemma4MTPDraft.__new__(gemma4_mtp.Gemma4MTPDraft)
+        owner.target_ctx = object()
+        owner.checkpoint_seconds = 0.0
+        state_calls = []
+
+        def checkpoint_size(ctx, seq_id, flags):
+            state_calls.append(("size", ctx, seq_id, flags))
+            return 16
+
+        def checkpoint_data(ctx, data, size, seq_id, flags):
+            state_calls.append(("data", ctx, size, seq_id, flags))
+            return size
+
+        owner._llama_cpp = SimpleNamespace(
+            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY=1,
+            LLAMA_STATE_SEQ_FLAGS_ON_DEVICE=2,
+            llama_state_seq_get_size_ext=checkpoint_size,
+            llama_state_seq_get_data_ext=checkpoint_data,
+        )
+
+        owner._save_target_checkpoint(42)
+
+        self.assertEqual(state_calls[0][2:], (0, 3))
+        self.assertEqual(state_calls[1][2:], (16, 0, 3))
+        self.assertEqual(owner._checkpoint_size, 16)
+        self.assertEqual(owner._proposal_base, 42)
+
+    def test_worker_generation_emits_decode_tokens_per_second(self):
+        class FakeLlama:
+            def generate(self, *_args, **_kwargs):
+                yield 10
+                yield 11
+                yield 12
+
+        llm = FakeLlama()
+        gemma4._install_worker_token_progress(llm)
+        with patch.object(gemma4.time, "perf_counter", side_effect=[1.0, 1.5, 2.0]), \
+                patch("builtins.print") as printed:
+            self.assertEqual(list(llm.generate([1, 2, 3])), [10, 11, 12])
+
+        progress_lines = [
+            call.args[0]
+            for call in printed.call_args_list
+            if call.args and call.args[0].startswith(gemma4._WORKER_PROGRESS_PREFIX)
+        ]
+        self.assertEqual(len(progress_lines), 2)
+        payload = json.loads(progress_lines[-1][len(gemma4._WORKER_PROGRESS_PREFIX):])
+        self.assertEqual(payload["tokens"], 3)
+        self.assertAlmostEqual(payload["tokens_per_second"], 2.0)
+
+    def test_parent_streams_worker_token_rate_without_mixing_it_into_result(self):
+        class CapturingInput(io.StringIO):
+            def close(self):
+                self.closed_by_worker = True
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = CapturingInput()
+                self.stdout = io.StringIO(
+                    gemma4._WORKER_PROGRESS_PREFIX
+                    + '{"generation":1,"tokens":64,"tokens_per_second":128.5}\n'
+                    + gemma4._WORKER_RESULT_PREFIX
+                    + '{"ok":true}\n'
+                )
+                self.returncode = None
+
+            def wait(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+        rates = []
+        process = FakeProcess()
+        output = gemma4._stream_worker_output(
+            process,
+            {"operation": "test"},
+            lambda tokens, rate, generation: rates.append((tokens, rate, generation)),
+        )
+
+        self.assertEqual(rates, [(64, 128.5, 1)])
+        self.assertEqual(output, gemma4._WORKER_RESULT_PREFIX + '{"ok":true}\n')
+        self.assertEqual(json.loads(process.stdin.getvalue()), {"operation": "test"})
 
     def test_gemma4_handler_sets_full_visual_budget(self):
         initialized = {}
@@ -357,6 +729,74 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("Source Shot 2: immutable preproduction timing schedule", observation)
         self.assertIn("Heman -> <Subject 1>", observation)
 
+    def test_clean_preproduction_memory_keeps_static_source_context_out_of_cached_chunks(self):
+        timing_request = self.timing_request()
+        plan = gemma4._validate_timing_plan(
+            self.timing_response(), timing_request, json.dumps(self.timing_response())
+        )
+        memory_system, memory = gemma4._render_preproduction_memory_messages(timing_request, plan)
+        self.assertIn(timing_request["original_prompt"], memory)
+        self.assertIn("Source Shot 1: immutable preproduction timing schedule", memory)
+        self.assertIn("# MiniMax H3 prompt-writing working summary", memory_system)
+
+        request = self.request()
+        request["preproduction_timing_plan"] = plan.for_target_shots(request["target_shots"], 24.0)
+        request["preproduction_current_slice"] = plan.current_slice_coverage_text(request["target_shots"])
+        request["character_name_table"] = plan.character_name_table_text()
+        request["preproduction_cache"] = {
+            "format": "hr-endless-sampler-gemma4-preproduction-kv-v1",
+            "state_path": "/tmp/unused-state",
+            "manifest_path": "/tmp/unused-manifest",
+        }
+        _system, cached_observation = gemma4._render_observation_messages(request)
+        self.assertIn("using the immutable preproduction memory", cached_observation)
+        self.assertIn("Mandatory current-slice portions", cached_observation)
+        self.assertIn(request["previous_gemma_description"], cached_observation)
+        self.assertNotIn(request["original_prompt"], cached_observation)
+        self.assertNotIn(request["target_shots"][1]["source_body"], cached_observation)
+        self.assertNotIn("COMPLETE RELEVANT PREPRODUCTION SCHEDULE", cached_observation)
+
+    def test_replay_materializes_clean_cache_from_existing_timing_plan(self):
+        request = self.timing_request()
+        request["preproduction_cache"] = {
+            "format": "hr-endless-sampler-gemma4-preproduction-kv-v1",
+            "state_path": "/tmp/unused-state",
+            "manifest_path": "/tmp/unused-manifest",
+        }
+        plan = gemma4._validate_timing_plan(
+            self.timing_response(), request, json.dumps(self.timing_response())
+        )
+        captured = {}
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **kwargs):
+                captured["llama_kwargs"] = kwargs
+
+            def close(self):
+                captured["closed"] = True
+
+        def fake_populate(llm, actual_request, actual_plan):
+            captured["llm"] = llm
+            captured["request"] = actual_request
+            captured["plan"] = actual_plan
+            return 123
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4, "_populate_preproduction_cache_state", side_effect=fake_populate), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            state_bytes = gemma4._materialize_preproduction_cache_in_process(request, plan, debug=False)
+
+        self.assertEqual(state_bytes, 123)
+        self.assertIs(captured["plan"], plan)
+        self.assertIs(captured["request"], request)
+        self.assertEqual(captured["llama_kwargs"]["n_gpu_layers"], -1)
+        self.assertTrue(captured["closed"])
+
     def test_preproduction_allows_dialogue_overlay_and_exposes_it_as_current_coverage(self):
         response = self.timing_response()
         response["shots"] = json.loads(json.dumps(response["shots"]))
@@ -416,6 +856,77 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(captured["max_tokens"], [2048, 2048])
         self.assertEqual([message["role"] for message in captured["messages"][0]], ["system", "user"])
         self.assertIsInstance(captured["messages"][0][1]["content"], str)
+        self.assertTrue(captured["closed"])
+
+    def test_preproduction_correction_schema_requires_character_name_table_array(self):
+        captured = {"messages": []}
+        invalid = self.timing_response()
+        invalid["character_name_table"] = {"Heman": "<Subject 1>"}
+        corrected = self.timing_response()
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [invalid, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._plan_timing_in_process(self.timing_request(), debug=False)
+
+        self.assertEqual(len(result.attempts), 2)
+        correction_prompt = result.attempts[1].correction_prompt
+        self.assertIn('"character_name_table":[{"character_name":"Heman", "subject":"<Subject 1>"}]', correction_prompt)
+        self.assertIn("`character_name_table` must be an array", correction_prompt)
+        self.assertIn("response field 'character_name_table' must be an array", correction_prompt)
+        self.assertEqual(result.character_name_table_text(), "- Heman -> <Subject 1>\n- Tila -> <Subject 2>")
+        self.assertTrue(captured["closed"])
+
+    def test_preproduction_correction_is_an_appended_chat_turn_when_runtime_supports_it(self):
+        captured = {"initial_messages": [], "append_content": []}
+        invalid = self.timing_response()
+        invalid["shots"] = json.loads(json.dumps(invalid["shots"]))
+        invalid["shots"][1]["visual_beats"][-1]["end_frame"] = 78
+        corrected = self.timing_response()
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+            def append_user_chat_completion(self, **kwargs):
+                captured["append_content"].append(kwargs["content"])
+                return {"choices": [{"message": {"content": json.dumps(corrected)}}]}
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                pass
+
+            def create_chat_completion(self, **kwargs):
+                captured["initial_messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(invalid)}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._plan_timing_in_process(self.timing_request(), debug=False)
+
+        self.assertEqual(len(result.attempts), 2)
+        self.assertEqual(len(captured["initial_messages"]), 1)
+        self.assertEqual(len(captured["append_content"]), 1)
+        self.assertIn("TIMING-PLAN CORRECTION REQUIRED", captured["append_content"][0])
         self.assertTrue(captured["closed"])
 
     def test_preproduction_rejects_gapped_schedule_without_sampler_fallback(self):
@@ -555,6 +1066,51 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual([message["role"] for message in retry_messages], ["system", "user", "assistant", "user"])
         self.assertEqual(retry_messages[2]["content"], json.dumps(wrong))
         self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", retry_messages[3]["content"])
+        self.assertTrue(captured["closed"])
+
+    def test_chunk_contract_correction_is_an_appended_chat_turn_when_runtime_supports_it(self):
+        captured = {"initial_messages": [], "append_content": []}
+        wrong = {
+            "confidence": "high",
+            "analysis": "Continue walking, then cut to the warning.",
+            "timing_plan": "[Shot 1]: walking; [Shot 2]: the warning after the cut.",
+            "end_state": "Heman has delivered the warning.",
+            "detailed_description": (
+                "Heman continues walking right. "
+                "[Shot 2] At 00:09.167, Heman says: <d>[English] Stay back!</d>"
+            ),
+        }
+        corrected = dict(wrong)
+        corrected["detailed_description"] = wrong["detailed_description"].replace("00:09.167", "00:00.667")
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+            def append_user_chat_completion(self, **kwargs):
+                captured["append_content"].append(kwargs["content"])
+                return {"choices": [{"message": {"content": json.dumps(corrected)}}]}
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                pass
+
+            def create_chat_completion(self, **kwargs):
+                captured["initial_messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(wrong)}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(self.request(), [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(len(captured["initial_messages"]), 1)
+        self.assertEqual(len(captured["append_content"]), 1)
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", captured["append_content"][0])
         self.assertTrue(captured["closed"])
 
     def test_retries_with_a_gemma_authored_coverage_correction_when_current_dialogue_is_deferred(self):

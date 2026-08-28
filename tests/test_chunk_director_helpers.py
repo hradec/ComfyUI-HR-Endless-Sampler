@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
+import json
 import sys
 import tempfile
 import unittest
@@ -38,6 +40,8 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(schema.node_id, "HREndlessSampler")
         self.assertEqual(schema.display_name, "HR Endless Sampler")
         self.assertIn("video_continuation", input_ids)
+        self.assertIn("cache_gemma_preproduction", input_ids)
+        self.assertIn("gemma4_mtp", input_ids)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
             "context_keyframes_enable",
@@ -47,7 +51,10 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "qwen_full_history",
             "prompt_preview_only",
         } & set(input_ids))
-        self.assertEqual(input_ids[-2:], ["debug", "debug_stop_chunk"])
+        self.assertEqual(
+            input_ids[-5:],
+            ["cache_gemma_preproduction", "gemma4_mtp", "debug", "debug_stop_chunk", "debug_start_chunk"],
+        )
 
         execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
         self.assertNotIn("video_continuation_enable", execute_params)
@@ -55,6 +62,91 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertNotIn("guide_overlap_enable", execute_params)
         self.assertNotIn("qwen_full_history", execute_params)
         self.assertNotIn("prompt_preview_only", execute_params)
+        self.assertIn("debug_start_chunk", execute_params)
+        self.assertIn("cache_gemma_preproduction", execute_params)
+        self.assertIn("gemma4_mtp", execute_params)
+
+    def test_last_run_replay_cache_keeps_exact_cpu_tensors_and_truncates_replayed_suffix(self):
+        video = torch.arange(24, dtype=torch.float16).reshape(1, 1, 2, 3, 4)
+        audio = torch.arange(16, dtype=torch.float16).reshape(1, 1, 2, 8)
+        plan = [{
+            "frame_start": 0,
+            "frame_end": 5,
+            "video_start": 0,
+            "video_end": 2,
+            "audio_start": 0,
+            "audio_end": 8,
+            "context_video_t": 0,
+            "context_audio_t": 0,
+            "output_trim_frames": 0,
+            "synthetic_prefix": False,
+        }]
+        fingerprint = nodes._replay_fingerprint(
+            video,
+            audio,
+            plan,
+            fps=24.0,
+            chunk_frames=5,
+            context_keyframes=0,
+            guide_overlap=0,
+            video_continuation=0,
+            ref2va=False,
+        )
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root):
+            cache = nodes._LastRunReplayCache()
+            cache.create(
+                fingerprint,
+                "original prompt",
+                {
+                    "video": video,
+                    "audio": audio,
+                    "video_noise": video + 1,
+                    "audio_noise": audio + 1,
+                    "noise_seed": 123,
+                },
+            )
+            cache.save_chunk(1, {
+                "sampled_video": video,
+                "sampled_audio": audio,
+                "previous_frame_count": 5,
+                "output_video": video,
+                "output_audio": audio,
+                "denoised_video": video,
+                "denoised_audio": audio,
+                "output_template": {"batch_index": torch.tensor([0])},
+                "denoised_template": {},
+                "gemma_description": "directed prompt",
+                "gemma_timing_plan": "timing",
+                "gemma_end_state": "end",
+                "debug_prompt": "chunk debug",
+                "prefix_video_noise": None,
+                "prefix_audio_noise": None,
+            })
+            loaded, reason = cache.load_if_compatible(fingerprint)
+            self.assertIsNone(reason)
+            self.assertEqual(loaded["initial"]["noise_seed"], 123)
+            self.assertEqual(loaded["initial"]["video"].device.type, "cpu")
+            self.assertTrue(torch.equal(cache.load_chunk(1)["sampled_video"], video.cpu()))
+            self.assertIsNone(cache.load_if_compatible({"different": True})[0])
+            cache.truncate_from(1)
+            self.assertFalse(cache.has_chunk(1))
+
+    def test_rebuilt_replay_timing_plan_updates_the_source_prompt_hash(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes, "_timing_plan_payload", return_value={"plan": "rebuilt"}):
+            cache = nodes._LastRunReplayCache()
+            cache.create({"geometry": "stable"}, "old source prompt", {"video": torch.zeros(1)})
+            cache.save_timing_plan(object(), source_prompt="edited source prompt")
+
+            manifest = json.loads(cache.manifest_path.read_text(encoding="utf-8"))
+            timing = json.loads(cache.timing_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["source_prompt_sha256"],
+                hashlib.sha256(b"edited source prompt").hexdigest(),
+            )
+            self.assertEqual(timing, {"plan": "rebuilt"})
 
     def test_preview_chunk_metadata_survives_a_server_state_restore(self):
         node_id = "preview-tooltip-test"
@@ -73,19 +165,136 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             preview._cache_payload({
                 "node_id": node_id,
                 "execution": 1,
+                "action": "phase",
+                "phase": "Gemma 4 is planning 4 source shots before H3 sampling",
+                "chunk": 0,
+            })
+            preview._cache_payload({
+                "node_id": node_id,
+                "execution": 1,
                 "action": "chunk_metadata",
                 "chunk": 0,
                 "gemma_detailed_description": "  [Shot 1] The tiger runs.  ",
+                "h3_render_seconds": 42.5,
+                "gemma_seconds": 3.25,
+                "gemma_preproduction_seconds": 2.0,
+                "chunk_total_seconds": 48.75,
             })
             snapshot = preview._cached_snapshot(node_id)
             self.assertEqual(
                 snapshot["reset"]["chunk_ranges"][0]["gemma_detailed_description"],
                 "[Shot 1] The tiger runs.",
             )
+            self.assertEqual(snapshot["reset"]["chunk_ranges"][0]["h3_render_seconds"], 42.5)
+            self.assertEqual(snapshot["reset"]["chunk_ranges"][0]["gemma_seconds"], 3.25)
+            self.assertEqual(
+                snapshot["reset"]["chunk_ranges"][0]["gemma_preproduction_seconds"],
+                2.0,
+            )
+            self.assertEqual(snapshot["reset"]["chunk_ranges"][0]["chunk_total_seconds"], 48.75)
+            self.assertEqual(
+                snapshot["phase"]["phase"],
+                "Gemma 4 is planning 4 source shots before H3 sampling",
+            )
             self.assertNotIn("gemma_detailed_description", snapshot["reset"]["chunk_ranges"][1])
         finally:
             with preview._PREVIEW_CACHE_LOCK:
                 preview._PREVIEW_CACHE.pop(node_id, None)
+
+    def test_preparation_progress_reports_to_console_and_preview(self):
+        phases = []
+
+        class FakePreview:
+            def set_phase(self, phase, *, chunk=None):
+                phases.append((phase, chunk))
+
+        with patch.object(nodes.logging, "info") as logged:
+            with nodes._PreparationProgress(
+                "Gemma 4 is planning source shots",
+                FakePreview(),
+                chunk=2,
+                interval=60,
+            ):
+                pass
+
+        self.assertEqual(len(phases), 2)
+        self.assertEqual(phases[0][1], 2)
+        self.assertIn("still working", phases[0][0])
+        self.assertIn("complete", phases[1][0])
+        self.assertEqual(logged.call_count, 2)
+
+    def test_gemma_directing_preparation_uses_an_indeterminate_live_tqdm_bar(self):
+        bars = []
+
+        class FakeBar:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                self.n = 0
+                self.disable = False
+                self.refresh_count = 0
+                self.closed = False
+
+            def refresh(self):
+                self.refresh_count += 1
+
+            def close(self):
+                self.closed = True
+
+        def fake_tqdm(**kwargs):
+            bar = FakeBar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        with patch.object(nodes, "tqdm", fake_tqdm), patch.object(nodes.logging, "info"):
+            with nodes._PreparationProgress(
+                "Chunk 4/10: Gemma 4 is directing the chunk prompt",
+                interval=60,
+                live_console_bar=True,
+            ):
+                pass
+
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].unit, "gemma")
+        self.assertEqual(bars[0].total, 30)
+        self.assertGreaterEqual(bars[0].refresh_count, 2)
+        self.assertTrue(bars[0].closed)
+
+    def test_gemma_progress_displays_live_decode_tokens_per_second(self):
+        phases = []
+
+        class FakePreview:
+            def set_phase(self, phase, *, chunk=None):
+                phases.append((phase, chunk))
+
+        class FakeBar:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                self.n = 0
+                self.disable = False
+                self.postfix = ""
+
+            def set_postfix_str(self, postfix, refresh=False):
+                self.postfix = postfix
+
+            def refresh(self):
+                pass
+
+            def close(self):
+                pass
+
+        with patch.object(nodes, "tqdm", lambda **kwargs: FakeBar(**kwargs)), \
+                patch.object(nodes.logging, "info"):
+            with nodes._PreparationProgress(
+                "Chunk 2/8: Gemma 4 is directing the chunk prompt",
+                FakePreview(),
+                chunk=1,
+                interval=60,
+                live_console_bar=True,
+            ) as progress:
+                progress.update_token_progress(96, 127.45, 1)
+                self.assertIn("96 tokens, 127.5 tokens/sec", progress._bar.postfix)
+
+        self.assertTrue(any("127.5 tokens/sec" in phase for phase, _chunk in phases))
 
     def test_timing_preproduction_is_logged_before_chunk_transcripts(self):
         with tempfile.TemporaryDirectory() as temp_root, \
@@ -273,6 +482,16 @@ class ChunkDirectorHelperTest(unittest.TestCase):
     def test_keyframe_overlap_must_be_smaller_than_chunk(self):
         with self.assertRaisesRegex(ValueError, "must be smaller"):
             nodes._continuation_controls(39, 0, 0, 39)
+
+    def test_video_continuation_allows_equal_chunk_and_clamps_a_larger_request(self):
+        self.assertEqual(
+            nodes._continuation_controls(0, 0, 22, 22)[:3],
+            (0, 0, 22),
+        )
+        self.assertEqual(
+            nodes._continuation_controls(0, 0, 56, 22)[:3],
+            (0, 0, 22),
+        )
 
     def test_video1_boundary_keyframe_uses_complete_discarded_packing_prefix(self):
         plan = nodes._chunk_plan_without_overlap(

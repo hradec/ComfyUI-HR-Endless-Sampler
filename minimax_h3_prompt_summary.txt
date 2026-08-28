@@ -1,0 +1,59 @@
+# MiniMax H3 prompt-writing working summary
+
+Use this as the compact runtime reference for Gemma's H3-facing prose. The
+complete reviewed MiniMax skill and mode guides remain vendored beside this
+file for human review and dependency updates; they are intentionally not
+inserted into every Gemma context.
+
+## Structured prompt rules
+
+- Preserve the existing prompt mode and section meanings. Base modes use the
+  normal integrated multimodal description. Ref2VA prompts may use
+  `subject_definitions`, `summary`, `retention_analysis`,
+  `detailed_description`, and sound/music sections. Do not invent or remove
+  reference labels or structured sections.
+- Keep `<Subject N>`, `<Picture N>`, `<Video N>`, and `<Audio N>` identifiers
+  exactly as supplied. They are semantic references, not decorative text.
+- For a native continuation source, use the supplied `<Video N>` and matching
+  `<Audio N>` only when the sampler says they exist. Do not create unavailable
+  labels or describe a reference as a new target shot.
+
+## Shot timeline rules
+
+- `[Shot 1]` is a real opening-shot marker. Use it only when the source shot
+  actually begins at the first physical frame of this H3 request.
+- A real later cut uses the supplied exact local marker:
+  `[Shot N] At MM:SS.mmm,`.
+- Copy sampler-supplied local markers exactly once, in order. Never infer,
+  move, renumber, or add cuts from global source timestamps.
+- If the sampler says a chunk begins inside an established shot, begin with
+  ordinary continuation prose and no synthetic `[Shot N]` marker.
+
+## H3-ready direction
+
+- Write concrete, observable screen action in playback order: composition,
+  subject identity and position, visible state changes, environment, lighting,
+  camera behavior, and synchronized sound when relevant.
+- Preserve explicit action order, outcomes, dialogue, lyrics, sound effects,
+  and real cuts from the source. Do not restart completed action, compress an
+  entire later shot into a short slice, or invent characters, props, locations,
+  camera setups, framing, angles, transitions, or cuts.
+- An uncut camera follow, pan, track, zoom, shake, or reposition must begin
+  exactly: `In a continuous movement,` and explicitly continue the established
+  view. A fresh camera setup implies a cut and must not be invented.
+- Dialogue is immutable. Preserve the exact words, language, and punctuation
+  inside `<d>...</d>`. Keep stable speaker IDs. When a supplied subject speaks
+  in a direct speaker clause, use `<Subject N> (Sx) says: <d>[Language] exact words</d>` with no human name
+  or extra parenthetical between the subject label and `(Sx)`.
+- Use `<scenetrans>` only for speech that genuinely crosses a supplied cut, and
+  `<cutoff>` only for speech genuinely cut off by the end of the generated
+  video.
+
+## Chunk-director priority
+
+The sampler's frame ownership, local cut markers, conditioning inventory, and
+preproduction timing schedule are immutable facts. The current generated stills
+are authoritative about what H3 actually rendered. Resolve a conflict by
+continuing the immediate unfinished action from those stills while preserving
+the source's intent. Return only the requested JSON contract; H3 receives only
+its final `detailed_description` value.
