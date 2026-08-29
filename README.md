@@ -17,6 +17,17 @@ allows to visualize the whole video as it is infered, with a timeslider that dis
 the video shots and each chunk. You can even visualize each chunk prompt Gemma created
 by holding the mouse pointer over a chunk bar. 
 
+<img width="350"  alt="image" src="https://github.com/user-attachments/assets/ac2c7bf3-cc07-45d9-b78b-760c4580338e" />
+<img width="350"  alt="image" src="https://github.com/user-attachments/assets/6308733b-101a-43b2-869e-ebfc97605e5e" />
+
+The `HR Endless Sampler Save Video` and `HR Endless Sampler Load Video` also display the timeslider with all the features of the preview node. They also have an extra button "Macthing Videos" that display a list of the last videos with the same filename prefix, so we can quickly compare previous renders with newer ones, also seeing the chunks, prompts, time to render, etc.:
+
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/9e1e1312-0493-4a10-a750-1e92b94451a7" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/d0c37c83-06e0-4582-b240-ae8199194d2d" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/d0a39920-647b-4891-90cb-b172c5e73c16" />
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/54e1f553-b7e5-470e-ade8-aafe333ce075" />
+
+
 ## Quick HELP as I don't have a workflow template yet!
 The way to use is pretty straight forward - just replace the normal "Sampler" node by this one, and add the preview node behind it so it can show the preview as the inference happens. You just have to add the extra inputs:
 - `clip` - just connect the model clip
