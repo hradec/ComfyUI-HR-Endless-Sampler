@@ -314,6 +314,12 @@ plus peak RAM and VRAM use.
   dialogue and sound instructions from the source prompt, but does not judge
   the resulting soundtrack.
 
+## TIPS TO RENDER 1080p with 16GB of VRAM:  
+ - These tips are from my workflow using ref2va with 5 images at 720p resolution as reference. 
+ - To render a 625 frames video at 1080p with only 16GB of VRAM, I use 56 `chunk_frames` and 22 `video_continuation` frames. This configuration may OOM without  `KJNodes MiniMax H3 Low VRAM Attention`. `KJNodes MiniMax H3 Low VRAM Attention` helps reduce VRAM memory peaks which is specially necessary during all chunks after Chunk1, since those chunks have an extra 22 frames to deal with. I set it to `4` and it renders 1080p without problems.
+ - If you don't want to use the amazing `KJNodes MiniMax H3 Low VRAM Attention`, you still can render 1080p by reducing `chunk_frames` to 39.
+ - off course this all changes depending on how many (and resolution) reference images/videos/audio you are using. 
+
 ## References
 
 - [MiniMax H3 prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md)
