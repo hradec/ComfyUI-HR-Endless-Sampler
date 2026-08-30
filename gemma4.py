@@ -499,6 +499,11 @@ def _model_paths() -> tuple[Path, Path]:
     return model_dir / GEMMA4_MODEL_FILENAME, model_dir / GEMMA4_MMPROJ_FILENAME
 
 
+def is_official_gemma4_pair(model_path: Path, mmproj_path: Path) -> bool:
+    expected_model, expected_mmproj = _model_paths()
+    return model_path.resolve() == expected_model.resolve() and mmproj_path.resolve() == expected_mmproj.resolve()
+
+
 def _ensure_model_files() -> tuple[Path, Path]:
     model_path, mmproj_path = _model_paths()
     if model_path.is_file() and mmproj_path.is_file():
@@ -532,6 +537,22 @@ def _ensure_model_files() -> tuple[Path, Path]:
             )
         )
     return paths[0], paths[1]
+
+
+def _model_files_for_request(request: dict[str, Any]) -> tuple[Path, Path]:
+    model_value = request.get("director_model_path")
+    mmproj_value = request.get("director_mmproj_path")
+    if model_value is None and mmproj_value is None:
+        return _ensure_model_files()
+    if not model_value or not mmproj_value:
+        raise Gemma4DependencyError("A local director requires both model and mmproj files")
+    models_root = Path(folder_paths.models_dir).resolve()
+    model_path = Path(model_value).resolve()
+    mmproj_path = Path(mmproj_value).resolve()
+    for path in (model_path, mmproj_path):
+        if not path.is_relative_to(models_root) or path.suffix.casefold() != ".gguf" or not path.is_file():
+            raise Gemma4DependencyError(f"Invalid local director file: {path}")
+    return model_path, mmproj_path
 
 
 def _ensure_mtp_model_file() -> Path:
@@ -795,7 +816,8 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
     return Gemma4MTMDChatHandler
 
 
-def _load_runtime():
+def _load_runtime(backend="gemma4"):
+    director_name = "Qwen3.5" if backend == "qwen3.5" else "Gemma 4"
     try:
         import llama_cpp
         from llama_cpp import Llama
@@ -804,16 +826,18 @@ def _load_runtime():
         import llama_cpp.mtmd_cpp
     except ImportError as error:
         raise Gemma4DependencyError(
-            "Gemma 4 continuity requires llama-cpp-python==0.3.35 with CUDA support. "
+            f"{director_name} continuity requires llama-cpp-python==0.3.35 with CUDA support. "
             "Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
         ) from error
 
     version = getattr(llama_cpp, "__version__", "unknown")
     if version != GEMMA4_REQUIRED_VERSION:
         raise Gemma4DependencyError(
-            f"Gemma 4 continuity requires llama-cpp-python=={GEMMA4_REQUIRED_VERSION} with MTMD vision support; "
+            f"{director_name} continuity requires llama-cpp-python=={GEMMA4_REQUIRED_VERSION} with MTMD vision support; "
             f"found {version}. Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
         )
+    if backend == "qwen3.5":
+        return Llama, MTMDChatHandler
     return Llama, _gemma4_mtmd_handler_type(
         MTMDChatHandler,
         llama_cpp,
@@ -828,15 +852,17 @@ def _create_runtime_llm(
     handler: Any,
     debug: bool,
     gemma4_mtp: bool = False,
+    n_ctx: int = 16384,
+    n_batch: int = GEMMA4_BATCH_SIZE,
 ) -> Any:
     """Create either the original runtime or a target born as native MTP."""
     real_runtime = str(getattr(Llama, "__module__", "")).startswith("llama_cpp")
     llama_kwargs = {
         "chat_handler": handler,
         "n_gpu_layers": -1,
-        "n_ctx": 16384,
-        "n_batch": GEMMA4_BATCH_SIZE,
-        "n_ubatch": GEMMA4_BATCH_SIZE,
+        "n_ctx": n_ctx,
+        "n_batch": n_batch,
+        "n_ubatch": n_batch,
         "flash_attn": True,
         # Sampler debug controls our captures, validation warnings, progress,
         # and MTP summary.  It must not enable llama.cpp's native trace stream:
@@ -2333,8 +2359,8 @@ def _observe_in_process(
     debug: bool,
 ) -> GemmaChunkPrompt:
     """Run one observation inside the disposable worker process."""
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     system_prompt, message = _render_observation_messages(request)
     # Gemma 4's official modality order is images before user text. Preserve
     # chronological order within the image sequence.
@@ -2357,6 +2383,8 @@ def _observe_in_process(
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
@@ -2476,8 +2504,8 @@ def _materialize_preproduction_cache_in_process(
     this static directorial conversation after the render-local cache reset.
     Otherwise every replayed chunk falls back to a full self-contained prompt.
     """
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     handler = None
     llm = None
     try:
@@ -2488,6 +2516,8 @@ def _materialize_preproduction_cache_in_process(
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         state_bytes = _populate_preproduction_cache_state(llm, request, timing_plan)
         logging.info(
@@ -2509,8 +2539,8 @@ def _materialize_preproduction_cache_in_process(
 
 def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTimingPlan:
     """Run the one-time text-only source-shot timing plan in the worker."""
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     system_prompt, message = _render_timing_plan_messages(request)
     handler = None
     llm = None
@@ -2525,6 +2555,8 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
@@ -2823,9 +2855,15 @@ class Gemma4ContinuityDirector:
 
     def __init__(self, debug: bool = False, gemma4_mtp: bool = False,
                  capture_directory: str | Path | None = None,
-                 observation_image_directory: str | Path | None = None):
+                 observation_image_directory: str | Path | None = None,
+                 model_path: str | Path | None = None,
+                 mmproj_path: str | Path | None = None):
         self.debug = debug
         self.gemma4_mtp = bool(gemma4_mtp)
+        self.model_path = Path(model_path).resolve() if model_path is not None else None
+        self.mmproj_path = Path(mmproj_path).resolve() if mmproj_path is not None else None
+        if (self.model_path is None) != (self.mmproj_path is None):
+            raise Gemma4DependencyError("A local Gemma director requires both model and mmproj files")
         self._capture_sequence = 0
         self.last_system_prompt = ""
         self.last_observation_prompt = ""
@@ -2842,6 +2880,13 @@ class Gemma4ContinuityDirector:
             self.capture_directory = Path(capture_directory)
             self.capture_directory.mkdir(parents=True, exist_ok=True)
             logging.info("HR Endless Sampler Gemma capture directory: %s", self.capture_directory)
+
+    def _configure_request(self, request: dict[str, Any]) -> None:
+        request["debug"] = self.debug
+        request["gemma4_mtp"] = self.gemma4_mtp
+        if self.model_path is not None:
+            request["director_model_path"] = str(self.model_path)
+            request["director_mmproj_path"] = str(self.mmproj_path)
 
     def _run_worker_with_mtp_fallback(
         self,
@@ -2890,8 +2935,7 @@ class Gemma4ContinuityDirector:
         if not request.get("source_shots"):
             raise Gemma4ObservationError("Gemma 4 needs source shots for timing preproduction")
         self.last_timing_system_prompt, self.last_timing_planning_prompt = _render_timing_plan_messages(request)
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         result = self._run_worker_with_mtp_fallback(
             "shot-timing preproduction",
             request,
@@ -2918,8 +2962,7 @@ class Gemma4ContinuityDirector:
         request = json.loads(json.dumps(request, ensure_ascii=False))
         if not request.get("preproduction_cache"):
             raise Gemma4ObservationError("Gemma preproduction cache is not configured for this replay")
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         return self._run_worker_with_mtp_fallback(
             "clean preproduction-cache creation",
             request,
@@ -2959,8 +3002,7 @@ class Gemma4ContinuityDirector:
         if not request.get("target_shots"):
             raise Gemma4ObservationError("Gemma 4 needs at least one source shot for the current chunk")
         request["image_urls"] = image_urls
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         if self.observation_image_directory is not None and image_urls:
             try:
                 _capture_last_observation_images(

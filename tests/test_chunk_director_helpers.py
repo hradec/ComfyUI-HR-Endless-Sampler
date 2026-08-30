@@ -40,6 +40,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(schema.node_id, "HREndlessSampler")
         self.assertEqual(schema.display_name, "HR Endless Sampler")
         self.assertIn("video_continuation", input_ids)
+        self.assertIn("director_backend", input_ids)
+        self.assertIn("director_model", input_ids)
+        self.assertIn("director_mmproj", input_ids)
         self.assertIn("cache_gemma_preproduction", input_ids)
         self.assertIn("gemma4_mtp", input_ids)
         self.assertNotIn("video_continuation_enable", input_ids)
@@ -52,9 +55,10 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "prompt_preview_only",
         } & set(input_ids))
         self.assertEqual(
-            input_ids[-5:],
+            input_ids[-8:-3],
             ["cache_gemma_preproduction", "gemma4_mtp", "debug", "debug_stop_chunk", "debug_start_chunk"],
         )
+        self.assertEqual(input_ids[-3:], ["director_backend", "director_model", "director_mmproj"])
 
         execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
         self.assertNotIn("video_continuation_enable", execute_params)
@@ -65,6 +69,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("debug_start_chunk", execute_params)
         self.assertIn("cache_gemma_preproduction", execute_params)
         self.assertIn("gemma4_mtp", execute_params)
+        parameter_ids = list(execute_params)
+        self.assertLess(parameter_ids.index("debug_start_chunk"), parameter_ids.index("director_backend"))
+        self.assertEqual(parameter_ids[-4:-1], ["director_backend", "director_model", "director_mmproj"])
 
     def test_last_run_replay_cache_keeps_exact_cpu_tensors_and_truncates_replayed_suffix(self):
         video = torch.arange(24, dtype=torch.float16).reshape(1, 1, 2, 3, 4)

@@ -177,6 +177,10 @@ review date, versions/commits checked, and outcome below.
   Host-only checkpoints reduced output to roughly 56 tokens/second and a later
   Chunk 2 worker still aborted during MTP initialization. Keep fast on-device
   MTP isolated in the child worker and retain the explicit non-MTP retry.
+- 2026-08-30: issue #27439 remains open with the `bug-unconfirmed` label and no
+  published fix. PyPI still reports `llama-cpp-python==0.3.35` as the newest
+  release (uploaded 2026-08-17). Preserve the disposable worker and
+  operation-local non-MTP retry while adding another local llama.cpp director.
 
 The runtime was compared against `llama-cpp-python` tag `0.3.35` at commit
 `3691546f1c9e0c1bf93323dff02230bd959cf562`; that package vendors llama.cpp at
