@@ -148,9 +148,9 @@ For every chunk, Gemma receives:
   current source prompt.
 
 Gemma writes one short H3 `detailed_description` for that chunk. It keeps exact
-dialogue inside `<d>...</d>`, preserves real shot cuts, and uses local H3
-timecodes for cuts. H3 receives only that final description, not Gemma's JSON
-notes or planning data.
+dialogue inside `<d>...</d>`, preserves each original global `[Shot N]` label,
+and recalculates only cut timecodes on the current chunk's local clock. H3
+receives only that final description, not Gemma's JSON notes or planning data.
 
 Generated Video1 frames shown to Qwen and Gemma use the same spatial canvas as
 ComfyUI's native H3 reference-video path: a nominal 768-pixel short edge with a
