@@ -150,12 +150,11 @@ replay after a rejected draft, JSON grammar generation, and teardown order.
 The fast path currently adds `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, but it is
 allowed only inside the disposable worker: llama.cpp can abort before its C API
 returns an error. The parent must preserve the exact request and retry that
-operation once without MTP after a native worker exit. The retry changes only
-the copied request's MTP flag: all cache fields remain intact, and the next
-independent operation attempts MTP again. Generated target logits stay inside
-llama.cpp—the director
-never requests logprobs, so copying every verification row into NumPy is
-prohibited on this path.
+operation up to ten times in fresh non-MTP workers after a native worker exit.
+The retries change only the copied request's MTP flag: all cache fields remain
+intact, and the next independent operation attempts MTP again. Generated
+target logits stay inside llama.cpp—the director never requests logprobs, so
+copying every verification row into NumPy is prohibited on this path.
 
 ### Periodic Gemma MTP upstream check
 
@@ -181,6 +180,65 @@ review date, versions/commits checked, and outcome below.
   published fix. PyPI still reports `llama-cpp-python==0.3.35` as the newest
   release (uploaded 2026-08-17). Preserve the disposable worker and
   operation-local non-MTP retry while adding another local llama.cpp director.
+- 2026-08-28 (latest Chunk 2 crash recheck): issue #27439 remains open with no
+  linked fix or pull request. GitHub still identifies `v0.3.35-hip-radeon` as
+  the latest `llama-cpp-python` release, built from package commit `3691546`;
+  no newer package containing an upstream state-restore fix is available. The
+  exact captured multimodal request showed an MTP load failure followed by a
+  CUDA abort in the first non-MTP worker, so worker-exit recovery now preserves
+  the request and permits up to ten fresh operation-local non-MTP retries.
+- 2026-08-29: issue #27439 remains open and has no recorded fix or close date.
+  GitHub still reports `v0.3.35-hip-radeon` (published 2026-08-17) as the
+  latest `llama-cpp-python` release. The 0.3.35 changelog still pins llama.cpp
+  `4df29be4f`/`adb55e514`, predating the affected issue's reproduction commit;
+  no package containing a confirmed fix is available. Preserve the disposable
+  worker and ten operation-local non-MTP retries unchanged.
+- 2026-08-29 (render-resume/response-repair session): rechecked issue #27439;
+  it remains open, labeled `bug-unconfirmed`, with no linked fix or pull
+  request. GitHub's latest-release endpoint still returns
+  `v0.3.35-hip-radeon`, and the current changelog still lists llama.cpp
+  `4df29be4f`/`adb55e514` for 0.3.35. No newer Python package contains a
+  confirmed fix. The disposable MTP worker and ten operation-local non-MTP
+  retries are therefore preserved unchanged.
+- 2026-08-29 (32K KV-cache alignment session): issue #27439 remains open,
+  labeled `bug-unconfirmed`, with no linked fix or release that contains one.
+  `llama-cpp-python` remains at 0.3.35; its published changelog still vendors
+  llama.cpp `4df29be4f`/`adb55e514`. The local `Llama` constructor exposes
+  `n_ctx`, `type_k`, `type_v`, and `swa_full`, so the sampler now explicitly
+  matches the tested native Gemma server's memory policy: 32,768 context,
+  Q8_0 K/V cache (`GGML_TYPE_Q8_0`), and no forced full-size SWA cache. The
+  prior 20,480 test was F16/default-cache configuration and is not evidence
+  against the 32K Q8_0 configuration. Preserve the disposable MTP worker and
+  ten operation-local non-MTP retries; this change does not alter them.
+- 2026-08-29 (MTP reliability regression investigation): issue #27439 remains
+  open and `llama-cpp-python` remains at 0.3.35. The render log establishes a
+  local configuration-dependent regression rather than a Gemma JSON failure:
+  early native-MTP runs at the original 16,384-token/default-KV configuration
+  completed hundreds of on-device checkpoints per response with roughly
+  62-75% draft acceptance, while recent 32,768-token/Q8_0 runs repeatedly abort
+  after two output tokens inside `llama_state_seq_get_data_ext()` with either
+  `not enough space in the buffer` or an invalid backend-buffer assertion.
+  `gemma4_mtp.py` itself did not change between those runs, but it still opts
+  into `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`. Upstream PR #24108 removed that flag
+  from speculative checkpoints because its extra device allocation is not
+  accounted at context startup and it is not fully compatible with meta/device
+  buffers; current `speculative-simple` uses `PARTIAL_ONLY` without
+  `ON_DEVICE`. Therefore the disposable-worker retry remains necessary but is
+  containment, not proof that the fast checkpoint path is correct. Before any
+  further performance tuning, replay the captured multimodal Chunk 2 request
+  against an explicit matrix of 16K/default-KV, 32K/Q8_0, and host-only
+  checkpoints after ComfyUI releases the GPU. Do not characterize the present
+  all-operation failure rate as only upstream randomness.
+- 2026-08-29 (reference-checkpoint port): the local native MTP adapter now
+  follows current llama.cpp checkpoint flags by saving and restoring only
+  `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` host state; it no longer requests
+  `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`. The adapter retains and overwrites one
+  growable host checkpoint buffer across proposals, while keeping the existing
+  accepted-prefix replay and disposable-worker/non-MTP retry unchanged. All
+  101 non-live repository tests pass. This is not yet a successful captured
+  multimodal replay: the running ComfyUI process held 14,954 MiB of the GPU, so
+  a separate Gemma worker could not load for the live test. Keep the fallback
+  until the next real Chunk 2 operation confirms the host-checkpoint path.
 
 The runtime was compared against `llama-cpp-python` tag `0.3.35` at commit
 `3691546f1c9e0c1bf93323dff02230bd959cf562`; that package vendors llama.cpp at
@@ -195,10 +253,14 @@ Exact-capture profiling on 2026-08-27 showed that strict JSON grammar made the
 CPU target sampler spend 45.060 seconds on 1,628 token samples while target
 verification itself took only 1.015 seconds. Gemma already receives a strict
 JSON output contract, and its unconstrained response is parsed and validated
-after generation. The grammar is therefore a recovery-only mechanism: use it
-for one retry when the ordinary response is not syntactically valid JSON. A
-valid response must take the fast unconstrained path; semantic validation and
-chat-style correction still run afterward. The same captured chunk reduced
+after generation. The grammar is therefore a final recovery-only mechanism:
+an ordinary non-MTP malformed response first gets two compact append-only
+model-authored repair turns, and only then may use grammar. An MTP response
+with no complete JSON must leave the disposable worker immediately and retry
+the exact operation in a fresh original-decoder worker; it must not spend
+several full generations in grammar recovery. A valid response must take the
+fast unconstrained path; semantic validation and chat-style correction still
+run afterward. The same captured chunk reduced
 target sampling to 0.285 seconds and streamed at 97.2 tokens/second on the
 initial response and 125.0 tokens/second on its correction. Preserve unit
 coverage for both the ordinary fast path and malformed-JSON recovery when
@@ -209,3 +271,12 @@ clamps it to zero. The `gemma4_mtp` sampler toggle is the
 explicit fallback: when it is false, use the original high-level runtime; when
 it is true, missing native symbols or invalid target setup must stop the Gemma
 pass instead of silently running and reporting the non-MTP decoder.
+
+The 2026-08-29 live 625-frame integration replay confirmed the distinction.
+MTP produced no complete JSON after one 1,024-token response (622 of 1,608
+draft tokens accepted, 38.7%); the new typed MTP-output failure immediately
+retried that same multimodal Chunk 10 operation through the original decoder,
+which returned usable JSON and completed the test. The former 20–30 token/s
+reports came from repeatedly generating maximum-length unusable responses and
+then entering the expensive grammar sampler, not from the clean non-MTP
+decoder. Preserve the typed early handoff until upstream MTP is reliable.

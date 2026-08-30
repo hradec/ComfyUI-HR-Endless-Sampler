@@ -68,7 +68,6 @@ class Gemma4MTPDraft:
             "llama_state_seq_get_data_ext",
             "llama_state_seq_set_data_ext",
             "LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY",
-            "LLAMA_STATE_SEQ_FLAGS_ON_DEVICE",
         )
         missing = [name for name in required if not hasattr(llama_cpp, name)]
         extension_required = (
@@ -111,6 +110,11 @@ class Gemma4MTPDraft:
         self._proposal_sampled: list[int] = []
         self._checkpoint_data: Any | None = None
         self._checkpoint_size = 0
+        # Match llama.cpp's common_prompt_checkpoint ownership model: retain
+        # one host allocation and overwrite it for each proposal instead of
+        # allocating a new state buffer in the speculative hot loop.
+        self._checkpoint_buffer: Any | None = None
+        self._checkpoint_capacity = 0
         self.proposed_tokens = 0
         self.accepted_tokens = 0
         self.proposal_batches = 0
@@ -308,14 +312,13 @@ class Gemma4MTPDraft:
 
     def _save_target_checkpoint(self, target_length: int) -> None:
         checkpoint_started = time.perf_counter()
-        # Keep the fast checkpoint on the device. This native path can abort
-        # inside llama.cpp on some requests, so it is deliberately confined to
-        # the disposable worker. The parent retries that exact operation with
-        # MTP disabled without changing later operations.
-        flags = (
-            self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
-            | self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
-        )
+        # Current llama.cpp speculative decoding deliberately checkpoints this
+        # hybrid/recurrent state in host memory. ON_DEVICE checkpoint storage
+        # is not accounted when the context is created and can abort inside
+        # get_data_ext for larger or quantized-KV contexts. PARTIAL_ONLY keeps
+        # the checkpoint limited to the state that ordinary KV removal cannot
+        # roll back; accepted attention tokens are still replayed below.
+        flags = self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
         size = int(
             self._llama_cpp.llama_state_seq_get_size_ext(
                 self.target_ctx, 0, flags
@@ -325,7 +328,12 @@ class Gemma4MTPDraft:
             raise Gemma4MTPError(
                 "llama.cpp returned an empty Gemma partial-state checkpoint"
             )
-        checkpoint = (ctypes.c_uint8 * size)()
+        checkpoint = getattr(self, "_checkpoint_buffer", None)
+        capacity = int(getattr(self, "_checkpoint_capacity", 0))
+        if checkpoint is None or capacity < size:
+            checkpoint = (ctypes.c_uint8 * size)()
+            self._checkpoint_buffer = checkpoint
+            self._checkpoint_capacity = size
         copied = int(
             self._llama_cpp.llama_state_seq_get_data_ext(
                 self.target_ctx, checkpoint, size, 0, flags
@@ -367,10 +375,7 @@ class Gemma4MTPDraft:
         replay_tokens = self.target.input_ids[base:replay_end].astype(
             np.intc, copy=True
         )
-        flags = (
-            self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
-            | self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_ON_DEVICE
-        )
+        flags = self._llama_cpp.LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
         restored = int(
             self._llama_cpp.llama_state_seq_set_data_ext(
                 self.target_ctx,
@@ -594,6 +599,10 @@ class Gemma4MTPDraft:
         if llama_cpp is not None and self.model is not None:
             llama_cpp.llama_model_free(self.model)
             self.model = None
+        self._checkpoint_data = None
+        self._checkpoint_buffer = None
+        self._checkpoint_size = 0
+        self._checkpoint_capacity = 0
         if self.proposed_tokens:
             acceptance = 100.0 * self.accepted_tokens / self.proposed_tokens
             draft_rate = (
@@ -617,7 +626,7 @@ class Gemma4MTPDraft:
                 f"target sync {self.target_sync_seconds:0.3f}s; "
                 f"target sample {self.target_sample_seconds:0.3f}s / "
                 f"{self.target_sample_calls} calls; "
-                f"device checkpoints {self.checkpoint_seconds:0.3f}s, "
+                f"host checkpoints {self.checkpoint_seconds:0.3f}s, "
                 f"{self.rollback_count} rollbacks / {self.replayed_tokens} replayed tokens.",
                 file=sys.stderr,
                 flush=True,

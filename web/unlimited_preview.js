@@ -276,6 +276,44 @@ api.addEventListener("hr_endless_sampler_preview", event => {
 });
 
 
+function hideSamplerWidget(node, name) {
+    const widget = node?.widgets?.find(candidate => candidate?.name === name);
+    if (!widget) return;
+
+    // Keep the native widget and its serialized value intact, but remove its
+    // visual/layout footprint in both legacy LiteGraph and Nodes 2.0. Do not
+    // change widget.type: converted widgets can acquire an unwanted socket.
+    widget.hidden = true;
+    widget.options = { ...(widget.options || {}), hidden: true };
+    widget.computeSize = () => [0, -4];
+    widget.computeLayoutSize = () => ({
+        minWidth: 0,
+        minHeight: 0,
+        maxWidth: 0,
+        maxHeight: 0,
+    });
+    if (widget.element?.style) widget.element.style.display = "none";
+}
+
+
+app.registerExtension({
+    name: "HREndlessSampler.HiddenSettings",
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData?.name !== "HREndlessSampler") return;
+
+        const previousCreated = nodeType.prototype.onNodeCreated;
+        nodeType.prototype.onNodeCreated = function () {
+            const result = previousCreated?.apply(this, arguments);
+            hideSamplerWidget(this, "pytorch_memory_fraction");
+            // Nodes 2.0 can attach the DOM element after onNodeCreated. Reapply
+            // once on the next frame without changing the stored widget value.
+            requestAnimationFrame(() => hideSamplerWidget(this, "pytorch_memory_fraction"));
+            return result;
+        };
+    },
+});
+
+
 app.registerExtension({
     name: "HREndlessSampler.Preview",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -336,8 +374,18 @@ app.registerExtension({
             transport.appendChild(transportFrame);
 
             const status = document.createElement("div");
-            status.style.cssText = "box-sizing:border-box;padding:7px 9px 3px;background:#1b1b1b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-            status.textContent = "Waiting for HR Endless Sampler…";
+            status.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;gap:1px;min-height:36px;padding:3px 9px;background:#1b1b1b;overflow:hidden;font:10px/11px ui-monospace,SFMono-Regular,Consolas,monospace;";
+            const statusPhase = document.createElement("div");
+            statusPhase.style.cssText = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#ddd;";
+            statusPhase.textContent = "Waiting for HR Endless Sampler…";
+            const statusMetrics = document.createElement("div");
+            statusMetrics.style.cssText = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa;";
+            const statusProgress = document.createElement("div");
+            statusProgress.style.cssText = "position:relative;height:3px;margin-top:1px;border-radius:2px;background:#303030;overflow:hidden;box-shadow:inset 0 0 0 1px rgba(0,0,0,.35);";
+            const statusProgressFill = document.createElement("div");
+            statusProgressFill.style.cssText = "position:absolute;left:0;top:0;height:100%;width:0;border-radius:2px;background:#65b9ff;transform:translateX(0);transition:width .15s linear;";
+            statusProgress.appendChild(statusProgressFill);
+            status.append(statusPhase, statusMetrics, statusProgress);
             root.appendChild(status);
 
             const graphs = document.createElement("div");
@@ -403,6 +451,7 @@ app.registerExtension({
             let completedElapsed = null;
             let elapsedTimer = null;
             let complete = false;
+            let statusProgressAnimation = null;
             let tooltipChunkIndex = null;
             let tooltipSignature = null;
 
@@ -842,11 +891,44 @@ app.registerExtension({
                 const eta = Number.isFinite(averageStepMs) ? formatEta(remainingSteps * averageStepMs / 1000) : "—";
                 const elapsedSeconds = completedElapsed ?? (startedAt == null ? NaN : (performance.now() - startedAt) / 1000);
                 const elapsed = formatEta(elapsedSeconds);
-                const chunk = chunkCount ? `Chunk ${activeChunk + 1}/${chunkCount}` : "Chunk —/—";
+                const chunk = chunkCount ? `C ${activeChunk + 1}/${chunkCount}` : "C —/—";
                 const displayStep = hoverStep ?? currentStep;
-                const inspecting = hoverStep == null ? "" : "inspect ";
-                const phasePrefix = phase ? `${phase} · ` : "";
-                status.textContent = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}${phasePrefix}${chunk} · ${resolution} · ${fps} · ${inspecting}step ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · Elapsed ${elapsed} · ETA ${eta}`;
+                const inspecting = hoverStep == null ? "" : "Inspect · ";
+                const statePrefix = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}`;
+                const phaseLine = `${statePrefix}${phase || "Preparing sampler"}`;
+                const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ETA ${eta}`;
+                statusPhase.textContent = phaseLine;
+                statusMetrics.textContent = metricsLine;
+                const gemmaActive = !complete && /gemma\s*4/i.test(phase || "");
+                const h3Active = !complete && /h3\s+(?:sampling|inference)/i.test(phase || "");
+                let progressHelp = "";
+                if (gemmaActive) {
+                    statusProgressFill.style.width = "32%";
+                    statusProgressFill.style.background = "#bd78ff";
+                    statusProgressFill.style.transition = "none";
+                    if (statusProgressAnimation == null) {
+                        statusProgressAnimation = statusProgressFill.animate(
+                            [
+                                { transform: "translateX(-115%)" },
+                                { transform: "translateX(315%)" },
+                            ],
+                            { duration: 950, iterations: Infinity, easing: "ease-in-out" },
+                        );
+                    }
+                    progressHelp = "Gemma generation is active; its final token count is not known in advance.";
+                } else {
+                    statusProgressAnimation?.cancel();
+                    statusProgressAnimation = null;
+                    statusProgressFill.style.transform = "translateX(0)";
+                    statusProgressFill.style.transition = "width .15s linear";
+                    statusProgressFill.style.background = complete ? "#63d38a" : "#65b9ff";
+                    const samplingProgress = totalSteps > 0 ? Math.max(0, Math.min(1, currentStep / totalSteps)) : 0;
+                    statusProgressFill.style.width = `${complete ? 100 : h3Active ? samplingProgress * 100 : 0}%`;
+                    progressHelp = h3Active
+                        ? `H3 sampling step ${currentStep}/${totalSteps || "—"}.`
+                        : complete ? "Render complete." : "Waiting for H3 or Gemma progress.";
+                }
+                status.title = `${phaseLine}\n${metricsLine}\n${progressHelp}`;
                 sigmaGraph.value.textContent = Number.isFinite(deltas[displayStep - 1]) ? deltas[displayStep - 1].toFixed(3) : "—";
                 timeGraph.value.textContent = Number.isFinite(stepTimes[displayStep - 1]) ? `${(stepTimes[displayStep - 1] / 1000).toFixed(2)}s` : "—";
             }

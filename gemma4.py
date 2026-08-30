@@ -47,6 +47,30 @@ GEMMA4_REQUIRED_VERSION = "0.3.35"
 GEMMA4_IMAGE_MIN_TOKENS = 70
 GEMMA4_IMAGE_MAX_TOKENS = 1120
 GEMMA4_BATCH_SIZE = GEMMA4_IMAGE_MAX_TOKENS
+# Match the user's known-good native llama.cpp Gemma server configuration.
+# Gemma 4's channel template greedily selects the empty ``thought`` turn when
+# temperature is zero, which yields no visible content at all. A normal
+# sampling distribution lets it enter its final-answer channel and produce the
+# requested JSON. These are intentionally shared by base, cached, correction,
+# and MTP calls so the assistant observes the same target distribution.
+GEMMA4_TEMPERATURE = 1.0
+GEMMA4_TOP_P = 0.95
+GEMMA4_TOP_K = 64
+# Mirror the tested native llama.cpp Gemma configuration: a 32K text context
+# with Q8_0 K/V cache. llama-cpp-python exposes GGML_TYPE_Q8_0 as 8 in the
+# pinned 0.3.35 runtime. Keeping the value local also lets lightweight unit
+# tests exercise runtime construction without importing libllama/CUDA.
+GEMMA4_KV_CACHE_Q8_0 = 8
+GEMMA4_CONTEXT_TOKENS = 32768
+GEMMA4_WORKER_RETRY_LIMIT = 10
+GEMMA4_RESPONSE_REPAIR_LIMIT = 10
+GEMMA4_CHUNK_RESPONSE_TOKENS = 2048
+# A valid JSON response is normally produced by the unconstrained decoder. If
+# Gemma accidentally answers in its private thought channel, correct it as a
+# real next chat turn first.  That keeps the already encoded request, images,
+# and MTP state alive.  The grammar path is only a final compatibility guard:
+# on Gemma 4 it is much slower and has itself returned an empty thought turn.
+GEMMA4_JSON_FORMAT_REPAIR_LIMIT = 2
 GEMMA4_PROMPTS_PATH = Path(__file__).with_name("gemma4_prompts.txt")
 MINIMAX_PROMPT_SUMMARY_PATH = Path(__file__).with_name("minimax_h3_prompt_summary.txt")
 MINIMAX_PROMPT_SKILL_PATH = Path(__file__).with_name("vendor") / "minimax-h3-prompt-writing" / "SKILL.md"
@@ -90,6 +114,17 @@ class Gemma4WorkerExitError(Gemma4ObservationError):
         self.worker_error_type = worker_error_type
 
 
+class Gemma4MTPOutputError(Gemma4ObservationError):
+    """MTP produced no parseable answer, so this operation needs a clean retry.
+
+    This is deliberately narrower than :class:`Gemma4ObservationError`.
+    Creative/schema mistakes remain Gemma-authored correction turns; only an
+    MTP transport/decode result containing no JSON at all crosses the worker
+    boundary and activates the existing operation-local original-decoder
+    retry.
+    """
+
+
 class Gemma4PreproductionCache:
     """One render-local clean Gemma context, stored outside the H3 process.
 
@@ -118,9 +153,9 @@ class Gemma4PreproductionCache:
         for parent in candidates:
             try:
                 if parent.is_dir() and os.access(parent, os.W_OK | os.X_OK):
-                    # A 16K F16 Gemma KV snapshot is already around 5 GiB.
-                    # Do not choose a tiny container /dev/shm and fail later
-                    # when a normal temporary directory can hold it instead.
+                    # A 32K Q8_0 Gemma KV snapshot is still multi-GiB. Do not
+                    # choose a tiny container /dev/shm and fail later when a
+                    # normal temporary directory can hold it instead.
                     if parent == Path("/dev/shm") and shutil.disk_usage(parent).free < _PREPRODUCTION_CACHE_MIN_FREE_BYTES:
                         continue
                     return parent / _PREPRODUCTION_CACHE_DIRECTORY
@@ -192,6 +227,7 @@ class GemmaChunkPrompt:
     raw_json: str
     timing_plan: str = ""
     end_state: str = ""
+    last_seen_character_state: tuple[dict[str, Any], ...] = ()
     system_prompt: str = ""
     observation_prompt: str = ""
     validation_warnings: tuple[str, ...] = ()
@@ -504,6 +540,22 @@ def is_official_gemma4_pair(model_path: Path, mmproj_path: Path) -> bool:
     return model_path.resolve() == expected_model.resolve() and mmproj_path.resolve() == expected_mmproj.resolve()
 
 
+def _normalize_gemma4_generation_suffix(text: str) -> str:
+    """Keep this GGUF's proven visible-answer delimiter on a model turn.
+
+    The installed QAT GGUF behaves differently from newer canonical Gemma
+    templates: a bare ``<|turn>model`` causes it to open a thought channel and
+    consume the whole output budget before a final answer. A closed empty
+    thought block is its tested transition into ordinary visible content. Do
+    not touch real historical thought content; add the delimiter only at the
+    terminal model generation boundary when it is missing.
+    """
+    stub = "<|channel>thought\n<channel|>"
+    if text.endswith(stub):
+        return text
+    return text + stub if text.endswith("<|turn>model\n") else text
+
+
 def _ensure_model_files() -> tuple[Path, Path]:
     model_path, mmproj_path = _model_paths()
     if model_path.is_file() and mmproj_path.is_file():
@@ -595,6 +647,10 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
     """
 
     class Gemma4MTMDChatHandler(base_handler):
+        def _postprocess_template_text(self, text, image_urls, media_marker):
+            text = super()._postprocess_template_text(text, image_urls, media_marker)
+            return _normalize_gemma4_generation_suffix(text)
+
         def _init_mtmd_context(self, llama_model):
             self.verbose = llama_model.verbose
             if self.mtmd_ctx is not None:
@@ -644,6 +700,7 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
             content: str | Sequence[dict[str, Any]],
             temperature: float = 0.0,
             top_p: float = 1.0,
+            top_k: int = GEMMA4_TOP_K,
             max_tokens: int = 1024,
             response_format: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
@@ -805,6 +862,7 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                 prompt=llama.input_ids[:llama.n_tokens].tolist(),
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 max_tokens=max_tokens,
                 grammar=grammar,
             )
@@ -864,6 +922,15 @@ def _create_runtime_llm(
         "n_batch": n_batch,
         "n_ubatch": n_batch,
         "flash_attn": True,
+        # The old Python path left these at llama.cpp's F16 defaults. Q8_0 is
+        # intentionally less aggressive than Q4_0, while halving K/V cache
+        # storage and matching the user's working native server setup.
+        "type_k": GEMMA4_KV_CACHE_Q8_0,
+        "type_v": GEMMA4_KV_CACHE_Q8_0,
+        # Native server uses its default (no --swa-full); make that explicit
+        # instead of forcing the full-size SWA allocation seen in the worker
+        # diagnostics.
+        "swa_full": False,
         # Sampler debug controls our captures, validation warnings, progress,
         # and MTP summary.  It must not enable llama.cpp's native trace stream:
         # native verbosity prints for every one-token MTP assistant decode and
@@ -887,7 +954,7 @@ def _create_runtime_llm(
         )
         print(
             "HR Endless Sampler Gemma 4 decoding mode: native draft-mtp "
-            "(spec-draft-n-max=4, fast device checkpoints; operation-local non-MTP retry enabled).",
+            "(spec-draft-n-max=4, reference host checkpoints; operation-local non-MTP retry enabled).",
             file=sys.stderr,
             flush=True,
         )
@@ -993,12 +1060,25 @@ def _image_data_url(frame: torch.Tensor) -> str:
 
 
 def _extract_json_object(content: str) -> tuple[dict[str, Any], str]:
+    """Decode the response's outer JSON object, never a nested truncation.
+
+    Gemma may prefix its answer with a short channel marker or Markdown fence,
+    so the first opening brace need not be byte zero. Once that brace appears,
+    however, it is the instructed root object. If the output budget cuts that
+    object off, scanning later braces can incorrectly accept a complete nested
+    ``last_seen_character_state`` entry as the whole response. Reject the
+    incomplete root so the caller can retry with the appropriate decoder and
+    token budget.
+    """
     decoder = json.JSONDecoder()
-    for match in re.finditer(r"\{", content):
+    match = re.search(r"\{", content)
+    if match is not None:
         try:
             value, end = decoder.raw_decode(content[match.start():])
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as error:
+            raise Gemma4ObservationError(
+                "Gemma 4 returned an incomplete or malformed top-level JSON object"
+            ) from error
         if isinstance(value, dict):
             return value, content[match.start():match.start() + end]
     raise Gemma4ObservationError("Gemma 4 did not return a JSON object")
@@ -1184,6 +1264,59 @@ def _required_local_markers(shots: Sequence[dict[str, Any]]) -> str:
             "There is no H3 shot marker in this physical chunk: it begins inside an already established source shot. "
             "Begin detailed_description as plain continuation prose; do not add [Shot 1] or any other [Shot N] marker."
         )
+    lines.extend(("", _local_marker_transition_map(shots)))
+    return "\n".join(lines)
+
+
+def _local_marker_transition_map(shots: Sequence[dict[str, Any]]) -> str:
+    """Explain the sampler-owned global-to-local cut mapping in plain prose.
+
+    Literal tokens alone are insufficient when a physical chunk begins in the
+    middle of a global source shot: Gemma can mistake the one allowed local
+    marker for a restart of that continuing shot. Keep Python authoritative
+    about the tokens while also stating which global shot ends before each
+    token and which global shot the token actually introduces.
+    """
+    if not shots:
+        return "SEMANTIC SHOT-TRANSITION MAP\n- This chunk contains no source shots."
+
+    lines = ["SEMANTIC SHOT-TRANSITION MAP — USE THE TOKENS AT THESE BOUNDARIES"]
+    first = shots[0]
+    first_global = int(first["shot_number"])
+    first_marker = first.get("required_marker")
+    if first_marker:
+        lines.append(
+            f"- Global Source Shot {first_global} begins at the physical chunk opening as local chunk Shot 1. "
+            f"Put {str(first_marker)!r} immediately before its first action."
+        )
+    else:
+        lines.append(
+            f"- This chunk time-slice begins inside global Source Shot {first_global}, represented as local chunk "
+            "Shot 1. Continue and/or finish that global shot as plain unmarked prose. Do not restart it and do not "
+            "put a [Shot] marker before its remaining action."
+        )
+
+    for local_index, shot in enumerate(shots[1:], 2):
+        marker = str(shot.get("required_marker") or "").strip()
+        if not marker:
+            continue
+        previous_global = int(shots[local_index - 2]["shot_number"])
+        current_global = int(shot["shot_number"])
+        match = _SHOT_MARKER.fullmatch(marker)
+        if match and match.group(2) is not None:
+            position = f"{match.group(2)}:{match.group(3)}.{match.group(4)}"
+        else:
+            position = "the supplied local position"
+        lines.append(
+            f"- The chunk time-slice encompasses the end of global Source Shot {previous_global}. Next, global "
+            f"Source Shot {current_global} begins as local chunk Shot {local_index} at position {position}. Put the "
+            f"exact token {marker!r} immediately before the first action of global Source Shot {current_global}, "
+            f"never before remaining action from global Source Shot {previous_global}."
+        )
+    lines.append(
+        "- Emit no other [Shot] marker. In particular, never copy a global/source shot number or its full-video "
+        "timecode from the original prompt into this chunk-local detailed_description."
+    )
     return "\n".join(lines)
 
 
@@ -1200,8 +1333,118 @@ def _contract_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
             "marker" in warning.lower()
             or "mandatory coverage" in warning.lower()
             or "dialogue speaker form" in warning.lower()
+            or "last-seen character state" in warning.lower()
         )
     )
+
+
+def _character_subject_mappings(request: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    """Read the immutable rendered name table supplied by preproduction."""
+    table = str(request.get("character_name_table") or "")
+    return tuple(
+        (match.group(1).strip(), match.group(2).strip())
+        for match in re.finditer(
+            r"(?im)^\s*-\s*(.+?)\s*->\s*(<Subject\s+\d+>)\s*$",
+            table,
+        )
+    )
+
+
+def _last_seen_character_state_contract(request: dict[str, Any]) -> str:
+    mappings = _character_subject_mappings(request)
+    if not mappings:
+        return (
+            "No immutable named-character mappings exist. Return "
+            '"last_seen_character_state": [].'
+        )
+    expected = "\n".join(f"- {name} -> {subject}" for name, subject in mappings)
+    previous = request.get("previous_last_seen_character_state")
+    previous_text = json.dumps(previous or [], ensure_ascii=False, indent=2)
+    return (
+        "Return exactly one entry for every immutable character below, in this order, and no other entries:\n"
+        + expected
+        + "\nEach entry must use this exact shape:\n"
+        '{"character_name":"Tila","subject":"<Subject 2>",'
+        '"last_seen_global_frame":208,"last_seen_source_shot":4,'
+        '"environment":"inside the ancient temple",'
+        '"pose_and_position":"mounted on the tiger, seated behind Heman",'
+        '"state_and_action":"alert and leaning forward",'
+        '"spatial_relationships":"behind Heman and on the tiger saddle"}\n'
+        "Use null frame/shot values and the phrase 'not yet observed in generated video' in every text field "
+        "until a character has actually appeared in attached rendered evidence. Update an entry only from the "
+        "chronological stills attached to this request. If the character is absent from those stills, copy the "
+        "previous entry exactly; never replace a known state with an inference from the current unrendered plan.\n"
+        "Previous persistent table:\n"
+        + previous_text
+    )
+
+
+def _validate_last_seen_character_state(value: dict[str, Any], request: dict[str, Any]) -> tuple[tuple[dict[str, Any], ...], list[str]]:
+    """Validate Gemma's persistent observed-state table without inventing it."""
+    mappings = _character_subject_mappings(request)
+    supplied = value.get("last_seen_character_state")
+    if not mappings:
+        if supplied in (None, []):
+            return (), []
+        return (), ["Gemma 4 last-seen character state must be an empty array when no character mappings exist"]
+    if not isinstance(supplied, list):
+        return (), ["Gemma 4 last-seen character state must be an array"]
+
+    warnings: list[str] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in supplied:
+        if not isinstance(item, dict):
+            warnings.append("Gemma 4 last-seen character state entries must be objects")
+            continue
+        name = item.get("character_name")
+        if not isinstance(name, str) or not name.strip():
+            warnings.append("Gemma 4 last-seen character state entry has no character_name")
+            continue
+        key = name.strip().casefold()
+        if key in by_name:
+            warnings.append(f"Gemma 4 last-seen character state duplicates {name.strip()!r}")
+            continue
+        by_name[key] = item
+
+    expected_keys = {name.casefold() for name, _subject in mappings}
+    for key, item in by_name.items():
+        if key not in expected_keys:
+            warnings.append(
+                f"Gemma 4 last-seen character state includes unknown character {item.get('character_name')!r}"
+            )
+
+    normalized: list[dict[str, Any]] = []
+    text_fields = ("environment", "pose_and_position", "state_and_action", "spatial_relationships")
+    for name, subject in mappings:
+        item = by_name.get(name.casefold())
+        if item is None:
+            warnings.append(f"Gemma 4 last-seen character state omits {name!r}")
+            continue
+        if str(item.get("subject") or "").strip().casefold() != subject.casefold():
+            warnings.append(
+                f"Gemma 4 last-seen character state maps {name!r} to {item.get('subject')!r}; expected {subject}"
+            )
+        frames: dict[str, int | None] = {}
+        for field in ("last_seen_global_frame", "last_seen_source_shot"):
+            field_value = item.get(field)
+            if field_value is not None and (isinstance(field_value, bool) or not isinstance(field_value, int) or field_value < 0):
+                warnings.append(f"Gemma 4 last-seen character state {name!r} has invalid {field}")
+                field_value = None
+            frames[field] = field_value
+        texts: dict[str, str] = {}
+        for field in text_fields:
+            field_value = item.get(field)
+            if not isinstance(field_value, str) or not field_value.strip():
+                warnings.append(f"Gemma 4 last-seen character state {name!r} has no usable {field}")
+                field_value = "unknown"
+            texts[field] = field_value.strip()
+        normalized.append({
+            "character_name": name,
+            "subject": subject,
+            **frames,
+            **texts,
+        })
+    return tuple(normalized), warnings
 
 
 def _normalized_prompt_text(value: str) -> str:
@@ -1278,7 +1521,7 @@ def _mandatory_coverage_warnings(value: dict[str, Any], request: dict[str, Any],
 
 
 def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequence[str]) -> str:
-    """Ask Gemma itself for one full marker/coverage correction, never a patch."""
+    """Ask Gemma itself for one complete schema/contract correction, never a patch."""
     shots = request["target_shots"]
     mandatory = request.get("mandatory_coverage", ())
     required_coverage = "\n".join(
@@ -1287,15 +1530,26 @@ def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequen
         for item in mandatory
         if isinstance(item, dict) and item.get("id")
     ) or "- No current-slice coverage entries are required."
+    current_dialogue = {
+        _dialogue_text(dialogue)
+        for source in (
+            *(str(item.get("action", "")) for item in mandatory if isinstance(item, dict)),
+            *(str(shot.get("source_body", "")) for shot in shots if isinstance(shot, dict)),
+        )
+        for dialogue in _DIALOGUE.findall(source)
+        if _dialogue_text(dialogue)
+    }
     speaker_forms = "\n".join(
         f"- {subject} ({speaker_id}) must introduce <d>{dialogue}</d>"
         for dialogue, subject, speaker_id in _mapped_dialogue_speaker_requirements(request)
-    ) or "- No mapped dialogue speaker form is required."
+        if dialogue in current_dialogue
+    ) or "- No mapped dialogue speaker form is required in this slice."
     return (
         "CHUNK CONTRACT CORRECTION REQUIRED\n"
-        "Your immediately preceding JSON violated the H3 local-marker or mandatory current-slice coverage contract. "
+        "Your immediately preceding JSON was missing a required field or violated the H3 local-marker, persistent-state, "
+        "dialogue, or mandatory current-slice coverage contract. "
         "Return one complete replacement JSON object "
-        "with all six required fields, not an explanation and not a textual patch. Keep the same current-frame-slice "
+        "with all seven required fields, not an explanation and not a textual patch. Keep the same current-frame-slice "
         "creative intent and continuity reasoning, but rewrite detailed_description and coverage so every current beat "
         "is explicitly started or continued now. A current beat may never be marked deferred. For dialogue coverage, "
         "include the exact <d>...</d> line in detailed_description now. A mapped visual speaker must use the immediate "
@@ -1304,11 +1558,45 @@ def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequen
         + speaker_forms
         + "\n\nH3 local marker contract:\n"
         f"{_required_local_markers(shots)}\n\n"
+        "Persistent last-seen character state contract:\n"
+        f"{_last_seen_character_state_contract(request)}\n\n"
         "Mandatory current-slice coverage:\n"
         + required_coverage
         + "\n\nThe source/global timestamps in the original prompt describe the full video and must not be used as markers "
         "inside this physical chunk. Do not add, remove, renumber, or move cuts.\n\n"
         "Detected validation errors in the preceding JSON:\n"
+        + "\n".join(f"- {warning}" for warning in warnings)
+    )
+
+
+def _chunk_contract_followup_request(warnings: Sequence[str]) -> str:
+    """Compact later repair turn; the complete contract is already in KV."""
+    return (
+        "CHUNK JSON REPAIR STILL REQUIRED\n"
+        "The complete chunk contract is in the immediately preceding user turn. Do not repeat or explain it. "
+        "Return one complete JSON object now with exactly these seven fields: confidence, analysis, timing_plan, "
+        "end_state, last_seen_character_state, coverage, and detailed_description. detailed_description must be "
+        "a non-empty JSON string containing the complete H3-facing prompt; coverage and "
+        "last_seen_character_state must be arrays. Correct these remaining errors:\n"
+        + "\n".join(f"- {warning}" for warning in warnings)
+    )
+
+
+def _marker_contract_followup_request(
+    request: dict[str, Any], warnings: Sequence[str]
+) -> str:
+    """Reinforce a still-invalid marker mapping without changing Gemma's prose."""
+    return (
+        "H3 SHOT-MARKER REPAIR STILL REQUIRED\n"
+        "Python rejected the marker structure in your immediately preceding JSON. Return one complete replacement "
+        "JSON object with the same seven fields. Preserve the intended actions, dialogue, continuity, coverage, and "
+        "observed character state, but rewrite detailed_description so its [Shot] markers obey this exact semantic "
+        "transition map:\n\n"
+        f"{_required_local_markers(request['target_shots'])}\n\n"
+        "The prose before the first supplied marker belongs only to the already-continuing global source shot. "
+        "The exact marker introduces the next global source shot shown in the map; it must not restart or relabel "
+        "the preceding shot. Delete every invented or copied global marker.\n\n"
+        "Detected marker errors in the preceding JSON:\n"
         + "\n".join(f"- {warning}" for warning in warnings)
     )
 
@@ -1428,6 +1716,8 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
         end_state = ""
     else:
         end_state = end_state.strip()
+    last_seen_character_state, state_warnings = _validate_last_seen_character_state(value, request)
+    warnings.extend(state_warnings)
     description = value.get("detailed_description")
     if not isinstance(description, str):
         raise Gemma4ObservationError("Gemma 4 response has no detailed_description string")
@@ -1458,9 +1748,16 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
 
     expected = [shot for shot in request["target_shots"] if shot.get("required_marker")]
     markers = list(_SHOT_MARKER.finditer(description))
+    actual_marker_sequence = [marker.group(0) for marker in markers]
+    required_marker_sequence = [str(shot["required_marker"]) for shot in expected]
     if len(markers) != len(expected):
         warnings.append(
             f"Gemma 4 returned {len(markers)} shot markers; this chunk requires {len(expected)}"
+        )
+    if [item.lower() for item in actual_marker_sequence] != [item.lower() for item in required_marker_sequence]:
+        warnings.append(
+            f"Gemma 4 shot marker sequence is {actual_marker_sequence!r}; required exact sequence is "
+            f"{required_marker_sequence!r}"
         )
     for marker, shot in zip(markers, expected):
         actual_marker = marker.group(0)
@@ -1479,15 +1776,16 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
     warnings.extend(_mandatory_coverage_warnings(value, request, description))
 
     return GemmaChunkPrompt(
-        confidence,
-        analysis.strip(),
-        description,
-        raw_json,
-        timing_plan,
-        end_state,
-        system_prompt,
-        observation_prompt,
-        tuple(dict.fromkeys(warnings)),
+        confidence=confidence,
+        analysis=analysis.strip(),
+        detailed_description=description,
+        raw_json=raw_json,
+        timing_plan=timing_plan,
+        end_state=end_state,
+        last_seen_character_state=last_seen_character_state,
+        system_prompt=system_prompt,
+        observation_prompt=observation_prompt,
+        validation_warnings=tuple(dict.fromkeys(warnings)),
     )
 
 
@@ -1499,6 +1797,7 @@ def _chunk_prompt_payload(result: GemmaChunkPrompt) -> dict[str, Any]:
         "raw_json": result.raw_json,
         "timing_plan": result.timing_plan,
         "end_state": result.end_state,
+        "last_seen_character_state": list(result.last_seen_character_state),
         "system_prompt": result.system_prompt,
         "observation_prompt": result.observation_prompt,
         "validation_warnings": list(result.validation_warnings),
@@ -1522,6 +1821,9 @@ def _chunk_prompt_from_payload(value: dict[str, Any]) -> GemmaChunkPrompt:
         raw_json=str(value["raw_json"]),
         timing_plan=str(value.get("timing_plan", "")),
         end_state=str(value.get("end_state", "")),
+        last_seen_character_state=tuple(
+            dict(item) for item in value.get("last_seen_character_state", ()) if isinstance(item, dict)
+        ),
         system_prompt=str(value.get("system_prompt", "")),
         observation_prompt=str(value.get("observation_prompt", "")),
         validation_warnings=tuple(str(item) for item in value.get("validation_warnings", ())),
@@ -1863,6 +2165,11 @@ def _render_observation_messages(
     current = request["current_chunk"]
     previous = request.get("previous_chunk")
     frame_numbers = [int(item) for item in request.get("observation_frame_numbers", ())]
+    previous_last_seen_character_state = json.dumps(
+        request.get("previous_last_seen_character_state") or [],
+        ensure_ascii=False,
+        indent=2,
+    )
     if previous is None:
         previous_context = (
             "There is no previous generated chunk. No chronological observation stills are attached. "
@@ -1938,6 +2245,8 @@ def _render_observation_messages(
             "previous_gemma_description": previous_gemma_description,
             "previous_gemma_timing_plan": previous_gemma_timing_plan,
             "previous_gemma_end_state": previous_gemma_end_state,
+            "previous_last_seen_character_state": previous_last_seen_character_state,
+            "last_seen_character_state_contract": _last_seen_character_state_contract(request),
             "target_shots": _shot_context(target_shots, fps, include_target=True),
             "chunk_generation_request": _chunk_generation_request(target_shots, current),
             "original_prompt": str(request["original_prompt"]),
@@ -2143,47 +2452,127 @@ def replay_gemma_capture(capture_dir: str | Path, debug: bool = False) -> GemmaC
     return _observe_in_worker(load_gemma_capture(capture_dir, debug=debug))
 
 
-def _gemma_chat_json(llm: Any, messages: Sequence[dict[str, Any]], *, max_tokens: int = 1024) -> tuple[dict[str, Any], str]:
-    """Run a fast instructed-JSON completion, constraining only recovery.
+def _json_format_repair_request(error: Gemma4ObservationError) -> str:
+    """Ask Gemma to replace a thought/invalid reply without resending context."""
+    return (
+        "Your immediately preceding reply was unusable because it was not a complete JSON object "
+        f"({error}). Return a complete replacement now. Output JSON only: begin with `{{`, end with `}}`, "
+        "and include every field required by the original request. Do not emit analysis-channel text, "
+        "Markdown fences, commentary, or an explanation."
+    )
 
-    llama.cpp's JSON grammar scans Gemma 4's very large vocabulary once per
-    output token.  That CPU work dominated the MTP path and kept the GPU idle.
-    Gemma is already given an explicit JSON contract, so use ordinary decoding
-    first and validate the text afterward.  A malformed response gets one
-    slower grammar-constrained retry from the same self-contained messages.
+
+def _gemma_response_text(choice: dict[str, Any]) -> str:
+    """Read either normal or Gemma-4 thought-channel completion content.
+
+    Recent llama.cpp chat conversion separates Gemma's thought-channel output
+    into ``reasoning_content``.  A malformed model reply can still contain a
+    complete JSON object there, and discarding it turns a usable answer into a
+    needless multi-pass retry.  The JSON validator remains the authority: an
+    ordinary non-JSON thought is rejected exactly as before.
+    """
+    for field in ("content", "reasoning_content"):
+        text = choice.get(field)
+        if isinstance(text, str) and text.strip():
+            return text
+    return ""
+
+
+def _gemma_chat_json(
+    llm: Any,
+    messages: Sequence[dict[str, Any]],
+    *,
+    handler: Any = None,
+    max_tokens: int = GEMMA4_CHUNK_RESPONSE_TOKENS,
+    mtp_active: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """Run a fast JSON request, repairing malformed output as a chat turn.
+
+    llama.cpp grammar is deliberately *not* the primary JSON recovery path.
+    It is expensive for Gemma's vocabulary and, crucially, it cannot correct
+    a model that has just selected an empty private-thought response.  When
+    the MTMD handler supports append-only chat, a short model-authored repair
+    continues the existing KV conversation instead of re-evaluating images or
+    the full request.  Keep the old grammar retry only for minimal/mock
+    runtimes with no append API, and as a final guard after two chat repairs.
     """
 
     def complete(response_format: dict[str, Any] | None = None) -> str:
         kwargs: dict[str, Any] = {
             "messages": list(messages),
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "temperature": GEMMA4_TEMPERATURE,
+            "top_p": GEMMA4_TOP_P,
+            "top_k": GEMMA4_TOP_K,
             "max_tokens": max_tokens,
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
         response = llm.create_chat_completion(**kwargs)
         choice = response["choices"][0]["message"]
-        text = choice.get("content") or ""
-        if not isinstance(text, str):
-            raise Gemma4ObservationError("Gemma 4 returned no textual response")
-        return text
+        return _gemma_response_text(choice)
 
     text = complete()
     try:
         return _extract_json_object(text)
     except Gemma4ObservationError as error:
+        if mtp_active:
+            raise Gemma4MTPOutputError(
+                "Gemma 4 MTP returned no complete JSON object; retry this operation with the original decoder",
+                raw_json=text,
+            ) from error
+        append = getattr(handler, "append_user_chat_completion", None)
+        if callable(append):
+            latest_error = error
+            for repair_index in range(1, GEMMA4_JSON_FORMAT_REPAIR_LIMIT + 1):
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 returned malformed instructed JSON; "
+                    "requesting a compact append-only JSON replacement (repair %d/%d): %s",
+                    repair_index,
+                    GEMMA4_JSON_FORMAT_REPAIR_LIMIT,
+                    latest_error,
+                )
+                response = append(
+                    llama=llm,
+                    content=_json_format_repair_request(latest_error),
+                    temperature=GEMMA4_TEMPERATURE,
+                    top_p=GEMMA4_TOP_P,
+                    top_k=GEMMA4_TOP_K,
+                    max_tokens=max_tokens,
+                )
+                candidate = _gemma_response_text(response["choices"][0]["message"])
+                try:
+                    return _extract_json_object(candidate)
+                except Gemma4ObservationError as repair_error:
+                    latest_error = repair_error
+            logging.warning(
+                "HR Endless Sampler Gemma 4 append-only JSON replacements were unusable; "
+                "using llama.cpp's grammar only as a final fallback: %s",
+                latest_error,
+            )
+            response = append(
+                llama=llm,
+                content=_json_format_repair_request(latest_error),
+                temperature=GEMMA4_TEMPERATURE,
+                top_p=GEMMA4_TOP_P,
+                top_k=GEMMA4_TOP_K,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
+            candidate = _gemma_response_text(response["choices"][0]["message"])
+            return _extract_json_object(candidate)
+
         logging.warning(
             "HR Endless Sampler Gemma 4 returned malformed instructed JSON; "
-            "retrying this response with llama.cpp's slower JSON grammar: %s",
+            "the runtime has no append-only chat API, so retrying with llama.cpp's slower JSON grammar: %s",
             error,
         )
         return _extract_json_object(complete({"type": "json_object"}))
 
 
 def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict[str, Any]], *,
-                             max_tokens: int = 1024) -> tuple[dict[str, Any], str]:
-    """Ask the next user turn, constraining only malformed-JSON recovery."""
+                             max_tokens: int = GEMMA4_CHUNK_RESPONSE_TOKENS,
+                             mtp_active: bool = False) -> tuple[dict[str, Any], str]:
+    """Ask the next user turn, preserving KV through JSON-format recovery."""
     append = getattr(handler, "append_user_chat_completion", None)
     if not callable(append):
         raise Gemma4ObservationError("Gemma runtime does not support append-only chat turns")
@@ -2192,31 +2581,46 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
         response = append(
             llama=llm,
             content=next_content,
-            temperature=0.0,
-            top_p=1.0,
+            temperature=GEMMA4_TEMPERATURE,
+            top_p=GEMMA4_TOP_P,
+            top_k=GEMMA4_TOP_K,
             max_tokens=max_tokens,
             response_format=response_format,
         )
         choice = response["choices"][0]["message"]
-        text = choice.get("content") or ""
-        if not isinstance(text, str):
-            raise Gemma4ObservationError("Gemma 4 returned no textual response")
-        return text
+        return _gemma_response_text(choice)
 
     text = complete(content)
     try:
         return _extract_json_object(text)
     except Gemma4ObservationError as error:
+        if mtp_active:
+            raise Gemma4MTPOutputError(
+                "Gemma 4 MTP returned no complete JSON object; retry this operation with the original decoder",
+                raw_json=text,
+            ) from error
+        latest_error = error
+        for repair_index in range(1, GEMMA4_JSON_FORMAT_REPAIR_LIMIT + 1):
+            logging.warning(
+                "HR Endless Sampler Gemma 4 returned malformed instructed JSON in an appended turn; "
+                "requesting a compact JSON replacement in the same chat (repair %d/%d): %s",
+                repair_index,
+                GEMMA4_JSON_FORMAT_REPAIR_LIMIT,
+                latest_error,
+            )
+            candidate = complete(_json_format_repair_request(latest_error))
+            try:
+                return _extract_json_object(candidate)
+            except Gemma4ObservationError as repair_error:
+                latest_error = repair_error
         logging.warning(
-            "HR Endless Sampler Gemma 4 returned malformed instructed JSON in an appended turn; "
-            "asking it to replace that response under the slower JSON grammar: %s",
-            error,
+            "HR Endless Sampler Gemma 4 append-only JSON replacements were unusable; "
+            "using llama.cpp's grammar only as a final fallback: %s",
+            latest_error,
         )
-        repair = (
-            "Your immediately preceding response was not a valid complete JSON object. "
-            "Return the same answer again as one complete JSON object only, preserving all requested fields and content."
+        return _extract_json_object(
+            complete(_json_format_repair_request(latest_error), {"type": "json_object"})
         )
-        return _extract_json_object(complete(repair, {"type": "json_object"}))
 
 
 def _write_preproduction_cache_state(llm: Any, spec: object, *, system_prompt: str,
@@ -2383,7 +2787,7 @@ def _observe_in_process(
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
-            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
             n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         initial_messages = [
@@ -2399,7 +2803,12 @@ def _observe_in_process(
                     restored_bytes / (1024 ** 3),
                     int(request["chunk_number"]),
                 )
-                payload, raw_json = _gemma_append_chat_json(handler, llm, content)
+                payload, raw_json = _gemma_append_chat_json(
+                    handler,
+                    llm,
+                    content,
+                    mtp_active=bool(request.get("gemma4_mtp", False)),
+                )
             except (Gemma4ObservationError, OSError, RuntimeError, ValueError) as cache_error:
                 # A cache is a speed-up, never a new dependency for a render.
                 # Render the ordinary fully self-contained request when its
@@ -2418,67 +2827,141 @@ def _observe_in_process(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content},
                 ]
-                payload, raw_json = _gemma_chat_json(llm, initial_messages)
+                payload, raw_json = _gemma_chat_json(
+                    llm,
+                    initial_messages,
+                    handler=handler,
+                    mtp_active=bool(request.get("gemma4_mtp", False)),
+                )
         else:
-            payload, raw_json = _gemma_chat_json(llm, initial_messages)
+            payload, raw_json = _gemma_chat_json(
+                llm,
+                initial_messages,
+                handler=handler,
+                mtp_active=bool(request.get("gemma4_mtp", False)),
+            )
         latest_raw_json = raw_json
-        try:
-            initial = _validate_chunk_prompt(
-                payload,
-                request,
-                raw_json,
-                system_prompt=system_prompt,
-                observation_prompt=message,
-            )
-            attempts = [
-                GemmaPromptAttempt(
-                    kind="initial response",
-                    raw_json=initial.raw_json,
-                    validation_warnings=initial.validation_warnings,
-                )
-            ]
-            contract_warnings = _contract_validation_warnings(initial.validation_warnings)
-            if not contract_warnings:
-                return replace(initial, attempts=tuple(attempts))
+        attempts: list[GemmaPromptAttempt] = []
+        response_repairs = 0
+        contract_correction_used = False
+        marker_repairs = 0
+        pending_correction_prompt = ""
 
-            correction_prompt = _chunk_contract_correction_request(request, contract_warnings)
+        def request_replacement(correction_prompt: str) -> tuple[dict[str, Any], str]:
             if callable(getattr(handler, "append_user_chat_completion", None)):
-                # This is a genuine second chat turn.  Its user text is tiny
-                # and the initial response is already in KV, so the correction
-                # does not re-encode the source prompt or observation images.
-                corrected_payload, corrected_raw_json = _gemma_append_chat_json(
-                    handler, llm, correction_prompt
+                # This is a genuine next chat turn. Its user text is small and
+                # the observation images plus preceding answer are already in
+                # KV, so schema repair does not re-encode the complete request.
+                return _gemma_append_chat_json(
+                    handler,
+                    llm,
+                    correction_prompt,
+                    mtp_active=bool(request.get("gemma4_mtp", False)),
                 )
-            else:
-                # Preserve compatibility with a deliberately minimal mocked
-                # runtime used by unit tests and with an unexpectedly older
-                # llama-cpp install. Real supported workers take the path
-                # above.
-                correction_messages = [
-                    *initial_messages,
-                    {"role": "assistant", "content": initial.raw_json},
-                    {"role": "user", "content": correction_prompt},
-                ]
-                corrected_payload, corrected_raw_json = _gemma_chat_json(llm, correction_messages)
-            latest_raw_json = corrected_raw_json
-            corrected = _validate_chunk_prompt(
-                corrected_payload,
-                request,
-                corrected_raw_json,
-                system_prompt=system_prompt,
-                observation_prompt=message,
+            # Compatibility path for the deliberately minimal mocked runtime
+            # used by unit tests and unexpectedly old llama-cpp installs.
+            correction_messages = [
+                *initial_messages,
+                {"role": "assistant", "content": latest_raw_json},
+                {"role": "user", "content": correction_prompt},
+            ]
+            return _gemma_chat_json(
+                llm,
+                correction_messages,
+                handler=handler,
+                mtp_active=bool(request.get("gemma4_mtp", False)),
             )
+
+        while True:
+            try:
+                candidate = _validate_chunk_prompt(
+                    payload,
+                    request,
+                    latest_raw_json,
+                    system_prompt=system_prompt,
+                    observation_prompt=message,
+                )
+            except Gemma4ObservationError as error:
+                attempts.append(
+                    GemmaPromptAttempt(
+                        kind=(
+                            "initial invalid response"
+                            if not attempts
+                            else "invalid schema-repair response"
+                        ),
+                        raw_json=latest_raw_json,
+                        validation_warnings=(str(error),),
+                        correction_prompt=pending_correction_prompt,
+                    )
+                )
+                if response_repairs >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                    raise Gemma4ObservationError(
+                        f"{error} after {response_repairs} model-authored repair attempts",
+                        raw_json=latest_raw_json,
+                    ) from error
+                response_repairs += 1
+                pending_correction_prompt = (
+                    _chunk_contract_correction_request(request, (str(error),))
+                    if response_repairs == 1
+                    else _chunk_contract_followup_request((str(error),))
+                )
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 returned an unusable chunk response: %s. "
+                    "Requesting a complete model-authored replacement in the same conversation "
+                    "(repair %d/%d).",
+                    error,
+                    response_repairs,
+                    GEMMA4_RESPONSE_REPAIR_LIMIT,
+                )
+                payload, latest_raw_json = request_replacement(pending_correction_prompt)
+                continue
+
             attempts.append(
                 GemmaPromptAttempt(
-                    kind="chunk-contract correction response",
-                    raw_json=corrected.raw_json,
-                    validation_warnings=corrected.validation_warnings,
-                    correction_prompt=correction_prompt,
+                    kind=(
+                        "initial response"
+                        if len(attempts) == 0
+                        else "chunk-contract correction response"
+                    ),
+                    raw_json=candidate.raw_json,
+                    validation_warnings=candidate.validation_warnings,
+                    correction_prompt=pending_correction_prompt,
                 )
             )
-            return replace(corrected, attempts=tuple(attempts))
-        except Gemma4ObservationError as error:
-            raise Gemma4ObservationError(str(error), raw_json=latest_raw_json) from error
+            contract_warnings = _contract_validation_warnings(candidate.validation_warnings)
+            marker_warnings = _marker_validation_warnings(contract_warnings)
+            if not contract_warnings:
+                return replace(candidate, attempts=tuple(attempts))
+
+            if not contract_correction_used:
+                # Keep the established policy of one creative contract rewrite.
+                # Structural marker errors are different: Python owns their
+                # exact sequence and may reinforce them again below without
+                # substituting algorithmic H3 prose.
+                contract_correction_used = True
+                marker_repairs = 1 if marker_warnings else 0
+                pending_correction_prompt = _chunk_contract_correction_request(request, contract_warnings)
+            elif marker_warnings:
+                if marker_repairs >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                    raise Gemma4ObservationError(
+                        "Gemma 4 still violates the sampler-owned H3 shot-marker contract after "
+                        f"{marker_repairs} model-authored marker repairs: " + "; ".join(marker_warnings),
+                        raw_json=candidate.raw_json,
+                    )
+                marker_repairs += 1
+                pending_correction_prompt = _marker_contract_followup_request(request, marker_warnings)
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 still returned invalid H3 shot markers. "
+                    "Requesting focused model-authored marker repair %d/%d in the same conversation:\n- %s",
+                    marker_repairs,
+                    GEMMA4_RESPONSE_REPAIR_LIMIT,
+                    "\n- ".join(marker_warnings),
+                )
+            else:
+                # Non-marker creative findings stay visible after the single
+                # established rewrite; never replace Gemma prose algorithmically.
+                return replace(candidate, attempts=tuple(attempts))
+            payload, latest_raw_json = request_replacement(pending_correction_prompt)
     finally:
         if llm is not None:
             llm.close()
@@ -2516,7 +2999,7 @@ def _materialize_preproduction_cache_in_process(
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
-            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
             n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         state_bytes = _populate_preproduction_cache_state(llm, request, timing_plan)
@@ -2555,7 +3038,7 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
-            n_ctx=int(request.get("director_n_ctx", 16384)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
             n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
         )
         initial_messages = [
@@ -2563,7 +3046,13 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
             {"role": "user", "content": message},
         ]
         latest_raw_json = ""
-        payload, raw_json = _gemma_chat_json(llm, initial_messages, max_tokens=2048)
+        payload, raw_json = _gemma_chat_json(
+            llm,
+            initial_messages,
+            handler=handler,
+            max_tokens=2048,
+            mtp_active=bool(request.get("gemma4_mtp", False)),
+        )
         latest_raw_json = raw_json
         try:
             initial = _validate_timing_plan(
@@ -2579,7 +3068,11 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
             correction_prompt = _timing_plan_correction_request(request, error)
             if callable(getattr(handler, "append_user_chat_completion", None)):
                 corrected_payload, corrected_raw_json = _gemma_append_chat_json(
-                    handler, llm, correction_prompt, max_tokens=2048
+                    handler,
+                    llm,
+                    correction_prompt,
+                    max_tokens=2048,
+                    mtp_active=bool(request.get("gemma4_mtp", False)),
                 )
             else:
                 correction_messages = [
@@ -2588,7 +3081,11 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
                     {"role": "user", "content": correction_prompt},
                 ]
                 corrected_payload, corrected_raw_json = _gemma_chat_json(
-                    llm, correction_messages, max_tokens=2048
+                    llm,
+                    correction_messages,
+                    handler=handler,
+                    max_tokens=2048,
+                    mtp_active=bool(request.get("gemma4_mtp", False)),
                 )
             latest_raw_json = corrected_raw_json
             try:
@@ -2686,6 +3183,11 @@ def _stream_worker_output(
         process.kill()
         process.wait()
         raise
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.stdout is not None and not process.stdout.closed:
+            process.stdout.close()
     return "".join(output)
 
 
@@ -2723,11 +3225,12 @@ def _observe_in_worker(request: dict[str, Any], progress_callback: Any = None) -
         raw_json = str(result.get("raw_json") or "")
         if result.get("error_type") == "Gemma4DependencyError":
             raise Gemma4DependencyError(message)
-        if result.get("error_type") == "Gemma4MTPError":
+        if result.get("error_type") in {"Gemma4MTPError", "Gemma4MTPOutputError"}:
+            worker_error_type = str(result["error_type"])
             raise Gemma4WorkerExitError(
                 message,
                 returncode=process.returncode,
-                worker_error_type="Gemma4MTPError",
+                worker_error_type=worker_error_type,
                 raw_json=raw_json,
             )
         raise Gemma4ObservationError(message, raw_json=raw_json)
@@ -2773,11 +3276,12 @@ def _plan_timing_in_worker(request: dict[str, Any], progress_callback: Any = Non
         raw_json = str(result.get("raw_json") or "")
         if result.get("error_type") == "Gemma4DependencyError":
             raise Gemma4DependencyError(message)
-        if result.get("error_type") == "Gemma4MTPError":
+        if result.get("error_type") in {"Gemma4MTPError", "Gemma4MTPOutputError"}:
+            worker_error_type = str(result["error_type"])
             raise Gemma4WorkerExitError(
                 message,
                 returncode=process.returncode,
-                worker_error_type="Gemma4MTPError",
+                worker_error_type=worker_error_type,
                 raw_json=raw_json,
             )
         raise Gemma4ObservationError(message, raw_json=raw_json)
@@ -2829,11 +3333,12 @@ def _materialize_preproduction_cache_in_worker(
         message = str(result.get("message") or "unknown worker failure")
         if result.get("error_type") == "Gemma4DependencyError":
             raise Gemma4DependencyError(message)
-        if result.get("error_type") == "Gemma4MTPError":
+        if result.get("error_type") in {"Gemma4MTPError", "Gemma4MTPOutputError"}:
+            worker_error_type = str(result["error_type"])
             raise Gemma4WorkerExitError(
                 message,
                 returncode=process.returncode,
-                worker_error_type="Gemma4MTPError",
+                worker_error_type=worker_error_type,
             )
         raise Gemma4ObservationError(message)
     if process.returncode != 0:
@@ -2894,40 +3399,92 @@ class Gemma4ContinuityDirector:
         request: dict[str, Any],
         worker: Any,
     ) -> Any:
-        """Retry a native-worker failure once with the original decoder.
+        """Retry disposable-worker crashes without sacrificing the render.
 
         Native llama.cpp aborts cannot be caught inside the child process. The
-        worker is disposable, however, so the parent can preserve a JSON copy
-        of the request, observe the process exit, and run the same operation in
-        a fresh non-MTP worker. This changes only the retry request; the next
-        independent Gemma operation still attempts MTP normally.
+        worker is disposable, however, so the parent preserves a JSON copy of
+        the exact request and repeats the same operation in fresh processes.
+        After an MTP failure all operation-local retries use the original
+        non-MTP decoder. This changes only each retry's MTP flag: cache and
+        request fields are retained, and the next independent Gemma operation
+        still attempts MTP normally.
         """
-        attempted_mtp = bool(request.get("gemma4_mtp", False))
-        retry_request = (
-            json.loads(json.dumps(request, ensure_ascii=False))
-            if attempted_mtp
-            else None
-        )
-        try:
-            return worker(request)
-        except Gemma4WorkerExitError as error:
-            if not attempted_mtp or retry_request is None:
-                raise
-            retry_request["gemma4_mtp"] = False
-            status = (
-                f"status {error.returncode}"
-                if error.returncode is not None
-                else error.worker_error_type or type(error).__name__
-            )
-            logging.warning(
-                "HR Endless Sampler Gemma 4 native MTP worker failed during %s (%s): %s. "
-                "Retrying this operation once with the original non-MTP decoder; "
-                "the next Gemma operation will try native MTP again.",
-                operation,
-                status,
-                error,
-            )
-            return worker(retry_request)
+        preserved_request = json.loads(json.dumps(request, ensure_ascii=False))
+        attempted_mtp = bool(preserved_request.get("gemma4_mtp", False))
+        use_mtp = attempted_mtp
+        retries_used = 0
+
+        while True:
+            attempt_request = json.loads(json.dumps(preserved_request, ensure_ascii=False))
+            attempt_request["gemma4_mtp"] = use_mtp
+            try:
+                return worker(attempt_request)
+            except Gemma4WorkerExitError as error:
+                if retries_used >= GEMMA4_WORKER_RETRY_LIMIT:
+                    logging.error(
+                        "HR Endless Sampler Gemma 4 worker failed during %s after %d fresh "
+                        "worker retries; the render cannot continue: %s",
+                        operation,
+                        retries_used,
+                        error,
+                    )
+                    raise
+                retries_used += 1
+                failed_with_mtp = use_mtp
+                use_mtp = False
+                status = error.worker_error_type or (
+                    f"status {error.returncode}"
+                    if error.returncode is not None
+                    else type(error).__name__
+                )
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 %s worker failed during %s (%s): %s. "
+                    "Retrying the exact operation in a fresh original non-MTP worker "
+                    "(retry %d/%d); the next independent Gemma operation will try MTP "
+                    "according to the sampler toggle again.",
+                    "native MTP" if failed_with_mtp else "non-MTP retry",
+                    operation,
+                    status,
+                    error,
+                    retries_used,
+                    GEMMA4_WORKER_RETRY_LIMIT,
+                )
+            except Gemma4ObservationError as error:
+                # A long-running ComfyUI parent can briefly coexist with a
+                # worker launched from a newer on-disk gemma4.py. Older parent
+                # decoding may preserve the precise MTP failure message while
+                # losing its newly introduced exception subtype. Treat only
+                # this exact MTP transport failure as retryable; creative and
+                # schema ObservationErrors must remain visible and must never
+                # silently switch decoders.
+                if not (
+                    use_mtp
+                    and str(error).startswith(
+                        "Gemma 4 MTP returned no complete JSON object"
+                    )
+                ):
+                    raise
+                if retries_used >= GEMMA4_WORKER_RETRY_LIMIT:
+                    logging.error(
+                        "HR Endless Sampler Gemma 4 MTP output failed during %s after %d "
+                        "fresh worker retries; the render cannot continue: %s",
+                        operation,
+                        retries_used,
+                        error,
+                    )
+                    raise
+                retries_used += 1
+                use_mtp = False
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 native MTP worker returned no complete JSON "
+                    "during %s: %s. Retrying the exact operation in a fresh original "
+                    "non-MTP worker (retry %d/%d); the next independent Gemma operation "
+                    "will try MTP according to the sampler toggle again.",
+                    operation,
+                    error,
+                    retries_used,
+                    GEMMA4_WORKER_RETRY_LIMIT,
+                )
 
     def plan_timing(self, request: dict[str, Any], progress_callback: Any = None) -> GemmaShotTimingPlan:
         """Create the immutable Gemma action schedule before any H3 chunk runs."""

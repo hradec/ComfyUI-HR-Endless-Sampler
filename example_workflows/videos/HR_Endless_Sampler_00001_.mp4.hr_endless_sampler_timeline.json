@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "timeline": {
+    "schema_version": 1,
+    "producer": "HR Endless Sampler",
+    "fps": 24.0,
+    "total_frames": 634,
+    "chunks": [
+      {
+        "chunk": 1,
+        "start": 0,
+        "end": 55,
+        "gemma_detailed_description": "[Shot 1] Cinematic, live-action. The scene opens with a Side view tracking shot of Heman (<Subject 1>) and Tila (<Subject 2>) riding on tiger (<Subject 4>)'s back as they run through a dense jungle. Tila is sitting behind Heman on the saddle. The ground is a wild jungle floor. Forest sounds are heard off-screen. In a continuous movement, the camera arcs to a shoulder view at a slow speed as they approach an ancient, jungle-overgrown Maya-like pyramid (<Picture 5>) in the middle of the jungle. The pyramid is extremely old, with dense vines and jungle growth covering its structures.",
+        "h3_render_seconds": 557.9100864809006,
+        "gemma_seconds": 88.55990579817444,
+        "gemma_preproduction_seconds": 0.0005092108622193336,
+        "chunk_total_seconds": 654.6039179740474
+      },
+      {
+        "chunk": 2,
+        "start": 56,
+        "end": 106,
+        "gemma_detailed_description": "In a continuous movement, the camera arcs to a shoulder view at a slow speed as they approach an ancient, jungle-overgrown Maya-like pyramid. The structure is heavily weathered with thick vines. Forest sounds are heard off-screen. [Shot 2] At 00:00.708, Cut to side view tracking shot as they cross from the jungle into a temple room, tiger running fast. The heroes enter a vast interior with stone architecture and light rays cutting through a hazy atmosphere. Heman pulls the harness; tiger roars and lowers its back close to the floor in a sudden stop. A powerful tiger roar is heard, accompanied by the sounds of skidding and smoke as the tiger's paws kick up dust on the stone floor.",
+        "h3_render_seconds": 710.5119997980073,
+        "gemma_seconds": 56.38058064971119,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 822.9572235597298
+      },
+      {
+        "chunk": 3,
+        "start": 107,
+        "end": 157,
+        "gemma_detailed_description": "The side view tracking shot continues as the heroes enter the temple. Heman (<Subject 1>) pulls the harness; tiger (<Subject 4>) roars and lowers his back close to the floor in a sudden stop. [Shot 2] At 00:01.958, Tiger skids across the floor in a cartoony fashion, creating smoke and tracks, sliding for a long duration before coming to a full stop. The skidding and smoke sounds are prominent throughout this motion. \n\n[Shot 3] At 00:06.208, the camera cuts to a face closeup of Tila (<Subject 2>); she points her hand toward the right side of the frame. <Subject 2> (S2) says: <d>[English] I heard something coming from that direction, he-man!</d>",
+        "h3_render_seconds": 709.7723128516227,
+        "gemma_seconds": 42.13438332360238,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 808.360506198369
+      },
+      {
+        "chunk": 4,
+        "start": 158,
+        "end": 208,
+        "gemma_detailed_description": "The camera maintains a tight face close-up of Tila (<Subject 2>) as she reacts to a sound. Her expression is one of focused intensity, her eyes wide and scanning toward the right side of the frame. She points her hand toward the right side of the frame. <Subject 2> (S2) says: <d>[English] I heard something coming from that direction, he-man!</d> The cinematic lighting of the temple creates sharp chiaroscuro on her face, with dust motes dancing in the shafts of light behind her. The background remains the blurred, atmospheric interior of the ancient stone temple.",
+        "h3_render_seconds": 714.0618884209543,
+        "gemma_seconds": 33.4749522972852,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 805.3508180221543
+      },
+      {
+        "chunk": 5,
+        "start": 209,
+        "end": 259,
+        "gemma_detailed_description": "The camera maintains a tight face close-up of Tila (<Subject 2>) as she remains alert and focused; Cut to a face closeup of Tila; she points her hand toward the right side of the frame. [Shot 2] At 00:00.458, In a continuous movement, the camera zooms out slowly; Heman (<Subject 1>) dismounts the tiger (<Subject 4>) and begins walking right while Tila (<Subject 2>) remains mounted, leaning forward. The tiger stands stationary on the stone floor. [Shot 3] At 00:02.292, Cut to a frontal closeup of Heman (<Subject 1>); the room begins to crumble and the camera starts to Shake Strongly.",
+        "h3_render_seconds": 712.1009672451764,
+        "gemma_seconds": 41.324504690244794,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 809.8989195134491
+      },
+      {
+        "chunk": 6,
+        "start": 260,
+        "end": 310,
+        "gemma_detailed_description": "The camera maintains a tight, frontal close-up of Heman (<Subject 1>) as the room begins to crumble and the camera starts to Shake Strongly. Heman (<Subject 1>) (S1) says: <d>[English] There's a weird and evil dark energy in this place.</d> While he speaks, wisps of dark energy manifest in the air. Heman (<Subject 1>) looks up with a worried expression as the dark energy manifests and the ceiling collapses around him. He continues to speak with increasing apprehension, <Subject 1> (S1) says: <d>[English] I don't like this!</d>",
+        "h3_render_seconds": 709.0499111171812,
+        "gemma_seconds": 40.32610586285591,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 805.8254171358421
+      },
+      {
+        "chunk": 7,
+        "start": 311,
+        "end": 361,
+        "gemma_detailed_description": "The camera maintains a tight, frontal close-up of Heman (<Subject 1>) as the environment around him becomes increasingly chaotic. Dust and debris rain down from above as the ceiling continues to buckle and collapse, illuminated by the swirling, ominous wisps of dark energy. Heman (<Subject 1>) looks up with a worried expression as the dark energy manifests and the ceiling collapses. He completes his warning, <Subject 1> (S1) says: <d>[English] I don't like this!</d> \n\n[Shot 2] At 00:02.208, the camera cuts to a closeup of Tila's face; she makes a scared expression, closes her eyes, and covers her head with her hands to shield from falling debris. Simultaneously, a big loud dragon roar is heard.",
+        "h3_render_seconds": 707.4923538034782,
+        "gemma_seconds": 42.45579855423421,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 806.141447333619
+      },
+      {
+        "chunk": 8,
+        "start": 362,
+        "end": 412,
+        "gemma_detailed_description": "The camera maintains a tight frontal close-up of Tila (<Subject 2>) as the environment around her becomes increasingly chaotic. In the center of the frame, she makes a scared expression, closes her eyes, and covers her head with her hands to shield from falling debris as the ceiling buckles. Simultaneously, a big loud dragon roar is heard, vibrating the camera and the very air. While the roar resonates, Tila (<Subject 2>) speaks with a panicked, trembling voice: <Subject 2> (S2) says: <d>[English] What a fuck was that?</d> Dust and pulverized stone rain down in a constant flurry around her face, illuminated by the flickering light of the dying temple.",
+        "h3_render_seconds": 713.5540766026825,
+        "gemma_seconds": 41.66559473145753,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 811.7175935180858
+      },
+      {
+        "chunk": 9,
+        "start": 413,
+        "end": 463,
+        "gemma_detailed_description": "The camera remains in a tight frontal close-up on Tila (<Subject 2>) for a final moment as she keeps her eyes tightly shut and her hands pressed firmly against her head, reacting to the chaos of the crumbling temple. [Shot 2] At 00:00.250, the camera cuts to a wide low shot behind the heroes. The ancient temple room is disintegrating around them, with dust and stone fragments cascading through the air. Directly ahead, a massive, 100-foot-high ancient gate is buckling and falling forward. Beyond the gate, a thick, ominous dark fog obscures the interior. A moment passes, and from within the swirling fog, the massive red head of a dragon (<Subject 3>, Tiamat) begins to slowly and menacingly emerge, accompanied by a sudden, deafening dragon roar that shakes the environment. Other dragon heads begin to break through the collapsing gate and walls as they move into the light.",
+        "h3_render_seconds": 713.0417052675039,
+        "gemma_seconds": 44.32681588642299,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 813.8750322563574
+      },
+      {
+        "chunk": 10,
+        "start": 464,
+        "end": 514,
+        "gemma_detailed_description": "The wide low-angle shot continues from behind the heroes as a moment passes and a huge red dragon head (Tiamat) (<Subject 3>) slowly emerges from the thick, dark fog of the collapsing gate, followed by other heads breaking through the gate. In a continuous movement, the camera zooms out to show the full scale of Tiamat; all heads drool as they roar in hunger. The heroes—Heman (<Subject 1>), Tila (<Subject 2>), and the tiger (<Subject 4>)—are dwarfed by her massive size in the lower portion of the frame. The central red head moves down close to the heroes, its eyes fixed on them.",
+        "h3_render_seconds": 718.6942662773654,
+        "gemma_seconds": 41.614973882213235,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 817.9337153537199
+      },
+      {
+        "chunk": 11,
+        "start": 515,
+        "end": 565,
+        "gemma_detailed_description": "In a continuous movement, the camera zooms out to show the full scale of Tiamat; all heads drool as they roar. The red head moves down close to the heroes. The heroes—Heman (<Subject 1>), Tila (<Subject 2>), and the tiger (<Subject 4>)—are dwarfed by the dragon's size in the lower portion of the frame as thick saliva drips from her fangs. Heman (<Subject 1>) suddenly pivots and begins to sprint away from the dragon toward the camera left, his face set in a panicked expression. <Subject 1> (S1) says: <d>[English] Fuck this! </d> While Heman flees, Tila (<Subject 2>) and the tiger (<Subject 4>) remain in the center-right, stopping in their tracks. Tila (<Subject 2>) turns her head toward the tiger, and they both look at each other in confusion, their eyes wide as they watch Heman retreat from the towering beast.",
+        "h3_render_seconds": 713.6240595150739,
+        "gemma_seconds": 43.97569588199258,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 814.466676581651
+      },
+      {
+        "chunk": 12,
+        "start": 566,
+        "end": 616,
+        "gemma_detailed_description": "Heman (<Subject 1>) continues his panicked sprint toward the left of the frame, his muscles straining as he moves away from the looming threat of Tiamat (<Subject 3>). In the center-right, the initial bewilderment on Tila (<Subject 2>) and the tiger (<Subject 4>) breaks; they both suddenly spring into motion. Tila (<Subject 2>) turns toward Heman and begins to run after him, the tiger (<Subject 4>) galloping in pursuit with its paws thudding on the stone floor. In a continuous movement, the camera follows the chase, tracking the three heroes as they move across the crumbling temple floor. <Subject 2> (S2) shouts towards him: <d>[English] Wait for us you jack ass!!</d>",
+        "h3_render_seconds": 714.596032936126,
+        "gemma_seconds": 40.459685950540006,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 812.5719831911847
+      },
+      {
+        "chunk": 13,
+        "start": 617,
+        "end": 633,
+        "gemma_detailed_description": "Heman (<Subject 1>) continues his desperate, high-speed sprint toward the left foreground of the frame, his face fixed in a mask of panic as he flees from the looming presence of Tiamat (<Subject 3>). In the middle ground, Tila (<Subject 2>) remains in full stride, her body leaning forward as she rides the tiger (<Subject 4>) in a determined chase. The tiger (<Subject 4>) gallops powerfully, its striped fur rippling and its paws striking the stone floor of the ancient temple with visible force. In a continuous movement, the camera maintains its dynamic track, following the trio's rapid progression across the crumbling floor. <Subject 2> (S2) shouts towards him: <d>[English] Wait for us you jack ass!!</d>",
+        "h3_render_seconds": 357.8955701906234,
+        "gemma_seconds": 38.36136347986758,
+        "gemma_preproduction_seconds": 0.0,
+        "chunk_total_seconds": 453.72643866203725
+      }
+    ],
+    "shots": [
+      {
+        "shot": 1,
+        "start": 0,
+        "end": 67,
+        "source_end": 67
+      },
+      {
+        "shot": 2,
+        "start": 68,
+        "end": 148,
+        "source_end": 148
+      },
+      {
+        "shot": 3,
+        "start": 149,
+        "end": 214,
+        "source_end": 214
+      },
+      {
+        "shot": 4,
+        "start": 215,
+        "end": 258,
+        "source_end": 258
+      },
+      {
+        "shot": 5,
+        "start": 259,
+        "end": 358,
+        "source_end": 358
+      },
+      {
+        "shot": 6,
+        "start": 359,
+        "end": 413,
+        "source_end": 413
+      },
+      {
+        "shot": 7,
+        "start": 414,
+        "end": 633,
+        "source_end": 633
+      }
+    ],
+    "render_total_seconds": 9383.52141853515
+  },
+  "media": {
+    "kind": "video",
+    "filename": "HR_Endless_Sampler_00001_.mp4"
+  }
+}

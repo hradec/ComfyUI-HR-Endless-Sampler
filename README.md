@@ -1,6 +1,14 @@
 # ComfyUI-HR-Endless-Sampler 
 ## (the older ComfyUI MiniMax H3 Sampler Unlimited)
 
+
+
+https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
+
+- video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
+
+
+
 `HR Endless Sampler` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long video/audio latents, currently supports 
 Minimax H3 only. The plan is to add support to LTX 2.5 in the near future.
@@ -66,6 +74,25 @@ chunk into the next one. H3 sees them as a synchronized `<Video N>` and
 the minimum. Larger values use more VRAM. If it is larger than the current
 chunk, the sampler caps it to the chunk size.
 
+`video_continuation_res` controls only the spatial size of the clean Video1
+latent passed to H3. `full` reuses the generated latent exactly and performs no
+extra encode. A smaller preset decodes the completed Video1 tail once, resizes
+all of its frames to the selected 32-pixel-aligned canvas, and VAE-encodes that
+sequence as a smaller `minimax_refs` block. This reduces H3 reference-attention
+VRAM and may allow a larger `chunk_frames`, particularly at 1080p. It trades
+some fine continuation detail and adds one VAE encode between chunks. The
+synchronized Audio1 latent and full-resolution five-frame boundary keyframe
+are unchanged. Qwen and Gemma also remain at the normal stock H3
+reference-video presentation size; this setting does not reduce what they see.
+For every continuation chunk, the console reports the Video1 video/audio and
+boundary-keyframe shapes, raw MiB, packed H3 row counts, reduction versus a
+full-resolution Video1, and continuation rows relative to the target AV rows.
+Packed rows are the useful comparison: the latent itself is small, while every
+additional row expands much larger per-layer attention and activation buffers.
+The sampler separately reports the complete Qwen cross-attention tensor retained
+for H3. That value includes the prompt, original references, and Video1 semantic
+presentation and does not change when only `video_continuation_res` changes.
+
 The sampler also uses the previous chunk's final five frames as a small H3
 boundary keyframe. This is automatic. It helps adjacent chunks meet cleanly.
 
@@ -90,6 +117,15 @@ draft-token acceptance rate, proposal count, verification work, rollback
 replays, and checkpoint time. This is real speculative decoding: the matching
 Gemma assistant proposes as many as four tokens and the 12B target verifies
 them together.
+
+`pytorch_memory_fraction` sets a process-wide ceiling for PyTorch's CUDA
+allocator when the sampler starts. The default `0.85` leaves 15% of physical
+VRAM outside PyTorch's cache so allocator pressure happens before a large H3
+temporary consumes the final driver pages. This is especially useful with
+ComfyUI's `cudaMallocAsync` backend, where `garbage_collection_threshold` is
+ignored. The setting remains active until another sampler run changes it; use
+`1.0` for PyTorch's normal unrestricted limit. The console and final run report
+show the effective fraction.
 
 `debug` adds detailed prompt and memory information to the console.
 
@@ -128,9 +164,17 @@ For every chunk, Gemma receives:
   current source prompt.
 
 Gemma writes one short H3 `detailed_description` for that chunk. It keeps exact
-dialogue inside `<d>...</d>`, preserves real shot cuts, and uses local H3
-timecodes for cuts. H3 receives only that final description, not Gemma's JSON
-notes or planning data.
+dialogue inside `<d>...</d>`, preserves each original global `[Shot N]` label,
+and recalculates only cut timecodes on the current chunk's local clock. H3
+receives only that final description, not Gemma's JSON notes or planning data.
+
+Generated Video1 frames shown to Qwen and Gemma use the same spatial canvas as
+ComfyUI's native H3 reference-video path: a nominal 768-pixel short edge with a
+768×1344 pixel-area cap, aligned to 32 pixels and never enlarged. For example,
+a 1920×1088 continuation is presented at 1344×768 rather than using a smaller
+sampler-only observation format. Temporal presentation remains 2 FPS plus the
+exact final frame for Gemma. The separate H3 `minimax_refs` continuation latent
+remains at the generated video's full latent resolution.
 
 The sampler saves the latest Gemma transcript after every chunk, even with
 `debug` off:
