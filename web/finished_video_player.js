@@ -510,6 +510,22 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (!new Set(["HREndlessSamplerSaveVideo", "HREndlessSamplerLoadVideo"]).has(nodeData?.name)) return;
 
+        const previousConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function () {
+            previousConfigure?.apply(this, arguments);
+            if (nodeData?.name !== "HREndlessSamplerSaveVideo") return;
+            for (let index = 0; index < (this.inputs?.length || 0); index++) {
+                const linkId = this.inputs[index]?.link;
+                if (linkId == null) continue;
+                const link = this.graph?.links?.[linkId];
+                const origin = link == null ? null : this.graph?.getNodeById?.(link.origin_id);
+                if (link != null && origin != null && (link.origin_slot < 0 || link.origin_slot >= (origin.outputs?.length || 0))) {
+                    console.warn(`HR Endless Sampler Save Video removed stale input link on ${this.inputs[index]?.name || index}.`);
+                    this.disconnectInput(index);
+                }
+            }
+        };
+
         const previousCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             previousCreated?.apply(this, arguments);
@@ -982,6 +998,7 @@ app.registerExtension({
             }
 
             async function restoreState(attempt=0) {
+                if (!isLoadNode) return;
                 if (node.id == null || Number(node.id) < 0) {
                     if (attempt < 20) setTimeout(() => restoreState(attempt + 1), 100);
                     return;
@@ -996,7 +1013,7 @@ app.registerExtension({
                     console.warn("HR Endless Sampler finished-video state restore failed", error);
                 }
             }
-            setTimeout(() => restoreState(), 0);
+            if (isLoadNode) setTimeout(() => restoreState(), 0);
 
             const previousRemoved = node.onRemoved;
             node.onRemoved = function () {

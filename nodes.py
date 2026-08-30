@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 from tqdm import tqdm as _cli_tqdm
 
 from .director_backend import DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
+from .director_errors import DirectorDependencyError, DirectorObservationError
 from .gemma4 import (
     Gemma4ContinuityDirector,
     Gemma4DependencyError,
@@ -949,12 +950,14 @@ def _gemma_timing_plan_transcript(result):
 
 
 def _resize(image, width, height, crop):
+    image = image.reshape(-1, *image.shape[-3:])
     samples = image[..., :3].movedim(-1, 1)
     samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop)
     return samples.movedim(1, -1)
 
 
 def _reference_image(image, width, height):
+    image = image.reshape(-1, *image.shape[-3:])[:1]
     source_height, source_width = image.shape[1:3]
     scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
     target_width = max(CANVAS_MULTIPLE, round(source_width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
@@ -2802,7 +2805,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if gemma_director is not None:
             if director_selection.backend == "qwen3.5":
                 logging.info(
-                    "HR Endless Sampler director: Qwen3.5 (%s, context 4096, no MTP or KV cache).",
+                    "HR Endless Sampler director: Qwen3.5 (%s, context 65536, CPU vision projector, no MTP or KV cache).",
                     director_selection.model_path.name,
                 )
             else:
@@ -3079,9 +3082,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "each chunk will receive the ordinary full directing request."
                             )
                     vram_monitor.report(f"after {director_name} shot-timing preproduction release")
-                except Gemma4DependencyError:
+                except (Gemma4DependencyError, DirectorDependencyError):
                     raise
-                except Gemma4ObservationError as error:
+                except (Gemma4ObservationError, DirectorObservationError) as error:
                     logging.warning(
                         "HR Endless Sampler Gemma 4 shot-timing preproduction failed; "
                         "sampling is stopping before Chunk 1 and no sampler-authored timing fallback will be used: %s",
@@ -3254,9 +3257,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             vram_monitor.report(
                                 f"chunk {index + 1}/{len(active_plan)} after {director_name} release",
                             )
-                    except Gemma4DependencyError:
+                    except (Gemma4DependencyError, DirectorDependencyError):
                         raise
-                    except Gemma4ObservationError as error:
+                    except (Gemma4ObservationError, DirectorObservationError) as error:
                         gemma_system_prompt = gemma_director.last_system_prompt
                         gemma_observation_prompt = gemma_director.last_observation_prompt
                         gemma_response = error.raw_json or f"{type(error).__name__}: {error}"

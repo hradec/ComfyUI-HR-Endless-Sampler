@@ -180,6 +180,13 @@ review date, versions/commits checked, and outcome below.
   published fix. PyPI still reports `llama-cpp-python==0.3.35` as the newest
   release (uploaded 2026-08-17). Preserve the disposable worker and
   operation-local non-MTP retry while adding another local llama.cpp director.
+- 2026-08-30 (CUDA 13 integration): issue #27439 remains open. The local Windows
+  runtime uses JamePeng `llama-cpp-python==0.3.48+cu131`, whose packaged DLLs,
+  `Llama`, MTMD handler, and existing Gemma handler subclass import successfully
+  with Python 3.12 and NumPy 1.26.4. The integration now accepts tested 0.3.35
+  and 0.3.48 runtimes and loads packaged Windows CUDA/ggml DLLs in dependency
+  order. Preserve disposable workers and the operation-local non-MTP retry until
+  a captured multimodal Chunk 2 replay passes on 0.3.48.
 - 2026-08-28 (latest Chunk 2 crash recheck): issue #27439 remains open with no
   linked fix or pull request. GitHub still identifies `v0.3.35-hip-radeon` as
   the latest `llama-cpp-python` release, built from package commit `3691546`;

@@ -307,6 +307,34 @@ class FinishedVideoIOTest(unittest.TestCase):
         audio = next(item for item in schema.inputs if item.id == "audio")
         self.assertTrue(audio.optional)
 
+    def test_save_prompt_repairs_a_stale_upstream_output_slot_by_type(self):
+        fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={
+            "Sampler": types.SimpleNamespace(RETURN_TYPES=("LATENT", "STRING", "HRENDLESS_TIMELINE")),
+        })
+        prompt = {
+            "prompt": {
+                "1": {"class_type": "Sampler", "inputs": {}},
+                "2595": {"class_type": "HREndlessSamplerSaveVideo", "inputs": {"timeline": ["1", 4]}},
+            },
+        }
+        with patch.dict(sys.modules, {"nodes": fake_nodes}):
+            repaired = video_io._repair_save_video_prompt_links(prompt)
+        self.assertEqual(repaired["prompt"]["2595"]["inputs"]["timeline"], ["1", 2])
+
+    def test_save_prompt_removes_an_unrecoverable_stale_output_slot(self):
+        fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={
+            "Decoder": types.SimpleNamespace(RETURN_TYPES=("LATENT",)),
+        })
+        prompt = {
+            "prompt": {
+                "1": {"class_type": "Decoder", "inputs": {}},
+                "2595": {"class_type": "HREndlessSamplerSaveVideo", "inputs": {"images": ["1", 3]}},
+            },
+        }
+        with patch.dict(sys.modules, {"nodes": fake_nodes}):
+            repaired = video_io._repair_save_video_prompt_links(prompt)
+        self.assertNotIn("images", repaired["prompt"]["2595"]["inputs"])
+
     def test_exr_audio_sidecar_round_trip_keeps_float_audio(self):
         audio = {
             "waveform": torch.tensor([[[0.0, -0.25, 0.5, 1.0], [0.25, 0.0, -0.5, 0.75]]]),

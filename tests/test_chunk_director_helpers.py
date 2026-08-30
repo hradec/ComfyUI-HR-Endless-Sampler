@@ -33,6 +33,20 @@ class _IndexedFakeVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_resize_flattens_extra_leading_image_dimensions(self):
+        image = torch.zeros((2, 1, 64, 32, 3), dtype=torch.float32)
+
+        resized = nodes._resize(image, 32, 64, "disabled")
+
+        self.assertEqual(tuple(resized.shape), (2, 64, 32, 3))
+
+    def test_reference_image_uses_one_image_from_extra_leading_dimensions(self):
+        image = torch.zeros((2, 1, 64, 32, 3), dtype=torch.float32)
+
+        resized = nodes._reference_image(image, 64, 64)
+
+        self.assertEqual(tuple(resized.shape), (1, 64, 32, 3))
+
     def test_hr_endless_sampler_schema_hides_retired_experiments_and_puts_debug_last(self):
         schema = nodes.HREndlessSampler.define_schema()
         input_ids = [item.id for item in schema.inputs]

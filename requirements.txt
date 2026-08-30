@@ -1,9 +1,7 @@
-# The CUDA 12.5 release channel publishes both Linux and Windows 0.3.35 wheels.
-# Newer CUDA 12 runtimes and NVIDIA drivers remain compatible with this wheel.
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
-
+# Install a CUDA wheel matching the local runtime. The integration is tested with
+# official 0.3.35 CUDA 12.5 and JamePeng 0.3.48 CUDA 13.1 builds.
 huggingface-hub>=0.34.0
-llama-cpp-python==0.3.35
+llama-cpp-python>=0.3.35
 # Finished-video EXR sequences and their float-WAV audio sidecar use PyAV.
 # ComfyUI currently supplies this too, but declare the direct runtime use here.
 av>=16.0.0

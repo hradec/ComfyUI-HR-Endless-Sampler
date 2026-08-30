@@ -1088,7 +1088,7 @@ class HREndlessSamplerLoadVideo(io.ComfyNode):
                 io.Int.Output(display_name="height"),
             ],
             hidden=[io.Hidden.unique_id],
-            is_output_node=True,
+            is_output_node=False,
         )
 
     @classmethod
@@ -1120,3 +1120,57 @@ class HREndlessSamplerLoadVideo(io.ComfyNode):
             width,
             height,
         )
+
+
+def _repair_save_video_prompt_links(json_data):
+    """Repair stale output slots before ComfyUI indexes RETURN_TYPES."""
+    prompt = json_data.get("prompt") if isinstance(json_data, dict) else None
+    if not isinstance(prompt, dict):
+        return json_data
+    import nodes as comfy_nodes
+
+    expected_types = {
+        "images": "IMAGE",
+        "latent": "LATENT",
+        "vae": "VAE",
+        "audio": "AUDIO",
+        "timeline": "HRENDLESS_TIMELINE",
+    }
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict) or node.get("class_type") != "HREndlessSamplerSaveVideo":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for input_name, expected_type in expected_types.items():
+            link = inputs.get(input_name)
+            if not isinstance(link, list) or len(link) != 2:
+                continue
+            origin_id, origin_slot = link
+            origin = prompt.get(str(origin_id), prompt.get(origin_id))
+            origin_type = origin.get("class_type") if isinstance(origin, dict) else None
+            origin_class = comfy_nodes.NODE_CLASS_MAPPINGS.get(origin_type)
+            return_types = tuple(getattr(origin_class, "RETURN_TYPES", ())) if origin_class is not None else ()
+            if isinstance(origin_slot, int) and 0 <= origin_slot < len(return_types):
+                continue
+            matching_slots = [index for index, value in enumerate(return_types) if value == expected_type]
+            if len(matching_slots) == 1:
+                repaired_slot = matching_slots[0]
+                inputs[input_name] = [origin_id, repaired_slot]
+                logging.warning(
+                    "HR Endless Sampler Save Video %s repaired stale %s link from %s output %r to output %d (%s).",
+                    node_id, input_name, origin_id, origin_slot, repaired_slot, expected_type,
+                )
+            else:
+                inputs.pop(input_name, None)
+                logging.error(
+                    "HR Endless Sampler Save Video %s removed invalid %s link from %s output %r; "
+                    "runtime %s exposes %d outputs %s and has no unique %s output.",
+                    node_id, input_name, origin_id, origin_slot, origin_type,
+                    len(return_types), return_types, expected_type,
+                )
+    return json_data
+
+
+if PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    PromptServer.instance.add_on_prompt_handler(_repair_save_video_prompt_links)

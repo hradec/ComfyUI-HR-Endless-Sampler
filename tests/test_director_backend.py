@@ -131,7 +131,7 @@ class DirectorBackendTest(unittest.TestCase):
 
         self.assertEqual(request["director_backend"], "qwen3.5")
         self.assertFalse(request["gemma4_mtp"])
-        self.assertEqual(request["director_n_ctx"], 4096)
+        self.assertEqual(request["director_n_ctx"], 65536)
         self.assertEqual(request["director_n_batch"], 256)
         self.assertTrue(request["director_model_path"].endswith("model.gguf"))
         self.assertTrue(request["director_mmproj_path"].endswith("mmproj.gguf"))
