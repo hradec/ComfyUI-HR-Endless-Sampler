@@ -150,9 +150,19 @@ def _reference_image(image, width, height):
     return _resize(image, target_width, target_height, "disabled")
 
 
-def _prompt_tokens(clip, prompt, images, positive, width, height, continuation):
+def _source_images(images, source_images):
+    if images is not None and source_images:
+        raise ValueError("Connect either images or source_images, not both")
+    if source_images:
+        def index(item):
+            match = re.search(r"_(\d+)$", item[0])
+            return int(match.group(1)) if match else -1
+        return [image[:1] for _, image in sorted(source_images.items(), key=index) if image is not None]
+    return [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
+
+
+def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuation):
     refs = positive[0].get("minimax_refs") if positive else None
-    image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
     if refs:
         ref_items = []
         image_index = 0
@@ -160,13 +170,18 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation):
             kind = ref["kind"]
             if kind == "image":
                 if image_index >= len(image_list):
-                    raise ValueError("SamplerCustomAdvanced-Unlimited needs every Ref2VA reference image in the images input")
-                ref_items.append({"type": "image", "data": _reference_image(image_list[image_index], width, height)})
+                    raise ValueError("SamplerCustomAdvanced-Unlimited needs every Ref2VA reference image in images or source_images")
+                image = image_list[image_index]
+                if "latent_h" in ref and "latent_w" in ref:
+                    image = _resize(image, ref["latent_w"] * 16, ref["latent_h"] * 16, "disabled")
+                else:
+                    image = _reference_image(image, width, height)
+                ref_items.append({"type": "image", "data": image})
                 image_index += 1
             elif kind == "audio":
                 ref_items.append({"type": "audio"})
             elif kind in ("video", "video_audio"):
-                raise ValueError("SamplerCustomAdvanced-Unlimited cannot rebuild video Ref2VA conditioning from an images input")
+                raise ValueError("SamplerCustomAdvanced-Unlimited cannot rebuild video Ref2VA conditioning from image inputs")
         if image_index != len(image_list):
             raise ValueError("SamplerCustomAdvanced-Unlimited received more images than the Ref2VA conditioning uses")
         return clip.tokenize(prompt, minimax_ref_items=ref_items)
@@ -177,8 +192,8 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation):
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, images, positive, width, height, continuation):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation))
+def _encode_prompt(clip, prompt, image_list, positive, width, height, continuation):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, image_list, positive, width, height, continuation))
     if len(conditioning) != 1:
         raise ValueError("SamplerCustomAdvanced-Unlimited expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -303,7 +318,11 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt to the console and return them through chunk_prompts."),
                 io.Image.Input("images", optional=True,
-                               tooltip="Original H3 conditioning images as a batch: first frame, then optional last frame; or all image-only Ref2VA references in order."),
+                               tooltip="Legacy batch input: first frame, then optional last frame; or all image-only Ref2VA references in order."),
+                io.Autogrow.Input("source_images", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("source_image", tooltip="One original Ref2VA reference image. Add them in the same order as MiniMax H3 Reference to Video."),
+                        prefix="source_image_", min=0, max=9)),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -313,7 +332,8 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         )
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False, images=None):
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, debug=False,
+                images=None, source_images=None):
         samples = latent_image["samples"]
         if not samples.is_nested:
             sampled = super().execute(noise, guider, sampler, sigmas, latent_image)
@@ -346,6 +366,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
         if positive is None:
             raise ValueError("SamplerCustomAdvanced-Unlimited requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
+        image_list = _source_images(images, source_images)
         total_frames = plan[-1]["frame_end"]
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
@@ -402,7 +423,7 @@ class MiniMaxH3SamplerCustomAdvancedUnlimited(SamplerCustomAdvanced):
                     )
                     debug_prompts.append(debug_prompt)
                     logging.info("SamplerCustomAdvanced-Unlimited debug:\n%s", debug_prompt)
-                encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation)
+                encoded_prompt = _encode_prompt(clip, chunk_prompt, image_list, positive, width, height, continuation)
                 guider.original_conds = _conditioning_for_chunk(
                     original_conds,
                     chunk["frame_start"],
