@@ -40,8 +40,12 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(schema.node_id, "HREndlessSampler")
         self.assertEqual(schema.display_name, "HR Endless Sampler")
         self.assertIn("video_continuation", input_ids)
+        self.assertEqual(input_ids[input_ids.index("video_continuation") + 1], "video_continuation_res")
+        video_continuation_input = next(item for item in schema.inputs if item.id == "video_continuation")
+        self.assertEqual(video_continuation_input.default, 22)
         self.assertIn("cache_gemma_preproduction", input_ids)
         self.assertIn("gemma4_mtp", input_ids)
+        self.assertIn("pytorch_memory_fraction", input_ids)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
             "context_keyframes_enable",
@@ -52,8 +56,15 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "prompt_preview_only",
         } & set(input_ids))
         self.assertEqual(
-            input_ids[-5:],
-            ["cache_gemma_preproduction", "gemma4_mtp", "debug", "debug_stop_chunk", "debug_start_chunk"],
+            input_ids[-6:],
+            [
+                "cache_gemma_preproduction",
+                "gemma4_mtp",
+                "pytorch_memory_fraction",
+                "debug",
+                "debug_stop_chunk",
+                "debug_start_chunk",
+            ],
         )
 
         execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
@@ -65,6 +76,43 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("debug_start_chunk", execute_params)
         self.assertIn("cache_gemma_preproduction", execute_params)
         self.assertIn("gemma4_mtp", execute_params)
+        self.assertIn("pytorch_memory_fraction", execute_params)
+        self.assertEqual(execute_params["video_continuation"].default, 22)
+        self.assertEqual(
+            nodes.VIDEO_CONTINUATION_RESOLUTIONS,
+            (
+                "full",
+                "0.98mp (1344x768 native)",
+                "0.90mp (1280x736)",
+                "0.80mp (1216x672)",
+                "0.70mp (1152x640)",
+                "0.60mp (1056x608)",
+                "0.50mp (960x544)",
+                "0.40mp (864x480)",
+                "0.30mp (736x416)",
+                "0.20mp (608x352)",
+                "0.10mp (448x256)",
+            ),
+        )
+
+    def test_pytorch_memory_fraction_sets_explicit_cuda_allocator_limit(self):
+        properties = type("DeviceProperties", (), {"total_memory": 16 * 1024 ** 3})()
+        with patch.object(nodes.torch.cuda, "is_available", return_value=True), \
+                patch.object(nodes.torch.cuda, "set_per_process_memory_fraction") as setter, \
+                patch.object(nodes.torch.cuda, "get_device_properties", return_value=properties), \
+                patch.object(nodes.torch.cuda, "get_allocator_backend", return_value="cudaMallocAsync"):
+            result = nodes._set_pytorch_memory_fraction(0.85, torch.device("cuda:0"))
+
+        setter.assert_called_once_with(0.85, device=torch.device("cuda:0"))
+        self.assertEqual(result["fraction"], 0.85)
+        self.assertEqual(result["limit_bytes"], int(16 * 1024 ** 3 * 0.85))
+        self.assertEqual(result["backend"], "cudaMallocAsync")
+
+    def test_pytorch_memory_fraction_skips_non_cuda_runtime(self):
+        with patch.object(nodes.torch.cuda, "is_available", return_value=False), \
+                patch.object(nodes.torch.cuda, "set_per_process_memory_fraction") as setter:
+            self.assertIsNone(nodes._set_pytorch_memory_fraction(0.85, torch.device("cpu")))
+        setter.assert_not_called()
 
     def test_last_run_replay_cache_keeps_exact_cpu_tensors_and_truncates_replayed_suffix(self):
         video = torch.arange(24, dtype=torch.float16).reshape(1, 1, 2, 3, 4)
@@ -90,6 +138,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             context_keyframes=0,
             guide_overlap=0,
             video_continuation=0,
+            video_continuation_res="full",
             ref2va=False,
         )
         with tempfile.TemporaryDirectory() as temp_root, \
@@ -131,6 +180,41 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertIsNone(cache.load_if_compatible({"different": True})[0])
             cache.truncate_from(1)
             self.assertFalse(cache.has_chunk(1))
+
+    def test_replay_cache_lifecycle_selects_only_interrupted_runs_for_automatic_resume(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root):
+            cache = nodes._LastRunReplayCache()
+            cache.create({"geometry": "stable"}, "original prompt", {"video": torch.zeros(1)})
+            loaded, reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertIsNone(reason)
+            self.assertEqual(
+                cache.automatic_resume_chunk(loaded["manifest"], 3),
+                1,
+            )
+
+            cache.save_chunk(1, {"sampled_video": torch.zeros(1)})
+            loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertEqual(loaded["manifest"]["status"], "recording")
+            self.assertEqual(
+                cache.automatic_resume_chunk(loaded["manifest"], 3),
+                2,
+            )
+
+            cache.mark_debug_stop(1)
+            loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertIsNone(cache.automatic_resume_chunk(loaded["manifest"], 3))
+
+            cache.mark_interrupted(1)
+            loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertEqual(
+                cache.automatic_resume_chunk(loaded["manifest"], 3),
+                2,
+            )
+
+            cache.mark_complete(3)
+            loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertIsNone(cache.automatic_resume_chunk(loaded["manifest"], 3))
 
     def test_rebuilt_replay_timing_plan_updates_the_source_prompt_hash(self):
         with tempfile.TemporaryDirectory() as temp_root, \
@@ -300,7 +384,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_root, \
                 patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
                 patch.object(nodes.logging, "info"):
-            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, 24.0, 3)
+            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, "full", 24.0, 3)
             nodes._append_gemma_timing_plan(
                 path,
                 "Source Shot 1: immutable preproduction timing schedule",
@@ -325,7 +409,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_root, \
                 patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
                 patch.object(nodes.logging, "info"):
-            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, 24.0, 3)
+            path = nodes._begin_last_gemma_prompt_log(39, 0, 0, 22, "full", 24.0, 3)
             nodes._append_last_gemma_prompt(
                 path,
                 "=== Chunk 1 ===",
@@ -358,7 +442,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertIn("=== GEMMA VALIDATION WARNINGS ===", content)
             self.assertIn("Gemma 4 returned 2 shot markers; this chunk requires 3", content)
 
-            replacement = nodes._begin_last_gemma_prompt_log(56, 5, 0, 0, 24.0, 2)
+            replacement = nodes._begin_last_gemma_prompt_log(56, 5, 0, 0, "full", 24.0, 2)
             replacement_content = replacement.read_text(encoding="utf-8")
             self.assertIn("Configuration: chunk_frames=56, context_keyframes=5", replacement_content)
             self.assertNotIn("first Gemma request", replacement_content)
@@ -379,6 +463,68 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         )
         self.assertEqual(indices, [5, 17, 29, 38])
         self.assertEqual(frames.shape[0], 4)
+
+    def test_generated_video_observations_match_stock_h3_reference_video_canvas(self):
+        self.assertEqual(nodes._reference_video_canvas(1920, 1088), (1344, 768))
+        self.assertEqual(nodes._reference_video_canvas(2048, 1152), (1344, 768))
+        self.assertEqual(nodes._reference_video_canvas(640, 352), (640, 352))
+        self.assertEqual(nodes._reference_video_canvas(1088, 1920), (768, 1344))
+
+    def test_continuation_reference_is_resized_in_pixels_and_vae_encoded(self):
+        class RecordingVAE:
+            def __init__(self):
+                self.encoded_shape = None
+
+            def encode(self, frames):
+                self.encoded_shape = tuple(frames.shape)
+                return torch.zeros((1, 24, 7, frames.shape[1] // 16, frames.shape[2] // 16))
+
+        frames = torch.zeros((22, 64, 128, 3), dtype=torch.float32)
+        vae = RecordingVAE()
+        with patch.dict(nodes.VIDEO_CONTINUATION_CANVASES, {"test": (64, 32)}):
+            latent, canvas = nodes._encode_resized_continuation_reference(vae, frames, "test")
+
+        self.assertEqual(canvas, (64, 32))
+        self.assertEqual(vae.encoded_shape, (22, 32, 64, 3))
+        self.assertEqual(tuple(latent.shape), (1, 24, 7, 2, 4))
+
+    def test_full_continuation_reference_keeps_original_latent_without_reencoding(self):
+        class FailingVAE:
+            def encode(self, _frames):
+                raise AssertionError("full must not re-encode Video1")
+
+        frames = torch.zeros((22, 64, 128, 3), dtype=torch.float32)
+        latent, canvas = nodes._encode_resized_continuation_reference(FailingVAE(), frames, "full")
+        self.assertIsNone(latent)
+        self.assertEqual(canvas, (128, 64))
+
+    def test_continuation_payload_reports_raw_bytes_and_attention_rows(self):
+        reference = torch.zeros((1, 24, 7, 34, 60), dtype=torch.bfloat16)
+        audio = torch.zeros((1, 32, 2, 37), dtype=torch.bfloat16)
+        boundary = torch.zeros((1, 24, 2, 68, 120), dtype=torch.bfloat16)
+        target_video = torch.zeros((1, 24, 17, 68, 120), dtype=torch.bfloat16)
+        target_audio = torch.zeros((1, 32, 2, 93), dtype=torch.bfloat16)
+        full_reference = torch.zeros((1, 24, 7, 68, 120), dtype=torch.bfloat16)
+
+        metrics = nodes._continuation_payload_metrics(
+            reference,
+            audio,
+            boundary,
+            target_video,
+            target_audio,
+            full_reference,
+        )
+
+        self.assertEqual(metrics["video_bytes"], 685440)
+        self.assertEqual(metrics["audio_bytes"], 4736)
+        self.assertEqual(metrics["boundary_bytes"], 783360)
+        self.assertEqual(metrics["total_bytes"], 1473536)
+        self.assertEqual(metrics["video_rows"], 3570)
+        self.assertEqual(metrics["audio_rows"], 74)
+        self.assertEqual(metrics["boundary_rows"], 4080)
+        self.assertEqual(metrics["total_rows"], 7724)
+        self.assertEqual(metrics["target_rows"], 34866)
+        self.assertEqual(metrics["full_reference_rows"], 14280)
 
     def test_observation_can_return_exact_full_resolution_final_frame(self):
         frames, indices, final_frame = nodes._decoded_video_frames(
@@ -436,6 +582,24 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         )
         self.assertEqual(after_carried_prefix[0]["required_marker"], "[Shot 2] At 00:00.208,")
 
+    def test_target_shots_omit_cut_that_is_complete_inside_discarded_prefix(self):
+        shots = [
+            (4, 259, 359, "Heman warns the others."),
+            (5, 359, 414, "Cut to Tila reacting inside the temple."),
+        ]
+        records = nodes._gemma_shot_records(
+            shots,
+            range_start=362,
+            range_end=413,
+            sampled_start=357,
+            fps=24.0,
+            target=True,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["shot_number"], 6)
+        self.assertIsNone(records[0]["required_marker"])
+
     def test_prompt_preview_omits_shot_one_for_mid_shot_continuation(self):
         prompt = (
             "detailed_description: [Shot 1] The tiger runs through the jungle. "
@@ -462,6 +626,49 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             fps=24.0,
         )
         self.assertIn("[Shot 1]", boundary)
+
+    def test_gemma_last_seen_state_is_injected_only_for_current_subjects(self):
+        prompt = (
+            "subject_definitions:\nTila is <Subject 2>.\nHeman is <Subject 1>.\n\n"
+            "retention_analysis:\nKeep identities consistent.\n\n"
+            "detailed_description: [Shot 1] Original description.\n\n"
+            "overall_soundscape: temple ambience"
+        )
+        state = [
+            {
+                "character_name": "Tila",
+                "subject": "<Subject 2>",
+                "last_seen_global_frame": 208,
+                "last_seen_source_shot": 4,
+                "environment": "inside the ancient temple",
+                "pose_and_position": "mounted on the tiger, seated behind Heman",
+                "state_and_action": "leaning forward and alert",
+                "spatial_relationships": "behind Heman on the tiger saddle",
+            },
+            {
+                "character_name": "Heman",
+                "subject": "<Subject 1>",
+                "last_seen_global_frame": 358,
+                "last_seen_source_shot": 5,
+                "environment": "inside the ancient temple",
+                "pose_and_position": "standing on the temple floor",
+                "state_and_action": "looking upward",
+                "spatial_relationships": "away from the tiger",
+            },
+        ]
+
+        rewritten = nodes._prompt_with_gemma_description(
+            prompt,
+            "In a closeup, Tila (<Subject 2>) reacts to an off-screen roar.",
+            last_seen_character_state=state,
+        )
+
+        retention = rewritten.index("Gemma last-seen continuity state relevant to this chunk:")
+        description = rewritten.index("detailed_description:")
+        self.assertLess(retention, description)
+        self.assertIn("mounted on the tiger, seated behind Heman", rewritten)
+        self.assertIn("inside the ancient temple", rewritten)
+        self.assertNotIn("standing on the temple floor", rewritten)
 
     def test_keyframes_use_truthful_physical_overlap_geometry(self):
         total_frames = 56
@@ -525,6 +732,66 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         keyframe = conds["positive"][0]["minimax_keyframes"][0]
         self.assertEqual(keyframe["resolved_frame_index"], 0)
         self.assertIs(keyframe["latent"], boundary_latent)
+
+    def test_debug_memory_preflight_uses_at_most_three_real_sigma_steps(self):
+        sigmas = torch.arange(21, dtype=torch.float32)
+        probe, steps = nodes._debug_preflight_sigmas(sigmas)
+
+        self.assertEqual(steps, 3)
+        self.assertTrue(torch.equal(probe, sigmas[:4]))
+
+        short_probe, short_steps = nodes._debug_preflight_sigmas(sigmas[:3])
+        self.assertEqual(short_steps, 2)
+        self.assertTrue(torch.equal(short_probe, sigmas[:3]))
+
+    def test_debug_memory_preflight_payload_matches_continuation_geometry(self):
+        video = torch.zeros((1, 24, nodes._video_steps(56), 68, 120))
+        audio = torch.zeros((1, 32, nodes._audio_steps(56)))
+
+        payload = nodes._debug_preflight_continuation_payload(
+            video,
+            audio,
+            22,
+            "0.30mp (736x416)",
+            1920,
+            1088,
+        )
+
+        self.assertEqual(
+            payload["reference_video"].shape,
+            (1, 24, nodes._video_steps(22), 416 // 16, 736 // 16),
+        )
+        self.assertEqual(payload["full_reference_video"].shape, (1, 24, nodes._video_steps(22), 68, 120))
+        self.assertEqual(payload["reference_audio"].shape[-1], nodes._audio_steps(22))
+        self.assertEqual(payload["boundary_video"].shape[2], nodes._video_steps(5))
+        self.assertEqual(len(payload["qwen_items"]), 2)
+        self.assertEqual(payload["qwen_items"][1]["data"].shape[0], 2)
+
+        full_payload = nodes._debug_preflight_continuation_payload(
+            video,
+            audio,
+            22,
+            "full",
+            1920,
+            1088,
+        )
+        self.assertIs(full_payload["full_reference_video"], full_payload["reference_video"])
+
+    def test_debug_memory_preflight_cleanup_forces_model_and_allocator_release(self):
+        patcher_a = object()
+        patcher_b = object()
+        backend = unittest.mock.MagicMock()
+        with patch.object(nodes, "_memory_backend", return_value=backend), \
+                patch.object(nodes.comfy.model_management, "unload_model_and_clones") as unload, \
+                patch.object(nodes.comfy.model_management, "soft_empty_cache") as empty, \
+                patch.object(nodes.gc, "collect") as collect:
+            nodes._release_debug_preflight(torch.device("cuda:0"), patcher_a, None, patcher_b)
+
+        self.assertEqual(unload.call_args_list, [unittest.mock.call(patcher_a), unittest.mock.call(patcher_b)])
+        empty.assert_called_once_with(force=True)
+        backend.synchronize.assert_called_once_with(torch.device("cuda:0"))
+        backend.empty_cache.assert_called_once_with()
+        self.assertEqual(collect.call_count, 2)
 
     def test_debug_redraw_leaves_sampling_steps_after_chunk_bar(self):
         refreshed = []

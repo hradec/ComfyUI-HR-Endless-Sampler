@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import json
 import logging
@@ -39,7 +40,26 @@ AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
 MIN_VIDEO_STEPS = 2
 CANVAS_MULTIPLE = 32
-QWEN_VIDEO_MAX_PIXELS = 512 * 512
+H3_REFERENCE_VIDEO_SHORT_EDGE = 768
+H3_REFERENCE_VIDEO_MAX_PIXELS = 768 * 1344
+VIDEO_CONTINUATION_RESOLUTIONS = (
+    "full",
+    "0.98mp (1344x768 native)",
+    "0.90mp (1280x736)",
+    "0.80mp (1216x672)",
+    "0.70mp (1152x640)",
+    "0.60mp (1056x608)",
+    "0.50mp (960x544)",
+    "0.40mp (864x480)",
+    "0.30mp (736x416)",
+    "0.20mp (608x352)",
+    "0.10mp (448x256)",
+)
+VIDEO_CONTINUATION_CANVASES = {
+    label: tuple(int(value) for value in re.search(r"\((\d+)x(\d+)", label).groups())
+    for label in VIDEO_CONTINUATION_RESOLUTIONS[1:]
+}
+DEFAULT_PYTORCH_MEMORY_FRACTION = 0.85
 VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
 # Set this to False only for the isolation experiment that retains the
 # five-frame visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
@@ -49,7 +69,7 @@ GEMMA_PROMPT_LOG_DIRNAME = "comfyui-hr-endless-sampler"
 GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
-REPLAY_CACHE_FORMAT = 1
+REPLAY_CACHE_FORMAT = 2
 DETAILED_DESCRIPTION_FIELD = re.compile(r"detailed_description\s*:", re.IGNORECASE)
 INTEGRATED_DESCRIPTION_FIELD = re.compile(r"integrated_multimodal_description\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
@@ -65,7 +85,7 @@ def _description_field(prompt, start=0):
 
 
 def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
-                                 video_continuation, fps, chunk_count,
+                                 video_continuation, video_continuation_res, fps, chunk_count,
                                  cache_gemma_preproduction=False,
                                  gemma4_mtp=False):
     """Replace the fixed temp capture so it always represents the latest run."""
@@ -77,6 +97,7 @@ def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
             f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
             f"Configuration: chunk_frames={chunk_frames}, context_keyframes={context_keyframes}, "
             f"guide_overlap={guide_overlap}, video_continuation={video_continuation}, "
+            f"video_continuation_res={video_continuation_res}, "
             f"fps={fps:g}, chunks={chunk_count}, "
             f"cache_gemma_preproduction={bool(cache_gemma_preproduction)}, "
             f"gemma4_mtp={bool(gemma4_mtp)}\n\n",
@@ -226,7 +247,8 @@ def _replay_plan_signature(plan):
 
 
 def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
-                        context_keyframes, guide_overlap, video_continuation, ref2va):
+                        context_keyframes, guide_overlap, video_continuation,
+                        video_continuation_res, ref2va):
     """Describe the immutable tensor/layout inputs required for an exact replay.
 
     The source prompt intentionally is not part of this signature: editing it
@@ -243,6 +265,7 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
         "context_keyframes": int(context_keyframes),
         "guide_overlap": int(guide_overlap),
         "video_continuation": int(video_continuation),
+        "video_continuation_res": str(video_continuation_res),
         "ref2va": bool(ref2va),
         "plan": _replay_plan_signature(plan),
     }
@@ -286,10 +309,33 @@ class _LastRunReplayCache:
             "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "fingerprint": fingerprint,
             "source_prompt_sha256": hashlib.sha256(source_prompt.encode("utf-8")).hexdigest(),
+            "status": "recording",
+            "completed_chunks": 0,
         }
         _replay_write_json(self.manifest_path, manifest)
         _replay_write_tensor_file(self.initial_path, initial_tensors)
         logging.info("HR Endless Sampler is recording replay state in %s", self.root)
+
+    def _update_manifest(self, **changes):
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"could not update replay manifest: {error}") from error
+        manifest.update(changes)
+        _replay_write_json(self.manifest_path, manifest)
+
+    @staticmethod
+    def automatic_resume_chunk(manifest, chunk_count):
+        """Return the next chunk only for an incomplete ordinary render."""
+        if manifest.get("status") not in {"recording", "interrupted"}:
+            return None
+        try:
+            completed = int(manifest.get("completed_chunks", -1))
+        except (TypeError, ValueError):
+            return None
+        if completed < 0 or completed >= int(chunk_count):
+            return None
+        return completed + 1
 
     def load_if_compatible(self, fingerprint):
         try:
@@ -321,15 +367,30 @@ class _LastRunReplayCache:
     def save_timing_plan(self, timing_plan, *, source_prompt=None):
         _replay_write_json(self.timing_path, _timing_plan_payload(timing_plan))
         if source_prompt is not None:
-            try:
-                manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise RuntimeError(f"could not update replay source-prompt hash: {error}") from error
-            manifest["source_prompt_sha256"] = hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
-            _replay_write_json(self.manifest_path, manifest)
+            self._update_manifest(
+                source_prompt_sha256=hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
+            )
 
     def save_chunk(self, chunk_number, state):
         _replay_write_tensor_file(self.chunk_path(chunk_number), state)
+        self._update_manifest(status="recording", completed_chunks=int(chunk_number))
+
+    def begin_from(self, chunk_number):
+        """Mark a restored cache as actively recording its rerun suffix."""
+        self._update_manifest(status="recording", completed_chunks=max(0, int(chunk_number) - 1))
+
+    def mark_interrupted(self, completed_chunks):
+        self._update_manifest(
+            status="interrupted",
+            completed_chunks=max(0, int(completed_chunks)),
+            interrupted=time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        )
+
+    def mark_debug_stop(self, completed_chunks):
+        self._update_manifest(status="debug_stop", completed_chunks=max(0, int(completed_chunks)))
+
+    def mark_complete(self, completed_chunks):
+        self._update_manifest(status="complete", completed_chunks=max(0, int(completed_chunks)))
 
     def truncate_from(self, chunk_number):
         directory = self.root / "chunks"
@@ -655,7 +716,14 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
                 # occurs after carried physical-prefix frames, the implied
                 # continuing source material is local Shot 1 and the new
                 # source shot is explicitly local Shot 2 at that real cut.
-                if shot_start == sampled_start:
+                # A real cut that falls entirely inside a discarded physical
+                # packing prefix has already been established by the opening
+                # Video1/keyframe context. Repeating it in H3 prose creates a
+                # second cut in retained output. Marker ownership therefore
+                # begins at the retained range, not merely sampled_start.
+                if shot_start < range_start:
+                    required_marker = None
+                elif shot_start == sampled_start:
                     required_marker = "[Shot 1]"
                 elif shot_start > sampled_start:
                     required_marker = f"[Shot 2] At {_frame_timestamp(shot_start - sampled_start, fps)},"
@@ -731,8 +799,35 @@ def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, 
     return "; ".join(sources) if sources else "No fixed opening frames or native Video/Audio continuation reference."
 
 
+def _last_seen_retention_lines(description, last_seen_character_state):
+    """Expose only current subjects' persistent observed state to H3."""
+    lines = []
+    for item in last_seen_character_state or ():
+        if not isinstance(item, dict) or item.get("last_seen_global_frame") is None:
+            continue
+        subject = str(item.get("subject") or "").strip()
+        name = str(item.get("character_name") or "").strip()
+        if not subject or re.search(re.escape(subject), description, re.IGNORECASE) is None:
+            continue
+        facts = []
+        for field in ("environment", "pose_and_position", "state_and_action", "spatial_relationships"):
+            value = str(item.get(field) or "").strip()
+            if value and value.casefold() not in {"unknown", "not yet observed in generated video"}:
+                facts.append(value.rstrip(". "))
+        if not facts:
+            continue
+        label = f"{name} ({subject})" if name else subject
+        lines.append(
+            f"{label}: fully_preserved - continuity entering this chunk from the last rendered appearance: "
+            + "; ".join(facts)
+            + ". Preserve this established physical state and environment unless detailed_description explicitly changes it."
+        )
+    return lines
+
+
 def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=False,
-                                   continuation_video_label=None, continuation_audio_label=None):
+                                   continuation_video_label=None, continuation_audio_label=None,
+                                   last_seen_character_state=()):
     if drop_picture_anchors:
         prompt = _drop_picture_anchors(prompt)
     field = _description_field(prompt)
@@ -747,6 +842,28 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
     else:
         replace_start = description_start
     rewritten = prompt[:replace_start] + " " + description.strip() + " " + prompt[description_end:]
+    retention_lines = _last_seen_retention_lines(description, last_seen_character_state)
+    if retention_lines:
+        retention = RETENTION_FIELD.search(rewritten)
+        description_field = _description_field(
+            rewritten,
+            retention.end() if retention is not None else 0,
+        )
+        insert_at = description_field.start() if description_field is not None else len(rewritten)
+        continuity_block = (
+            "Gemma last-seen continuity state relevant to this chunk:\n"
+            + "\n".join(retention_lines)
+        )
+        if retention is not None:
+            rewritten = rewritten[:insert_at].rstrip() + "\n" + continuity_block + "\n\n" + rewritten[insert_at:].lstrip()
+        else:
+            rewritten = (
+                rewritten[:insert_at].rstrip()
+                + "\n\nretention_analysis:\n"
+                + continuity_block
+                + "\n\n"
+                + rewritten[insert_at:].lstrip()
+            )
     if continuation_video_label is not None:
         rewritten = _video_continuation_prompt(
             rewritten,
@@ -763,13 +880,14 @@ def _gemma_report(chunk_number, result):
         f"progress summary: {result.analysis or 'none'}\n"
         f"timing plan: {result.timing_plan or 'none'}\n"
         f"Gemma-only end state: {result.end_state or 'none'}\n"
+        "Gemma-only last-seen character state:\n"
+        f"{json.dumps(list(result.last_seen_character_state), ensure_ascii=False, indent=2)}\n"
         f"H3 detailed_description: {result.detailed_description}\n"
         f"Gemma JSON attempts:\n{_gemma_response_transcript(result)}"
     )
     if len(result.attempts) > 1:
         report += (
-            f"\nGemma chunk-contract correction: attempt 1 had local-marker or current-slice coverage validation errors; "
-            f"H3 uses Gemma's attempt {len(result.attempts)} response."
+            f"\nGemma response repair/correction: H3 uses Gemma's attempt {len(result.attempts)} response."
         )
     if result.validation_warnings:
         report += "\nvalidation warnings:\n- " + "\n- ".join(result.validation_warnings)
@@ -826,6 +944,34 @@ def _reference_image(image, width, height):
     target_width = max(CANVAS_MULTIPLE, round(source_width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
     target_height = max(CANVAS_MULTIPLE, round(source_height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
     return _resize(image, target_width, target_height, "disabled")
+
+
+def _reference_video_canvas(width, height):
+    """Match ComfyUI's native MiniMax H3 reference-video presentation.
+
+    H3 reference videos use a 768-pixel nominal short edge with a 768x1344
+    area cap, aligned to 32 pixels. Smaller sources are never enlarged. This
+    keeps internally generated Video1 frames equivalent to videos supplied to
+    the stock H3 Ref2VA conditioning node instead of applying an undocumented
+    lower-resolution sampler-only path.
+    """
+    ratio = width / height
+    if ratio >= 1.0:
+        nominal_width = H3_REFERENCE_VIDEO_SHORT_EDGE * ratio
+        nominal_height = H3_REFERENCE_VIDEO_SHORT_EDGE
+    else:
+        nominal_width = H3_REFERENCE_VIDEO_SHORT_EDGE
+        nominal_height = H3_REFERENCE_VIDEO_SHORT_EDGE / ratio
+    if nominal_width * nominal_height > H3_REFERENCE_VIDEO_MAX_PIXELS:
+        scale = math.sqrt(H3_REFERENCE_VIDEO_MAX_PIXELS / (nominal_width * nominal_height))
+        nominal_width *= scale
+        nominal_height *= scale
+    target_width = max(CANVAS_MULTIPLE, round(nominal_width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    target_height = max(CANVAS_MULTIPLE, round(nominal_height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    if width * height < target_width * target_height:
+        target_width = max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        target_height = max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    return target_width, target_height
 
 
 def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items=()):
@@ -990,6 +1136,17 @@ def _decode_video_frames(vae, latent):
 
 def _decoded_video_frames(vae, latent, include_final=False, start_frame=0, return_final_frame=False):
     frames = _decode_video_frames(vae, latent)
+    result = _sample_decoded_video_frames(
+        frames,
+        include_final=include_final,
+        start_frame=start_frame,
+        return_final_frame=return_final_frame,
+    )
+    return result
+
+
+def _sample_decoded_video_frames(frames, include_final=False, start_frame=0, return_final_frame=False):
+    """Create the stock-resolution 2 FPS Qwen/Gemma presentation from decoded frames."""
     final_frame = frames[-1:].detach().to(device="cpu", copy=True) if return_final_frame else None
     start_frame = max(0, min(int(start_frame), frames.shape[0]))
     sample_indices = list(range(start_frame, frames.shape[0], VIDEO_FPS // 2))
@@ -997,10 +1154,8 @@ def _decoded_video_frames(vae, latent, include_final=False, start_frame=0, retur
         sample_indices.append(frames.shape[0] - 1)
     sampled_frames = frames[sample_indices]
     height, width = sampled_frames.shape[1:3]
-    if height * width > QWEN_VIDEO_MAX_PIXELS:
-        scale = math.sqrt(QWEN_VIDEO_MAX_PIXELS / (height * width))
-        target_width = max(CANVAS_MULTIPLE, round(width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-        target_height = max(CANVAS_MULTIPLE, round(height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    target_width, target_height = _reference_video_canvas(width, height)
+    if (target_width, target_height) != (width, height):
         sampled_frames = _resize(sampled_frames, target_width, target_height, "disabled")
     if return_final_frame:
         return sampled_frames, sample_indices, final_frame
@@ -1008,12 +1163,54 @@ def _decoded_video_frames(vae, latent, include_final=False, start_frame=0, retur
 
 
 def _decoded_video_item(vae, latent):
-    qwen_frames, sample_indices = _decoded_video_frames(vae, latent)
+    return _decoded_video_item_from_frames(_decode_video_frames(vae, latent))
+
+
+def _decoded_video_item_from_frames(frames):
+    qwen_frames, sample_indices = _sample_decoded_video_frames(frames)
     return {
         "type": "video",
         "data": qwen_frames,
         "timestamps": [index / 2.0 for index in range(len(sample_indices))],
     }
+
+
+def _continuation_reference_canvas(video_continuation_res, source_width, source_height):
+    """Resolve the selected H3 reference canvas without enlarging the source."""
+    if video_continuation_res == "full":
+        return source_width, source_height
+    try:
+        target_width, target_height = VIDEO_CONTINUATION_CANVASES[video_continuation_res]
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown video_continuation_res {video_continuation_res!r}; choose one of "
+            + ", ".join(VIDEO_CONTINUATION_RESOLUTIONS)
+        ) from error
+    if source_height > source_width:
+        target_width, target_height = target_height, target_width
+    if source_width * source_height <= target_width * target_height:
+        return source_width, source_height
+    return target_width, target_height
+
+
+def _encode_resized_continuation_reference(vae, decoded_frames, video_continuation_res):
+    """VAE-encode a smaller pixel-space Video1 while preserving its full timeline."""
+    source_height, source_width = decoded_frames.shape[1:3]
+    target_width, target_height = _continuation_reference_canvas(
+        video_continuation_res,
+        source_width,
+        source_height,
+    )
+    if (target_width, target_height) == (source_width, source_height):
+        return None, (source_width, source_height)
+    resized_frames = _resize(decoded_frames, target_width, target_height, "disabled")
+    try:
+        reference_latent = vae.encode(resized_frames)
+    finally:
+        del resized_frames
+    if reference_latent.ndim != 5 or reference_latent.shape[1] != 24:
+        raise ValueError("MiniMax H3 continuation VAE encode did not return a 24-channel video latent")
+    return reference_latent, (target_width, target_height)
 
 
 def _video_ref_block(latent, audio_latent=None):
@@ -1027,6 +1224,178 @@ def _video_ref_block(latent, audio_latent=None):
         "latent": latent,
         "audio_latent": audio_latent,
     }
+
+
+def _continuation_payload_metrics(reference_latent, reference_audio, boundary_latent,
+                                  target_video, target_audio, full_reference_video):
+    """Measure raw conditioning tensors and the packed rows that drive H3 cost."""
+    def tensor_bytes(value):
+        return 0 if value is None else value.numel() * value.element_size()
+
+    def video_rows(value):
+        if value is None:
+            return 0
+        return int(value.shape[2]) * (int(value.shape[3]) // 2) * (int(value.shape[4]) // 2)
+
+    def audio_rows(value):
+        return 0 if value is None else int(value.shape[-1]) * 2
+
+    reference_video_rows = video_rows(reference_latent)
+    reference_audio_rows = audio_rows(reference_audio)
+    boundary_rows = video_rows(boundary_latent)
+    target_rows = video_rows(target_video) + audio_rows(target_audio)
+    full_reference_rows = video_rows(full_reference_video)
+    return {
+        "video_bytes": tensor_bytes(reference_latent),
+        "audio_bytes": tensor_bytes(reference_audio),
+        "boundary_bytes": tensor_bytes(boundary_latent),
+        "total_bytes": tensor_bytes(reference_latent) + tensor_bytes(reference_audio) + tensor_bytes(boundary_latent),
+        "video_rows": reference_video_rows,
+        "audio_rows": reference_audio_rows,
+        "boundary_rows": boundary_rows,
+        "total_rows": reference_video_rows + reference_audio_rows + boundary_rows,
+        "target_rows": target_rows,
+        "full_reference_rows": full_reference_rows,
+    }
+
+
+def _log_continuation_payload(chunk_number, chunk_count, preset, reference_latent,
+                              reference_audio, boundary_latent, target_video,
+                              target_audio, full_reference_video):
+    metrics = _continuation_payload_metrics(
+        reference_latent,
+        reference_audio,
+        boundary_latent,
+        target_video,
+        target_audio,
+        full_reference_video,
+    )
+    mib = 1024 ** 2
+    full_fraction = (
+        100.0 * metrics["video_rows"] / metrics["full_reference_rows"]
+        if metrics["full_reference_rows"] else 0.0
+    )
+    target_fraction = (
+        100.0 * metrics["total_rows"] / metrics["target_rows"]
+        if metrics["target_rows"] else 0.0
+    )
+    boundary_shape = "none" if boundary_latent is None else str(tuple(boundary_latent.shape))
+    audio_shape = "none" if reference_audio is None else str(tuple(reference_audio.shape))
+    logging.info(
+        "HR Endless Sampler chunk %d/%d Video1 H3 payload [%s]:\n"
+        "  video: shape=%s, raw=%0.3f MiB, packed_rows=%d (%0.1f%% of full-resolution Video1 rows=%d)\n"
+        "  audio: shape=%s, raw=%0.3f MiB, packed_rows=%d\n"
+        "  full-resolution boundary keyframe: shape=%s, raw=%0.3f MiB, packed_rows=%d\n"
+        "  total continuation conditioning: raw=%0.3f MiB, packed_rows=%d (%0.1f%% of target AV rows=%d)\n"
+        "  Note: raw payload is small; packed rows drive the much larger per-layer attention/activation allocation.",
+        chunk_number,
+        chunk_count,
+        preset,
+        tuple(reference_latent.shape),
+        metrics["video_bytes"] / mib,
+        metrics["video_rows"],
+        full_fraction,
+        metrics["full_reference_rows"],
+        audio_shape,
+        metrics["audio_bytes"] / mib,
+        metrics["audio_rows"],
+        boundary_shape,
+        metrics["boundary_bytes"] / mib,
+        metrics["boundary_rows"],
+        metrics["total_bytes"] / mib,
+        metrics["total_rows"],
+        target_fraction,
+        metrics["target_rows"],
+    )
+
+
+def _debug_preflight_sigmas(sigmas, maximum_steps=3):
+    """Return a short, truthful prefix of the configured sampling schedule."""
+    step_count = min(max(0, int(maximum_steps)), max(0, int(sigmas.shape[-1]) - 1))
+    return sigmas[..., :step_count + 1], step_count
+
+
+def _debug_preflight_continuation_payload(video, audio, continuation_frames,
+                                          video_continuation_res, width, height):
+    """Build shape-faithful black continuation data for the debug VRAM probe.
+
+    The values are intentionally meaningless; only the temporal/spatial rows,
+    synchronized audio span, Qwen presentation, and five-frame boundary anchor
+    need to match a real continuation chunk for its allocation behavior.
+    """
+    reference_t = _video_steps(continuation_frames)
+    reference_audio_t = _audio_steps(continuation_frames)
+    target_width, target_height = _continuation_reference_canvas(
+        video_continuation_res,
+        width,
+        height,
+    )
+    reference_video = video.new_zeros(
+        (video.shape[0], video.shape[1], reference_t, target_height // 16, target_width // 16)
+    )
+    if reference_video.shape[3:] == video.shape[3:]:
+        # The real full-resolution path aliases these names to the same latent;
+        # do not accidentally make the debug probe one reference more costly.
+        full_reference_video = reference_video
+    else:
+        full_reference_video = video.new_zeros(
+            (video.shape[0], video.shape[1], reference_t, video.shape[3], video.shape[4])
+        )
+    reference_audio = audio.new_zeros((*audio.shape[:-1], reference_audio_t))
+    boundary_video = video.new_zeros(
+        (video.shape[0], video.shape[1], _video_steps(5), video.shape[3], video.shape[4])
+    )
+
+    # A real Video1 is decoded in full, then sparsely presented to Qwen at 2
+    # FPS. Construct only those retained presentation frames: the discarded
+    # intermediate decoded frames do not survive into H3 sampling.
+    qwen_frame_count = len(range(0, continuation_frames, VIDEO_FPS // 2))
+    qwen_width, qwen_height = _reference_video_canvas(width, height)
+    qwen_frames = torch.zeros(
+        (qwen_frame_count, qwen_height, qwen_width, 3),
+        dtype=torch.float32,
+        device=video.device,
+    )
+    qwen_video_item = {
+        "type": "video",
+        "data": qwen_frames,
+        "timestamps": [index / 2.0 for index in range(qwen_frame_count)],
+    }
+    return {
+        "reference_video": reference_video,
+        "full_reference_video": full_reference_video,
+        "reference_audio": reference_audio,
+        "boundary_video": boundary_video,
+        "qwen_items": [{"type": "audio"}, qwen_video_item],
+    }
+
+
+def _allocator_active_reserved(device):
+    backend = _memory_backend(device)
+    if backend is None:
+        return 0, 0
+    if device.type == "cuda":
+        backend.synchronize(device)
+    stats = backend.memory_stats(device)
+    return (
+        int(stats.get("active_bytes.all.current", stats.get("allocated_bytes.all.current", 0))),
+        int(stats.get("reserved_bytes.all.current", 0)),
+    )
+
+
+def _release_debug_preflight(device, *patchers):
+    """Drop every disposable preflight owner and flush reclaimable VRAM."""
+    for patcher in patchers:
+        if patcher is not None:
+            comfy.model_management.unload_model_and_clones(patcher)
+    gc.collect()
+    comfy.model_management.soft_empty_cache(force=True)
+    backend = _memory_backend(device)
+    if backend is not None:
+        if device.type == "cuda":
+            backend.synchronize(device)
+            backend.empty_cache()
+        gc.collect()
 
 
 def _tensor_bytes(value, device):
@@ -1047,6 +1416,56 @@ def _memory_backend(device):
     if device.type in ("xpu", "npu", "mlu"):
         return getattr(torch, device.type)
     return None
+
+
+def _set_pytorch_memory_fraction(fraction, device):
+    """Apply an explicit process-wide PyTorch CUDA allocator ceiling."""
+    fraction = float(fraction)
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("pytorch_memory_fraction must be greater than 0 and at most 1.0")
+    if not torch.cuda.is_available():
+        logging.info(
+            "HR Endless Sampler PyTorch memory fraction %.2f was not applied because CUDA is unavailable.",
+            fraction,
+        )
+        return None
+
+    cuda_device = torch.device(device)
+    if cuda_device.type != "cuda":
+        logging.info(
+            "HR Endless Sampler PyTorch memory fraction %.2f was not applied to non-CUDA device %s.",
+            fraction,
+            cuda_device,
+        )
+        return None
+    if cuda_device.index is None:
+        cuda_device = torch.device("cuda", torch.cuda.current_device())
+
+    try:
+        torch.cuda.set_per_process_memory_fraction(fraction, device=cuda_device)
+    except (RuntimeError, ValueError) as error:
+        raise RuntimeError(
+            f"Could not set PyTorch CUDA memory fraction to {fraction:.2f} on {cuda_device}: {error}"
+        ) from error
+
+    total_bytes = int(torch.cuda.get_device_properties(cuda_device).total_memory)
+    allocator_backend = torch.cuda.get_allocator_backend()
+    logging.info(
+        "HR Endless Sampler PyTorch CUDA allocator limit: %.1f%% on %s "
+        "(%.2f GiB of %.2f GiB, backend=%s).",
+        fraction * 100.0,
+        cuda_device,
+        total_bytes * fraction / (1024 ** 3),
+        total_bytes / (1024 ** 3),
+        allocator_backend,
+    )
+    return {
+        "fraction": fraction,
+        "device": str(cuda_device),
+        "limit_bytes": int(total_bytes * fraction),
+        "total_bytes": total_bytes,
+        "backend": allocator_backend,
+    }
 
 
 def _vram_report(stage, device, components=(), tensors=None):
@@ -1142,9 +1561,18 @@ class _VRAMMonitor:
         self.debug = debug
         self.chunk = 0
         self.call = 0
+        self.scope = None
 
     def set_chunk(self, index):
         self.chunk = index
+        self.call = 0
+        self.scope = None
+        backend = _memory_backend(self.device)
+        if self.debug and self.device.type == "cuda" and backend is not None:
+            backend.reset_peak_memory_stats(self.device)
+
+    def set_scope(self, label):
+        self.scope = str(label) if label else None
         self.call = 0
         backend = _memory_backend(self.device)
         if self.debug and self.device.type == "cuda" and backend is not None:
@@ -1158,7 +1586,8 @@ class _VRAMMonitor:
 
     def __call__(self, executor, x, t, c_concat=None, c_crossattn=None, control=None, transformer_options=None, **kwargs):
         self.call += 1
-        label = f"chunk {self.chunk + 1}/{self.chunk_count} DiT evaluation {self.call}"
+        scope = self.scope or f"chunk {self.chunk + 1}/{self.chunk_count}"
+        label = f"{scope} DiT evaluation {self.call}"
         tensors = {"model input": x, "cross attention": c_crossattn, "model conditions": kwargs}
         self.report(label + " before", tensors, sample_group="dit")
         try:
@@ -1179,6 +1608,172 @@ class _FixedNoise:
 
     def generate_noise(self, _latent):
         return self.samples
+
+
+def _run_debug_memory_preflight(*, guider, sampler, sigmas, chunk_latent, chunk_noise,
+                                clip, vae, images, positive, original_conds, chunk_prompt,
+                                chunk_seed, video, audio, continuation_frames,
+                                video_continuation_res, video_number, audio_number,
+                                width, height, chunk_count, vram_monitor=None,
+                                preview_execution=None):
+    """Probe continuation-chunk VRAM with three disposable denoising steps."""
+    preflight_sigmas, preflight_steps = _debug_preflight_sigmas(sigmas, 3)
+    if preflight_steps == 0:
+        logging.info("HR Endless Sampler debug VRAM preflight skipped: the sigma schedule has no steps.")
+        return
+
+    device = guider.model_patcher.load_device
+    baseline_active, baseline_reserved = _allocator_active_reserved(device)
+    mib = 1024 ** 2
+    payload = None
+    preflight_encoded = None
+    preflight_conds = None
+    preflight_refs = []
+    preflight_result = None
+    simulated_completed_output = None
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_state = None
+    if device.type == "cuda" and torch.cuda.is_available():
+        cuda_rng_state = torch.cuda.get_rng_state(device)
+
+    phase = (
+        f"Debug VRAM preflight: simulating a continuation chunk for {preflight_steps} steps "
+        f"with {continuation_frames} Video1 frames"
+    )
+    logging.info("HR Endless Sampler: %s.", phase)
+    if preview_execution is not None:
+        preview_execution.set_phase(phase, chunk=0)
+    if vram_monitor is not None:
+        vram_monitor.set_scope("debug VRAM preflight")
+
+    try:
+        payload = _debug_preflight_continuation_payload(
+            video,
+            audio,
+            continuation_frames,
+            video_continuation_res,
+            width,
+            height,
+        )
+        video_label = f"<Video {video_number}>"
+        audio_label = f"<Audio {audio_number}>"
+        preflight_prompt = _video_continuation_prompt(chunk_prompt, video_label, audio_label)
+        preflight_encoded = _encode_prompt(
+            clip,
+            preflight_prompt,
+            images,
+            positive,
+            width,
+            height,
+            True,
+            payload["qwen_items"],
+        )
+        payload["qwen_items"].clear()
+        comfy.model_management.unload_model_and_clones(clip.patcher)
+        if vae is not None:
+            comfy.model_management.unload_model_and_clones(vae.patcher)
+        comfy.model_management.soft_empty_cache(force=True)
+
+        preflight_refs.append(
+            _video_ref_block(payload["reference_video"], payload["reference_audio"])
+        )
+        target_video, target_audio = chunk_latent["samples"].unbind()
+        intermediate_device = comfy.model_management.intermediate_device()
+        simulated_completed_output = (
+            torch.empty_like(target_video, device=intermediate_device),
+            torch.empty_like(target_audio, device=intermediate_device),
+            torch.empty_like(target_video, device=intermediate_device),
+            torch.empty_like(target_audio, device=intermediate_device),
+        )
+        preflight_conds = _conditioning_for_chunk(
+            original_conds,
+            0,
+            _pixel_frames(chunk_latent["samples"].unbind()[0].shape[2]),
+            preflight_encoded,
+            video_context=payload["boundary_video"],
+            video_refs=preflight_refs,
+            video_context_start=0,
+        )
+        guider.original_conds = preflight_conds
+        _log_continuation_payload(
+            2,
+            chunk_count,
+            f"debug preflight/{video_continuation_res}",
+            payload["reference_video"],
+            payload["reference_audio"],
+            payload["boundary_video"],
+            *chunk_latent["samples"].unbind(),
+            payload["full_reference_video"],
+        )
+        payload["full_reference_video"] = None
+        if vram_monitor is not None:
+            vram_monitor.report(
+                "debug VRAM preflight immediately before sampler",
+                {
+                    "chunk latent": chunk_latent,
+                    "chunk noise": chunk_noise,
+                    "conditioning": preflight_conds,
+                    "simulated completed output": simulated_completed_output,
+                },
+            )
+
+        preflight_result = guider.sample(
+            chunk_noise,
+            chunk_latent["samples"],
+            sampler,
+            preflight_sigmas,
+            denoise_mask=None,
+            callback=None,
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+            seed=chunk_seed,
+        )
+        active, reserved = _allocator_active_reserved(device)
+        backend = _memory_backend(device)
+        stats = {} if backend is None else backend.memory_stats(device)
+        peak_active = int(stats.get("active_bytes.all.peak", active))
+        peak_reserved = int(stats.get("reserved_bytes.all.peak", reserved))
+        logging.info(
+            "HR Endless Sampler debug VRAM preflight passed: %d/%d steps; "
+            "peak %.1f MiB active, %.1f MiB reserved. Discarding the simulation before Chunk 1.",
+            preflight_steps,
+            max(0, int(sigmas.shape[-1]) - 1),
+            peak_active / mib,
+            peak_reserved / mib,
+        )
+    finally:
+        guider.original_conds = original_conds
+        preflight_result = None
+        simulated_completed_output = None
+        preflight_conds = None
+        preflight_encoded = None
+        preflight_refs.clear()
+        if payload is not None:
+            payload.clear()
+        payload = None
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, device)
+        _release_debug_preflight(
+            device,
+            guider.model_patcher,
+            clip.patcher,
+            vae.patcher if vae is not None else None,
+        )
+        post_active, post_reserved = _allocator_active_reserved(device)
+        active_delta = post_active - baseline_active
+        reserved_delta = post_reserved - baseline_reserved
+        message = (
+            "HR Endless Sampler debug VRAM preflight cleanup: "
+            f"active {post_active / mib:.1f} MiB ({active_delta / mib:+.1f} MiB vs baseline), "
+            f"reserved {post_reserved / mib:.1f} MiB ({reserved_delta / mib:+.1f} MiB vs baseline)."
+        )
+        if active_delta > 16 * mib:
+            logging.warning("%s Disposable allocations remain above baseline.", message)
+        else:
+            logging.info("%s Disposable allocations were released.", message)
+        if vram_monitor is not None:
+            vram_monitor.set_chunk(0)
+            vram_monitor.report("after debug VRAM preflight cleanup")
 
 
 class _ChunkProgress:
@@ -1344,7 +1939,7 @@ class _SamplerTiming:
         ("Qwen encode/tokenize", "qwen"),
         ("Gemma 4", "gemma4"),
         ("VAE decode: previous chunk for Gemma", "vae_previous_chunk"),
-        ("VAE continuation decode", "vae_context"),
+        ("VAE continuation decode/resize/encode", "vae_context"),
         ("VAE decode: Qwen full history", "vae_history"),
     )
 
@@ -1591,7 +2186,9 @@ class _SamplerTiming:
         rendered = "none" if rendered_frames <= 0 else f"frames 0-{rendered_frames - 1}"
         configuration = (
             f"chunk_frames={run['chunk_frames']}, context_keyframes={run['context_keyframes']}, "
-            f"guide_overlap={run['guide_overlap']}, video_continuation={run['video_continuation']}"
+            f"guide_overlap={run['guide_overlap']}, video_continuation={run['video_continuation']}, "
+            f"video_continuation_res={run.get('video_continuation_res', 'full')}, "
+            f"pytorch_memory_fraction={run.get('pytorch_memory_fraction', 1.0):.2f}"
         )
         lines = [
             "HR Endless Sampler run report:",
@@ -1690,20 +2287,44 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Maximum frames sampled at once. MiniMax H3 values are snapped down to its 17k+5 frame grid."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
-                io.Int.Input("video_continuation", default=5, min=5, max=3600, step=17,
+                io.Int.Input("video_continuation", default=22, min=5, max=3600, step=17,
                              tooltip="Completed continuation tail length. MiniMax H3 currently uses the synchronized Ref2VA <Audio N> + <Video N> continuation path; values at or above chunk_frames are clamped to the effective chunk size."),
+                io.Combo.Input(
+                    "video_continuation_res",
+                    options=list(VIDEO_CONTINUATION_RESOLUTIONS),
+                    default="full",
+                    tooltip=(
+                        "Spatial resolution of the H3 Video1 continuation reference. full preserves the generated "
+                        "latent exactly. Smaller choices decode, resize, and VAE-encode only Video1 before H3 "
+                        "sampling, reducing reference attention/VRAM so more frames may fit in chunk_frames. "
+                        "Qwen and Gemma keep the normal native H3 reference-video presentation resolution."
+                    ),
+                ),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
                                  tooltip="Use native Gemma 4 draft-MTP with four speculative tokens. Disable it to compare against the original non-MTP decoder."),
+                io.Float.Input(
+                    "pytorch_memory_fraction",
+                    default=DEFAULT_PYTORCH_MEMORY_FRACTION,
+                    min=0.50,
+                    max=1.0,
+                    step=0.01,
+                    tooltip=(
+                        "Global PyTorch CUDA allocator limit applied when this sampler starts. 0.85 reserves "
+                        "15% of VRAM outside PyTorch so cached memory is pressured before a driver-level OOM. "
+                        "The setting remains active for the ComfyUI process until another run changes it; "
+                        "set 1.0 for the normal unrestricted allocator limit."
+                    ),
+                ),
                 io.Boolean.Input("debug", default=False,
-                                 tooltip="Log every chunk prompt and detailed VRAM snapshots to the console. chunk_prompts is returned whether debug is enabled or not."),
+                                 tooltip="Log every chunk prompt and detailed VRAM snapshots. Before a multi-chunk render, also run a disposable three-step continuation preflight to test the expected Chunk 2 memory footprint, then unload it completely. chunk_prompts is returned whether debug is enabled or not."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Int.Input("debug_start_chunk", default=0, min=0, max=10000, step=1,
-                             tooltip="Replay from this 1-based chunk using the temporary last-run cache. The first nonzero run records chunks from 1; 0 clears that cache on the next run."),
+                             tooltip="Resume or rerun from this 1-based chunk using the automatically recorded last-run recovery cache. Leave this at 0 to automatically continue a compatible interrupted render; nonzero forces a specific chunk for debugging."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -1720,10 +2341,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=5, vae=None, cache_gemma_preproduction=False,
+                video_continuation=22, video_continuation_res="full", vae=None, cache_gemma_preproduction=False,
                 gemma4_mtp=True,
+                pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
                 **_deprecated_inputs):
+        _set_pytorch_memory_fraction(pytorch_memory_fraction, guider.model_patcher.load_device)
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
         # serialized legacy values too: an old workflow must not quietly enable
@@ -1735,13 +2358,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
         guide_overlap = 5
         video_continuation_enable = True
         qwen_full_history = False
+        if video_continuation_res not in VIDEO_CONTINUATION_RESOLUTIONS:
+            raise ValueError(
+                f"Unknown video_continuation_res {video_continuation_res!r}; choose one of "
+                + ", ".join(VIDEO_CONTINUATION_RESOLUTIONS)
+            )
         debug_start_chunk = int(debug_start_chunk)
         debug_stop_chunk = int(debug_stop_chunk)
-        if debug_start_chunk == 0:
-            # A normal run deliberately invalidates every previous replay
-            # checkpoint. This avoids accidentally mixing a new render with a
-            # stale continuation tail on a later debugging pass.
-            _remove_replay_cache()
         samples = latent_image["samples"]
         if not samples.is_nested:
             if prompt_preview_only:
@@ -1821,10 +2444,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if debug:
             logging.info(
                 "HR Endless Sampler independent continuation controls: "
-                "context_keyframes=%d, guide_overlap=%d, video_continuation=%d",
+                "context_keyframes=%d, guide_overlap=%d, video_continuation=%d, video_continuation_res=%s",
                 context_keyframes,
                 guide_overlap,
                 video_continuation,
+                video_continuation_res,
             )
             if use_video_continuation and not include_video1_reference:
                 logging.info(
@@ -1878,9 +2502,32 @@ class HREndlessSampler(SamplerCustomAdvanced):
             context_keyframes=context_keyframes,
             guide_overlap=guide_overlap,
             video_continuation=video_continuation,
+            video_continuation_res=video_continuation_res,
             ref2va=ref2va,
         )
         replay_cached_initial = None
+        auto_resumed = False
+        if debug_start_chunk == 0:
+            candidate_cache = _LastRunReplayCache()
+            loaded_cache, _cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
+            if loaded_cache is not None:
+                automatic_start = candidate_cache.automatic_resume_chunk(
+                    loaded_cache["manifest"], len(active_plan)
+                )
+                if automatic_start is not None:
+                    debug_start_chunk = automatic_start
+                    auto_resumed = True
+                    logging.warning(
+                        "HR Endless Sampler automatically resuming the compatible interrupted render from Chunk %d "
+                        "(checkpointed through Chunk %d).",
+                        debug_start_chunk,
+                        debug_start_chunk - 1,
+                    )
+                else:
+                    # A completed run, an intentional debug stop, or a
+                    # manifest from before lifecycle tracking is a new render
+                    # rather than an automatic continuation candidate.
+                    candidate_cache.clear()
         if debug_start_chunk:
             candidate_cache = _LastRunReplayCache()
             loaded_cache, cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
@@ -1913,8 +2560,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     replay_cache = candidate_cache
                     replay_start_index = debug_start_chunk - 1
                     replay_cache.truncate_from(debug_start_chunk)
+                    replay_cache.begin_from(debug_start_chunk)
                     logging.info(
-                        "HR Endless Sampler replay: restoring cached state through Chunk %d and rerunning from Chunk %d.",
+                        "HR Endless Sampler %s: restoring cached state through Chunk %d and rerunning from Chunk %d.",
+                        "automatic recovery" if auto_resumed else "replay",
                         debug_start_chunk - 1,
                         debug_start_chunk,
                     )
@@ -1959,6 +2608,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             context_keyframes,
             guide_overlap,
             video_continuation,
+            video_continuation_res,
             fps,
             len(active_plan),
             cache_gemma_preproduction=cache_gemma_preproduction,
@@ -1992,19 +2642,27 @@ class HREndlessSampler(SamplerCustomAdvanced):
             raise ValueError("HR Endless Sampler expected nested video and audio noise")
         if replay_cached_initial is None:
             video_noise, audio_noise = full_noise.unbind()
-        if debug_start_chunk and replay_cache is None:
-            replay_cache = _LastRunReplayCache()
-            replay_cache.create(
-                replay_fingerprint,
-                prompt,
-                {
-                    "video": video,
-                    "audio": audio,
-                    "video_noise": video_noise,
-                    "audio_noise": audio_noise,
-                    "noise_seed": replay_noise_seed,
-                },
-            )
+        if len(active_plan) > 1 and replay_cache is None:
+            candidate_cache = _LastRunReplayCache()
+            try:
+                candidate_cache.create(
+                    replay_fingerprint,
+                    prompt,
+                    {
+                        "video": video,
+                        "audio": audio,
+                        "video_noise": video_noise,
+                        "audio_noise": audio_noise,
+                        "noise_seed": replay_noise_seed,
+                    },
+                )
+                replay_cache = candidate_cache
+            except (OSError, RuntimeError, ValueError) as error:
+                logging.warning(
+                    "HR Endless Sampler could not create its automatic recovery checkpoint; "
+                    "sampling will continue, but an interrupted render cannot resume: %s",
+                    error,
+                )
 
         width = int(video.shape[4]) * 16
         height = int(video.shape[3]) * 16
@@ -2021,6 +2679,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_gemma_description = None
         previous_gemma_timing_plan = None
         previous_gemma_end_state = None
+        previous_gemma_last_seen_character_state = None
         output_template = None
         denoised_template = None
         completed_chunks = 0
@@ -2044,6 +2703,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 previous_gemma_description = previous_state.get("gemma_description")
                 previous_gemma_timing_plan = previous_state.get("gemma_timing_plan")
                 previous_gemma_end_state = previous_state.get("gemma_end_state")
+                previous_gemma_last_seen_character_state = previous_state.get("gemma_last_seen_character_state")
                 if replay_prompt_changed:
                     # These were authored against the old source prompt. The
                     # predecessor still remains available as chronological
@@ -2052,6 +2712,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_description = None
                     previous_gemma_timing_plan = None
                     previous_gemma_end_state = None
+                    previous_gemma_last_seen_character_state = None
                     logging.info(
                         "HR Endless Sampler replay: discarded stale prior Gemma text; "
                         "the edited plan will use the retained predecessor frames as evidence."
@@ -2131,7 +2792,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         )
         preparation_message = (
             f"Preparing {len(active_plan)} chunks at {fps:g} fps; "
-            f"Video1 continuation carries {video_continuation} frames"
+            f"Video1 continuation carries {video_continuation} frames at {video_continuation_res}"
         )
         logging.info("HR Endless Sampler: %s.", preparation_message)
         if preview_execution is not None:
@@ -2162,6 +2823,55 @@ class HREndlessSampler(SamplerCustomAdvanced):
         vram_monitor.report("execution prepared", {"full latent": samples, "full noise": full_noise})
 
         try:
+            if (
+                debug
+                and replay_start_index == 0
+                and len(active_plan) > 1
+                and include_video1_reference
+            ):
+                first_chunk = active_plan[0]
+                preflight_video = video[:, :, first_chunk["video_start"]:first_chunk["video_end"]]
+                preflight_audio = audio[..., first_chunk["audio_start"]:first_chunk["audio_end"]]
+                preflight_video_noise = video_noise[:, :, first_chunk["video_start"]:first_chunk["video_end"]]
+                preflight_audio_noise = audio_noise[..., first_chunk["audio_start"]:first_chunk["audio_end"]]
+                preflight_latent = fixed_latent.copy()
+                preflight_latent["samples"] = comfy.nested_tensor.NestedTensor((preflight_video, preflight_audio))
+                preflight_noise = comfy.nested_tensor.NestedTensor((preflight_video_noise, preflight_audio_noise))
+                try:
+                    _run_debug_memory_preflight(
+                        guider=guider,
+                        sampler=sampler,
+                        sigmas=sigmas,
+                        chunk_latent=preflight_latent,
+                        chunk_noise=preflight_noise,
+                        clip=clip,
+                        vae=vae,
+                        images=images,
+                        positive=positive,
+                        original_conds=original_conds,
+                        chunk_prompt=planned_prompts[0][0],
+                        chunk_seed=replay_noise_seed & 0xffffffffffffffff,
+                        video=video,
+                        audio=audio,
+                        continuation_frames=video_continuation,
+                        video_continuation_res=video_continuation_res,
+                        video_number=video_number,
+                        audio_number=audio_number,
+                        width=width,
+                        height=height,
+                        chunk_count=len(active_plan),
+                        vram_monitor=vram_monitor,
+                        preview_execution=preview_execution,
+                    )
+                finally:
+                    preflight_latent = None
+                    preflight_noise = None
+                    preflight_video = None
+                    preflight_audio = None
+                    preflight_video_noise = None
+                    preflight_audio_noise = None
+                    gc.collect()
+
             if gemma_director is not None:
                 preproduction_shots = _gemma_source_shot_records(
                     gemma_shots,
@@ -2408,6 +3118,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             "previous_gemma_description": previous_gemma_description,
                             "previous_gemma_timing_plan": previous_gemma_timing_plan,
                             "previous_gemma_end_state": previous_gemma_end_state,
+                            "previous_last_seen_character_state": previous_gemma_last_seen_character_state,
                             "target_shots": target_shots,
                             "preproduction_timing_plan": gemma_preproduction_timing_plan.for_target_shots(
                                 target_shots,
@@ -2570,6 +3281,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     audio_end_frame += overhang / FRAME_RESCALE
                 video_items = []
                 video_refs = []
+                boundary_video_context = None
                 if continuation and use_video_continuation:
                     boundary_video_context, boundary_keyframe_index = _video_continuation_boundary_guide(
                         previous_video,
@@ -2589,6 +3301,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             )
                     if include_video1_reference:
                         reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
+                        full_reference_latent = reference_latent
                         reference_audio_t = _audio_steps(content_start) - _audio_steps(content_start - video_continuation)
                         reference_audio = previous_audio[..., -reference_audio_t:].clone()
                         if vram_monitor is not None:
@@ -2604,9 +3317,48 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         video_items.append({"type": "audio"})
                         timer_started = time.perf_counter()
                         try:
-                            video_items.append(_decoded_video_item(vae, reference_latent))
+                            decoded_reference_frames = _decode_video_frames(vae, reference_latent)
+                            video_items.append(_decoded_video_item_from_frames(decoded_reference_frames))
+                            resized_reference_latent, reference_canvas = _encode_resized_continuation_reference(
+                                vae,
+                                decoded_reference_frames,
+                                video_continuation_res,
+                            )
+                            if resized_reference_latent is not None:
+                                if resized_reference_latent.shape[2] != reference_latent.shape[2]:
+                                    raise ValueError(
+                                        "MiniMax H3 resized Video1 changed temporal latent length "
+                                        f"from {reference_latent.shape[2]} to {resized_reference_latent.shape[2]}"
+                                    )
+                                reference_latent = resized_reference_latent
+                            if debug:
+                                logging.info(
+                                    "HR Endless Sampler chunk %d/%d H3 Video1 reference: %s, "
+                                    "%dx%d pixels -> latent %dx%d with %d temporal tokens",
+                                    index + 1,
+                                    len(active_plan),
+                                    video_continuation_res,
+                                    reference_canvas[0],
+                                    reference_canvas[1],
+                                    reference_latent.shape[4],
+                                    reference_latent.shape[3],
+                                    reference_latent.shape[2],
+                                )
                         finally:
                             timing.add("vae_context", timer_started)
+                            decoded_reference_frames = None
+                        _log_continuation_payload(
+                            index + 1,
+                            len(active_plan),
+                            video_continuation_res,
+                            reference_latent,
+                            reference_audio,
+                            boundary_video_context,
+                            chunk_video,
+                            chunk_audio,
+                            full_reference_latent,
+                        )
+                        full_reference_latent = None
                         video_refs.append(_video_ref_block(reference_latent, reference_audio))
                 if continuation and qwen_full_history:
                     history_latent = torch.cat(output_video, dim=2)
@@ -2643,6 +3395,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         drop_picture_anchors=continuation and not ref2va,
                         continuation_video_label=continuation_video_label,
                         continuation_audio_label=continuation_audio_label,
+                        last_seen_character_state=result.last_seen_character_state,
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
@@ -2686,6 +3439,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation, video_items)
                 finally:
                     timing.add("qwen", timer_started)
+                if continuation and include_video1_reference:
+                    qwen_cross_attn = encoded_prompt[0]
+                    logging.info(
+                        "HR Endless Sampler chunk %d/%d Qwen conditioning retained for H3 "
+                        "(complete prompt + original references + Video1 presentation): "
+                        "shape=%s, raw=%0.3f MiB. This does not change with video_continuation_res.",
+                        index + 1,
+                        len(active_plan),
+                        tuple(qwen_cross_attn.shape),
+                        qwen_cross_attn.numel() * qwen_cross_attn.element_size() / (1024 ** 2),
+                    )
                 del video_items
                 if vram_monitor is not None:
                     vram_monitor.report(
@@ -2830,6 +3594,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_description = gemma_description
                     previous_gemma_timing_plan = result.timing_plan
                     previous_gemma_end_state = result.end_state
+                    previous_gemma_last_seen_character_state = list(result.last_seen_character_state)
                 if replay_cache is not None:
                     try:
                         replay_cache.save_chunk(
@@ -2847,6 +3612,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "gemma_description": previous_gemma_description,
                                 "gemma_timing_plan": previous_gemma_timing_plan,
                                 "gemma_end_state": previous_gemma_end_state,
+                                "gemma_last_seen_character_state": previous_gemma_last_seen_character_state,
                                 "h3_render_seconds": h3_render_seconds,
                                 "gemma_seconds": chunk_gemma_seconds,
                                 "gemma_preproduction_seconds": chunk_preproduction_seconds,
@@ -2914,6 +3680,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     "context_keyframes": context_keyframes,
                     "guide_overlap": guide_overlap,
                     "video_continuation": video_continuation,
+                    "video_continuation_res": video_continuation_res,
+                    "pytorch_memory_fraction": float(pytorch_memory_fraction),
                     "width": width,
                     "height": height,
                     "sampling_steps": max(0, len(sigmas) - 1),
@@ -2922,6 +3690,32 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     "full_chunks": len(plan),
                 },
             )
+            if not sampling_completed and replay_cache is not None:
+                resume_chunk = min(completed_chunks + 1, len(active_plan))
+                try:
+                    replay_cache.mark_interrupted(completed_chunks)
+                except (OSError, RuntimeError, ValueError) as error:
+                    logging.warning(
+                        "HR Endless Sampler could not mark its recovery checkpoint as interrupted: %s",
+                        error,
+                    )
+                logging.error(
+                    "HR Endless Sampler preserved the interrupted render through Chunk %d in %s. "
+                    "Queue the same workflow again with debug_start_chunk=0 to continue automatically from Chunk %d "
+                    "without rerendering completed chunks. Set a nonzero debug_start_chunk only to force a specific "
+                    "debug replay point.",
+                    completed_chunks,
+                    replay_cache.root,
+                    resume_chunk,
+                )
+            elif sampling_completed and debug_stop_chunk and replay_cache is not None:
+                try:
+                    replay_cache.mark_debug_stop(completed_chunks)
+                except (OSError, RuntimeError, ValueError) as error:
+                    logging.warning(
+                        "HR Endless Sampler could not mark its recovery checkpoint as an intentional debug stop: %s",
+                        error,
+                    )
 
         final_output_video = torch.cat(output_video, dim=2)
         final_output_audio = torch.cat(output_audio, dim=-1)
@@ -2952,6 +3746,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
             fps=fps,
             total_frames=rendered_frames,
         )
+        if replay_cache is not None and sampling_completed and debug_stop_chunk == 0:
+            try:
+                replay_cache.mark_complete(completed_chunks)
+            except (OSError, RuntimeError, ValueError) as error:
+                logging.warning(
+                    "HR Endless Sampler could not mark the recovery checkpoint complete: %s",
+                    error,
+                )
         return io.NodeOutput(output_template, denoised_template, "\n\n".join(debug_prompts), timeline)
 
     sample = execute

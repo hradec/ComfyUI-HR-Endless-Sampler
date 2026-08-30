@@ -510,6 +510,27 @@ The clean bounded pair is independently appended to `minimax_refs` as a native
 `video_audio` block, so the DiT can attend to both continuation streams without
 merging them into the noisy target latent.
 
+`video_continuation_res` is an explicit spatial-quality/VRAM control for that
+DiT Video1 block. `full` preserves the cloned generated latent exactly. The
+smaller presets range from the stock 1344x768 H3 reference-video canvas down to
+448x256, always in 32-pixel-aligned dimensions. For a reduced preset, the node
+decodes the complete bounded tail once, uses that decode for Qwen, resizes all
+chronological frames in pixel space, and VAE-encodes them back into a smaller
+24-channel reference latent. It rejects any encode that changes the temporal
+latent length. The synchronized Audio1 latent and the full-resolution
+five-frame boundary keyframe do not change. Qwen and Gemma independently keep
+the stock H3 reference-video presentation canvas, so reducing the DiT reference
+does not also hide details from the semantic directors. The replay fingerprint,
+last-run prompt header, debug log, and final run report record the selected
+preset because changing it changes H3 conditioning and invalidates cached
+continuation state. Every continuation chunk also emits an always-on payload
+report with separate Video1 video, Audio1, and full-resolution boundary-keyframe
+tensor shapes/raw MiB; packed row counts; Video1 row reduction against its
+full-resolution equivalent; and total continuation rows relative to target AV
+rows. Raw latent bytes are explicitly not presented as the expected VRAM
+savings because H3 expands each row into much larger per-layer attention and
+activation allocations.
+
 When `video_continuation` is enabled while `context_keyframes` is disabled, the
 node also clones the previous sampler chunk's exact final two video-latent
 tokens, which represent its final five pixel frames, as one native video
@@ -587,8 +608,11 @@ both modes; `debug` controls console/VRAM logging rather than text availability.
 Both decoded-video modes require the H3 video VAE and a Ref2VA conditioning
 whose original Qwen presentation can be reconstructed by this node. Decoded
 pixel tensors are execution-local and released after CLIP encoding. Dynamic
-video presentations are sampled at 2 FPS and downscaled to at most a 512x512
-pixel-area budget before Qwen encoding. This does not resize the clean DiT
+video presentations are sampled at 2 FPS and use the same canvas policy as
+ComfyUI's stock H3 reference-video input: a nominal 768-pixel short edge with a
+`768 * 1344` area cap, 32-pixel alignment, and no enlargement. A 1920x1088
+continuation is therefore presented at 1344x768 to both Qwen and Gemma. This
+does not resize the clean DiT
 reference latent or any original Ref2VA image. The native mode keeps only its
 bounded full-resolution clean latent for the sampler call. The full-history
 mode keeps no additional DiT latent, although its temporary VAE decode and Qwen
@@ -635,12 +659,18 @@ scales output in parts, retains every part, and then allocates a second complete
 buffer with `torch.cat`; this small sequence increase crosses its sharp QKV
 allocation threshold.
 
-Dynamic Qwen video frames are therefore resized by aspect-preserving pixel area
-to at most `512 * 512` before tokenization. A 1920x1088 pair becomes 672x384,
-reducing its merged vision rows from roughly 2,040 to 252. The separate clean
-video latent still enters the DiT at the original 1920x1088 latent resolution.
-Debug logging reports the actual frame count and Qwen presentation resolution
-for every dynamic video item.
+An earlier emergency optimization resized dynamic Qwen video frames by
+aspect-preserving area to at most `512 * 512` before tokenization. A 1920x1088
+pair became 672x384, reducing its merged vision rows from roughly 2,040 to 252.
+That avoided the observed Qwen token wall, but it also made internally generated
+Video1 conditioning materially lower resolution than a video supplied through
+ComfyUI's stock H3 Ref2VA node. It could hide small generated continuity details
+from both Qwen and Gemma. The default path now uses the stock 768-short-edge,
+`768 * 1344`-area reference-video canvas instead. The separate clean video
+latent still enters the DiT at the original 1920x1088 latent resolution. Debug
+logging reports the actual frame count and presentation resolution. A future
+explicit optimization control may restore lower presentation sizes for tight
+VRAM workflows; it must never be a silent behavioral difference.
 
 ### Debug VRAM accounting
 
@@ -1203,13 +1233,14 @@ worker starts, so images remain available when Gemma or H3 later fails. This is
 separate from debug-only replay fixtures, contains only the concise still set,
 and is reset only by another real sampler execution—not prompt preview.
 
-The llama context was raised from 8192 to 16384 for the official guide, full
-source prompt, visual tokens, and response. This is intentionally not 256K on
-the 16 GB RTX 4070 Ti SUPER: the real llama.cpp debug log showed an 8192-cell
-F16 KV allocation of 2560 MiB, so this backend scales to roughly 5 GiB at 16K
-before adding the 6638 MiB model and approximately 527 MiB compute buffer. A
-256K allocation would not fit even though the GGUF metadata declares a native
-262144-token context.
+The context was initially raised from 8192 to 16384 for the official guide,
+full source prompt, visual tokens, and response. That first configuration used
+the default F16 K/V cache: its real llama.cpp log showed 2560 MiB at 8192 cells,
+or roughly 5 GiB at 16K before the 6638 MiB model and 527 MiB compute buffer.
+The resulting brief 20K test aborted during full-size SWA initialization. This
+historical F16 result was superseded on 2026-08-29 by the explicit 32K Q8_0
+K/V, non-full-SWA configuration documented below; it must not be used as an
+upper bound for the current runtime.
 
 Gemma 4's observation path now follows Google's image-first modality order:
 the chronological stills precede the observation text in the user content
@@ -1225,7 +1256,7 @@ The exact installed official projector was probed without running inference.
 Its unset/default range reported 92,160-645,120 pixels, with the 48x48 patch
 size making the maximum 280 visual tokens. Explicit budgets map to 161,280
 pixels at 70, 645,120 at 280, 1,290,240 at 560, and 2,580,480 at 1120. Thus the
-latest captured 672x384 observations already fit below the old ceiling, while
+historical captured 672x384 observations already fit below the old ceiling, while
 a 2048x1152 observation would previously have been reduced to roughly
 1070x600. The new dynamic maximum can retain that complete 2K pixel area;
 smaller inputs are not forcibly upscaled to 1120 tokens because the minimum
@@ -1846,6 +1877,21 @@ without an explicit decision and a checkpoint of the working version.
     diffusion trajectory, so it may cause missing detail, texture instability,
     or temporal artifacts.
 
+13. **Explicit Qwen/Gemma presentation-resolution optimization.** The
+    default Qwen and Gemma presentation of generated Video1 frames now matches
+    ComfyUI's stock H3 reference-video canvas (768-pixel nominal short edge,
+    `768 * 1344` area cap) so internal continuation does not silently lose more
+    small details than an externally supplied reference video. Later, test an
+    opt-in semantic-presentation resolution control for memory-constrained
+    workflows. This is separate from the implemented `video_continuation_res`,
+    which reduces only H3's clean DiT Video1 block. Keep temporal
+    sampling at 2 FPS, preserve aspect ratio/32-pixel alignment, report the
+    actual presentation dimensions, and do not silently couple it to the DiT
+    `minimax_refs` resolution.
+    Compare prompt accuracy, tiny generated-detail retention, Qwen token count,
+    encoding time, and Chunk 2+ VRAM/OOM behavior at stock, 768, and legacy
+    `512 * 512`-area presentation budgets.
+
 ## Verification performed
 
 The implementation was checked with the Python environment used by the running
@@ -1867,8 +1913,9 @@ Completed checks include:
   installed stock H3 Ref2VA implementation;
 - non-mutation and final restoration of the original Ref2VA reference list;
 - targeted Qwen/VAE unload ordering before every stock sampler invocation;
-- dynamic Qwen video downscaling with preserved aspect ratio, 32-pixel canvas
-  alignment, correct timestamps, and unchanged DiT reference dimensions;
+- dynamic Qwen/Gemma video presentation matching stock H3's 768-short-edge,
+  `768 * 1344` area cap with preserved aspect ratio, 32-pixel canvas alignment,
+  correct timestamps, and unchanged full-resolution DiT reference dimensions;
 - native continuation insertion into subject definitions, combined summary
   task types, retention analysis, and the local first-shot instruction;
 - native keyframe lengths of 5, 22, 39, 56, and 107 frames smaller than their
@@ -2043,9 +2090,9 @@ The saved format contains native llama.cpp KV state plus token history, not
 `Llama.save_state()`'s large historical logits matrix. An appended user turn
 will always evaluate fresh suffix tokens before sampling, so historical logits
 are unnecessary; omitting them keeps the RAM-disk snapshot close to KV size.
-At the current 16K F16 KV configuration it is still several GiB of system RAM,
-not VRAM. Do not raise the Gemma context window casually without checking
-available RAM-disk capacity.
+At the current 32K Q8_0 configuration it is still several GiB of system RAM,
+not VRAM. Check available RAM-disk capacity before increasing the context
+further.
 
 The pinned `MTMDChatHandler` clears llama.cpp KV on every high-level
 `create_chat_completion`, which used to make a correction retry re-evaluate the
@@ -2321,7 +2368,7 @@ it remains confined to the disposable Gemma worker. Before launching an MTP
 worker, the parent retains a serialized copy of the exact request. If the
 worker aborts, exits without a result, returns a non-zero status after a result,
 or reports a native `Gemma4MTPError`, the parent prints a prominent warning and
-retries the same operation once using the original non-MTP decoder.
+retries the same operation using fresh original non-MTP workers.
 
 The fallback applies only to the operation whose MTP worker failed. Its copied
 request changes only `gemma4_mtp` from true to false; the preproduction cache
@@ -2333,6 +2380,26 @@ remain visible and fail normally.
 This policy restores the previously observed 100–150 token/second fast path
 when native MTP behaves, while treating a native child-process crash as a
 recoverable acceleration failure rather than losing the entire H3 render.
+
+On 2026-08-28, another exact Chunk 2 capture exposed a two-stage failure: the
+native worker could not load the 444 MiB MTP assistant, then the first non-MTP
+fallback aborted inside MTMD `clip_encode` with a CUDA error while encoding the
+first 1344x768 observation still. The parent had reported 14,001.8 MiB
+physically free immediately before directing, while an isolated replay showed
+the same native request reaching about 14,800 MiB in its worker alone. The
+captured request itself replayed successfully once more GPU headroom was
+available, confirming a transient/resource-sensitive native failure rather
+than corrupt prompt or image data.
+
+One fallback was not enough to preserve a long render in that case. Worker
+crash recovery now keeps one immutable serialized request and allows ten fresh
+operation-local retries. The initial attempt honors `gemma4_mtp`; after an MTP
+worker failure, all retries for that one operation use the original non-MTP
+decoder. Every retry receives a new deep copy so subprocess cleanup cannot
+erase image, cache, or request fields. An operation that starts with MTP off is
+also allowed ten fresh non-MTP retries. The sampler fails only after the
+initial attempt and all ten retries exit; the next independent operation still
+honors the sampler's MTP toggle normally.
 
 ## 2026-08-28 — Per-chunk timing in all timeline players
 
@@ -2385,3 +2452,261 @@ sections to source/global timeline shots by chronological overlap rather than
 assuming the marker number is a global shot number. When a chunk starts in the
 middle of an existing shot, unmarked continuation prose receives the active
 shot's color and the first subsequent marker receives the next shot's color.
+
+## 2026-08-28 — Explicit PyTorch allocator ceiling
+
+The sampler exposes `pytorch_memory_fraction`, defaulting to `0.85`. At the
+very beginning of every sampler execution it calls
+`torch.cuda.set_per_process_memory_fraction` for the model patcher's CUDA
+device and logs the resulting GiB ceiling and active allocator backend. The
+setting is process-wide and remains active until a later sampler run changes
+it; `1.0` restores the normal unrestricted PyTorch limit. CPU/non-CUDA
+execution skips it explicitly.
+
+This was added after a 1920x1088 diagnostic completed two Chunk 2 evaluations
+and failed on the third INT8 QKV concatenation. Only about 330 MiB was actively
+allocated between evaluations, but `cudaMallocAsync` retained 14,720 MiB and
+left only 104.9 MiB physically free. ComfyUI does not otherwise call
+`set_per_process_memory_fraction`; it automatically enables
+`cudaMallocAsync` on supported CUDA systems unless launched with
+`--disable-cuda-malloc`. PyTorch's `garbage_collection_threshold` is ignored by
+that backend. The explicit 85% ceiling is intended to create allocator
+pressure while driver-side headroom still exists, rather than waiting for the
+next large contiguous allocation to encounter a physically full device.
+
+The backend input remains serialized and callable, but its native widget is
+hidden from the sampler UI to keep the normal controls concise. The frontend
+uses both the legacy zero-layout footprint and the Nodes 2.0 hidden flag
+without changing the widget type or value, preserving existing workflows.
+`video_continuation` now defaults to 22 frames in both the node schema and the
+Python execute fallback; 5 remains the minimum selectable value.
+
+## 2026-08-28 — Debug continuation VRAM preflight
+
+Debug mode now performs a disposable three-step continuation simulation before
+the real first chunk of a multi-chunk Video1 render. It uses the configured
+target chunk shape, Video1 frame count and spatial-resolution preset, a
+synchronized black audio/video reference, the normal sparse Qwen video
+presentation, and the five-frame full-resolution boundary keyframe. This makes
+the probe exercise the continuation attention rows that make Chunk 2 more
+expensive instead of merely repeating the cheaper Chunk 1 layout. It also
+holds simulated sampled and denoised Chunk 1 AV outputs on ComfyUI's configured
+intermediate device during the probe; this costs no VRAM when that device is
+CPU, but reproduces the retained-output cost on configurations that keep it on
+the GPU.
+
+The probe uses the first three transitions of the workflow's real sigma
+schedule and the already-generated fixed chunk noise. Its output is never sent
+to the preview, timeline, replay cache, or accumulated result. CPU and CUDA RNG
+states are restored afterward. Cleanup clears every local reference, restores
+the original guider conditioning, unloads H3/Qwen/VAE model owners, runs Python
+garbage collection, forces ComfyUI's cache release, and empties the CUDA cache.
+The console reports the preflight peak plus post-cleanup active/reserved memory
+relative to the baseline and warns if active allocations remain materially
+above it. This intentionally adds startup time only when `debug` is enabled.
+
+## 2026-08-29 — Retained-boundary shot markers and persistent character state
+
+A 13-chunk diagnostic exposed a false cut in Chunk 8. Source Shot 6 began at
+global frame 359, while Chunk 8 physically sampled frames 357–412 but retained
+only frames 362–412. The real cut therefore existed entirely inside the five
+discarded packing frames and was already established by the Video1/boundary
+conditioning. The old marker calculation compared the cut only with the
+physical sampled start and incorrectly forced `[Shot 2] At 00:00.083,` into
+Chunk 8. Gemma's initially correct unmarked continuation was rejected and its
+model-authored correction inserted that duplicate cut. Marker ownership now
+starts at the retained output boundary: cuts before `output_start` receive no
+H3 marker, cuts exactly at or after it retain their truthful physical-local
+timecode.
+
+The same render showed Tila reappearing against a green meadow instead of
+remaining mounted inside the ancient temple. Immediate-previous-chunk stills
+cannot solve this when a character has been off-screen for several chunks.
+Every Gemma chunk response therefore now owns a persistent
+`last_seen_character_state` table with one entry per immutable named Subject:
+last observed global frame/source shot, environment, pose and position,
+ongoing state/action, and spatial relationships. The table represents rendered
+evidence only through the prior generated chunk, never a forecast of the chunk
+currently being directed. Gemma updates visible characters from the attached
+chronological stills and copies absent characters' entries exactly, including
+across replay-cache checkpoints. The replay format was bumped to 2 so older
+checkpoints cannot silently omit this continuity memory.
+
+For H3 conditioning, the sampler selects only table entries whose `<Subject N>`
+actually appears in the current Gemma detailed description. Their environment
+and physical state are inserted as a dynamic `retention_analysis` addendum;
+off-screen characters are excluded to avoid inviting accidental appearances.
+The detailed description remains responsible for current action and explicit
+state changes. Gemma is also instructed that a camera cut changes framing, not
+location or mounted/seated/standing state, and that an audible source not
+explicitly revealed by the source prompt remains off-screen. This last rule
+addresses the observed Shot 6 failure where H3 visualized a scheduled dragon
+roar by cutting to the referenced roaring tiger.
+
+## 2026-08-29 — Recoverable Gemma responses and interrupted-render checkpoints
+
+A long render was interrupted after Gemma returned syntactically valid JSON
+without its required `detailed_description` field. The former response path
+treated that as a hard `Gemma4ObservationError`: only native disposable-worker
+crashes had the ten-attempt recovery policy. This made an ordinary model output
+mistake unnecessarily abort the entire H3 render.
+
+Chunk-response validation now requests a complete **model-authored** replacement
+in the same Gemma chat when the JSON lacks a usable `detailed_description` (or
+another hard response-shape requirement). It preserves the current request,
+chronological images, preproduction cache context, and prior answer in KV. Up
+to ten bounded schema-repair turns are allowed; there is no algorithmic prompt
+fallback. Existing one-pass marker/coverage/dialogue contract correction
+behavior is retained, and an invalid response during that correction also uses
+the bounded repair path. The transcript records every invalid JSON response and
+the correction instruction whenever a repaired answer succeeds.
+
+Serial runs now create the existing CPU/disk `last_run_replay` checkpoint for
+every multi-chunk render, not only runs launched with `debug_start_chunk` set.
+The checkpoint stores the initial AV latent/noise plus each successfully
+completed chunk's sampled AV tail, assembled output, Gemma state, timings, and
+independent prefix noise. Its manifest tracks `recording`, `interrupted`,
+`debug_stop`, and `complete` states atomically with each chunk save.
+
+With `debug_start_chunk=0` (the normal UI default), a new execution now first
+checks that manifest. A compatible `recording` or `interrupted` render resumes
+automatically at the next unsampled chunk; a completed run, intentional debug
+stop, old unmarked cache, changed latent/chunk/continuation configuration, or
+missing checkpoint begins a fresh render and replaces stale state. A nonzero
+`debug_start_chunk` remains an explicit override for rerunning a chosen suffix.
+The legacy manually created replay cache could not recover the already
+interrupted diagnostic run, because it was not active for normal runs before
+this change.
+
+### 32K Q8 preproduction-cache configuration
+
+The earlier 20,480-context failure was not an upper limit of this GPU: the
+sampler had left llama.cpp's K/V cache at its F16 defaults and its worker log
+reported a full-size SWA cache. The same machine's native llama.cpp Gemma
+server successfully uses a 262K context with quantized cache configuration.
+
+The sampler now explicitly configures the pinned llama-cpp-python runtime with
+`n_ctx=32768`, `type_k=GGML_TYPE_Q8_0`, `type_v=GGML_TYPE_Q8_0`, and
+`swa_full=False`. Q8_0 halves the K/V storage versus F16 while retaining more
+precision than Q4_0; it is the chosen default for prompt-directing quality.
+Disabling forced full-size SWA mirrors the native server's normal default.
+Native MTP's linked assistant context inherits these target-cache settings.
+
+The clean preproduction KV cache is never removed merely to recover context
+space. It carries the prompt, source-shot plan, and prior preproduction state
+that Gemma needs to direct chunks coherently. A genuine 32K overflow remains a
+visible Gemma error to be fixed by reducing/summarizing the appended request,
+not by silently re-running Gemma without its preproduction memory. Existing
+preproduction cache files are versioned by their runtime metadata and are
+recreated at the start of each render, so the changed context size cannot load
+an incompatible old state.
+
+## 2026-08-29 — Real Gemma integration replay and MTP JSON recovery
+
+`tests/test_gemma4_live.py` is an opt-in real-GPU integration test. It reads
+the user's untracked `prompt.txt` as a 625-frame production, runs the actual
+Gemma preproduction timing planner, finds a recent exact observation capture
+under `/tmp/hr-endless-sampler-gemma4-*`, restores its chronological JPG
+stills, and directs that real chunk. It never downloads the model and remains
+skipped in the ordinary unit suite. Enable it with
+`HR_ENDLESS_SAMPLER_RUN_GEMMA4_LIVE_TEST=1`; use
+`HR_ENDLESS_SAMPLER_GEMMA4_LIVE_MTP=0` for the original-decoder comparison.
+
+The captured Chunk 10 replay isolated two failures. First, experimental MTP
+could consume its complete 1,024-token output budget without producing a
+parseable JSON object. The old path then generated two more append responses
+and a grammar response in the same broken MTP operation. That both delayed the
+render and produced misleading 20–30 token/s readings: local diagnostics had
+already shown grammar sampling dominating target time, while the clean
+original decoder remained around its former 50–60 token/s class. A new typed
+`Gemma4MTPOutputError` now exits the disposable worker after the first
+no-complete-JSON MTP answer. The parent retries the exact operation in a fresh
+non-MTP worker, retaining every request and preproduction-cache field. The
+next independent chunk still attempts MTP normally.
+
+Second, a valid non-MTP JSON answer could fail the H3 coverage contract and
+then append the same large correction contract up to ten times, eventually
+overflowing 32K context. Only the first correction now repeats the complete
+contract; later schema repairs are compact deltas listing the seven required
+JSON fields and the remaining errors. Dialogue speaker reminders are limited
+to dialogue belonging to the current source shot(s), instead of copying every
+line from the whole production. The live MTP-enabled test now survives the
+native preproduction abort, the Chunk 10 empty-MTP response, the operation-local
+original-decoder fallback, and one creative coverage correction, completing in
+105 seconds. The normal suite passes 99 tests with the live test skipped.
+
+A sampler run started before this revision exposed a hot-reload boundary:
+ComfyUI's long-lived parent retained the older worker-result decoder while the
+new disposable worker imported the edited file from disk. The worker returned
+the new typed MTP-output error, but the stale parent reduced it to a generic
+`Gemma4ObservationError` and stopped before the retry loop could recognize it.
+The retry loop now also recognizes the exact MTP no-complete-JSON message when
+it arrives as the generic class. This is intentionally narrow and does not
+retry unrelated creative/schema errors. A ComfyUI restart is still required
+after editing backend Python so the active parent and workers use one revision.
+
+The next real Chunk 2 run exposed a separate output-budget/parser bug after
+the MTP abort recovered correctly. The original decoder generated exactly
+1,024 tokens on every attempt. Its outer seven-field response was truncated
+inside `last_seen_character_state` before it reached `detailed_description`.
+The old JSON extractor searched every later `{` after the incomplete root and
+incorrectly accepted one complete nested character-state object as the whole
+response. Validation consequently reported a missing detailed description and
+asked ten times for a replacement that hit the identical 1,024-token limit.
+
+Chunk JSON generations and their append-only corrections now receive a 2,048
+token budget. The extractor permits prose/channel text before the first `{`,
+but once the instructed root begins it either decodes that complete outer
+object or reports an incomplete/malformed top-level response; it never salvages
+a nested object. The exact saved six-image Chunk 2 capture was replayed through
+the original decoder: it returned a 3,847-character complete response, used
+one normal coverage correction, and finished with a usable H3 description and
+no validation warnings.
+
+## 2026-08-29 — Native MTP checkpoint regression and reference port
+
+The later near-100% native-MTP failure rate was not a Gemma response problem.
+Historical render logs showed that the original 16K/default-KV MTP runtime
+successfully completed hundreds of device checkpoints per response at roughly
+120–150 output tokens/second and 62–75% draft acceptance. Recent 32K/Q8_0 runs
+instead repeatedly aborted after exactly two generated tokens inside
+`llama_state_seq_get_data_ext()`, reporting either `not enough space in the
+buffer` or an invalid backend-buffer assertion. `gemma4_mtp.py` had not changed
+between those runs; its explicit `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` checkpoint
+flag was the incompatible part exposed by the larger/quantized runtime.
+
+Current llama.cpp removed on-device speculative checkpoints because their
+extra device allocation is not accounted at context startup and is not fully
+compatible with device/meta buffers. The local adapter now matches the current
+reference lifecycle: save and restore `PARTIAL_ONLY` state in host memory,
+retain one growable host checkpoint allocation across proposals, restore that
+hybrid state after partial draft rejection, remove the speculative attention
+suffix, and replay only the accepted target prefix. Four-token native MTP,
+linked NextN contexts, and the disposable-worker operation-local original
+decoder retry remain unchanged. All 101 normal unit tests pass; the real GPU
+Chunk 2 replay still has to be run after ComfyUI releases the approximately
+14.95 GiB it currently owns.
+
+## 2026-08-29 — Enforced global-to-local shot-marker repairs
+
+A live Chunk 3 exposed that reporting only `returned 2 shot markers; requires
+1` was not enough. The physical chunk began inside global Source Shot 2 and
+contained the one real transition into global Source Shot 3, represented on
+H3's reset local clock as `[Shot 2] At 00:01.958,`. Gemma instead replayed the
+end of global Shot 2, placed that exact local token before another version of
+Shot 2's skid, and then copied the forbidden global `[Shot 3] At 00:06.208,`
+before Tila's close-up. Python detected the count error, but the established
+one-creative-rewrite policy accepted Gemma's still-invalid correction with a
+warning, so H3 received two apparent restarts.
+
+Every initial chunk request and marker correction now includes a sampler-owned
+semantic transition map. It explicitly states which global source shot the
+time-slice begins inside and must continue as unmarked prose, which global shot
+ends before a cut, which next global shot is represented by each local chunk
+`[Shot N]`, and the exact local timecode where that next shot begins. Python
+validates both count and the complete exact marker-token sequence. Marker
+violations are structural rather than creative, so they receive focused
+append-only Gemma repair turns—up to the existing ten-repair bound—until the
+exact sequence is valid; Python never edits or substitutes the H3 prose. Other
+creative coverage warnings retain the one-rewrite policy. The normal suite now
+passes 102 tests with the opt-in live GPU test skipped.

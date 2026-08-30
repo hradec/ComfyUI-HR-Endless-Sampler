@@ -236,7 +236,137 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertTrue(director.gemma4_mtp)
         warning_text = "\n".join(warning_log.output)
         self.assertIn("status -6", warning_text)
-        self.assertIn("next Gemma operation will try native MTP again", warning_text)
+        self.assertIn("retry 1/10", warning_text)
+        self.assertIn("next independent Gemma operation will try MTP", warning_text)
+
+    def test_mtp_empty_json_retries_only_failed_operation_without_mtp(self):
+        result = gemma4.GemmaChunkPrompt(
+            confidence="high",
+            analysis="The action continues.",
+            detailed_description="Heman continues walking right.",
+            raw_json='{"confidence":"high"}',
+        )
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        calls = []
+
+        def fake_worker(request):
+            calls.append(request.get("gemma4_mtp"))
+            if request.get("gemma4_mtp"):
+                raise gemma4.Gemma4WorkerExitError(
+                    "MTP returned no JSON",
+                    returncode=1,
+                    worker_error_type="Gemma4MTPOutputError",
+                )
+            return result
+
+        with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker), \
+                self.assertLogs(level="WARNING") as warning_log:
+            self.assertIs(director.direct(self.request(), frames), result)
+
+        self.assertEqual(calls, [True, False])
+        self.assertTrue(director.gemma4_mtp)
+        self.assertIn("MTP returned no JSON", "\n".join(warning_log.output))
+
+    def test_mtp_empty_json_message_survives_parent_worker_version_skew(self):
+        result = gemma4.GemmaChunkPrompt(
+            confidence="high",
+            analysis="The action continues.",
+            detailed_description="Heman continues walking right.",
+            raw_json='{"confidence":"high"}',
+        )
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        calls = []
+
+        def fake_worker(request):
+            calls.append(request.get("gemma4_mtp"))
+            if request.get("gemma4_mtp"):
+                # Simulate a stale parent that decoded the worker's new typed
+                # error as its older generic observation-error class.
+                raise gemma4.Gemma4ObservationError(
+                    "Gemma 4 MTP returned no complete JSON object; retry this operation with the original decoder"
+                )
+            return result
+
+        with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker), \
+                self.assertLogs(level="WARNING") as warning_log:
+            self.assertIs(director.direct(self.request(), frames), result)
+
+        self.assertEqual(calls, [True, False])
+        self.assertTrue(director.gemma4_mtp)
+        self.assertIn("returned no complete JSON", "\n".join(warning_log.output))
+
+    def test_worker_abort_retries_ten_times_with_fresh_preserved_requests(self):
+        result = gemma4.GemmaChunkPrompt(
+            confidence="high",
+            analysis="The action continues.",
+            detailed_description="Heman continues walking right.",
+            raw_json='{"confidence":"high"}',
+        )
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        calls = []
+
+        def fake_worker(request):
+            calls.append({
+                "mtp": request.get("gemma4_mtp"),
+                "cache": request.get("preproduction_cache"),
+                "slice": request.get("preproduction_current_slice"),
+            })
+            request.clear()
+            if len(calls) <= gemma4.GEMMA4_WORKER_RETRY_LIMIT:
+                raise gemma4.Gemma4WorkerExitError("worker aborted", returncode=-6)
+            return result
+
+        request = self.request()
+        request["preproduction_cache"] = {"path": "/dev/shm/test-cache"}
+        request["preproduction_current_slice"] = "cached slice"
+        with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker), \
+                self.assertLogs(level="WARNING") as warning_log:
+            self.assertIs(director.direct(request, frames), result)
+
+        self.assertEqual(len(calls), gemma4.GEMMA4_WORKER_RETRY_LIMIT + 1)
+        self.assertTrue(calls[0]["mtp"])
+        self.assertTrue(all(not call["mtp"] for call in calls[1:]))
+        self.assertTrue(all(call["cache"] == {"path": "/dev/shm/test-cache"} for call in calls))
+        self.assertTrue(all(call["slice"] == "cached slice" for call in calls))
+        self.assertIn("retry 10/10", "\n".join(warning_log.output))
+
+    def test_worker_abort_after_ten_retries_raises_last_failure(self):
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=False)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        with patch.object(
+            gemma4,
+            "_observe_in_worker",
+            side_effect=gemma4.Gemma4WorkerExitError("worker aborted", returncode=-6),
+        ) as worker, self.assertLogs(level="WARNING"):
+            with self.assertRaisesRegex(gemma4.Gemma4WorkerExitError, "worker aborted"):
+                director.direct(self.request(), frames)
+
+        self.assertEqual(worker.call_count, gemma4.GEMMA4_WORKER_RETRY_LIMIT + 1)
+
+    def test_context_overflow_preserves_preproduction_cache(self):
+        director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
+        frames = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+        calls = []
+
+        def fake_worker(request):
+            calls.append(dict(request))
+            raise gemma4.Gemma4ObservationError(
+                "Appended prompt exceeds n_ctx: 32813 > 32768"
+            )
+
+        request = self.request()
+        request["preproduction_cache"] = {"path": "/dev/shm/test-cache"}
+        request["preproduction_current_slice"] = "cached slice"
+        with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker):
+            with self.assertRaisesRegex(gemma4.Gemma4ObservationError, "32813 > 32768"):
+                director.direct(request, frames)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("preproduction_cache", calls[0])
+        self.assertIn("preproduction_current_slice", calls[0])
 
     def test_non_process_gemma_error_does_not_disable_mtp_or_retry(self):
         director = gemma4.Gemma4ContinuityDirector(gemma4_mtp=True)
@@ -286,6 +416,10 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIs(kwargs["draft_model_path"], draft)
         self.assertEqual(kwargs["num_pred_tokens"], 4)
         self.assertIs(kwargs["chat_handler"], handler)
+        self.assertEqual(kwargs["n_ctx"], 32768)
+        self.assertEqual(kwargs["type_k"], gemma4.GEMMA4_KV_CACHE_Q8_0)
+        self.assertEqual(kwargs["type_v"], gemma4.GEMMA4_KV_CACHE_Q8_0)
+        self.assertFalse(kwargs["swa_full"])
         self.assertFalse(kwargs["verbose"])
 
     def test_runtime_mtp_failure_is_not_silently_reported_as_mtp(self):
@@ -329,6 +463,10 @@ class GemmaCaptureTest(unittest.TestCase):
 
         self.assertIsInstance(llm, FakeRealLlama)
         self.assertNotIn("logits_all", created)
+        self.assertEqual(created["n_ctx"], 32768)
+        self.assertEqual(created["type_k"], gemma4.GEMMA4_KV_CACHE_Q8_0)
+        self.assertEqual(created["type_v"], gemma4.GEMMA4_KV_CACHE_Q8_0)
+        self.assertFalse(created["swa_full"])
         ensure.assert_not_called()
 
     def test_json_completion_uses_fast_unconstrained_path_when_gemma_returns_valid_json(self):
@@ -351,6 +489,39 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(raw, '{"confidence":"high"}')
         self.assertEqual(len(calls), 1)
         self.assertNotIn("response_format", calls[0])
+        self.assertEqual(calls[0]["max_tokens"], gemma4.GEMMA4_CHUNK_RESPONSE_TOKENS)
+
+    def test_incomplete_root_json_never_salvages_a_nested_character_object(self):
+        truncated = (
+            '{"confidence":"high","last_seen_character_state":['
+            '{"character_name":"Heman","subject":"<Subject 1>"}'
+        )
+        with self.assertRaisesRegex(
+            gemma4.Gemma4ObservationError,
+            "incomplete or malformed top-level JSON",
+        ):
+            gemma4._extract_json_object(truncated)
+
+    def test_normalizes_terminal_gemma_visible_answer_delimiter_without_touching_history(self):
+        prompt = "<|turn>model\n<|channel>thought\n<channel|>"
+        self.assertEqual(gemma4._normalize_gemma4_generation_suffix(prompt), prompt)
+        self.assertEqual(
+            gemma4._normalize_gemma4_generation_suffix("<|turn>model\n"),
+            prompt,
+        )
+        historical = "<|channel>thought\nreal thought\n<channel|>"
+        self.assertEqual(gemma4._normalize_gemma4_generation_suffix(historical), historical)
+
+    def test_json_completion_accepts_valid_json_returned_as_gemma_reasoning_content(self):
+        class FakeLlama:
+            def create_chat_completion(self, **_kwargs):
+                return {"choices": [{"message": {"content": "", "reasoning_content": '{"confidence":"high"}'}}]}
+
+        payload, raw = gemma4._gemma_chat_json(
+            FakeLlama(), [{"role": "user", "content": "Return JSON"}]
+        )
+        self.assertEqual(payload, {"confidence": "high"})
+        self.assertEqual(raw, '{"confidence":"high"}')
 
     def test_json_completion_uses_grammar_only_to_recover_malformed_json(self):
         calls = []
@@ -375,6 +546,56 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertNotIn("response_format", calls[0])
         self.assertEqual(calls[1]["response_format"], {"type": "json_object"})
         self.assertIn("malformed instructed JSON", "\n".join(captured.output))
+
+    def test_json_completion_repairs_thought_only_reply_as_an_append_chat_turn_before_grammar(self):
+        initial_calls = []
+        append_calls = []
+
+        class FakeLlama:
+            def create_chat_completion(self, **kwargs):
+                initial_calls.append(kwargs)
+                return {"choices": [{"message": {"content": ""}}]}
+
+        class FakeHandler:
+            def append_user_chat_completion(self, **kwargs):
+                append_calls.append(kwargs)
+                return {"choices": [{"message": {"content": '{"confidence":"high"}'}}]}
+
+        with self.assertLogs(level="WARNING") as captured:
+            payload, raw = gemma4._gemma_chat_json(
+                FakeLlama(),
+                [{"role": "user", "content": "Return JSON"}],
+                handler=FakeHandler(),
+            )
+
+        self.assertEqual(payload, {"confidence": "high"})
+        self.assertEqual(raw, '{"confidence":"high"}')
+        self.assertEqual(len(initial_calls), 1)
+        self.assertEqual(len(append_calls), 1)
+        self.assertNotIn("response_format", append_calls[0])
+        self.assertIn("append-only JSON replacement", "\n".join(captured.output))
+
+    def test_mtp_empty_json_exits_before_slow_append_or_grammar_repairs(self):
+        append_calls = []
+
+        class FakeLlama:
+            def create_chat_completion(self, **_kwargs):
+                return {"choices": [{"message": {"content": ""}}]}
+
+        class FakeHandler:
+            def append_user_chat_completion(self, **kwargs):
+                append_calls.append(kwargs)
+                return {"choices": [{"message": {"content": '{"confidence":"high"}'}}]}
+
+        with self.assertRaisesRegex(gemma4.Gemma4MTPOutputError, "original decoder"):
+            gemma4._gemma_chat_json(
+                FakeLlama(),
+                [{"role": "user", "content": "Return JSON"}],
+                handler=FakeHandler(),
+                mtp_active=True,
+            )
+
+        self.assertEqual(append_calls, [])
 
     def test_native_mtp_factory_configures_target_before_construction(self):
         target_config = {}
@@ -410,7 +631,7 @@ class GemmaCaptureTest(unittest.TestCase):
                 model_path="target.gguf",
                 draft_model_path="assistant.gguf",
                 num_pred_tokens=4,
-                n_ctx=16384,
+                n_ctx=gemma4.GEMMA4_CONTEXT_TOKENS,
             )
 
         self.assertTrue(target_config["model_load_mtp"])
@@ -450,7 +671,6 @@ class GemmaCaptureTest(unittest.TestCase):
 
         owner._llama_cpp = SimpleNamespace(
             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY=1,
-            LLAMA_STATE_SEQ_FLAGS_ON_DEVICE=2,
             llama_state_seq_set_data_ext=restore_state,
         )
         removals = []
@@ -474,13 +694,15 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(owner.accepted_tokens, 1)
         self.assertEqual(owner.rollback_count, 1)
         self.assertEqual(owner.replayed_tokens, 2)
-        self.assertEqual(state_calls[0][2:], (37, 0, 3))
+        self.assertEqual(state_calls[0][2:], (37, 0, 1))
         self.assertIsNone(owner._proposal_base)
 
-    def test_native_mtp_checkpoint_uses_fast_device_state_inside_worker(self):
+    def test_native_mtp_checkpoint_uses_reusable_reference_host_state(self):
         owner = gemma4_mtp.Gemma4MTPDraft.__new__(gemma4_mtp.Gemma4MTPDraft)
         owner.target_ctx = object()
         owner.checkpoint_seconds = 0.0
+        owner._checkpoint_buffer = None
+        owner._checkpoint_capacity = 0
         state_calls = []
 
         def checkpoint_size(ctx, seq_id, flags):
@@ -493,17 +715,22 @@ class GemmaCaptureTest(unittest.TestCase):
 
         owner._llama_cpp = SimpleNamespace(
             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY=1,
-            LLAMA_STATE_SEQ_FLAGS_ON_DEVICE=2,
             llama_state_seq_get_size_ext=checkpoint_size,
             llama_state_seq_get_data_ext=checkpoint_data,
         )
 
         owner._save_target_checkpoint(42)
+        first_buffer = owner._checkpoint_data
+        owner._clear_proposal()
+        owner._save_target_checkpoint(43)
 
-        self.assertEqual(state_calls[0][2:], (0, 3))
-        self.assertEqual(state_calls[1][2:], (16, 0, 3))
+        self.assertEqual(state_calls[0][2:], (0, 1))
+        self.assertEqual(state_calls[1][2:], (16, 0, 1))
+        self.assertEqual(state_calls[2][2:], (0, 1))
+        self.assertEqual(state_calls[3][2:], (16, 0, 1))
+        self.assertIs(owner._checkpoint_data, first_buffer)
         self.assertEqual(owner._checkpoint_size, 16)
-        self.assertEqual(owner._proposal_base, 42)
+        self.assertEqual(owner._proposal_base, 43)
 
     def test_worker_generation_emits_decode_tokens_per_second(self):
         class FakeLlama:
@@ -964,11 +1191,24 @@ class GemmaCaptureTest(unittest.TestCase):
 
     def test_previous_gemma_description_is_explicitly_linked_to_prior_stills(self):
         request = self.request()
+        request["character_name_table"] = "- Heman -> <Subject 1>"
+        request["previous_last_seen_character_state"] = [{
+            "character_name": "Heman",
+            "subject": "<Subject 1>",
+            "last_seen_global_frame": 208,
+            "last_seen_source_shot": 4,
+            "environment": "inside the ancient temple",
+            "pose_and_position": "standing on the temple floor",
+            "state_and_action": "walking right",
+            "spatial_relationships": "away from the tiger",
+        }]
         _system, observation = gemma4._render_observation_messages(request)
 
         self.assertIn(request["previous_gemma_description"], observation)
         self.assertIn(request["previous_gemma_timing_plan"], observation)
         self.assertIn(request["previous_gemma_end_state"], observation)
+        self.assertIn('"last_seen_global_frame": 208', observation)
+        self.assertIn("Return exactly one entry for every immutable character", observation)
         self.assertIn("exact attached stills", observation)
         self.assertIn("latest rendered still is authoritative", gemma4._gemma_prompt_templates()["SYSTEM"])
 
@@ -979,6 +1219,7 @@ class GemmaCaptureTest(unittest.TestCase):
         first_chunk["previous_gemma_description"] = None
         first_chunk["previous_gemma_timing_plan"] = None
         first_chunk["previous_gemma_end_state"] = None
+        first_chunk["previous_last_seen_character_state"] = None
         _system, first_observation = gemma4._render_observation_messages(first_chunk)
         self.assertIn("No previous Gemma-directed detailed_description exists", first_observation)
         self.assertIn("No previous Gemma timing plan exists", first_observation)
@@ -1017,6 +1258,15 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("begin it as unmarked continuation prose", observation)
         self.assertNotIn('exact token: "[Shot 1]"', observation)
         self.assertIn('exact token: "[Shot 2] At 00:00.667,"', observation)
+        self.assertIn("The chunk time-slice encompasses the end of global Source Shot 4", observation)
+        self.assertIn(
+            "global Source Shot 5 begins as local chunk Shot 2 at position 00:00.667",
+            observation,
+        )
+        self.assertIn(
+            "never before remaining action from global Source Shot 4",
+            observation,
+        )
 
     def test_retries_once_with_literal_local_markers_when_initial_json_uses_global_timecodes(self):
         captured = {"messages": []}
@@ -1067,6 +1317,151 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(retry_messages[2]["content"], json.dumps(wrong))
         self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", retry_messages[3]["content"])
         self.assertTrue(captured["closed"])
+
+    def test_reinforces_global_to_local_mapping_until_marker_sequence_is_valid(self):
+        captured = {"messages": []}
+        wrong = {
+            "confidence": "high",
+            "analysis": "Finish source Shot 4 and then begin source Shot 5.",
+            "timing_plan": "Finish walking, then make the one required cut.",
+            "end_state": "Heman has delivered the warning.",
+            "detailed_description": (
+                "Heman continues walking right. "
+                "[Shot 2] At 00:00.667, Heman keeps walking. "
+                "[Shot 5] At 00:09.167, Heman says: <d>[English] Stay back!</d>"
+            ),
+        }
+        still_wrong = dict(wrong)
+        corrected = dict(wrong)
+        corrected["detailed_description"] = (
+            "Heman continues walking right. "
+            "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
+        )
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [wrong, still_wrong, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(self.request(), [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(result.validation_warnings, ())
+        self.assertEqual(len(result.attempts), 3)
+        reinforcement = result.attempts[2].correction_prompt
+        self.assertIn("H3 SHOT-MARKER REPAIR STILL REQUIRED", reinforcement)
+        self.assertIn("The chunk time-slice encompasses the end of global Source Shot 4", reinforcement)
+        self.assertIn(
+            "global Source Shot 5 begins as local chunk Shot 2 at position 00:00.667",
+            reinforcement,
+        )
+        self.assertIn("Delete every invented or copied global marker", reinforcement)
+        self.assertTrue(captured["closed"])
+
+    def test_missing_detailed_description_is_repaired_in_same_operation(self):
+        captured = {"messages": []}
+        malformed = {
+            "confidence": "high",
+            "analysis": "I identified the correct continuation but omitted the output field.",
+            "timing_plan": "Continue walking, then make the required cut.",
+            "end_state": "Heman has delivered the warning.",
+        }
+        corrected = {
+            **malformed,
+            "detailed_description": (
+                "Heman continues walking right. "
+                "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
+            ),
+        }
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                pass
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                self.responses = [malformed, corrected]
+
+            def create_chat_completion(self, **kwargs):
+                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+            def close(self):
+                captured["closed"] = True
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(self.request(), [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(len(result.attempts), 2)
+        self.assertEqual(result.attempts[0].kind, "initial invalid response")
+        self.assertIn("no detailed_description string", result.attempts[0].validation_warnings[0])
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", result.attempts[1].correction_prompt)
+        self.assertIn("no detailed_description string", result.attempts[1].correction_prompt)
+        self.assertEqual(len(captured["messages"]), 2)
+        self.assertTrue(captured["closed"])
+
+    def test_missing_detailed_description_can_need_multiple_bounded_repairs(self):
+        malformed = {
+            "confidence": "high",
+            "analysis": "The response is still missing the required output field.",
+            "timing_plan": "Continue walking, then make the cut.",
+            "end_state": "Heman has delivered the warning.",
+        }
+        corrected = {
+            **malformed,
+            "detailed_description": (
+                "Heman continues walking right. "
+                "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d>"
+            ),
+        }
+        appended = []
+
+        class FakeHandler:
+            def __init__(self, **_kwargs):
+                self.responses = [malformed, corrected]
+
+            def append_user_chat_completion(self, **kwargs):
+                appended.append(kwargs["content"])
+                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+
+        class FakeLlama:
+            def __init__(self, **_kwargs):
+                pass
+
+            def create_chat_completion(self, **_kwargs):
+                return {"choices": [{"message": {"content": json.dumps(malformed)}}]}
+
+            def close(self):
+                pass
+
+        with patch.object(gemma4, "_load_runtime", return_value=(FakeLlama, FakeHandler)), \
+                patch.object(gemma4, "_ensure_model_files", return_value=(Path("model"), Path("mmproj"))), \
+                patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
+            result = gemma4._observe_in_process(self.request(), [], debug=False)
+
+        self.assertEqual(result.detailed_description, corrected["detailed_description"])
+        self.assertEqual(len(result.attempts), 3)
+        self.assertEqual(len(appended), 2)
+        self.assertTrue(all("no detailed_description string" in prompt for prompt in appended))
+        self.assertIn("CHUNK CONTRACT CORRECTION REQUIRED", appended[0])
+        self.assertIn("CHUNK JSON REPAIR STILL REQUIRED", appended[1])
+        self.assertNotIn("Persistent last-seen character state contract", appended[1])
 
     def test_chunk_contract_correction_is_an_appended_chat_turn_when_runtime_supports_it(self):
         captured = {"initial_messages": [], "append_content": []}
@@ -1148,7 +1543,10 @@ class GemmaCaptureTest(unittest.TestCase):
                 "status": "begins",
                 "evidence": "Heman says: <d>[English] Stay back!</d>",
             }],
-            "detailed_description": "Heman says: <d>[English] Stay back!</d> while continuing to walk right.",
+            "detailed_description": (
+                "Heman continues the already established walk. "
+                "[Shot 2] At 00:00.667, Heman says: <d>[English] Stay back!</d> while continuing to walk right."
+            ),
         }
         captured = {"messages": []}
 
@@ -1242,6 +1640,9 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("Every camera movement, follow, pan, zoom, track, shake, or reposition", system)
         self.assertIn("`In a continuous movement,`", system)
         self.assertIn("never turn it into an undocumented cut", system)
+        self.assertIn("Maintain `last_seen_character_state`", system)
+        self.assertIn("remains off-screen", system)
+        self.assertIn("never substitute a referenced animal", system)
         self.assertIn("`In a continuous movement,`", planning_system)
 
     def test_reports_marker_and_dialogue_warnings_without_replacing_gemma_text(self):
@@ -1270,6 +1671,46 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(result.system_prompt, "exact system prompt")
         self.assertEqual(result.observation_prompt, "exact chunk request")
         self.assertEqual(gemma4._chunk_prompt_from_payload(gemma4._chunk_prompt_payload(result)), result)
+
+        state_request = dict(request)
+        state_request["character_name_table"] = "- Heman -> <Subject 1>"
+        state_request["previous_last_seen_character_state"] = []
+        state_value = dict(value)
+        state_value["last_seen_character_state"] = [{
+            "character_name": "Heman",
+            "subject": "<Subject 1>",
+            "last_seen_global_frame": 208,
+            "last_seen_source_shot": 4,
+            "environment": "inside the ancient temple",
+            "pose_and_position": "standing on the temple floor",
+            "state_and_action": "walking toward the right",
+            "spatial_relationships": "away from the mounted riders",
+        }]
+        state_result = gemma4._validate_chunk_prompt(
+            state_value,
+            state_request,
+            json.dumps(state_value),
+        )
+        self.assertEqual(state_result.last_seen_character_state[0]["character_name"], "Heman")
+        self.assertEqual(state_result.last_seen_character_state[0]["last_seen_global_frame"], 208)
+        self.assertFalse(any("last-seen character state" in warning for warning in state_result.validation_warnings))
+        self.assertEqual(
+            gemma4._chunk_prompt_from_payload(gemma4._chunk_prompt_payload(state_result)),
+            state_result,
+        )
+
+        missing_state = gemma4._validate_chunk_prompt(value, state_request, json.dumps(value))
+        self.assertIn(
+            "Gemma 4 last-seen character state must be an array",
+            missing_state.validation_warnings,
+        )
+        self.assertIn(
+            "Persistent last-seen character state contract",
+            gemma4._chunk_contract_correction_request(
+                state_request,
+                gemma4._contract_validation_warnings(missing_state.validation_warnings),
+            ),
+        )
 
         wrong_marker = dict(value)
         wrong_marker["detailed_description"] = value["detailed_description"].replace("00:00.667", "00:00.500")
