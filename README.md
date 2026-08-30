@@ -1,6 +1,14 @@
 # ComfyUI-HR-Endless-Sampler 
 ## (the older ComfyUI MiniMax H3 Sampler Unlimited)
 
+
+
+https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
+
+- video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
+
+
+
 `HR Endless Sampler` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long video/audio latents, currently supports 
 Minimax H3 only. The plan is to add support to LTX 2.5 in the near future.
