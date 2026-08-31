@@ -321,6 +321,59 @@ class FinishedVideoIOTest(unittest.TestCase):
             repaired = video_io._repair_save_video_prompt_links(prompt)
         self.assertEqual(repaired["prompt"]["2595"]["inputs"]["timeline"], ["1", 2])
 
+    def test_prompt_repairs_transitional_qwen_widget_order(self):
+        inputs = {
+            "cache_gemma_preproduction": 2,
+            "gemma4_mtp": "xhigh",
+            "pytorch_memory_fraction": False,
+            "debug": 0,
+            "debug_stop_chunk": False,
+            "debug_start_chunk": True,
+            "director_backend": 0.85,
+            "director_model": True,
+            "director_mmproj": 0,
+            "director_mtp_draft_tokens": 0,
+            "director_reasoning_effort": "qwen3.8",
+            "director_cpu_moe": "LLM/GGUF/qwen3.8-27B/model.gguf",
+            "director_n_cpu_moe": "LLM/GGUF/qwen3.8-27B/mmproj-model.gguf",
+        }
+        prompt = {"prompt": {"2599": {"class_type": "HREndlessSampler", "inputs": inputs}}}
+        fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+        with patch.dict(sys.modules, {"nodes": fake_nodes}):
+            video_io._repair_save_video_prompt_links(prompt)
+        self.assertEqual(inputs["director_backend"], "qwen3.8")
+        self.assertEqual(inputs["director_model"], "LLM/GGUF/qwen3.8-27B/model.gguf")
+        self.assertEqual(inputs["director_mmproj"], "LLM/GGUF/qwen3.8-27B/mmproj-model.gguf")
+        self.assertEqual(inputs["director_mtp_draft_tokens"], 2)
+        self.assertEqual(inputs["director_reasoning_effort"], "xhigh")
+        self.assertEqual(inputs["pytorch_memory_fraction"], 0.85)
+        self.assertTrue(inputs["debug"])
+
+    def test_prompt_restores_zero_memory_fraction_before_validation(self):
+        inputs = {"pytorch_memory_fraction": 0.0}
+        prompt = {"prompt": {"2599": {"class_type": "HREndlessSampler", "inputs": inputs}}}
+        fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={})
+        with patch.dict(sys.modules, {"nodes": fake_nodes}):
+            video_io._repair_save_video_prompt_links(prompt)
+        self.assertEqual(inputs["pytorch_memory_fraction"], 0.85)
+
+    def test_save_prompt_keeps_valid_v3_timeline_output(self):
+        class V3Sampler:
+            @classmethod
+            def define_schema(cls):
+                return nodes.HREndlessSampler.define_schema()
+
+        fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={"HREndlessSampler": V3Sampler})
+        prompt = {
+            "prompt": {
+                "2576": {"class_type": "HREndlessSampler", "inputs": {}},
+                "2595": {"class_type": "HREndlessSamplerSaveVideo", "inputs": {"timeline": ["2576", 3]}},
+            },
+        }
+        with patch.dict(sys.modules, {"nodes": fake_nodes}):
+            repaired = video_io._repair_save_video_prompt_links(prompt)
+        self.assertEqual(repaired["prompt"]["2595"]["inputs"]["timeline"], ["2576", 3])
+
     def test_save_prompt_removes_an_unrecoverable_stale_output_slot(self):
         fake_nodes = types.SimpleNamespace(NODE_CLASS_MAPPINGS={
             "Decoder": types.SimpleNamespace(RETURN_TYPES=("LATENT",)),

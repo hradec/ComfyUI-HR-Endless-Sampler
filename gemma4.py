@@ -65,8 +65,8 @@ GEMMA4_KV_CACHE_Q8_0 = 8
 GEMMA4_CONTEXT_TOKENS = 32768
 GEMMA4_WORKER_RETRY_LIMIT = 10
 GEMMA4_RESPONSE_REPAIR_LIMIT = 10
-GEMMA4_CHUNK_RESPONSE_TOKENS = 2048
-GEMMA4_TIMING_RESPONSE_TOKENS = 4096
+GEMMA4_CHUNK_RESPONSE_TOKENS = 4096
+GEMMA4_TIMING_RESPONSE_TOKENS = 8192
 # A valid JSON response is normally produced by the unconstrained decoder. If
 # Gemma accidentally answers in its private thought channel, correct it as a
 # real next chat turn first.  That keeps the already encoded request, images,
@@ -2034,8 +2034,13 @@ def _timing_plan_validation_error(message: str, raw_json: str) -> Gemma4Observat
 def _validate_character_name_table(value: dict[str, Any], raw_json: str) -> tuple[GemmaCharacterSubject, ...]:
     """Accept only explicit, stable name-to-existing-subject declarations."""
     raw_table = value.get("character_name_table")
+    if isinstance(raw_table, dict):
+        raw_table = [
+            {"character_name": character_name, "subject": subject}
+            for character_name, subject in raw_table.items()
+        ]
     if not isinstance(raw_table, list):
-        raise _timing_plan_validation_error("response field 'character_name_table' must be an array", raw_json)
+        raise _timing_plan_validation_error("response field 'character_name_table' must be an array or name-to-subject object", raw_json)
     table: list[GemmaCharacterSubject] = []
     seen_names: dict[str, str] = {}
     for item in raw_table:
@@ -3163,7 +3168,7 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
             max_tokens=GEMMA4_TIMING_RESPONSE_TOKENS,
             mtp_active=bool(request.get("gemma4_mtp", False)),
             director_name=director_name,
-            prefer_json_grammar=director_name == "Qwen3.5",
+            prefer_json_grammar=True,
         )
         attempts: list[GemmaPromptAttempt] = []
         correction_prompt = ""

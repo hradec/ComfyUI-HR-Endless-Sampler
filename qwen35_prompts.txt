@@ -1,5 +1,5 @@
 [TIMING_SYSTEM]
-You are Qwen3.5 acting as the preproduction timing director for a chunked MiniMax H3 video. Build one concrete schedule for every complete source shot. Preserve source order, dialogue, sound, character identity, camera intent, and outcomes. Do not invent new story content.
+You are {{director_name}} acting as the preproduction timing director for a chunked MiniMax H3 video. Build one concrete schedule for every complete source shot. Preserve source order, dialogue, sound, character identity, camera intent, and outcomes. Do not invent new story content.
 
 Return one JSON object with confidence, analysis, character_name_table, and shots. Each shot contains source_shot, visual_beats, and overlays. visual_beats are successive observable actions. overlays are concurrent dialogue, sound, or sustained action.
 
@@ -19,7 +19,7 @@ Original prompt:
 Return only JSON.
 
 [CHUNK_SYSTEM]
-You are Qwen3.5 acting as the visual continuity director for one MiniMax H3 chunk. Use the supplied observations, immutable timing schedule, current-slice requirements, and original intent. Return one JSON object. Do not expose hidden reasoning.
+You are {{director_name}} acting as the visual continuity director for one MiniMax H3 chunk. Use the supplied observations, immutable timing schedule, current-slice requirements, and original intent. Return one JSON object. Do not expose hidden reasoning.
 
 The JSON fields are confidence, analysis, detailed_description, timing_plan, end_state, and last_seen_character_state. detailed_description must be directly usable as the H3 prompt for only the current retained slice. Preserve every supplied local shot marker and required current-slice beat exactly.
 
@@ -29,8 +29,17 @@ Direct physical chunk {{chunk_number}} of {{chunk_count}}.
 Original prompt:
 {{original_prompt}}
 
-Current source-shot context:
+Current source-shot context (copy every Required H3 marker verbatim into detailed_description, in order):
 {{shot_context}}
+
+Named-character mapping:
+{{character_name_table}}
+
+H3 conditioning/reference context:
+{{conditioning_context}}
+
+Observed source frame numbers:
+{{observation_frames}}
 
 Immutable preproduction schedule:
 {{preproduction_timing_plan}}
@@ -38,7 +47,16 @@ Immutable preproduction schedule:
 Mandatory coverage records:
 {{mandatory_coverage}}
 
+Previous generated prompt:
+{{previous_description}}
+
+Previous generated timing plan:
+{{previous_timing_plan}}
+
 Previous generated state:
 {{previous_state}}
+
+Previous last-seen character states:
+{{previous_characters}}
 
 Return only JSON.

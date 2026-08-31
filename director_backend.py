@@ -6,7 +6,8 @@ from pathlib import Path
 import folder_paths
 
 
-DIRECTOR_BACKENDS = ("gemma4", "qwen3.5")
+QWEN_DIRECTOR_BACKENDS = ("qwen3.5", "qwen3.6", "qwen3.8")
+DIRECTOR_BACKENDS = ("gemma4", *QWEN_DIRECTOR_BACKENDS)
 _MODEL_ROOTS = ("llama_cpp", "LLM/GGUF")
 
 
@@ -59,9 +60,8 @@ def resolve_director_model(selection):
     return path
 
 
-def _qwen35_defaults():
-    files = director_model_files()
-    candidates = [path for path in files if "qwen3.5" in path.casefold()]
+def _qwen_defaults(family):
+    candidates = [path for path in director_model_files() if family in path.casefold()]
     models = [path for path in candidates if "mmproj" not in Path(path).name.casefold()]
     projectors = [path for path in candidates if "mmproj" in Path(path).name.casefold()]
     for model in models:
@@ -90,9 +90,9 @@ def _qwen35_model_for_projector(mmproj):
 def resolve_director_selection(backend, model="auto", mmproj="auto"):
     if backend not in DIRECTOR_BACKENDS:
         raise DirectorConfigurationError(f"Unknown director backend: {backend}")
-    if backend == "qwen3.5":
+    if backend in QWEN_DIRECTOR_BACKENDS:
         if model == "auto" and mmproj == "auto":
-            model, mmproj = _qwen35_defaults()
+            model, mmproj = _qwen_defaults(backend)
         elif model == "auto":
             model = _qwen35_model_for_projector(mmproj)
         elif mmproj == "auto":
@@ -103,4 +103,9 @@ def resolve_director_selection(backend, model="auto", mmproj="auto"):
         raise DirectorConfigurationError("The director model selection cannot be an mmproj file")
     if mmproj_path is not None and "mmproj" not in mmproj_path.name.casefold():
         raise DirectorConfigurationError("The director mmproj selection must be an mmproj GGUF file")
+    if backend in QWEN_DIRECTOR_BACKENDS and model_path is not None and mmproj_path is not None:
+        if model_path.parent != mmproj_path.parent:
+            raise DirectorConfigurationError("The Qwen director model and mmproj must be selected from the same model directory")
+        if backend not in model_path.as_posix().casefold() or backend not in mmproj_path.as_posix().casefold():
+            raise DirectorConfigurationError(f"The {backend} backend requires matching {backend} model and mmproj files")
     return DirectorModelSelection(backend, model_path, mmproj_path)

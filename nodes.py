@@ -24,7 +24,7 @@ from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from tqdm.auto import tqdm
 from tqdm import tqdm as _cli_tqdm
 
-from .director_backend import DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
+from .director_backend import DIRECTOR_BACKENDS, QWEN_DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
 from .director_errors import DirectorDependencyError, DirectorObservationError
 from .gemma4 import (
     Gemma4ContinuityDirector,
@@ -2332,19 +2332,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
-                                 tooltip="Use native Gemma 4 draft-MTP with four speculative tokens. Disable it to compare against the original non-MTP decoder."),
+                                 tooltip="Use native MTP speculative decoding when the selected Gemma or Qwen GGUF supports it. Qwen uses MTP only for text-only timing preproduction; visual chunk directing remains MTMD."),
                 io.Float.Input(
                     "pytorch_memory_fraction",
                     default=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                    min=0.50,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        "Global PyTorch CUDA allocator limit applied when this sampler starts. 0.85 reserves "
-                        "15% of VRAM outside PyTorch so cached memory is pressured before a driver-level OOM. "
-                        "The setting remains active for the ComfyUI process until another run changes it; "
-                        "set 1.0 for the normal unrestricted allocator limit."
-                    ),
+                    tooltip="Compatibility placeholder retained to preserve old workflow widget positions; execution always uses the internal 0.85 limit.",
                 ),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots. Before a multi-chunk render, also run a disposable three-step continuation preflight to test the expected Chunk 2 memory footprint, then unload it completely. chunk_prompts is returned whether debug is enabled or not."),
@@ -2358,6 +2350,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                tooltip="Local GGUF director model. Auto keeps the selected backend's existing default."),
                 io.Combo.Input("director_mmproj", options=director_model_options(projector=True), default="auto",
                                tooltip="Local multimodal projector. Auto keeps the selected backend's existing default."),
+                io.Int.Input("director_mtp_draft_tokens", default=2, min=1, max=8, step=1,
+                             tooltip="Maximum Qwen3.6/Qwen3.8 MTP draft tokens per step. Qwen3.5 does not support MTP; Gemma keeps its native fixed configuration."),
+                io.Combo.Input("director_reasoning_effort", options=["xhigh", "medium", "low"], default="xhigh",
+                               tooltip="Qwen3.8 reasoning effort. The Qwen director disables free-form thinking for JSON reliability but passes this native template setting."),
+                io.Boolean.Input("director_cpu_moe", default=False,
+                                 tooltip="Qwen3.6 only: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
+                io.Int.Input("director_n_cpu_moe", default=0, min=0, max=256, step=1,
+                             tooltip="Qwen3.6 only: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -2375,23 +2375,22 @@ class HREndlessSampler(SamplerCustomAdvanced):
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
                 source_images=None, video_continuation=22, video_continuation_res="full", vae=None,
-                cache_gemma_preproduction=False, gemma4_mtp=True,
+                cache_gemma_preproduction=False, gemma4_mtp=True, director_mtp_draft_tokens=2,
+                director_reasoning_effort="xhigh", director_cpu_moe=False, director_n_cpu_moe=0,
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
                 director_model="auto", director_mmproj="auto", **_deprecated_inputs):
-        _set_pytorch_memory_fraction(pytorch_memory_fraction, guider.model_patcher.load_device)
+        _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
         # serialized legacy values too: an old workflow must not quietly enable
         # an experimental overlap, keyframe, Qwen-history, or preview-only path.
         director_selection = resolve_director_selection(director_backend, director_model, director_mmproj)
-        if director_selection.backend == "qwen3.5":
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
             if director_selection.model_path is None or director_selection.mmproj_path is None:
-                raise ValueError("Qwen3.5 requires a local GGUF model and mmproj")
+                raise ValueError("Qwen requires a local GGUF model and mmproj")
             if cache_gemma_preproduction:
-                raise ValueError("Qwen3.5 does not support the Gemma preproduction KV cache")
-            if gemma4_mtp:
-                raise ValueError("Qwen3.5 does not support gemma4_mtp; disable it explicitly")
+                raise ValueError("Qwen does not support the Gemma preproduction KV cache")
         elif (director_selection.model_path is None) != (director_selection.mmproj_path is None):
             raise ValueError("Gemma 4 requires both a local GGUF model and mmproj, or auto for both")
         elif gemma4_mtp and director_selection.model_path is not None and not is_official_gemma4_pair(
@@ -2400,7 +2399,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
         ):
             raise ValueError("gemma4_mtp is supported only by the official Gemma 4 model/projector pair")
 
-        director_name = "Qwen3.5" if director_selection.backend == "qwen3.5" else "Gemma 4"
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+            director_name = director_selection.backend.replace("qwen", "Qwen")
+        else:
+            director_name = "Gemma 4"
         prompt_preview_only = False
         context_keyframes_enable = False
         context_keyframes = 5
@@ -2666,7 +2668,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             fps,
             len(active_plan),
             cache_gemma_preproduction=cache_gemma_preproduction,
-            gemma4_mtp=gemma4_mtp if director_selection.backend == "gemma4" else False,
+            gemma4_mtp=gemma4_mtp,
             director_name=director_name,
             director_model=(
                 director_selection.model_path.name
@@ -2787,12 +2789,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 raise RuntimeError(f"HR Endless Sampler replay cache has invalid completed chunk state: {error}") from error
         gemma_director = None
         if gemma_director_needed:
-            if director_selection.backend == "qwen3.5":
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
                 gemma_director = Qwen35ContinuityDirector(
                     director_selection.model_path,
                     director_selection.mmproj_path,
                     debug=debug,
                     observation_image_directory=gemma_image_log,
+                    mtp_enabled=gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"},
+                    mtp_draft_tokens=director_mtp_draft_tokens,
+                    reasoning_effort=director_reasoning_effort,
+                    cpu_moe=director_cpu_moe,
+                    n_cpu_moe=director_n_cpu_moe,
+                    backend=director_selection.backend,
                 )
             else:
                 gemma_director = Gemma4ContinuityDirector(
@@ -2803,10 +2811,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     mmproj_path=director_selection.mmproj_path,
                 )
         if gemma_director is not None:
-            if director_selection.backend == "qwen3.5":
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
                 logging.info(
-                    "HR Endless Sampler director: Qwen3.5 (%s, context 65536, CPU vision projector, no MTP or KV cache).",
+                    "HR Endless Sampler director: %s (%s, context 16384, CPU vision projector, MTP=%s, draft tokens=%d).",
+                    director_name,
                     director_selection.model_path.name,
+                    bool(gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"}),
+                    int(director_mtp_draft_tokens),
                 )
             else:
                 logging.info(

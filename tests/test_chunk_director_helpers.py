@@ -63,6 +63,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("cache_gemma_preproduction", input_ids)
         self.assertIn("gemma4_mtp", input_ids)
         self.assertIn("pytorch_memory_fraction", input_ids)
+        memory_fraction_input = next(item for item in schema.inputs if item.id == "pytorch_memory_fraction")
+        self.assertIsNone(memory_fraction_input.min)
+        self.assertIsNone(memory_fraction_input.max)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
             "context_keyframes_enable",
@@ -73,7 +76,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "prompt_preview_only",
         } & set(input_ids))
         self.assertEqual(
-            input_ids[-9:-3],
+            input_ids[-13:-7],
             [
                 "cache_gemma_preproduction",
                 "gemma4_mtp",
@@ -83,7 +86,11 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 "debug_start_chunk",
             ],
         )
-        self.assertEqual(input_ids[-3:], ["director_backend", "director_model", "director_mmproj"])
+        self.assertEqual(input_ids[-7:-4], ["director_backend", "director_model", "director_mmproj"])
+        self.assertEqual(
+            input_ids[-4:],
+            ["director_mtp_draft_tokens", "director_reasoning_effort", "director_cpu_moe", "director_n_cpu_moe"],
+        )
 
         execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
         self.assertNotIn("video_continuation_enable", execute_params)

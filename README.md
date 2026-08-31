@@ -96,11 +96,12 @@ presentation and does not change when only `video_continuation_res` changes.
 The sampler also uses the previous chunk's final five frames as a small H3
 boundary keyframe. This is automatic. It helps adjacent chunks meet cleanly.
 
-`director_backend` selects `gemma4` or `qwen3.5`. `director_model` and
-`director_mmproj` select local GGUF files discovered recursively beneath
-`models/llama_cpp` and `models/LLM/GGUF`. `auto` keeps Gemma's existing default
-or selects the first Qwen3.5 model/projector pair whose path contains
-`qwen3.5`. URLs, paths outside the registered model roots, and non-GGUF files
+`director_backend` explicitly selects `gemma4`, `qwen3.5`, `qwen3.6`, or
+`qwen3.8`. The existing `qwen3.5` value remains compatible with old workflows.
+`director_model` and `director_mmproj` select local files discovered recursively
+beneath `models/llama_cpp` and `models/LLM/GGUF`. For each Qwen backend, `auto`
+selects only a same-directory model/projector pair from that exact Qwen series.
+Explicit Qwen selections must match the selected series and directory. URLs, external paths, and non-GGUF files
 are rejected. Qwen never downloads a model.
 
 `cache_gemma_preproduction` saves Gemma's static preproduction context in
@@ -110,8 +111,13 @@ has enough free RAM; otherwise the normal temporary directory is used. The
 cache uses several GiB of RAM, never VRAM. It is optional and does not change
 the generated video.
 
-`gemma4_mtp` enables Gemma's native four-token draft-MTP decoder. Turn it off
-to run the original non-MTP decoder and compare speed on the same workflow.
+`gemma4_mtp` enables native MTP where the selected director supports it.
+Gemma uses its four-token configuration. Qwen3.5 does not support MTP.
+Qwen3.6 and Qwen3.8 use embedded NextN/MTP layers for both text timing and visual
+MTMD requests. `director_mtp_draft_tokens` controls their draft length. A native Qwen
+MTP failure is retried once in a fresh non-MTP worker; invalid model-authored
+JSON is not repeatedly regenerated. Turn the setting off to compare ordinary
+decoding on the same workflow.
 The console reports generated tokens/second and, in MTP mode, the assistant's
 draft-token acceptance rate, proposal count, verification work, rollback
 replays, and checkpoint time. This is real speculative decoding: the matching
@@ -190,7 +196,7 @@ to H3. The image directory contains the stills that the director saw. The legacy
 `last_gemma_*` filenames remain unchanged for workflow/tool compatibility. A new
 render replaces both.
 
-## Qwen3.5 setup
+## Qwen3.5, Qwen3.6, and Qwen3.8 setup
 
 Place the local model and projector beneath `models/LLM/GGUF`, for example:
 
@@ -200,14 +206,15 @@ models/LLM/GGUF/qwen3.5-9B/
 └── mmproj-Huihui-Qwen3.5-9B-abliterated.gguf
 ```
 
-Select `director_backend: qwen3.5`; `auto` discovers that pair. Qwen uses an
-isolated llama.cpp worker with a 4096-token context and 256-token batch. It does
-not use Gemma MTP or the Gemma preproduction KV cache. Set both
-`cache_gemma_preproduction: false` and `gemma4_mtp: false`; unsupported Qwen
-combinations fail clearly rather than silently changing decoding mode. The
-same directing contract accepts Chinese source prompts, writes H3 visual/action/
-camera prose in English, and preserves original dialogue, lyrics, and visible
-text in their source language.
+Select the matching `qwen3.5`, `qwen3.6`, or `qwen3.8` value in
+`director_backend`; `auto` then discovers only that series. Qwen uses a disposable llama.cpp worker
+with a 16384-token context and 256-token batch. Qwen3.8 reads the GGUF's native
+chat template, supports `xhigh`, `medium`, and `low` reasoning effort, and adapts
+that template for its mmproj. Qwen3.6 can optionally pass `cpu_moe` or
+`n_cpu_moe`. The Gemma preproduction KV cache remains unsupported. The same
+directing contract accepts Chinese source prompts, writes H3 visual/action/
+camera prose in English, and preserves original dialogue, lyrics, visible text,
+required shot markers, and prior chunk continuity context.
 
 The Qwen worker exits before H3 sampling resumes, so its llama.cpp CUDA context
 cannot remain allocated beside H3. The plugin does not use Transformers,

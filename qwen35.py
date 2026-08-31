@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import re
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,6 +28,9 @@ QWEN35_CONTEXT_TOKENS = 65536
 QWEN35_BATCH_SIZE = 256
 QWEN35_CHUNK_RESPONSE_TOKENS = 8192
 QWEN35_TIMING_RESPONSE_TOKENS = 32768
+QWEN36_CONTEXT_TOKENS = 16384
+QWEN36_CHUNK_RESPONSE_TOKENS = 2048
+QWEN36_TIMING_RESPONSE_TOKENS = 4096
 QWEN35_PROMPTS_PATH = Path(__file__).with_name("qwen35_prompts.txt")
 _WORKER_RESULT_PREFIX = "MINIMAX_H3_QWEN35_RESULT="
 _SECTION = re.compile(r"(?ms)^\[([A-Z][A-Z0-9_]*)\]\s*$\n?(.*?)(?=^\[[A-Z][A-Z0-9_]*\]\s*$|\Z)")
@@ -192,13 +197,19 @@ def _source_shots(shots: Sequence[dict[str, Any]]) -> str:
     blocks = []
     for shot in shots:
         duration = int(shot["shot_end"]) - int(shot["shot_start"])
-        blocks.append(f"Source Shot {int(shot['shot_number'])}: duration {duration} frames; valid local interval [0,{duration}).\n{str(shot['source_body']).strip()}")
+        marker = shot.get("required_marker")
+        marker_line = f"Required H3 marker: {marker}\n" if marker else ""
+        blocks.append(
+            f"Source Shot {int(shot['shot_number'])}: duration {duration} frames; valid local interval [0,{duration}).\n"
+            f"{marker_line}{str(shot['source_body']).strip()}"
+        )
     return "\n\n".join(blocks)
 
 
 def _timing_messages(request: dict[str, Any]) -> tuple[str, str]:
     templates = _templates()
     values = {
+        "director_name": request.get("director_backend", "qwen3.5").replace("qwen", "Qwen"),
         "chunk_count": request["chunk_count"], "fps": request["fps"],
         "source_shots": _source_shots(request["source_shots"]), "original_prompt": request["original_prompt"],
     }
@@ -208,12 +219,19 @@ def _timing_messages(request: dict[str, Any]) -> tuple[str, str]:
 def _chunk_messages(request: dict[str, Any]) -> tuple[str, str]:
     templates = _templates()
     values = {
+        "director_name": request.get("director_backend", "qwen3.5").replace("qwen", "Qwen"),
         "chunk_number": request["chunk_number"], "chunk_count": request["chunk_count"],
         "original_prompt": request["original_prompt"],
         "shot_context": _source_shots(request.get("target_shots", ())),
         "preproduction_timing_plan": request.get("preproduction_timing_plan", ""),
         "mandatory_coverage": json.dumps(request.get("mandatory_coverage", ()), ensure_ascii=False),
-        "previous_state": request.get("previous_end_state", "none"),
+        "character_name_table": request.get("character_name_table", "none"),
+        "conditioning_context": request.get("conditioning_context", "none"),
+        "observation_frames": ", ".join(str(value) for value in request.get("observation_frame_numbers", ())) or "none",
+        "previous_description": request.get("previous_gemma_description", "none") or "none",
+        "previous_timing_plan": request.get("previous_gemma_timing_plan", "none") or "none",
+        "previous_state": request.get("previous_gemma_end_state", request.get("previous_end_state", "none")) or "none",
+        "previous_characters": json.dumps(request.get("previous_last_seen_character_state", ()), ensure_ascii=False),
     }
     return templates["CHUNK_SYSTEM"], _render(templates["CHUNK_USER"], values)
 
@@ -271,12 +289,23 @@ def _timing_plan(value: dict[str, Any], request: dict[str, Any], raw: str, syste
             raise Qwen35ObservationError(f"Qwen3.5 Source Shot {number} needs visual beats", raw_json=raw)
         beats = []
         previous = 0
+        coordinate_offset = 0
         for index, beat in enumerate(raw_beats):
             if not isinstance(beat, dict):
                 raise Qwen35ObservationError(f"Qwen3.5 Source Shot {number} visual beat {index + 1} is not an object", raw_json=raw)
             try:
-                start = int(beat["start_frame"])
-                end = duration if index == len(raw_beats) - 1 and start == previous and start < duration else int(beat["end_frame"])
+                start = int(beat["start_frame"] if "start_frame" in beat else beat["frame_start"])
+                if index == 0 and start == int(source["shot_start"]):
+                    coordinate_offset = int(source["shot_start"])
+                start -= coordinate_offset
+                if index == len(raw_beats) - 1 and start == previous and start < duration:
+                    end = duration
+                elif "end_frame" in beat or "frame_end" in beat:
+                    end_value = beat["end_frame"] if "end_frame" in beat else beat["frame_end"]
+                    end = int(end_value) - coordinate_offset
+                else:
+                    next_beat = raw_beats[index + 1]
+                    end = int(next_beat["start_frame"] if "start_frame" in next_beat else next_beat["frame_start"]) - coordinate_offset
             except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise Qwen35ObservationError(
                     f"Qwen3.5 Source Shot {number} visual beat {index + 1} needs integer start_frame and end_frame; returned keys: {', '.join(sorted(str(key) for key in beat))}",
@@ -302,8 +331,11 @@ def _timing_plan(value: dict[str, Any], request: dict[str, Any], raw: str, syste
             content = str(overlay.get("content", "")).strip()
             if kind not in {"dialogue", "sound", "action"} or not content:
                 continue
-            start = max(0, int(overlay["start_frame"]))
-            end = min(duration, int(overlay["end_frame"]))
+            try:
+                start = max(0, int(overlay["start_frame"]) - coordinate_offset)
+                end = min(duration, int(overlay["end_frame"]) - coordinate_offset)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
             if start < end:
                 overlays.append(QwenShotTimingOverlay(start, end, kind, content))
         shots.append(QwenShotTimingShot(number, int(source["shot_start"]), int(source["shot_end"]), tuple(beats), tuple(overlays)))
@@ -321,7 +353,7 @@ def _timing_plan(value: dict[str, Any], request: dict[str, Any], raw: str, syste
     return QwenShotTimingPlan(str(value.get("confidence", "unknown")), str(value.get("analysis", "")).strip(), tuple(shots), tuple(table), raw, system, prompt, attempts=(attempt,))
 
 
-def _chunk_prompt(value: dict[str, Any], raw: str, system: str, prompt: str) -> QwenChunkPrompt:
+def _chunk_prompt(value: dict[str, Any], raw: str, system: str, prompt: str, request: dict[str, Any] | None = None) -> QwenChunkPrompt:
     description = next(
         (
             candidate.strip()
@@ -333,9 +365,17 @@ def _chunk_prompt(value: dict[str, Any], raw: str, system: str, prompt: str) -> 
     if not description:
         keys = ", ".join(sorted(str(name) for name in value)) or "none"
         raise Qwen35ObservationError(
-            f"Qwen3.5 response contains no usable H3 prompt text; returned keys: {keys}",
+            f"Qwen response contains no usable H3 prompt text; returned keys: {keys}",
             raw_json=raw,
         )
+    required_markers = [
+        str(shot["required_marker"]).strip()
+        for shot in (request or {}).get("target_shots", ())
+        if shot.get("required_marker")
+    ]
+    missing_markers = [marker for marker in required_markers if marker not in description]
+    if missing_markers:
+        description = " ".join([*missing_markers, description])
     state = value.get("last_seen_character_state", ())
     if not isinstance(state, list):
         state = []
@@ -357,19 +397,184 @@ def _image_url(frame: torch.Tensor) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
+def _gguf_mtp_layers(model_path: str | Path) -> int | None:
+    """Return embedded NextN/MTP layers, zero when absent, or None when unreadable."""
+    path = Path(model_path)
+    if path.suffix.casefold() != ".gguf":
+        return None
+    fixed_types = {
+        0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
+        4: ("<I", 4), 5: ("<i", 4), 6: ("<f", 4), 7: ("<?", 1),
+        10: ("<Q", 8), 11: ("<q", 8), 12: ("<d", 8),
+    }
+    try:
+        with path.open("rb") as gguf:
+            def read_exact(size: int) -> bytes:
+                value = gguf.read(size)
+                if len(value) != size:
+                    raise EOFError
+                return value
+
+            def read_string() -> str:
+                size = struct.unpack("<Q", read_exact(8))[0]
+                return read_exact(size).decode("utf-8", errors="replace")
+
+            def read_value(value_type: int, capture=False):
+                if value_type in fixed_types:
+                    fmt, size = fixed_types[value_type]
+                    value = struct.unpack(fmt, read_exact(size))[0]
+                    return value if capture else None
+                if value_type == 8:
+                    value = read_string()
+                    return value if capture else None
+                if value_type == 9:
+                    element_type = struct.unpack("<I", read_exact(4))[0]
+                    count = struct.unpack("<Q", read_exact(8))[0]
+                    if element_type in fixed_types:
+                        gguf.seek(fixed_types[element_type][1] * count, os.SEEK_CUR)
+                    else:
+                        for _ in range(count):
+                            read_value(element_type)
+                    return None
+                raise ValueError(value_type)
+
+            if read_exact(4) != b"GGUF" or struct.unpack("<I", read_exact(4))[0] not in (2, 3):
+                return None
+            tensor_count, metadata_count = struct.unpack("<QQ", read_exact(16))
+            layers = 0
+            for _ in range(metadata_count):
+                key = read_string()
+                value_type = struct.unpack("<I", read_exact(4))[0]
+                capture = key.casefold().endswith(".nextn_predict_layers")
+                value = read_value(value_type, capture)
+                if capture and isinstance(value, (int, float)):
+                    layers = max(layers, int(value))
+            if layers <= 0:
+                for _ in range(tensor_count):
+                    name = read_string().casefold()
+                    dimensions = struct.unpack("<I", read_exact(4))[0]
+                    gguf.seek(dimensions * 8 + 4 + 8, os.SEEK_CUR)
+                    if ".nextn." in name or ".mtp." in name:
+                        layers = 1
+            return layers
+    except (OSError, EOFError, ValueError, struct.error):
+        return None
+
+
+def _qwen_family(model_path: str | Path) -> str:
+    name = Path(model_path).name.casefold().replace("-", "").replace("_", "")
+    if "qwen38" in name or "qwen3.8" in name:
+        return "qwen3.8"
+    if "qwen36" in name or "qwen3.6" in name:
+        return "qwen3.6"
+    return "qwen3.5"
+
+
+def _adapt_qwen38_mtmd_template(chat_template: str) -> str:
+    if not chat_template or "<|image_pad|>" not in chat_template:
+        return chat_template
+    pattern = r"\{\{-?\s*(['\"])<\|vision_start\|><\|image_pad\|><\|vision_end\|>\1\s*-?\}\}"
+    replacement = (
+        "{{- '<|vision_start|>' }}"
+        "{%- if item.image_url is string %}{{- item.image_url }}"
+        "{%- else %}{{- item.image_url.url }}{%- endif %}"
+        "{{- '<|vision_end|>' }}"
+    )
+    adapted, count = re.subn(pattern, replacement, chat_template)
+    if count == 0:
+        raise Qwen35DependencyError("Qwen3.8 chat template contains an unsupported image_pad expression")
+    return adapted
+
+
+def _qwen38_text_handler(llm, formatter_class, handler_factory, reasoning_effort: str):
+    template = (getattr(llm, "metadata", {}) or {}).get("tokenizer.chat_template")
+    if not template:
+        raise Qwen35DependencyError("Qwen3.8 GGUF is missing tokenizer.chat_template")
+    model = getattr(llm, "_model", None)
+
+    def token_text(token_id: int) -> str:
+        if token_id == -1 or model is None or not hasattr(model, "token_get_text"):
+            return ""
+        return model.token_get_text(token_id)
+
+    eos, bos, eot = llm.token_eos(), llm.token_bos(), llm.token_eot()
+    formatter = formatter_class(
+        template=template,
+        eos_token=token_text(eos),
+        bos_token=token_text(bos),
+        stop_token_ids=[token for token in (eos, eot) if token != -1] or None,
+    )
+
+    def qwen38_formatter(*, messages, **kwargs):
+        kwargs.update(enable_thinking=False, preserve_thinking=False, reasoning_effort=reasoning_effort)
+        return formatter(messages=messages, **kwargs)
+
+    return handler_factory(qwen38_formatter)
+
+
+def _install_mtmd_physical_token_ledger(llm: Any) -> None:
+    original_generate = getattr(llm, "generate", None)
+    if not callable(original_generate):
+        return
+
+    def physical_generate(*args: Any, **kwargs: Any):
+        n_tokens = int(getattr(llm, "n_tokens", 0))
+        physical_tokens = llm.input_ids[:n_tokens].tolist() if n_tokens > 0 else []
+        supplied_tokens = args[0] if args else kwargs.get("tokens")
+        has_media_tokens = supplied_tokens is not None and any(int(token) < 0 for token in supplied_tokens)
+        if has_media_tokens:
+            final_text_token = next((int(token) for token in reversed(supplied_tokens) if int(token) >= 0), None)
+            if final_text_token is None:
+                raise Qwen35ObservationError("Qwen MTMD prompt has no final text token for speculative decoding")
+            generation_tokens = [final_text_token]
+            if args:
+                args = (generation_tokens, *args[1:])
+            else:
+                kwargs["tokens"] = generation_tokens
+            kwargs["reset"] = False
+            supplied_tokens = generation_tokens
+        elif supplied_tokens is not None and n_tokens > 0 and len(supplied_tokens) < n_tokens:
+            if args:
+                args = (physical_tokens, *args[1:])
+            else:
+                kwargs["tokens"] = physical_tokens
+            supplied_tokens = physical_tokens
+        if supplied_tokens is not None and list(supplied_tokens) == physical_tokens and n_tokens > 0:
+            output_start = int(getattr(llm, "_last_eval_output_start", 0))
+            output_count = int(getattr(llm, "_last_eval_output_count", 0))
+            if not output_start <= n_tokens - 1 < output_start + output_count:
+                llm._last_eval_output_start = n_tokens - 1
+                llm._last_eval_output_count = 1
+        return original_generate(*args, **kwargs)
+
+    llm.generate = physical_generate
+
+
 def _load_runtime():
+    try:
+        from llama_cpp import Llama, SpecConfig, SpeculativeType
+        from llama_cpp.llama_chat_format import (
+            Jinja2ChatFormatter,
+            MTMDChatHandler,
+            Qwen35ChatHandler,
+            chat_formatter_to_chat_completion_handler,
+        )
+    except ImportError as error:
+        raise Qwen35DependencyError("Qwen director requires llama-cpp-python 0.3.48+ with Qwen MTMD and MTP support") from error
+    return Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, chat_formatter_to_chat_completion_handler, SpecConfig, SpeculativeType
+
+
+def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
     try:
         from llama_cpp import Llama
         from llama_cpp.llama_chat_format import MTMDChatHandler
     except ImportError as error:
         raise Qwen35DependencyError("Qwen3.5 requires llama-cpp-python with MTMD support") from error
-    return Llama, MTMDChatHandler
 
-
-def _complete(request: dict[str, Any]) -> dict[str, Any]:
-    Llama, MTMDChatHandler = _load_runtime()
     timing = request["operation"] == "timing_plan"
-    handler = None if timing else MTMDChatHandler(clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False)
+    handler = None if timing else MTMDChatHandler(
+        clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
+    )
     llm = Llama(
         model_path=request["director_model_path"], chat_handler=handler, n_gpu_layers=-1,
         n_ctx=QWEN35_CONTEXT_TOKENS, n_batch=QWEN35_BATCH_SIZE, n_ubatch=QWEN35_BATCH_SIZE,
@@ -390,12 +595,110 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
         message = response["choices"][0]["message"]
         text = str(message.get("content") or message.get("reasoning_content") or "")
         value, raw = _extract_json(text)
-        result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt)
+        result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
         return {"timing_plan" if timing else "chunk_prompt": _payload(result)}
     finally:
         llm.close()
-        if handler is not None:
-            handler.close()
+        close_handler = getattr(handler, "close", None)
+        if callable(close_handler):
+            close_handler()
+
+
+def _complete(request: dict[str, Any]) -> dict[str, Any]:
+    if request.get("director_backend", "qwen3.5") == "qwen3.5":
+        return _complete_qwen35(request)
+
+    Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, handler_factory, SpecConfig, SpeculativeType = _load_runtime()
+    timing = request["operation"] == "timing_plan"
+    family = _qwen_family(request["director_model_path"])
+    handler = None if timing or family == "qwen3.8" else MTMDChatHandler(
+        clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
+    )
+    context_tokens = QWEN35_CONTEXT_TOKENS if family == "qwen3.5" else QWEN36_CONTEXT_TOKENS
+    llama_kwargs = {
+        "model_path": request["director_model_path"], "chat_handler": handler, "n_gpu_layers": -1,
+        "n_ctx": context_tokens, "n_batch": QWEN35_BATCH_SIZE, "n_ubatch": QWEN35_BATCH_SIZE,
+        "flash_attn": True, "type_k": 8, "type_v": 8, "swa_full": False, "verbose": False,
+    }
+    if family == "qwen3.6":
+        if request.get("director_cpu_moe", False):
+            llama_kwargs["cpu_moe"] = True
+        elif int(request.get("director_n_cpu_moe", 0)) > 0:
+            llama_kwargs["n_cpu_moe"] = int(request["director_n_cpu_moe"])
+    mtp_supported = family in {"qwen3.6", "qwen3.8"}
+    mtp_layers = _gguf_mtp_layers(request["director_model_path"]) if mtp_supported and request.get("director_mtp", False) else 0
+    if mtp_layers and mtp_layers > 0:
+        llama_kwargs["speculative"] = SpecConfig(
+            spec_type=SpeculativeType.DRAFT_MTP,
+            draft_n_max=int(request.get("director_mtp_draft_tokens", 2)),
+        )
+    llm = Llama(**llama_kwargs)
+    if not timing and "speculative" in llama_kwargs:
+        _install_mtmd_physical_token_ledger(llm)
+    try:
+        if family == "qwen3.8":
+            reasoning_effort = str(request.get("director_reasoning_effort", "xhigh"))
+            if reasoning_effort not in {"xhigh", "medium", "low"}:
+                raise Qwen35ObservationError(f"Unknown Qwen3.8 reasoning effort: {reasoning_effort}")
+            if timing:
+                handler = _qwen38_text_handler(llm, Jinja2ChatFormatter, handler_factory, reasoning_effort)
+            else:
+                template = (getattr(llm, "metadata", {}) or {}).get("tokenizer.chat_template")
+                if not template:
+                    raise Qwen35DependencyError("Qwen3.8 GGUF is missing tokenizer.chat_template")
+                handler = Qwen35ChatHandler(
+                    clip_model_path=request["director_mmproj_path"],
+                    enable_thinking=False,
+                    preserve_thinking=False,
+                    extra_template_arguments={"reasoning_effort": reasoning_effort},
+                    chat_template_override=_adapt_qwen38_mtmd_template(template),
+                    verbose=False,
+                    use_gpu=False,
+                )
+            llm.chat_handler = handler
+        system, prompt = _timing_messages(request) if timing else _chunk_messages(request)
+        content: Any = prompt
+        if not timing:
+            content = [{"type": "image_url", "image_url": {"url": url}} for url in request.get("image_urls", ())]
+            content.append({"type": "text", "text": prompt})
+        completion_kwargs = {
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.7,
+            "top_p": 0.8 if family == "qwen3.8" else 0.9,
+            "top_k": 40,
+            "max_tokens": (
+                QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS
+            ) if family == "qwen3.5" else (
+                QWEN36_TIMING_RESPONSE_TOKENS if timing else QWEN36_CHUNK_RESPONSE_TOKENS
+            ),
+            "reasoning_budget": 0,
+        }
+        if family == "qwen3.8":
+            completion_kwargs["min_p"] = 0.0
+        response = llm.create_chat_completion(**completion_kwargs)
+        choice = response["choices"][0]
+        message = choice["message"]
+        text = str(message.get("content") or message.get("reasoning_content") or "")
+        value, raw = _extract_json(text)
+        result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        stats = getattr(llm, "last_speculative_stats", None)
+        return {
+            "timing_plan" if timing else "chunk_prompt": _payload(result),
+            "generation": {
+                "finish_reason": choice.get("finish_reason"),
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "mtp_enabled": "speculative" in llama_kwargs,
+                "mtp_stats": stats if isinstance(stats, dict) else None,
+            },
+        }
+    finally:
+        llm.close()
+        close_handler = getattr(handler, "close", None)
+        if callable(close_handler):
+            close_handler()
 
 
 def _payload(value: Any) -> dict[str, Any]:
@@ -423,36 +726,75 @@ def _from_payload(value: dict[str, Any], timing: bool):
     return QwenShotTimingPlan(value["confidence"], value["analysis"], shots, table, value["raw_json"], value.get("system_prompt", ""), value.get("planning_prompt", ""))
 
 
-def _run_worker(request: dict[str, Any], timing: bool):
-    payload = json.loads(json.dumps(request, ensure_ascii=False))
-    payload["operation"] = "timing_plan" if timing else "chunk"
+def _run_worker_once(payload: dict[str, Any]) -> tuple[subprocess.CompletedProcess, dict[str, Any] | None]:
     process = subprocess.run(
         [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"], input=json.dumps(payload, ensure_ascii=False),
         text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
     line = next((item[len(_WORKER_RESULT_PREFIX):] for item in reversed(process.stdout.splitlines()) if item.startswith(_WORKER_RESULT_PREFIX)), None)
-    if line is None:
-        raise DirectorWorkerError(f"Qwen3.5 worker exited with status {process.returncode} without a result", returncode=process.returncode)
-    value = json.loads(line)
+    return process, json.loads(line) if line is not None else None
+
+
+def _run_worker(request: dict[str, Any], timing: bool):
+    payload = json.loads(json.dumps(request, ensure_ascii=False))
+    payload["operation"] = "timing_plan" if timing else "chunk"
+    process, value = _run_worker_once(payload)
+    native_failure = value is None or value.get("error_type") not in {"Qwen35ObservationError", "Qwen35DependencyError"}
+    if payload.get("director_mtp", False) and native_failure:
+        payload["director_mtp"] = False
+        process, value = _run_worker_once(payload)
+    if value is None:
+        raise DirectorWorkerError(f"Qwen worker exited with status {process.returncode} without a result", returncode=process.returncode)
     if not value.get("ok"):
-        raise Qwen35ObservationError(str(value.get("message", "Qwen3.5 worker failed")), raw_json=str(value.get("raw_json", "")))
+        raise Qwen35ObservationError(str(value.get("message", "Qwen worker failed")), raw_json=str(value.get("raw_json", "")))
+    generation = value.get("generation") if isinstance(value.get("generation"), dict) else {}
+    stats = generation.get("mtp_stats") if isinstance(generation.get("mtp_stats"), dict) else {}
+    logging.info(
+        "HR Endless Sampler Qwen %s generation: finish=%s, prompt_tokens=%s, completion_tokens=%s, MTP=%s%s.",
+        "timing" if timing else "chunk",
+        generation.get("finish_reason", "unknown"),
+        generation.get("prompt_tokens", "unknown"),
+        generation.get("completion_tokens", "unknown"),
+        "active" if generation.get("mtp_enabled") else "inactive",
+        f", draft_acceptance={float(stats.get('draft_token_acceptance_rate', 0.0)):.1%}, decode={float(stats.get('decode_tokens_per_second', 0.0)):.2f} tok/s" if stats else "",
+    )
     return _from_payload(value["timing_plan" if timing else "chunk_prompt"], timing)
 
 
 class Qwen35ContinuityDirector:
-    def __init__(self, model_path: Path, mmproj_path: Path, debug=False, capture_directory=None, observation_image_directory=None):
+    def __init__(self, model_path: Path, mmproj_path: Path, debug=False, capture_directory=None, observation_image_directory=None,
+                 mtp_enabled=True, mtp_draft_tokens=2, reasoning_effort="xhigh", cpu_moe=False, n_cpu_moe=0,
+                 backend="qwen3.5"):
         self.model_path = Path(model_path).resolve()
         self.mmproj_path = Path(mmproj_path).resolve()
+        self.backend = str(backend)
+        if self.backend not in {"qwen3.5", "qwen3.6", "qwen3.8"}:
+            raise ValueError(f"Unknown Qwen backend: {self.backend}")
         self.debug = bool(debug)
+        self.mtp_enabled = bool(mtp_enabled) and self.backend in {"qwen3.6", "qwen3.8"}
+        self.mtp_draft_tokens = int(mtp_draft_tokens)
+        if self.mtp_draft_tokens < 1 or self.mtp_draft_tokens > 8:
+            raise ValueError("Qwen MTP draft tokens must be between 1 and 8")
+        self.cpu_moe = bool(cpu_moe)
+        self.n_cpu_moe = int(n_cpu_moe)
+        if self.n_cpu_moe < 0:
+            raise ValueError("Qwen3.6 n_cpu_moe cannot be negative")
+        self.reasoning_effort = str(reasoning_effort)
+        if self.reasoning_effort not in {"xhigh", "medium", "low"}:
+            raise ValueError(f"Unknown Qwen3.8 reasoning effort: {self.reasoning_effort}")
         self.capture_directory = Path(capture_directory) if capture_directory else None
         self.observation_image_directory = Path(observation_image_directory) if observation_image_directory else None
         self.last_system_prompt = self.last_observation_prompt = ""
         self.last_timing_system_prompt = self.last_timing_planning_prompt = ""
 
     def _configure_request(self, request: dict[str, Any]) -> None:
-        request.update(debug=self.debug, director_backend="qwen3.5", director_model_path=str(self.model_path),
-                       director_mmproj_path=str(self.mmproj_path), director_n_ctx=QWEN35_CONTEXT_TOKENS,
-                       director_n_batch=QWEN35_BATCH_SIZE, gemma4_mtp=False)
+        context_tokens = QWEN35_CONTEXT_TOKENS if self.backend == "qwen3.5" else QWEN36_CONTEXT_TOKENS
+        request.update(debug=self.debug, director_backend=self.backend, director_model_path=str(self.model_path),
+                       director_mmproj_path=str(self.mmproj_path), director_n_ctx=context_tokens,
+                       director_n_batch=QWEN35_BATCH_SIZE, gemma4_mtp=False,
+                       director_mtp=self.mtp_enabled, director_mtp_draft_tokens=self.mtp_draft_tokens,
+                       director_reasoning_effort=self.reasoning_effort,
+                       director_cpu_moe=self.cpu_moe, director_n_cpu_moe=self.n_cpu_moe)
 
     def plan_timing(self, request: dict[str, Any], progress_callback: Any = None) -> QwenShotTimingPlan:
         request = json.loads(json.dumps(request, ensure_ascii=False))

@@ -517,6 +517,8 @@ class GemmaCaptureTest(unittest.TestCase):
         ensure.assert_not_called()
 
     def test_json_completion_uses_fast_unconstrained_path_when_gemma_returns_valid_json(self):
+        self.assertEqual(gemma4.GEMMA4_CHUNK_RESPONSE_TOKENS, 4096)
+        self.assertEqual(gemma4.GEMMA4_TIMING_RESPONSE_TOKENS, 8192)
         calls = []
 
         class FakeLlama:
@@ -1250,7 +1252,7 @@ class GemmaCaptureTest(unittest.TestCase):
 
         self.assertEqual(len(result.attempts), 2)
         self.assertIn("TIMING-PLAN CORRECTION REQUIRED", result.attempts[1].correction_prompt)
-        self.assertEqual(captured["max_tokens"], [4096, 4096])
+        self.assertEqual(captured["max_tokens"], [8192, 8192])
         self.assertEqual([message["role"] for message in captured["messages"][0]], ["system", "user"])
         self.assertIsInstance(captured["messages"][0][1]["content"], str)
         self.assertTrue(captured["closed"])
@@ -1296,11 +1298,10 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("overlay", result.attempts[0].validation_warnings[0])
         self.assertIn("conflicting subjects", result.attempts[1].validation_warnings[0])
 
-    def test_preproduction_correction_schema_requires_character_name_table_array(self):
-        captured = {"messages": []}
-        invalid = self.timing_response()
-        invalid["character_name_table"] = {"Heman": "<Subject 1>"}
-        corrected = self.timing_response()
+    def test_preproduction_normalizes_character_name_object_at_the_model_boundary(self):
+        captured = {"calls": []}
+        response = self.timing_response()
+        response["character_name_table"] = {"Heman": "<Subject 1>"}
 
         class FakeHandler:
             def __init__(self, **_kwargs):
@@ -1308,11 +1309,11 @@ class GemmaCaptureTest(unittest.TestCase):
 
         class FakeLlama:
             def __init__(self, **_kwargs):
-                self.responses = [invalid, corrected]
+                pass
 
             def create_chat_completion(self, **kwargs):
-                captured["messages"].append(json.loads(json.dumps(kwargs["messages"])))
-                return {"choices": [{"message": {"content": json.dumps(self.responses.pop(0))}}]}
+                captured["calls"].append(kwargs)
+                return {"choices": [{"message": {"content": json.dumps(response)}}]}
 
             def close(self):
                 captured["closed"] = True
@@ -1322,12 +1323,9 @@ class GemmaCaptureTest(unittest.TestCase):
                 patch.object(gemma4.comfy.model_management, "soft_empty_cache"):
             result = gemma4._plan_timing_in_process(self.timing_request(), debug=False)
 
-        self.assertEqual(len(result.attempts), 2)
-        correction_prompt = result.attempts[1].correction_prompt
-        self.assertIn('"character_name_table":[{"character_name":"Heman", "subject":"<Subject 1>"}]', correction_prompt)
-        self.assertIn("`character_name_table` must be an array", correction_prompt)
-        self.assertIn("response field 'character_name_table' must be an array", correction_prompt)
-        self.assertEqual(result.character_name_table_text(), "- Heman -> <Subject 1>\n- Tila -> <Subject 2>")
+        self.assertEqual(len(result.attempts), 1)
+        self.assertEqual(captured["calls"][0]["response_format"], {"type": "json_object"})
+        self.assertEqual(result.character_name_table_text(), "- Heman -> <Subject 1>")
         self.assertTrue(captured["closed"])
 
     def test_preproduction_correction_is_an_appended_chat_turn_when_runtime_supports_it(self):

@@ -1123,11 +1123,49 @@ class HREndlessSamplerLoadVideo(io.ComfyNode):
 
 
 def _repair_save_video_prompt_links(json_data):
-    """Repair stale output slots before ComfyUI indexes RETURN_TYPES."""
+    """Repair stale sampler widgets and output slots before prompt validation."""
     prompt = json_data.get("prompt") if isinstance(json_data, dict) else None
     if not isinstance(prompt, dict):
         return json_data
     import nodes as comfy_nodes
+
+    qwen_backends = {"qwen3.5", "qwen3.6", "qwen3.8"}
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict) or node.get("class_type") != "HREndlessSampler":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        # One development build inserted four Qwen widgets before the existing
+        # tail widgets. Workflows saved with that build retain positional widget
+        # values after the controls moved to the compatibility-safe tail.
+        if inputs.get("director_reasoning_effort") in qwen_backends and isinstance(inputs.get("director_n_cpu_moe"), str) and "mmproj" in inputs["director_n_cpu_moe"].casefold():
+            old = {name: inputs.get(name) for name in (
+                "cache_gemma_preproduction", "gemma4_mtp", "pytorch_memory_fraction", "debug",
+                "debug_stop_chunk", "debug_start_chunk", "director_backend", "director_model",
+                "director_mmproj", "director_mtp_draft_tokens", "director_reasoning_effort",
+                "director_cpu_moe", "director_n_cpu_moe",
+            )}
+            inputs.update(
+                cache_gemma_preproduction=old["debug_stop_chunk"],
+                gemma4_mtp=old["debug_start_chunk"],
+                pytorch_memory_fraction=old["director_backend"],
+                debug=old["director_model"],
+                debug_stop_chunk=old["director_mmproj"],
+                debug_start_chunk=old["director_mtp_draft_tokens"],
+                director_backend=old["director_reasoning_effort"],
+                director_model=old["director_cpu_moe"],
+                director_mmproj=old["director_n_cpu_moe"],
+                director_mtp_draft_tokens=old["cache_gemma_preproduction"],
+                director_reasoning_effort=old["gemma4_mtp"],
+                director_cpu_moe=old["pytorch_memory_fraction"],
+                director_n_cpu_moe=old["debug"],
+            )
+            logging.warning("HR Endless Sampler %s repaired Qwen widget values saved by the transitional UI schema.", node_id)
+        memory_fraction = inputs.get("pytorch_memory_fraction")
+        if isinstance(memory_fraction, (int, float)) and not isinstance(memory_fraction, bool) and not 0.0 < float(memory_fraction) <= 1.0:
+            inputs["pytorch_memory_fraction"] = 0.85
+            logging.warning("HR Endless Sampler %s restored invalid PyTorch memory fraction %r to 0.85.", node_id, memory_fraction)
 
     expected_types = {
         "images": "IMAGE",
@@ -1136,6 +1174,16 @@ def _repair_save_video_prompt_links(json_data):
         "audio": "AUDIO",
         "timeline": "HRENDLESS_TIMELINE",
     }
+
+    def output_types(node_class):
+        return_types = tuple(getattr(node_class, "RETURN_TYPES", ())) if node_class is not None else ()
+        if return_types or node_class is None or not hasattr(node_class, "define_schema"):
+            return return_types
+        schema = node_class.define_schema()
+        return tuple(
+            getattr(getattr(type(output), "Parent", None), "io_type", None)
+            for output in schema.outputs
+        )
     for node_id, node in prompt.items():
         if not isinstance(node, dict) or node.get("class_type") != "HREndlessSamplerSaveVideo":
             continue
@@ -1150,7 +1198,7 @@ def _repair_save_video_prompt_links(json_data):
             origin = prompt.get(str(origin_id), prompt.get(origin_id))
             origin_type = origin.get("class_type") if isinstance(origin, dict) else None
             origin_class = comfy_nodes.NODE_CLASS_MAPPINGS.get(origin_type)
-            return_types = tuple(getattr(origin_class, "RETURN_TYPES", ())) if origin_class is not None else ()
+            return_types = ("LATENT", "LATENT", "STRING", "HRENDLESS_TIMELINE") if origin_type == "HREndlessSampler" else output_types(origin_class)
             if isinstance(origin_slot, int) and 0 <= origin_slot < len(return_types):
                 continue
             matching_slots = [index for index, value in enumerate(return_types) if value == expected_type]

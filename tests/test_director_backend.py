@@ -17,6 +17,12 @@ spec.loader.exec_module(director_backend)
 
 
 class DirectorBackendTest(unittest.TestCase):
+    def test_ui_exposes_each_qwen_backend(self):
+        self.assertEqual(
+            director_backend.DIRECTOR_BACKENDS,
+            ("gemma4", "qwen3.5", "qwen3.6", "qwen3.8"),
+        )
+
     def test_qwen_auto_selects_local_model_and_projector(self):
         with tempfile.TemporaryDirectory() as temporary:
             models = Path(temporary)
@@ -40,6 +46,34 @@ class DirectorBackendTest(unittest.TestCase):
             with patch.object(director_backend.folder_paths, "models_dir", str(models)):
                 with self.assertRaises(director_backend.DirectorConfigurationError):
                     director_backend.resolve_director_model(str(outside))
+
+    def test_qwen38_auto_selects_only_qwen38_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            models = Path(temporary)
+            for family in ("qwen3.5", "qwen3.8"):
+                directory = models / "LLM" / "GGUF" / family
+                directory.mkdir(parents=True)
+                (directory / f"{family}-model.gguf").touch()
+                (directory / f"mmproj-{family}.gguf").touch()
+            with patch.object(director_backend.folder_paths, "models_dir", str(models)):
+                selection = director_backend.resolve_director_selection("qwen3.8")
+        self.assertIn("qwen3.8", selection.model_path.as_posix())
+        self.assertIn("qwen3.8", selection.mmproj_path.as_posix())
+
+    def test_qwen_backend_rejects_another_qwen_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            models = Path(temporary)
+            directory = models / "LLM" / "GGUF" / "qwen3.8"
+            directory.mkdir(parents=True)
+            model = directory / "qwen3.8-model.gguf"
+            projector = directory / "mmproj-qwen3.8.gguf"
+            model.touch()
+            projector.touch()
+            with patch.object(director_backend.folder_paths, "models_dir", str(models)):
+                with self.assertRaisesRegex(director_backend.DirectorConfigurationError, "qwen3.6 backend"):
+                    director_backend.resolve_director_selection(
+                        "qwen3.6", model.relative_to(models).as_posix(), projector.relative_to(models).as_posix(),
+                    )
 
     def test_qwen_auto_does_not_mix_model_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,6 +136,25 @@ class DirectorBackendTest(unittest.TestCase):
                 with self.assertRaises(director_backend.DirectorConfigurationError):
                     director_backend.resolve_director_selection("qwen3.5", mmproj.relative_to(models).as_posix(), model.relative_to(models).as_posix())
 
+    def test_rejects_explicit_qwen_model_and_projector_from_different_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            models = Path(temporary)
+            model_directory = models / "LLM" / "GGUF" / "qwen3.8"
+            projector_directory = models / "LLM" / "GGUF" / "qwen3.5"
+            model_directory.mkdir(parents=True)
+            projector_directory.mkdir(parents=True)
+            model = model_directory / "Qwen3.8.gguf"
+            projector = projector_directory / "mmproj-Qwen3.5.gguf"
+            model.touch()
+            projector.touch()
+            with patch.object(director_backend.folder_paths, "models_dir", str(models)):
+                with self.assertRaisesRegex(director_backend.DirectorConfigurationError, "same model directory"):
+                    director_backend.resolve_director_selection(
+                        "qwen3.5",
+                        model.relative_to(models).as_posix(),
+                        projector.relative_to(models).as_posix(),
+                    )
+
     def test_qwen_adapter_configures_local_non_mtp_worker(self):
         package_name = "hr_endless_qwen_adapter_test"
         package = types.ModuleType(package_name)
@@ -131,7 +184,7 @@ class DirectorBackendTest(unittest.TestCase):
 
         self.assertEqual(request["director_backend"], "qwen3.5")
         self.assertFalse(request["gemma4_mtp"])
-        self.assertEqual(request["director_n_ctx"], 65536)
+        self.assertEqual(request["director_n_ctx"], 16384)
         self.assertEqual(request["director_n_batch"], 256)
         self.assertTrue(request["director_model_path"].endswith("model.gguf"))
         self.assertTrue(request["director_mmproj_path"].endswith("mmproj.gguf"))
