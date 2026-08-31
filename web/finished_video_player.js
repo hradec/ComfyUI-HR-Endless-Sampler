@@ -543,6 +543,7 @@ app.registerExtension({
             let uploadButton = null;
             let uploadInput = null;
             let matchingButton = null;
+            let downloadButton = null;
             if (isLoadNode || isSaveNode) {
                 const picker = document.createElement("div");
                 picker.style.cssText = "display:flex;align-items:center;gap:6px;box-sizing:border-box;padding:6px 8px;border-bottom:1px solid #2d2d2d;background:#1b1b1b;";
@@ -562,6 +563,14 @@ app.registerExtension({
                     uploadButton.style.cssText = pickerButtonStyle;
                     picker.appendChild(uploadButton);
                 }
+                if (isSaveNode) {
+                    downloadButton = document.createElement("button");
+                    downloadButton.type = "button";
+                    downloadButton.textContent = "Download video";
+                    downloadButton.title = "Download the video currently shown in this player to your computer.";
+                    downloadButton.style.cssText = `${pickerButtonStyle}opacity:.45;cursor:not-allowed;`;
+                    downloadButton.disabled = true;
+                }
                 matchingButton = document.createElement("button");
                 matchingButton.type = "button";
                 matchingButton.textContent = "Matching videos ▾";
@@ -577,6 +586,9 @@ app.registerExtension({
                     : String(filenamePrefixWidget?.value || "No filename prefix");
                 selectedPathLabel.title = selectedPathLabel.textContent;
                 picker.appendChild(selectedPathLabel);
+                if (downloadButton) {
+                    picker.appendChild(downloadButton);
+                }
                 if (isLoadNode) {
                     uploadInput = document.createElement("input");
                     uploadInput.type = "file";
@@ -648,6 +660,31 @@ app.registerExtension({
             let loadRequestSerial = 0;
             let tooltipChunk = null;
             let tooltipSignature = null;
+
+            function downloadFilename() {
+                try {
+                    const url = new URL(String(state?.media_url || ""), window.location.href);
+                    const sourceName = url.searchParams.get("filename");
+                    if (sourceName) return sourceName.split(/[\\/]/).pop();
+                } catch (_error) {
+                    // Fall back to the player title below.
+                }
+                const title = String(state?.title || "").trim();
+                return title && !title.endsWith(" sequence")
+                    ? title.split(/[\\/]/).pop()
+                    : "hr-endless-sampler-video.mp4";
+            }
+
+            function updateDownloadButton() {
+                if (!downloadButton) return;
+                const available = Boolean(state?.media_url);
+                downloadButton.disabled = !available;
+                downloadButton.style.opacity = available ? "1" : ".45";
+                downloadButton.style.cursor = available ? "pointer" : "not-allowed";
+                downloadButton.title = available
+                    ? `Download ${downloadFilename()} to your computer. This does not remove the copy in ComfyUI's output folder.`
+                    : "Run this Save Video node or select a matching saved render before downloading.";
+            }
 
             function totalFrames() {
                 const declared = Number(timeline?.total_frames);
@@ -816,6 +853,7 @@ app.registerExtension({
             function setState(data) {
                 if (!data?.media_url || !data?.timeline) return;
                 state = data;
+                updateDownloadButton();
                 timeline = data.timeline;
                 sourceFps = validEndlessFps(data.source_fps) || validEndlessFps(timeline.fps) || 24;
                 bracketKey = null;
@@ -836,6 +874,7 @@ app.registerExtension({
                     selectedPathLabel.title = path;
                 }
                 state = null;
+                updateDownloadButton();
                 timeline = null;
                 bracketKey = null;
                 media.pause();
@@ -866,6 +905,19 @@ app.registerExtension({
             }
 
             node._hrEndlessSamplerFinishedVideo = setState;
+
+            downloadButton?.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (downloadButton.disabled || !state?.media_url) return;
+                const link = document.createElement("a");
+                link.href = state.media_url;
+                link.download = downloadFilename();
+                link.style.display = "none";
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+            });
 
             if (isLoadNode) {
                 browseButton.addEventListener("click", async event => {
