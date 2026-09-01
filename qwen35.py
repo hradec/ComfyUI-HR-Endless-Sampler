@@ -620,11 +620,19 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
         "n_ctx": context_tokens, "n_batch": QWEN35_BATCH_SIZE, "n_ubatch": QWEN35_BATCH_SIZE,
         "flash_attn": True, "type_k": 8, "type_v": 8, "swa_full": False, "verbose": False,
     }
-    if family == "qwen3.6":
+    if family in {"qwen3.6", "qwen3.8"}:
         if request.get("director_cpu_moe", False):
             llama_kwargs["cpu_moe"] = True
         elif int(request.get("director_n_cpu_moe", 0)) > 0:
             llama_kwargs["n_cpu_moe"] = int(request["director_n_cpu_moe"])
+    if family == "qwen3.8":
+        logging.info(
+            "HR Endless Sampler Qwen3.8 runtime: n_ctx=%d, n_gpu_layers=%d, cpu_moe=%s, n_cpu_moe=%d.",
+            context_tokens,
+            int(llama_kwargs["n_gpu_layers"]),
+            bool(llama_kwargs.get("cpu_moe", False)),
+            int(llama_kwargs.get("n_cpu_moe", 0)),
+        )
     mtp_supported = family in {"qwen3.6", "qwen3.8"}
     mtp_layers = _gguf_mtp_layers(request["director_model_path"]) if mtp_supported and request.get("director_mtp", False) else 0
     if mtp_layers and mtp_layers > 0:

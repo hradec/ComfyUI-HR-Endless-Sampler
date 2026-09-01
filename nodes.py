@@ -2355,9 +2355,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Combo.Input("director_reasoning_effort", options=["xhigh", "medium", "low"], default="xhigh",
                                tooltip="Qwen3.8 reasoning effort. The Qwen director disables free-form thinking for JSON reliability but passes this native template setting."),
                 io.Boolean.Input("director_cpu_moe", default=False,
-                                 tooltip="Qwen3.6 only: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
+                                 tooltip="Qwen3.6/Qwen3.8: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
                 io.Int.Input("director_n_cpu_moe", default=0, min=0, max=256, step=1,
-                             tooltip="Qwen3.6 only: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
+                             tooltip="Qwen3.6/Qwen3.8: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),

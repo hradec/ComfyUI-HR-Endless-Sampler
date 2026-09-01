@@ -221,6 +221,44 @@ class Qwen35Tests(unittest.TestCase):
         self.assertTrue(request["director_cpu_moe"])
         self.assertEqual(request["director_n_cpu_moe"], 4)
 
+    def test_qwen38_runtime_passes_partial_cpu_moe_to_llama(self):
+        captured = {}
+
+        class FakeLlama:
+            metadata = {"tokenizer.chat_template": "template"}
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def create_chat_completion(self, **kwargs):
+                value = {
+                    "shots": [{
+                        "source_shot": 1,
+                        "visual_beats": [{"start_frame": 0, "end_frame": 68, "action": "walk"}],
+                    }],
+                }
+                return {"choices": [{"message": {"content": json.dumps(value)}, "finish_reason": "stop"}], "usage": {}}
+
+            def close(self):
+                pass
+
+        request = self.request()
+        request.update(
+            operation="timing_plan",
+            director_backend="qwen3.8",
+            director_model_path="qwen3.8-model.gguf",
+            director_mmproj_path="mmproj-qwen3.8.gguf",
+            director_cpu_moe=False,
+            director_n_cpu_moe=8,
+            director_mtp=False,
+        )
+        runtime = (FakeLlama, object, object, object, object, object, object)
+        with patch.object(qwen35, "_load_runtime", return_value=runtime), patch.object(qwen35, "_qwen38_text_handler", return_value=None):
+            qwen35._complete(request)
+        self.assertEqual(captured["n_cpu_moe"], 8)
+        self.assertNotIn("cpu_moe", captured)
+        self.assertEqual(captured["n_ctx"], 16384)
+
     def test_qwen35_configuration_always_disables_mtp(self):
         director = qwen35.Qwen35ContinuityDirector(
             Path("qwen3.5-model.gguf"), Path("mmproj-qwen3.5.gguf"), mtp_enabled=True, backend="qwen3.5",
