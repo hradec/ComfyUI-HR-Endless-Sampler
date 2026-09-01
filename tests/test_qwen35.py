@@ -198,13 +198,16 @@ class Qwen35Tests(unittest.TestCase):
         with self.assertRaisesRegex(qwen35.Qwen35ObservationError, "analysis, confidence"):
             qwen35._chunk_prompt(value, json.dumps(value), "system", "prompt")
 
-    def test_qwen35_keeps_original_context_and_output_budgets(self):
+    def test_qwen_family_context_and_output_budgets(self):
         self.assertEqual(qwen35.QWEN35_CONTEXT_TOKENS, 65536)
         self.assertEqual(qwen35.QWEN35_TIMING_RESPONSE_TOKENS, 32768)
         self.assertEqual(qwen35.QWEN35_CHUNK_RESPONSE_TOKENS, 8192)
-        self.assertEqual(qwen35.QWEN36_CONTEXT_TOKENS, 16384)
-        self.assertEqual(qwen35.QWEN36_TIMING_RESPONSE_TOKENS, 4096)
-        self.assertEqual(qwen35.QWEN36_CHUNK_RESPONSE_TOKENS, 2048)
+        self.assertEqual(qwen35.QWEN36_CONTEXT_TOKENS, 32768)
+        self.assertEqual(qwen35.QWEN36_TIMING_RESPONSE_TOKENS, 8192)
+        self.assertEqual(qwen35.QWEN36_CHUNK_RESPONSE_TOKENS, 4096)
+        self.assertEqual(qwen35.QWEN38_CONTEXT_TOKENS, 32768)
+        self.assertEqual(qwen35.QWEN38_TIMING_RESPONSE_TOKENS, 8192)
+        self.assertEqual(qwen35.QWEN38_CHUNK_RESPONSE_TOKENS, 4096)
 
     def test_qwen38_configuration_enables_mtp(self):
         director = qwen35.Qwen35ContinuityDirector(
@@ -213,7 +216,7 @@ class Qwen35Tests(unittest.TestCase):
         )
         request = {}
         director._configure_request(request)
-        self.assertEqual(request["director_n_ctx"], 16384)
+        self.assertEqual(request["director_n_ctx"], 32768)
         self.assertFalse(request["gemma4_mtp"])
         self.assertTrue(request["director_mtp"])
         self.assertEqual(request["director_mtp_draft_tokens"], 3)
@@ -257,7 +260,7 @@ class Qwen35Tests(unittest.TestCase):
             qwen35._complete(request)
         self.assertEqual(captured["n_cpu_moe"], 8)
         self.assertNotIn("cpu_moe", captured)
-        self.assertEqual(captured["n_ctx"], 16384)
+        self.assertEqual(captured["n_ctx"], 32768)
 
     def test_qwen35_configuration_always_disables_mtp(self):
         director = qwen35.Qwen35ContinuityDirector(

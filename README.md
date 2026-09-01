@@ -208,9 +208,10 @@ models/LLM/GGUF/qwen3.5-9B/
 
 Select the matching `qwen3.5`, `qwen3.6`, or `qwen3.8` value in
 `director_backend`; `auto` then discovers only that series. Qwen uses a disposable llama.cpp worker
-with a 16384-token context and 256-token batch. Qwen3.8 reads the GGUF's native
+with a 256-token batch. Qwen3.5 uses a 65536-token context; Qwen3.6 and Qwen3.8
+use 32768 to match Gemma 4's director context. Qwen3.8 reads the GGUF's native
 chat template, supports `xhigh`, `medium`, and `low` reasoning effort, and adapts
-that template for its mmproj. Qwen3.6 can optionally pass `cpu_moe` or
+that template for its mmproj. Qwen3.6 and Qwen3.8 can optionally pass `cpu_moe` or
 `n_cpu_moe`. The Gemma preproduction KV cache remains unsupported. The same
 directing contract accepts Chinese source prompts, writes H3 visual/action/
 camera prose in English, and preserves original dialogue, lyrics, visible text,

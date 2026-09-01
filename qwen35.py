@@ -28,9 +28,12 @@ QWEN35_CONTEXT_TOKENS = 65536
 QWEN35_BATCH_SIZE = 256
 QWEN35_CHUNK_RESPONSE_TOKENS = 8192
 QWEN35_TIMING_RESPONSE_TOKENS = 32768
-QWEN36_CONTEXT_TOKENS = 16384
-QWEN36_CHUNK_RESPONSE_TOKENS = 2048
-QWEN36_TIMING_RESPONSE_TOKENS = 4096
+QWEN36_CONTEXT_TOKENS = 32768
+QWEN36_CHUNK_RESPONSE_TOKENS = 4096
+QWEN36_TIMING_RESPONSE_TOKENS = 8192
+QWEN38_CONTEXT_TOKENS = 32768
+QWEN38_CHUNK_RESPONSE_TOKENS = 4096
+QWEN38_TIMING_RESPONSE_TOKENS = 8192
 QWEN35_PROMPTS_PATH = Path(__file__).with_name("qwen35_prompts.txt")
 _WORKER_RESULT_PREFIX = "MINIMAX_H3_QWEN35_RESULT="
 _SECTION = re.compile(r"(?ms)^\[([A-Z][A-Z0-9_]*)\]\s*$\n?(.*?)(?=^\[[A-Z][A-Z0-9_]*\]\s*$|\Z)")
@@ -614,7 +617,11 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
     handler = None if timing or family == "qwen3.8" else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
     )
-    context_tokens = QWEN35_CONTEXT_TOKENS if family == "qwen3.5" else QWEN36_CONTEXT_TOKENS
+    context_tokens = {
+        "qwen3.5": QWEN35_CONTEXT_TOKENS,
+        "qwen3.6": QWEN36_CONTEXT_TOKENS,
+        "qwen3.8": QWEN38_CONTEXT_TOKENS,
+    }[family]
     llama_kwargs = {
         "model_path": request["director_model_path"], "chat_handler": handler, "n_gpu_layers": -1,
         "n_ctx": context_tokens, "n_batch": QWEN35_BATCH_SIZE, "n_ubatch": QWEN35_BATCH_SIZE,
@@ -675,11 +682,11 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             "temperature": 0.7,
             "top_p": 0.8 if family == "qwen3.8" else 0.9,
             "top_k": 40,
-            "max_tokens": (
-                QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS
-            ) if family == "qwen3.5" else (
-                QWEN36_TIMING_RESPONSE_TOKENS if timing else QWEN36_CHUNK_RESPONSE_TOKENS
-            ),
+            "max_tokens": {
+                "qwen3.5": QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS,
+                "qwen3.6": QWEN36_TIMING_RESPONSE_TOKENS if timing else QWEN36_CHUNK_RESPONSE_TOKENS,
+                "qwen3.8": QWEN38_TIMING_RESPONSE_TOKENS if timing else QWEN38_CHUNK_RESPONSE_TOKENS,
+            }[family],
             "reasoning_budget": 0,
         }
         if family == "qwen3.8":
@@ -796,7 +803,11 @@ class Qwen35ContinuityDirector:
         self.last_timing_system_prompt = self.last_timing_planning_prompt = ""
 
     def _configure_request(self, request: dict[str, Any]) -> None:
-        context_tokens = QWEN35_CONTEXT_TOKENS if self.backend == "qwen3.5" else QWEN36_CONTEXT_TOKENS
+        context_tokens = {
+            "qwen3.5": QWEN35_CONTEXT_TOKENS,
+            "qwen3.6": QWEN36_CONTEXT_TOKENS,
+            "qwen3.8": QWEN38_CONTEXT_TOKENS,
+        }[self.backend]
         request.update(debug=self.debug, director_backend=self.backend, director_model_path=str(self.model_path),
                        director_mmproj_path=str(self.mmproj_path), director_n_ctx=context_tokens,
                        director_n_batch=QWEN35_BATCH_SIZE, gemma4_mtp=False,

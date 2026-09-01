@@ -2813,9 +2813,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if gemma_director is not None:
             if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
                 logging.info(
-                    "HR Endless Sampler director: %s (%s, context 16384, CPU vision projector, MTP=%s, draft tokens=%d).",
+                    "HR Endless Sampler director: %s (%s, context %d, CPU vision projector, MTP=%s, draft tokens=%d).",
                     director_name,
                     director_selection.model_path.name,
+                    65536 if director_selection.backend == "qwen3.5" else 32768,
                     bool(gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"}),
                     int(director_mtp_draft_tokens),
                 )
