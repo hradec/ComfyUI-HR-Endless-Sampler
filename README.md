@@ -1,5 +1,7 @@
-# ComfyUI-HR-Endless-Sampler 
-## (the older ComfyUI MiniMax H3 Sampler Unlimited)
+# ComfyUI-MiniMax-H3-Sampler-Unlimited (mickeylan fork)
+## 适用于中文用户和低显存环境的增强版
+
+> ⚠️ **注意**：这是 [hradec/ComfyUI-HR-Endless-Sampler](https://github.com/hradec/ComfyUI-HR-Endless-Sampler) 的中文用户/低显存优化分支。
 
 
 
@@ -7,7 +9,39 @@ https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
 
 - video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
 
+## 🎯 本分支特色
 
+本分支专为 **中文用户** 和 **低显存（12GB）用户** 设计：
+
+| 特性 | 原版 | 本分支 |
+|------|------|--------|
+| Gemma 4 导演 | ✅ 支持 | ✅ 支持 |
+| Qwen3.5 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.6 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.8 导演 | ❌ 不支持 | ✅ 支持 |
+| 12GB VRAM 支持 | ❌ Gemma 12B 太大 | ✅ Qwen 27B MoE + UD-IQ2-mtp |
+| 中文提示词 | ⚠️ 需要翻译 | ✅ 原生支持 |
+| MoE CPU Offload | ❌ 不支持 | ✅ 支持 |
+
+### 为什么选择 Qwen3.6/3.8？
+
+- **Qwen3.6/3.8 是 27B MoE 模型**，使用 UD-IQ2-mtp 量化后仅需 ~8-9GB 显存
+- **速度与 9B 模型相当**（MoE 架构，激活参数 ~3-4B）
+- **Gemma 4 12B 在 12GB 显存上根本无法使用**
+- 内置 MTP 推测解码，加速生成
+
+### 12GB VRAM 推荐配置
+
+```text
+director_backend = qwen3.8           # 27B MoE + UD-IQ2-mtp
+director_mtp = true                  # 内置 MTP
+director_reasoning_effort = medium   # 平衡质量与速度
+chunk_frames = 56-62                 # 1080p 推荐值
+video_continuation = 22
+pytorch_memory_fraction = 0.82
+```
+
+---
 
 `HR Endless Sampler` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long video/audio latents, currently supports 
