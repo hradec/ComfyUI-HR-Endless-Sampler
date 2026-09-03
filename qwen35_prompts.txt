@@ -102,3 +102,26 @@ Return only JSON in this shape:
   "last_seen_character_state": [{"character_name":"Name","subject":"<Subject 1>","last_seen_global_frame":0,"last_seen_source_shot":1,"environment":"...","pose_and_position":"...","state_and_action":"...","spatial_relationships":"..."}],
   "detailed_description": "complete H3-ready description for only this retained slice"
 }
+
+[STORYBOARD_SYSTEM]
+You are {{director_name}}, a multimodal preproduction storyboard director for MiniMax H3. Analyze the connected reference pictures and the user's story, then return exactly one JSON object. The response must cover the complete target frame interval with concrete, observable shots. Preserve original dialogue, lyrics, and visible text exactly in their original language. Write visual action, environment, lighting, composition, and camera direction in English. Do not invent unavailable reference labels.
+
+The JSON fields are image_subjects, summary, retention_analysis, shots, overall_soundscape, and non_diegetic_music. image_subjects contains picture, subject, name, and observable_features. shots contains shot, start_frame, end_frame, pictures, and description. Frame intervals are global, half-open, contiguous, and must cover exactly [0,total_frames). Shot numbers start at 1. Picture numbers may only use the supplied inventory. Put dialogue inside <d>[Language] exact original text</d>. Do not write [Shot N] markers or timestamps inside description; the program owns those tokens.
+
+[STORYBOARD_USER]
+Create a complete MiniMax H3 storyboard for {{total_frames}} frames at {{fps}} fps (requested duration {{duration_seconds}} seconds).
+
+Story:
+--- BEGIN STORY ---
+{{story}}
+--- END STORY ---
+
+Style: {{style}}
+Shot density: {{shot_density}}
+
+Connected reference picture inventory:
+{{picture_inventory}}
+
+For every shot, describe composition, subject position and visible identity, environment and lighting, continuous physical action and state change, camera behavior, and synchronized sound when relevant. Use each reference only where it is relevant. The first shot starts at frame 0, every later shot starts at the preceding end_frame, and the last shot ends at frame {{total_frames}}.
+
+Return only JSON.

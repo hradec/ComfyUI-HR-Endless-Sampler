@@ -20,8 +20,10 @@ from PIL import Image
 
 try:
     from .director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
+    from .story_format import compile_h3_prompt, validate_storyboard_plan
 except ImportError:  # Direct worker execution.
     from director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
+    from story_format import compile_h3_prompt, validate_storyboard_plan
 
 
 QWEN35_CONTEXT_TOKENS = 65536
@@ -237,6 +239,44 @@ def _chunk_messages(request: dict[str, Any]) -> tuple[str, str]:
         "previous_characters": json.dumps(request.get("previous_last_seen_character_state", ()), ensure_ascii=False),
     }
     return templates["CHUNK_SYSTEM"], _render(templates["CHUNK_USER"], values)
+
+
+def _storyboard_messages(request: dict[str, Any]) -> tuple[str, str]:
+    templates = _templates()
+    count = int(request["image_count"])
+    inventory = "\n".join(f"- <Picture {index}>: connected reference image {index}" for index in range(1, count + 1))
+    values = {
+        "director_name": request.get("director_backend", "qwen3.5").replace("qwen", "Qwen"),
+        "story": str(request["story"]).strip(),
+        "style": str(request.get("style", "Follow the story's natural visual style.")).strip(),
+        "shot_density": str(request.get("shot_density", "medium")).strip(),
+        "fps": request["fps"],
+        "total_frames": request["total_frames"],
+        "duration_seconds": request["duration_seconds"],
+        "picture_inventory": inventory,
+    }
+    return templates["STORYBOARD_SYSTEM"], _render(templates["STORYBOARD_USER"], values)
+
+
+def _storyboard_result(value: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    plan = validate_storyboard_plan(
+        value,
+        image_count=int(request["image_count"]),
+        total_frames=int(request["total_frames"]),
+    )
+    fps = float(request["fps"])
+    lines = []
+    for shot in plan["shots"]:
+        start = shot["start_frame"] / fps
+        end = shot["end_frame"] / fps
+        pictures = ", ".join(f"Picture {number}" for number in shot["pictures"]) or "无图片引用"
+        lines.append(f"镜头 {shot['shot']}｜{start:.3f}-{end:.3f} 秒｜{pictures}\n{shot['description']}")
+    return {
+        "prompt": compile_h3_prompt(plan, fps=fps),
+        "story_plan": plan,
+        "shot_report": "\n\n".join(lines),
+        "warnings": [],
+    }
 
 
 def _extract_json(text: str) -> tuple[dict[str, Any], str]:
@@ -574,7 +614,11 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
     except ImportError as error:
         raise Qwen35DependencyError("Qwen3.5 requires llama-cpp-python with MTMD support") from error
 
-    timing = request["operation"] == "timing_plan"
+    operation = request["operation"]
+    if operation not in {"timing_plan", "chunk", "storyboard"}:
+        raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
+    timing = operation == "timing_plan"
+    storyboard = operation == "storyboard"
     handler = None if timing else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
     )
@@ -584,7 +628,12 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         flash_attn=True, type_k=8, type_v=8, swa_full=False, verbose=False,
     )
     try:
-        system, prompt = _timing_messages(request) if timing else _chunk_messages(request)
+        if timing:
+            system, prompt = _timing_messages(request)
+        elif storyboard:
+            system, prompt = _storyboard_messages(request)
+        else:
+            system, prompt = _chunk_messages(request)
         content: Any = prompt
         if not timing:
             content = [{"type": "image_url", "image_url": {"url": url}} for url in request.get("image_urls", ())]
@@ -598,6 +647,8 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         message = response["choices"][0]["message"]
         text = str(message.get("content") or message.get("reasoning_content") or "")
         value, raw = _extract_json(text)
+        if storyboard:
+            return {"storyboard": _storyboard_result(value, request)}
         result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
         return {"timing_plan" if timing else "chunk_prompt": _payload(result)}
     finally:
@@ -612,7 +663,11 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
         return _complete_qwen35(request)
 
     Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, handler_factory, SpecConfig, SpeculativeType = _load_runtime()
-    timing = request["operation"] == "timing_plan"
+    operation = request["operation"]
+    if operation not in {"timing_plan", "chunk", "storyboard"}:
+        raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
+    timing = operation == "timing_plan"
+    storyboard = operation == "storyboard"
     family = _qwen_family(request["director_model_path"])
     handler = None if timing or family == "qwen3.8" else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
@@ -671,7 +726,12 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
                     use_gpu=False,
                 )
             llm.chat_handler = handler
-        system, prompt = _timing_messages(request) if timing else _chunk_messages(request)
+        if timing:
+            system, prompt = _timing_messages(request)
+        elif storyboard:
+            system, prompt = _storyboard_messages(request)
+        else:
+            system, prompt = _chunk_messages(request)
         content: Any = prompt
         if not timing:
             content = [{"type": "image_url", "image_url": {"url": url}} for url in request.get("image_urls", ())]
@@ -696,11 +756,14 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
         message = choice["message"]
         text = str(message.get("content") or message.get("reasoning_content") or "")
         value, raw = _extract_json(text)
-        result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
+        if storyboard:
+            result = _storyboard_result(value, request)
+        else:
+            result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         stats = getattr(llm, "last_speculative_stats", None)
         return {
-            "timing_plan" if timing else "chunk_prompt": _payload(result),
+            "storyboard" if storyboard else ("timing_plan" if timing else "chunk_prompt"): result if storyboard else _payload(result),
             "generation": {
                 "finish_reason": choice.get("finish_reason"),
                 "prompt_tokens": usage.get("prompt_tokens"),
@@ -776,6 +839,29 @@ def _run_worker(request: dict[str, Any], timing: bool):
     return _from_payload(value["timing_plan" if timing else "chunk_prompt"], timing)
 
 
+def _run_storyboard_worker(request: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(json.dumps(request, ensure_ascii=False))
+    payload["operation"] = "storyboard"
+    process, value = _run_worker_once(payload)
+    native_failure = value is None or value.get("error_type") not in {
+        "Qwen35ObservationError", "Qwen35DependencyError", "ValueError"
+    }
+    if payload.get("director_mtp", False) and native_failure:
+        payload["director_mtp"] = False
+        process, value = _run_worker_once(payload)
+    if value is None:
+        raise DirectorWorkerError(
+            f"Qwen storyboard worker exited with status {process.returncode} without a result",
+            returncode=process.returncode,
+        )
+    if not value.get("ok"):
+        raise Qwen35ObservationError(
+            str(value.get("message", "Qwen storyboard worker failed")),
+            raw_json=str(value.get("raw_json", "")),
+        )
+    return dict(value["storyboard"])
+
+
 class Qwen35ContinuityDirector:
     def __init__(self, model_path: Path, mmproj_path: Path, debug=False, capture_directory=None, observation_image_directory=None,
                  mtp_enabled=True, mtp_draft_tokens=2, reasoning_effort="xhigh", cpu_moe=False, n_cpu_moe=0,
@@ -843,6 +929,33 @@ class Qwen35ContinuityDirector:
         self.last_system_prompt = result.system_prompt or self.last_system_prompt
         self.last_observation_prompt = result.observation_prompt or self.last_observation_prompt
         return result
+
+    def plan_storyboard(self, story: str, frames: Sequence[torch.Tensor], *, duration_seconds: float, fps: float,
+                        style: str = "cinematic realism", shot_density: str = "medium") -> dict[str, Any]:
+        if not isinstance(story, str) or not story.strip():
+            raise Qwen35ObservationError("Storyboard planning requires a non-empty story")
+        frames = tuple(frames)
+        if len(frames) < 1 or len(frames) > 9 or any(
+            not isinstance(frame, torch.Tensor) or frame.ndim != 4 or frame.shape[0] != 1
+            for frame in frames
+        ):
+            raise Qwen35ObservationError("Storyboard planning requires 1 to 9 single-image NHWC batches")
+        total_frames = max(5, int(round(float(duration_seconds) * float(fps))))
+        remainder = (total_frames - 5) % 17
+        if remainder:
+            total_frames += 17 - remainder
+        request = {
+            "story": story.strip(),
+            "duration_seconds": float(duration_seconds),
+            "fps": float(fps),
+            "total_frames": total_frames,
+            "image_count": len(frames),
+            "style": str(style),
+            "shot_density": str(shot_density),
+            "image_urls": [_image_url(frame[0]) for frame in frames],
+        }
+        self._configure_request(request)
+        return _run_storyboard_worker(request)
 
     def materialize_preproduction_cache(self, request, timing_plan, progress_callback=None):
         raise Qwen35ObservationError("Qwen3.5 does not support the Gemma preproduction KV cache")

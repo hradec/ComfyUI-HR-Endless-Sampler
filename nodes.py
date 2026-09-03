@@ -25,6 +25,7 @@ from tqdm.auto import tqdm
 from tqdm import tqdm as _cli_tqdm
 
 from .director_backend import DIRECTOR_BACKENDS, QWEN_DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
+from .director_config import HRDirectorConfig, normalize_qwen38_config
 from .director_errors import DirectorDependencyError, DirectorObservationError
 from .gemma4 import (
     Gemma4ContinuityDirector,
@@ -37,6 +38,7 @@ from .gemma4 import (
 )
 from .preview import begin_preview_execution
 from .qwen35 import Qwen35ContinuityDirector
+from .reference_set import HRReferenceSet, reference_images, reference_presentation_items
 from .video_io import HREndlessTimeline, normalize_timeline
 
 
@@ -997,9 +999,11 @@ def _reference_video_canvas(width, height):
     return target_width, target_height
 
 
-def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuation, video_items=()):
+def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
     refs = positive[0].get("minimax_refs") if positive else None
     if refs:
+        if base_reference_items is not None:
+            return clip.tokenize(prompt, minimax_ref_items=[*base_reference_items, *video_items])
         ref_items = []
         image_index = 0
         for ref in refs:
@@ -1027,8 +1031,10 @@ def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuati
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, image_list, positive, width, height, continuation, video_items=()):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, image_list, positive, width, height, continuation, video_items))
+def _encode_prompt(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(
+        clip, prompt, image_list, positive, width, height, continuation, video_items, base_reference_items
+    ))
     if len(conditioning) != 1:
         raise ValueError("HR Endless Sampler expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -2358,6 +2364,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                  tooltip="Qwen3.6/Qwen3.8: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
                 io.Int.Input("director_n_cpu_moe", default=0, min=0, max=256, step=1,
                              tooltip="Qwen3.6/Qwen3.8: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
+                HRDirectorConfig.Input(
+                    "director_config",
+                    optional=True,
+                    tooltip=("Optional shared HR Qwen3.8 configuration. When connected, it overrides the legacy "
+                             "director widgets so Planner and Sampler use the same model and runtime settings."),
+                ),
+                HRReferenceSet.Input(
+                    "reference_set",
+                    optional=True,
+                    tooltip=("Optional shared MiniMax H3 image/video/audio references. Connect the Reference Conditioning "
+                             "passthrough output so Planner, conditioning, and Sampler use one media connection."),
+                ),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -2379,8 +2397,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 director_reasoning_effort="xhigh", director_cpu_moe=False, director_n_cpu_moe=0,
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
-                director_model="auto", director_mmproj="auto", **_deprecated_inputs):
+                director_model="auto", director_mmproj="auto", director_config=None, reference_set=None, **_deprecated_inputs):
         _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
+        if director_config is not None:
+            shared = normalize_qwen38_config(director_config)
+            director_backend = shared["backend"]
+            director_model = shared["model"]
+            director_mmproj = shared["mmproj"]
+            gemma4_mtp = shared["mtp"]
+            director_mtp_draft_tokens = shared["mtp_draft_tokens"]
+            director_reasoning_effort = shared["reasoning_effort"]
+            director_cpu_moe = shared["cpu_moe"]
+            director_n_cpu_moe = shared["n_cpu_moe"]
+            debug = shared["debug"]
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
         # serialized legacy values too: an old workflow must not quietly enable
@@ -2477,7 +2506,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if positive is None:
             raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
-        image_list = _source_images(images, source_images)
+        if reference_set is not None and (images is not None or source_images):
+            raise ValueError("Connect reference_set or legacy images/source_images, not both")
+        image_list = list(reference_images(reference_set)) if reference_set is not None else _source_images(images, source_images)
+        base_reference_items = reference_presentation_items(reference_set, width, height) if reference_set is not None else None
         if len(active_plan) > 1 and (use_video_continuation or qwen_full_history) and not ref2va:
             raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
         original_refs = positive[0].get("minimax_refs", ())
@@ -3534,7 +3566,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     preview_execution.set_phase(qwen_message, chunk=index)
                 timer_started = time.perf_counter()
                 try:
-                    encoded_prompt = _encode_prompt(clip, chunk_prompt, image_list, positive, width, height, continuation, video_items)
+                    encoded_prompt = _encode_prompt(
+                        clip, chunk_prompt, image_list, positive, width, height, continuation, video_items,
+                        base_reference_items,
+                    )
                 finally:
                     timing.add("qwen", timer_started)
                 if continuation and include_video1_reference:

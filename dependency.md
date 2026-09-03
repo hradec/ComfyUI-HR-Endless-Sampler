@@ -246,6 +246,13 @@ review date, versions/commits checked, and outcome below.
   multimodal replay: the running ComfyUI process held 14,954 MiB of the GPU, so
   a separate Gemma worker could not load for the live test. Keep the fallback
   until the next real Chunk 2 operation confirms the host-checkpoint path.
+- 2026-09-03 (storyboard-planner integration): issue #27439 remains open with
+  the `bug-unconfirmed` label and no confirmed fix. GitHub's releases page still
+  marks `v0.3.35-hip-radeon` as the latest official `llama-cpp-python` release,
+  built from package commit `3691546`; the page exposes the official 0.3.35 CUDA
+  wheel variants but no newer official release containing a confirmed state
+  restore fix. The local Qwen storyboard planner therefore reuses disposable
+  workers, and the Gemma operation-local non-MTP fallback remains unchanged.
 
 The runtime was compared against `llama-cpp-python` tag `0.3.35` at commit
 `3691546f1c9e0c1bf93323dff02230bd959cf562`; that package vendors llama.cpp at
