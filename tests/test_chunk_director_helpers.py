@@ -33,6 +33,20 @@ class _IndexedFakeVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_resize_flattens_extra_leading_image_dimensions(self):
+        image = torch.zeros((2, 1, 64, 32, 3), dtype=torch.float32)
+
+        resized = nodes._resize(image, 32, 64, "disabled")
+
+        self.assertEqual(tuple(resized.shape), (2, 64, 32, 3))
+
+    def test_reference_image_uses_one_image_from_extra_leading_dimensions(self):
+        image = torch.zeros((2, 1, 64, 32, 3), dtype=torch.float32)
+
+        resized = nodes._reference_image(image, 64, 64)
+
+        self.assertEqual(tuple(resized.shape), (1, 64, 32, 3))
+
     def test_hr_endless_sampler_schema_hides_retired_experiments_and_puts_debug_last(self):
         schema = nodes.HREndlessSampler.define_schema()
         input_ids = [item.id for item in schema.inputs]
@@ -40,12 +54,18 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(schema.node_id, "HREndlessSampler")
         self.assertEqual(schema.display_name, "HR Endless Sampler")
         self.assertIn("video_continuation", input_ids)
+        self.assertIn("director_backend", input_ids)
+        self.assertIn("director_model", input_ids)
+        self.assertIn("director_mmproj", input_ids)
         self.assertEqual(input_ids[input_ids.index("video_continuation") + 1], "video_continuation_res")
         video_continuation_input = next(item for item in schema.inputs if item.id == "video_continuation")
         self.assertEqual(video_continuation_input.default, 22)
         self.assertIn("cache_gemma_preproduction", input_ids)
         self.assertIn("gemma4_mtp", input_ids)
         self.assertIn("pytorch_memory_fraction", input_ids)
+        memory_fraction_input = next(item for item in schema.inputs if item.id == "pytorch_memory_fraction")
+        self.assertIsNone(memory_fraction_input.min)
+        self.assertIsNone(memory_fraction_input.max)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
             "context_keyframes_enable",
@@ -56,7 +76,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "prompt_preview_only",
         } & set(input_ids))
         self.assertEqual(
-            input_ids[-6:],
+            input_ids[-13:-7],
             [
                 "cache_gemma_preproduction",
                 "gemma4_mtp",
@@ -65,6 +85,11 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 "debug_stop_chunk",
                 "debug_start_chunk",
             ],
+        )
+        self.assertEqual(input_ids[-7:-4], ["director_backend", "director_model", "director_mmproj"])
+        self.assertEqual(
+            input_ids[-4:],
+            ["director_mtp_draft_tokens", "director_reasoning_effort", "director_cpu_moe", "director_n_cpu_moe"],
         )
 
         execute_params = inspect.signature(nodes.HREndlessSampler.execute).parameters
@@ -76,6 +101,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("debug_start_chunk", execute_params)
         self.assertIn("cache_gemma_preproduction", execute_params)
         self.assertIn("gemma4_mtp", execute_params)
+        parameter_ids = list(execute_params)
+        self.assertLess(parameter_ids.index("debug_start_chunk"), parameter_ids.index("director_backend"))
+        self.assertEqual(parameter_ids[-4:-1], ["director_backend", "director_model", "director_mmproj"])
         self.assertIn("pytorch_memory_fraction", execute_params)
         self.assertEqual(execute_params["video_continuation"].default, 22)
         self.assertEqual(

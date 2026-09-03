@@ -14,6 +14,7 @@ again.
 from __future__ import annotations
 
 import base64
+import ctypes
 import gc
 import io
 import json
@@ -43,7 +44,7 @@ GEMMA4_MMPROJ_FILENAME = "mmproj-gemma-4-12b-it-qat-q4_0.gguf"
 GEMMA4_MTP_REPOSITORY = "Janvitos/gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF"
 GEMMA4_MTP_FILENAME = "gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf"
 GEMMA4_MODEL_DIRECTORY = "llama_cpp/gemma-4-12b-it-qat-q4_0"
-GEMMA4_REQUIRED_VERSION = "0.3.35"
+GEMMA4_SUPPORTED_VERSIONS = ("0.3.35", "0.3.48")
 GEMMA4_IMAGE_MIN_TOKENS = 70
 GEMMA4_IMAGE_MAX_TOKENS = 1120
 GEMMA4_BATCH_SIZE = GEMMA4_IMAGE_MAX_TOKENS
@@ -64,7 +65,8 @@ GEMMA4_KV_CACHE_Q8_0 = 8
 GEMMA4_CONTEXT_TOKENS = 32768
 GEMMA4_WORKER_RETRY_LIMIT = 10
 GEMMA4_RESPONSE_REPAIR_LIMIT = 10
-GEMMA4_CHUNK_RESPONSE_TOKENS = 2048
+GEMMA4_CHUNK_RESPONSE_TOKENS = 4096
+GEMMA4_TIMING_RESPONSE_TOKENS = 8192
 # A valid JSON response is normally produced by the unconstrained decoder. If
 # Gemma accidentally answers in its private thought channel, correct it as a
 # real next chat turn first.  That keeps the already encoded request, images,
@@ -535,6 +537,11 @@ def _model_paths() -> tuple[Path, Path]:
     return model_dir / GEMMA4_MODEL_FILENAME, model_dir / GEMMA4_MMPROJ_FILENAME
 
 
+def is_official_gemma4_pair(model_path: Path, mmproj_path: Path) -> bool:
+    expected_model, expected_mmproj = _model_paths()
+    return model_path.resolve() == expected_model.resolve() and mmproj_path.resolve() == expected_mmproj.resolve()
+
+
 def _normalize_gemma4_generation_suffix(text: str) -> str:
     """Keep this GGUF's proven visible-answer delimiter on a model turn.
 
@@ -586,6 +593,22 @@ def _ensure_model_files() -> tuple[Path, Path]:
     return paths[0], paths[1]
 
 
+def _model_files_for_request(request: dict[str, Any]) -> tuple[Path, Path]:
+    model_value = request.get("director_model_path")
+    mmproj_value = request.get("director_mmproj_path")
+    if model_value is None and mmproj_value is None:
+        return _ensure_model_files()
+    if not model_value or not mmproj_value:
+        raise Gemma4DependencyError("A local director requires both model and mmproj files")
+    models_root = Path(folder_paths.models_dir).resolve()
+    model_path = Path(model_value).resolve()
+    mmproj_path = Path(mmproj_value).resolve()
+    for path in (model_path, mmproj_path):
+        if not path.is_relative_to(models_root) or path.suffix.casefold() != ".gguf" or not path.is_file():
+            raise Gemma4DependencyError(f"Invalid local director file: {path}")
+    return model_path, mmproj_path
+
+
 def _ensure_mtp_model_file() -> Path:
     """Return the small Gemma QAT assistant head, downloading it once."""
     model_path, _ = _model_paths()
@@ -615,7 +638,7 @@ def _ensure_mtp_model_file() -> Path:
     )
 
 
-def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
+def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output, native_visual_budget=False):
     """Expose Gemma 4's visual-token budget missing from the pinned handler.
 
     llama-cpp-python 0.3.35 binds ``image_min_tokens`` and
@@ -626,11 +649,19 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
     """
 
     class Gemma4MTMDChatHandler(base_handler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.image_min_tokens = GEMMA4_IMAGE_MIN_TOKENS
+            self.image_max_tokens = GEMMA4_IMAGE_MAX_TOKENS
+            self.batch_max_tokens = GEMMA4_IMAGE_MAX_TOKENS
+
         def _postprocess_template_text(self, text, image_urls, media_marker):
             text = super()._postprocess_template_text(text, image_urls, media_marker)
             return _normalize_gemma4_generation_suffix(text)
 
         def _init_mtmd_context(self, llama_model):
+            if native_visual_budget:
+                return super()._init_mtmd_context(llama_model)
             self.verbose = llama_model.verbose
             if self.mtmd_ctx is not None:
                 return
@@ -640,13 +671,14 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                 ctx_params.use_gpu = self.use_gpu
                 ctx_params.print_timings = self.verbose
                 ctx_params.n_threads = llama_model.n_threads
+                flash_attn_type = llama_cpp_module.llama_flash_attn_type
                 ctx_params.flash_attn_type = (
-                    llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_ENABLED
+                    flash_attn_type.LLAMA_FLASH_ATTN_TYPE_ENABLED
                     if (
                         llama_model.context_params.flash_attn_type
-                        == llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_ENABLED
+                        == flash_attn_type.LLAMA_FLASH_ATTN_TYPE_ENABLED
                     )
-                    else llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_DISABLED
+                    else flash_attn_type.LLAMA_FLASH_ATTN_TYPE_DISABLED
                 )
                 ctx_params.image_min_tokens = GEMMA4_IMAGE_MIN_TOKENS
                 ctx_params.image_max_tokens = GEMMA4_IMAGE_MAX_TOKENS
@@ -723,7 +755,11 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                 {"role": "assistant", "content": anchor},
                 {"role": "user", "content": user_content},
             ]
-            image_urls = self.get_image_urls(messages)
+            image_urls = (
+                [item["url"] for item in self._get_media_items(messages)]
+                if native_visual_budget
+                else self.get_image_urls(messages)
+            )
             media_marker = self._mtmd_cpp.mtmd_default_marker().decode("utf-8")
             template_env = ImmutableSandboxedEnvironment(
                 trim_blocks=True,
@@ -733,25 +769,29 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                     jinja2.ext.loopcontrols,
                 ],
             )
-            template_env.filters["tojson"] = Jinja2ChatFormatter.tojson
-            template = template_env.from_string(self._get_chat_template(llama))
+            if native_visual_budget:
+                text = self._render_and_replace_media(messages, self._get_media_items(messages))
+                text = _normalize_gemma4_generation_suffix(text)
+            else:
+                template_env.filters["tojson"] = Jinja2ChatFormatter.tojson
+                template = template_env.from_string(self._get_chat_template(llama))
 
-            def raise_exception(message: str):
-                raise ValueError(message)
+                def raise_exception(message: str):
+                    raise ValueError(message)
 
-            text = template.render(
-                messages=self._get_template_messages(messages, media_marker),
-                add_generation_prompt=True,
-                eos_token=self._decode_token_piece(llama.detokenize([llama.token_eos()])),
-                bos_token=self._decode_token_piece(llama.detokenize([llama.token_bos()])),
-                raise_exception=raise_exception,
-                functions=None,
-                function_call=None,
-                tools=None,
-                tool_choice=None,
-                strftime_now=Jinja2ChatFormatter.strftime_now,
-            )
-            text = self._postprocess_template_text(text, image_urls, media_marker)
+                text = template.render(
+                    messages=self._get_template_messages(messages, media_marker),
+                    add_generation_prompt=True,
+                    eos_token=self._decode_token_piece(llama.detokenize([llama.token_eos()])),
+                    bos_token=self._decode_token_piece(llama.detokenize([llama.token_bos()])),
+                    raise_exception=raise_exception,
+                    functions=None,
+                    function_call=None,
+                    tools=None,
+                    tool_choice=None,
+                    strftime_now=Jinja2ChatFormatter.strftime_now,
+                )
+                text = self._postprocess_template_text(text, image_urls, media_marker)
             if text.count(anchor) != 1:
                 raise ValueError("Could not derive an append-only Gemma chat-template turn")
             # Keep the template's exact assistant closing sequence, then the
@@ -788,12 +828,17 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                     )
                     if result != 0:
                         raise ValueError(f"Failed to tokenize appended input: error code {result}")
+                    chunk_types = (
+                        self._mtmd_cpp.mtmd_input_chunk_type
+                        if native_visual_budget
+                        else self._mtmd_cpp
+                    )
                     for index in range(self._mtmd_cpp.mtmd_input_chunks_size(chunks)):
                         chunk = self._mtmd_cpp.mtmd_input_chunks_get(chunks, index)
                         if chunk is None:
                             continue
                         chunk_type = self._mtmd_cpp.mtmd_input_chunk_get_type(chunk)
-                        if chunk_type == self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_TEXT:
+                        if chunk_type == chunk_types.MTMD_INPUT_CHUNK_TYPE_TEXT:
                             n_tokens_out = ctypes.c_size_t()
                             tokens_ptr = self._mtmd_cpp.mtmd_input_chunk_get_tokens_text(
                                 chunk, ctypes.byref(n_tokens_out)
@@ -806,8 +851,8 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                                     )
                                 llama.eval(tokens)
                         elif chunk_type in (
-                            self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                            self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_AUDIO,
+                            chunk_types.MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                            chunk_types.MTMD_INPUT_CHUNK_TYPE_AUDIO,
                         ):
                             chunk_n_tokens = self._mtmd_cpp.mtmd_input_chunk_get_n_tokens(chunk)
                             if llama.n_tokens + chunk_n_tokens > llama.n_ctx():
@@ -853,8 +898,25 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
     return Gemma4MTMDChatHandler
 
 
-def _load_runtime():
+def _prepare_windows_llama_dlls():
+    if sys.platform != "win32":
+        return
+    for entry in sys.path:
+        lib_dir = Path(entry) / "llama_cpp" / "lib"
+        ggml_base = lib_dir / "ggml-base.dll"
+        if ggml_base.is_file():
+            os.add_dll_directory(str(lib_dir))
+            for name in ("cudart64_13.dll", "cublasLt64_13.dll", "cublas64_13.dll", "ggml-base.dll", "ggml.dll", "ggml-cpu.dll", "ggml-cuda.dll"):
+                path = lib_dir / name
+                if path.is_file():
+                    ctypes.WinDLL(str(path))
+            return
+
+
+def _load_runtime(backend="gemma4"):
+    director_name = "Qwen3.5" if backend == "qwen3.5" else "Gemma 4"
     try:
+        _prepare_windows_llama_dlls()
         import llama_cpp
         from llama_cpp import Llama
         from llama_cpp.llama_chat_format import MTMDChatHandler
@@ -862,20 +924,23 @@ def _load_runtime():
         import llama_cpp.mtmd_cpp
     except ImportError as error:
         raise Gemma4DependencyError(
-            "Gemma 4 continuity requires llama-cpp-python==0.3.35 with CUDA support. "
+            f"{director_name} continuity requires llama-cpp-python==0.3.35 with CUDA support. "
             "Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
         ) from error
 
-    version = getattr(llama_cpp, "__version__", "unknown")
-    if version != GEMMA4_REQUIRED_VERSION:
+    version = getattr(llama_cpp, "__version__", "unknown").split("+")[0]
+    if version not in GEMMA4_SUPPORTED_VERSIONS:
         raise Gemma4DependencyError(
-            f"Gemma 4 continuity requires llama-cpp-python=={GEMMA4_REQUIRED_VERSION} with MTMD vision support; "
-            f"found {version}. Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
+            f"{director_name} continuity requires a tested llama-cpp-python version with MTMD vision support "
+            f"({', '.join(GEMMA4_SUPPORTED_VERSIONS)}); found {version}."
         )
+    if backend == "qwen3.5":
+        return Llama, MTMDChatHandler
     return Llama, _gemma4_mtmd_handler_type(
         MTMDChatHandler,
         llama_cpp,
         suppress_stdout_stderr,
+        native_visual_budget=version == "0.3.48",
     )
 
 
@@ -886,15 +951,18 @@ def _create_runtime_llm(
     handler: Any,
     debug: bool,
     gemma4_mtp: bool = False,
+    n_ctx: int = 16384,
+    n_batch: int = GEMMA4_BATCH_SIZE,
+    track_token_progress: bool = True,
 ) -> Any:
     """Create either the original runtime or a target born as native MTP."""
     real_runtime = str(getattr(Llama, "__module__", "")).startswith("llama_cpp")
     llama_kwargs = {
         "chat_handler": handler,
         "n_gpu_layers": -1,
-        "n_ctx": GEMMA4_CONTEXT_TOKENS,
-        "n_batch": GEMMA4_BATCH_SIZE,
-        "n_ubatch": GEMMA4_BATCH_SIZE,
+        "n_ctx": n_ctx,
+        "n_batch": n_batch,
+        "n_ubatch": n_batch,
         "flash_attn": True,
         # The old Python path left these at llama.cpp's F16 defaults. Q8_0 is
         # intentionally less aggressive than Q4_0, while halving K/V cache
@@ -917,15 +985,29 @@ def _create_runtime_llm(
         # failure is fatal: an enabled comparison toggle must never silently
         # run the ordinary decoder and report it as MTP.
         mtp_path = _ensure_mtp_model_file()
-        from gemma4_mtp import create_native_mtp_llama
+        import llama_cpp
 
-        llm = create_native_mtp_llama(
-            Llama,
-            model_path=model_path,
-            draft_model_path=mtp_path,
-            num_pred_tokens=4,
-            **llama_kwargs,
-        )
+        if getattr(llama_cpp, "__version__", "").split("+")[0] == "0.3.48":
+            llm = Llama(
+                model_path=str(model_path),
+                speculative=llama_cpp.SpecConfig(
+                    spec_type=llama_cpp.SpeculativeType.DRAFT_MTP,
+                    draft_n_max=4,
+                    draft_model_path=str(mtp_path),
+                    draft_n_gpu_layers="all",
+                ),
+                **llama_kwargs,
+            )
+        else:
+            from gemma4_mtp import create_native_mtp_llama
+
+            llm = create_native_mtp_llama(
+                Llama,
+                model_path=model_path,
+                draft_model_path=mtp_path,
+                num_pred_tokens=4,
+                **llama_kwargs,
+            )
         print(
             "HR Endless Sampler Gemma 4 decoding mode: native draft-mtp "
             "(spec-draft-n-max=4, reference host checkpoints; operation-local non-MTP retry enabled).",
@@ -940,7 +1022,8 @@ def _create_runtime_llm(
                 file=sys.stderr,
                 flush=True,
             )
-    _install_worker_token_progress(llm)
+    if track_token_progress:
+        _install_worker_token_progress(llm)
     return llm
 
 
@@ -961,6 +1044,21 @@ def _install_worker_token_progress(llm: Any) -> None:
         nonlocal generation_number
         generation_number += 1
         current_generation = generation_number
+        n_tokens = int(getattr(llm, "n_tokens", 0))
+        physical_tokens = llm.input_ids[:n_tokens].tolist() if n_tokens > 0 else []
+        supplied_tokens = args[0] if args else kwargs.get("tokens")
+        if supplied_tokens is not None and len(supplied_tokens) < n_tokens:
+            if args:
+                args = (physical_tokens, *args[1:])
+            else:
+                kwargs["tokens"] = physical_tokens
+            supplied_tokens = physical_tokens
+        if supplied_tokens is not None and list(supplied_tokens) == physical_tokens and n_tokens > 0:
+            output_start = int(getattr(llm, "_last_eval_output_start", 0))
+            output_count = int(getattr(llm, "_last_eval_output_count", 0))
+            if not output_start <= n_tokens - 1 < output_start + output_count:
+                llm._last_eval_output_start = n_tokens - 1
+                llm._last_eval_output_count = 1
         iterator = original_generate(*args, **kwargs)
         generated = 0
         first_token_at = None
@@ -1936,10 +2034,15 @@ def _timing_plan_validation_error(message: str, raw_json: str) -> Gemma4Observat
 def _validate_character_name_table(value: dict[str, Any], raw_json: str) -> tuple[GemmaCharacterSubject, ...]:
     """Accept only explicit, stable name-to-existing-subject declarations."""
     raw_table = value.get("character_name_table")
+    if isinstance(raw_table, dict):
+        raw_table = [
+            {"character_name": character_name, "subject": subject}
+            for character_name, subject in raw_table.items()
+        ]
     if not isinstance(raw_table, list):
-        raise _timing_plan_validation_error("response field 'character_name_table' must be an array", raw_json)
+        raise _timing_plan_validation_error("response field 'character_name_table' must be an array or name-to-subject object", raw_json)
     table: list[GemmaCharacterSubject] = []
-    seen_names: set[str] = set()
+    seen_names: dict[str, str] = {}
     for item in raw_table:
         if not isinstance(item, dict):
             raise _timing_plan_validation_error("every character_name_table entry must be an object", raw_json)
@@ -1952,12 +2055,16 @@ def _validate_character_name_table(value: dict[str, Any], raw_json: str) -> tupl
                 "character_name_table entries need an existing '<Subject N>' subject label", raw_json
             )
         normalized_name = name.strip().casefold()
-        if normalized_name in seen_names:
+        normalized_subject = subject.strip()
+        previous_subject = seen_names.get(normalized_name)
+        if previous_subject is not None:
+            if previous_subject == normalized_subject:
+                continue
             raise _timing_plan_validation_error(
-                f"character_name_table repeats character name {name.strip()!r}", raw_json
+                f"character_name_table assigns character name {name.strip()!r} to conflicting subjects", raw_json
             )
-        seen_names.add(normalized_name)
-        table.append(GemmaCharacterSubject(name.strip(), subject.strip()))
+        seen_names[normalized_name] = normalized_subject
+        table.append(GemmaCharacterSubject(name.strip(), normalized_subject))
     return tuple(table)
 
 
@@ -1992,7 +2099,7 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
             raise _timing_plan_validation_error("every shot schedule must be an object", raw_json)
         try:
             source_shot = int(supplied["source_shot"])
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise _timing_plan_validation_error(
                 "every shot schedule needs an integer source_shot", raw_json
             ) from error
@@ -2019,7 +2126,7 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
             try:
                 start = int(raw_beat["start_frame"])
                 end = int(raw_beat["end_frame"])
-            except (KeyError, TypeError, ValueError) as error:
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} visual_beats need integer start_frame and end_frame", raw_json
                 ) from error
@@ -2028,13 +2135,10 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} visual beat {start}-{end} needs a non-empty action", raw_json
                 )
-            # Gemma consistently describes intermediate beat boundaries as
-            # half-open (the next start equals the prior end), but can echo the
-            # final *last frame index* from the human-readable source listing
-            # instead of the schema's exclusive endpoint.  It is the same
-            # final action, not a sampler-authored fallback, so normalize just
-            # that unambiguous one-frame spelling at the known shot endpoint.
-            if beat_index == len(raw_visual_beats) - 1 and end == duration - 1:
+            # The sampler owns the exact shot endpoint. Preserve the model's
+            # action, ordering, and contiguous start, but never ask it to echo
+            # the exclusive endpoint that is already known here.
+            if beat_index == len(raw_visual_beats) - 1 and start == previous_end and start < duration:
                 end = duration
             if start != previous_end or end <= start or end > duration:
                 raise _timing_plan_validation_error(
@@ -2061,13 +2165,13 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
             try:
                 start = int(raw_overlay["start_frame"])
                 end = int(raw_overlay["end_frame"])
-            except (KeyError, TypeError, ValueError) as error:
+            except (KeyError, TypeError, ValueError, OverflowError) as error:
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} overlay {overlay_index} needs integer start_frame and end_frame", raw_json
                 ) from error
             overlay_type = raw_overlay.get("type")
             content = raw_overlay.get("content")
-            if overlay_type not in {"dialogue", "sound", "action"}:
+            if not isinstance(overlay_type, str) or overlay_type not in {"dialogue", "sound", "action"}:
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} overlay {overlay_index} type must be dialogue, sound, or action", raw_json
                 )
@@ -2075,10 +2179,13 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} overlay {overlay_index} needs non-empty content", raw_json
                 )
-            if start < 0 or end <= start or end > duration:
-                raise _timing_plan_validation_error(
-                    f"Source Shot {expected_number} overlay {overlay_index} must fit source-relative frames 0-{duration}", raw_json
-                )
+            # Overlay timing is bounded by the sampler-owned shot interval.
+            # Preserve the model's content and type while intersecting its
+            # interval with the only frames where that overlay can exist.
+            start = max(0, start)
+            end = min(duration, end)
+            if start >= end:
+                continue
             overlays.append(GemmaShotTimingOverlay(start, end, overlay_type, content.strip()))
         # Global source-shot boundaries are immutable sampler facts, not
         # generated timing content.  Do not require Gemma to echo a redundant
@@ -2122,8 +2229,13 @@ def _timing_plan_correction_request(request: dict[str, Any], error: Gemma4Observ
         '"shots":[{"source_shot":1, '
         '"visual_beats":[{"start_frame":0, "end_frame":34, "action":"..."}], '
         '"overlays":[{"start_frame":4, "end_frame":20, "type":"dialogue|sound|action", "content":"..."}]}]}\n\n'
-        "`character_name_table` must be an array. Preserve only explicit name-to-<Subject N> mappings "
-        "from the original prompt; use [] when there are none.\n\n"
+        "Return exactly one shot object for every required Source Shot, in the listed order. Every visual beat and "
+        "overlay must be an object. Actions and overlay content must be non-empty. Visual beats must cover each shot "
+        "exactly from frame 0 to its exclusive duration without gaps or overlaps. Every overlay must have 0 <= "
+        "start_frame < end_frame <= shot duration and type dialogue, sound, or action. "
+        "`character_name_table` must be an array with at most one mapping per character name; repeated identical "
+        "mappings are unnecessary and conflicting subjects are invalid. Preserve only explicit name-to-<Subject N> "
+        "mappings from the original prompt; use [] when there are none.\n\n"
         "Required source-shot coverage:\n"
         + expected
         + "\n\nDetected error:\n- "
@@ -2459,6 +2571,8 @@ def _gemma_chat_json(
     handler: Any = None,
     max_tokens: int = GEMMA4_CHUNK_RESPONSE_TOKENS,
     mtp_active: bool = False,
+    director_name: str = "Gemma 4",
+    prefer_json_grammar: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Run a fast JSON request, repairing malformed output as a chat turn.
 
@@ -2485,7 +2599,7 @@ def _gemma_chat_json(
         choice = response["choices"][0]["message"]
         return _gemma_response_text(choice)
 
-    text = complete()
+    text = complete({"type": "json_object"} if prefer_json_grammar else None)
     try:
         return _extract_json_object(text)
     except Gemma4ObservationError as error:
@@ -2499,8 +2613,9 @@ def _gemma_chat_json(
             latest_error = error
             for repair_index in range(1, GEMMA4_JSON_FORMAT_REPAIR_LIMIT + 1):
                 logging.warning(
-                    "HR Endless Sampler Gemma 4 returned malformed instructed JSON; "
+                    "HR Endless Sampler %s returned malformed instructed JSON; "
                     "requesting a compact append-only JSON replacement (repair %d/%d): %s",
+                    director_name,
                     repair_index,
                     GEMMA4_JSON_FORMAT_REPAIR_LIMIT,
                     latest_error,
@@ -2519,8 +2634,9 @@ def _gemma_chat_json(
                 except Gemma4ObservationError as repair_error:
                     latest_error = repair_error
             logging.warning(
-                "HR Endless Sampler Gemma 4 append-only JSON replacements were unusable; "
+                "HR Endless Sampler %s append-only JSON replacements were unusable; "
                 "using llama.cpp's grammar only as a final fallback: %s",
+                director_name,
                 latest_error,
             )
             response = append(
@@ -2536,8 +2652,9 @@ def _gemma_chat_json(
             return _extract_json_object(candidate)
 
         logging.warning(
-            "HR Endless Sampler Gemma 4 returned malformed instructed JSON; "
+            "HR Endless Sampler %s returned malformed instructed JSON; "
             "the runtime has no append-only chat API, so retrying with llama.cpp's slower JSON grammar: %s",
+            director_name,
             error,
         )
         return _extract_json_object(complete({"type": "json_object"}))
@@ -2737,9 +2854,11 @@ def _observe_in_process(
     debug: bool,
 ) -> GemmaChunkPrompt:
     """Run one observation inside the disposable worker process."""
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     system_prompt, message = _render_observation_messages(request)
+    director_name = "Qwen3.5" if request.get("director_backend") == "qwen3.5" else "Gemma 4"
+    response_tokens = GEMMA4_TIMING_RESPONSE_TOKENS if director_name == "Qwen3.5" else GEMMA4_CHUNK_RESPONSE_TOKENS
     # Gemma 4's official modality order is images before user text. Preserve
     # chronological order within the image sequence.
     content: list[dict[str, Any]] = [
@@ -2754,13 +2873,20 @@ def _observe_in_process(
     try:
         # Keep llama.cpp/MTMD native timing traces separate from the sampler's
         # useful debug mode.  The latter is preserved by our own diagnostics.
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        handler = MTMDChatHandler(
+            clip_model_path=str(mmproj_path),
+            verbose=False,
+            use_gpu=request.get("director_backend", "gemma4") != "qwen3.5",
+        )
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
+            track_token_progress=request.get("director_backend", "gemma4") != "qwen3.5",
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
@@ -2803,14 +2929,19 @@ def _observe_in_process(
                     llm,
                     initial_messages,
                     handler=handler,
+                    max_tokens=response_tokens,
                     mtp_active=bool(request.get("gemma4_mtp", False)),
+                    director_name=director_name,
+                    prefer_json_grammar=director_name == "Qwen3.5",
                 )
         else:
             payload, raw_json = _gemma_chat_json(
                 llm,
                 initial_messages,
                 handler=handler,
+                max_tokens=response_tokens,
                 mtp_active=bool(request.get("gemma4_mtp", False)),
+                director_name=director_name,
             )
         latest_raw_json = raw_json
         attempts: list[GemmaPromptAttempt] = []
@@ -2841,7 +2972,9 @@ def _observe_in_process(
                 llm,
                 correction_messages,
                 handler=handler,
+                max_tokens=response_tokens,
                 mtp_active=bool(request.get("gemma4_mtp", False)),
+                director_name=director_name,
             )
 
         while True:
@@ -2959,18 +3092,25 @@ def _materialize_preproduction_cache_in_process(
     this static directorial conversation after the render-local cache reset.
     Otherwise every replayed chunk falls back to a full self-contained prompt.
     """
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     handler = None
     llm = None
     try:
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        handler = MTMDChatHandler(
+            clip_model_path=str(mmproj_path),
+            verbose=False,
+            use_gpu=request.get("director_backend", "gemma4") != "qwen3.5",
+        )
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
+            track_token_progress=request.get("director_backend", "gemma4") != "qwen3.5",
         )
         state_bytes = _populate_preproduction_cache_state(llm, request, timing_plan)
         logging.info(
@@ -2992,93 +3132,108 @@ def _materialize_preproduction_cache_in_process(
 
 def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTimingPlan:
     """Run the one-time text-only source-shot timing plan in the worker."""
-    Llama, MTMDChatHandler = _load_runtime()
-    model_path, mmproj_path = _ensure_model_files()
+    Llama, MTMDChatHandler = _load_runtime(request.get("director_backend", "gemma4"))
+    model_path, mmproj_path = _model_files_for_request(request)
     system_prompt, message = _render_timing_plan_messages(request)
+    director_name = "Qwen3.5" if request.get("director_backend") == "qwen3.5" else "Gemma 4"
     handler = None
     llm = None
     try:
-        # Keep the official Gemma multimodal chat handler even though this pass
-        # has no images.  It supplies the same model-specific conversation
-        # formatting as the later image-and-text requests.
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        # Qwen timing planning is text-only. Keep it out of MTMD entirely so
+        # media-token bookkeeping cannot alter the prompt ledger before sampling.
+        if request.get("director_backend", "gemma4") != "qwen3.5":
+            handler = MTMDChatHandler(
+                clip_model_path=str(mmproj_path),
+                verbose=False,
+                use_gpu=True,
+            )
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            n_ctx=int(request.get("director_n_ctx", GEMMA4_CONTEXT_TOKENS)),
+            n_batch=int(request.get("director_n_batch", GEMMA4_BATCH_SIZE)),
+            track_token_progress=request.get("director_backend", "gemma4") != "qwen3.5",
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ]
-        latest_raw_json = ""
-        payload, raw_json = _gemma_chat_json(
+        payload, latest_raw_json = _gemma_chat_json(
             llm,
             initial_messages,
             handler=handler,
-            max_tokens=2048,
+            max_tokens=GEMMA4_TIMING_RESPONSE_TOKENS,
             mtp_active=bool(request.get("gemma4_mtp", False)),
+            director_name=director_name,
+            prefer_json_grammar=True,
         )
-        latest_raw_json = raw_json
-        try:
-            initial = _validate_timing_plan(
-                payload,
-                request,
-                raw_json,
-                system_prompt=system_prompt,
-                planning_prompt=message,
-            )
-            attempts = [GemmaPromptAttempt(kind="initial response", raw_json=initial.raw_json)]
-            result = replace(initial, attempts=tuple(attempts))
-        except Gemma4ObservationError as error:
-            correction_prompt = _timing_plan_correction_request(request, error)
-            if callable(getattr(handler, "append_user_chat_completion", None)):
-                corrected_payload, corrected_raw_json = _gemma_append_chat_json(
-                    handler,
-                    llm,
-                    correction_prompt,
-                    max_tokens=2048,
-                    mtp_active=bool(request.get("gemma4_mtp", False)),
-                )
-            else:
-                correction_messages = [
-                    *initial_messages,
-                    {"role": "assistant", "content": latest_raw_json},
-                    {"role": "user", "content": correction_prompt},
-                ]
-                corrected_payload, corrected_raw_json = _gemma_chat_json(
-                    llm,
-                    correction_messages,
-                    handler=handler,
-                    max_tokens=2048,
-                    mtp_active=bool(request.get("gemma4_mtp", False)),
-                )
-            latest_raw_json = corrected_raw_json
+        attempts: list[GemmaPromptAttempt] = []
+        correction_prompt = ""
+        repairs = 0
+        repair_limit = 0 if director_name == "Qwen3.5" else GEMMA4_RESPONSE_REPAIR_LIMIT
+        while True:
             try:
-                corrected = _validate_timing_plan(
-                    corrected_payload,
+                candidate = _validate_timing_plan(
+                    payload,
                     request,
-                    corrected_raw_json,
+                    latest_raw_json,
                     system_prompt=system_prompt,
                     planning_prompt=message,
                 )
-            except Gemma4ObservationError as corrected_error:
-                raise Gemma4ObservationError(str(corrected_error), raw_json=latest_raw_json) from corrected_error
-            attempts = (
-                GemmaPromptAttempt(
-                    kind="initial response",
-                    raw_json=raw_json,
+            except Gemma4ObservationError as error:
+                attempts.append(GemmaPromptAttempt(
+                    kind="initial response" if repairs == 0 else "invalid timing-plan correction response",
+                    raw_json=latest_raw_json,
                     validation_warnings=(str(error),),
-                ),
-                GemmaPromptAttempt(
-                    kind="timing-plan correction response",
-                    raw_json=corrected.raw_json,
                     correction_prompt=correction_prompt,
-                ),
-            )
-            result = replace(corrected, attempts=attempts)
+                ))
+                if repairs >= repair_limit:
+                    raise Gemma4ObservationError(
+                        f"{error} after {repairs} model-authored repair attempts",
+                        raw_json=latest_raw_json,
+                    ) from error
+                repairs += 1
+                correction_prompt = _timing_plan_correction_request(request, error)
+                logging.warning(
+                    "HR Endless Sampler director returned an invalid timing plan: %s. "
+                    "Requesting complete replacement %d/%d in the same operation.",
+                    error,
+                    repairs,
+                    repair_limit,
+                )
+                if callable(getattr(handler, "append_user_chat_completion", None)):
+                    payload, latest_raw_json = _gemma_append_chat_json(
+                        handler,
+                        llm,
+                        correction_prompt,
+                        max_tokens=GEMMA4_TIMING_RESPONSE_TOKENS,
+                        mtp_active=bool(request.get("gemma4_mtp", False)),
+                    )
+                else:
+                    correction_messages = [*initial_messages]
+                    if director_name != "Qwen3.5":
+                        correction_messages.append({"role": "assistant", "content": latest_raw_json})
+                    correction_messages.append({"role": "user", "content": correction_prompt})
+                    payload, latest_raw_json = _gemma_chat_json(
+                        llm,
+                        correction_messages,
+                        handler=handler,
+                        max_tokens=GEMMA4_TIMING_RESPONSE_TOKENS,
+                        mtp_active=bool(request.get("gemma4_mtp", False)),
+                        director_name=director_name,
+                        prefer_json_grammar=director_name == "Qwen3.5",
+                    )
+                continue
+            attempts.append(GemmaPromptAttempt(
+                kind="initial response" if repairs == 0 else "timing-plan correction response",
+                raw_json=candidate.raw_json,
+                correction_prompt=correction_prompt,
+            ))
+            result = replace(candidate, attempts=tuple(attempts))
+            break
 
         if request.get("preproduction_cache"):
             try:
@@ -3116,6 +3271,7 @@ def _worker_environment() -> dict[str, str]:
     environment["PYTHONPATH"] = (
         comfy_root if not current_pythonpath else comfy_root + os.pathsep + current_pythonpath
     )
+    environment["PYTHONIOENCODING"] = "utf-8"
     return environment
 
 
@@ -3167,6 +3323,7 @@ def _observe_in_worker(request: dict[str, Any], progress_callback: Any = None) -
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=_worker_environment(),
     )
     try:
@@ -3201,6 +3358,13 @@ def _observe_in_worker(request: dict[str, Any], progress_callback: Any = None) -
                 worker_error_type=worker_error_type,
                 raw_json=raw_json,
             )
+        if message.startswith("Llama.eval(decode):"):
+            raise Gemma4WorkerExitError(
+                message,
+                returncode=process.returncode,
+                worker_error_type="native decode failure",
+                raw_json=raw_json,
+            )
         raise Gemma4ObservationError(message, raw_json=raw_json)
     if process.returncode != 0:
         raise Gemma4WorkerExitError(
@@ -3221,6 +3385,7 @@ def _plan_timing_in_worker(request: dict[str, Any], progress_callback: Any = Non
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=_worker_environment(),
     )
     stdout = _stream_worker_output(process, request, progress_callback)
@@ -3252,6 +3417,13 @@ def _plan_timing_in_worker(request: dict[str, Any], progress_callback: Any = Non
                 worker_error_type=worker_error_type,
                 raw_json=raw_json,
             )
+        if message.startswith("Llama.eval(decode):"):
+            raise Gemma4WorkerExitError(
+                message,
+                returncode=process.returncode,
+                worker_error_type="native decode failure",
+                raw_json=raw_json,
+            )
         raise Gemma4ObservationError(message, raw_json=raw_json)
     if process.returncode != 0:
         raise Gemma4WorkerExitError(
@@ -3279,6 +3451,7 @@ def _materialize_preproduction_cache_in_worker(
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=_worker_environment(),
     )
     stdout = _stream_worker_output(process, worker_request, progress_callback)
@@ -3328,9 +3501,15 @@ class Gemma4ContinuityDirector:
 
     def __init__(self, debug: bool = False, gemma4_mtp: bool = False,
                  capture_directory: str | Path | None = None,
-                 observation_image_directory: str | Path | None = None):
+                 observation_image_directory: str | Path | None = None,
+                 model_path: str | Path | None = None,
+                 mmproj_path: str | Path | None = None):
         self.debug = debug
         self.gemma4_mtp = bool(gemma4_mtp)
+        self.model_path = Path(model_path).resolve() if model_path is not None else None
+        self.mmproj_path = Path(mmproj_path).resolve() if mmproj_path is not None else None
+        if (self.model_path is None) != (self.mmproj_path is None):
+            raise Gemma4DependencyError("A local Gemma director requires both model and mmproj files")
         self._capture_sequence = 0
         self.last_system_prompt = ""
         self.last_observation_prompt = ""
@@ -3347,6 +3526,13 @@ class Gemma4ContinuityDirector:
             self.capture_directory = Path(capture_directory)
             self.capture_directory.mkdir(parents=True, exist_ok=True)
             logging.info("HR Endless Sampler Gemma capture directory: %s", self.capture_directory)
+
+    def _configure_request(self, request: dict[str, Any]) -> None:
+        request["debug"] = self.debug
+        request["gemma4_mtp"] = self.gemma4_mtp
+        if self.model_path is not None:
+            request["director_model_path"] = str(self.model_path)
+            request["director_mmproj_path"] = str(self.mmproj_path)
 
     def _run_worker_with_mtp_fallback(
         self,
@@ -3365,9 +3551,11 @@ class Gemma4ContinuityDirector:
         still attempts MTP normally.
         """
         preserved_request = json.loads(json.dumps(request, ensure_ascii=False))
+        director_name = "Qwen3.5" if preserved_request.get("director_backend") == "qwen3.5" else "Gemma 4"
         attempted_mtp = bool(preserved_request.get("gemma4_mtp", False))
         use_mtp = attempted_mtp
         retries_used = 0
+        retry_limit = 0 if director_name == "Qwen3.5" else GEMMA4_WORKER_RETRY_LIMIT
 
         while True:
             attempt_request = json.loads(json.dumps(preserved_request, ensure_ascii=False))
@@ -3375,10 +3563,11 @@ class Gemma4ContinuityDirector:
             try:
                 return worker(attempt_request)
             except Gemma4WorkerExitError as error:
-                if retries_used >= GEMMA4_WORKER_RETRY_LIMIT:
+                if retries_used >= retry_limit:
                     logging.error(
-                        "HR Endless Sampler Gemma 4 worker failed during %s after %d fresh "
+                        "HR Endless Sampler %s worker failed during %s after %d fresh "
                         "worker retries; the render cannot continue: %s",
+                        director_name,
                         operation,
                         retries_used,
                         error,
@@ -3393,16 +3582,15 @@ class Gemma4ContinuityDirector:
                     else type(error).__name__
                 )
                 logging.warning(
-                    "HR Endless Sampler Gemma 4 %s worker failed during %s (%s): %s. "
-                    "Retrying the exact operation in a fresh original non-MTP worker "
-                    "(retry %d/%d); the next independent Gemma operation will try MTP "
-                    "according to the sampler toggle again.",
-                    "native MTP" if failed_with_mtp else "non-MTP retry",
+                    "HR Endless Sampler %s %s worker failed during %s (%s): %s. "
+                    "Retrying the exact operation in a fresh worker (retry %d/%d).",
+                    director_name,
+                    "native MTP" if failed_with_mtp else "non-MTP",
                     operation,
                     status,
                     error,
                     retries_used,
-                    GEMMA4_WORKER_RETRY_LIMIT,
+                    retry_limit,
                 )
             except Gemma4ObservationError as error:
                 # A long-running ComfyUI parent can briefly coexist with a
@@ -3419,7 +3607,7 @@ class Gemma4ContinuityDirector:
                     )
                 ):
                     raise
-                if retries_used >= GEMMA4_WORKER_RETRY_LIMIT:
+                if retries_used >= retry_limit:
                     logging.error(
                         "HR Endless Sampler Gemma 4 MTP output failed during %s after %d "
                         "fresh worker retries; the render cannot continue: %s",
@@ -3438,7 +3626,7 @@ class Gemma4ContinuityDirector:
                     operation,
                     error,
                     retries_used,
-                    GEMMA4_WORKER_RETRY_LIMIT,
+                    retry_limit,
                 )
 
     def plan_timing(self, request: dict[str, Any], progress_callback: Any = None) -> GemmaShotTimingPlan:
@@ -3447,8 +3635,7 @@ class Gemma4ContinuityDirector:
         if not request.get("source_shots"):
             raise Gemma4ObservationError("Gemma 4 needs source shots for timing preproduction")
         self.last_timing_system_prompt, self.last_timing_planning_prompt = _render_timing_plan_messages(request)
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         result = self._run_worker_with_mtp_fallback(
             "shot-timing preproduction",
             request,
@@ -3475,8 +3662,7 @@ class Gemma4ContinuityDirector:
         request = json.loads(json.dumps(request, ensure_ascii=False))
         if not request.get("preproduction_cache"):
             raise Gemma4ObservationError("Gemma preproduction cache is not configured for this replay")
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         return self._run_worker_with_mtp_fallback(
             "clean preproduction-cache creation",
             request,
@@ -3516,8 +3702,7 @@ class Gemma4ContinuityDirector:
         if not request.get("target_shots"):
             raise Gemma4ObservationError("Gemma 4 needs at least one source shot for the current chunk")
         request["image_urls"] = image_urls
-        request["debug"] = self.debug
-        request["gemma4_mtp"] = self.gemma4_mtp
+        self._configure_request(request)
         if self.observation_image_directory is not None and image_urls:
             try:
                 _capture_last_observation_images(

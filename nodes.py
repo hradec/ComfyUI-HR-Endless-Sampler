@@ -24,6 +24,9 @@ from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from tqdm.auto import tqdm
 from tqdm import tqdm as _cli_tqdm
 
+from .director_backend import DIRECTOR_BACKENDS, QWEN_DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
+from .director_config import HRDirectorConfig, normalize_qwen38_config
+from .director_errors import DirectorDependencyError, DirectorObservationError
 from .gemma4 import (
     Gemma4ContinuityDirector,
     Gemma4DependencyError,
@@ -31,8 +34,11 @@ from .gemma4 import (
     Gemma4PreproductionCache,
     _timing_plan_from_payload,
     _timing_plan_payload,
+    is_official_gemma4_pair,
 )
 from .preview import begin_preview_execution
+from .qwen35 import Qwen35ContinuityDirector
+from .reference_set import HRReferenceSet, reference_images, reference_presentation_items
 from .video_io import HREndlessTimeline, normalize_timeline
 
 
@@ -87,18 +93,20 @@ def _description_field(prompt, start=0):
 def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
                                  video_continuation, video_continuation_res, fps, chunk_count,
                                  cache_gemma_preproduction=False,
-                                 gemma4_mtp=False):
+                                 gemma4_mtp=False, director_name="Gemma 4",
+                                 director_model="auto"):
     """Replace the fixed temp capture so it always represents the latest run."""
     path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / GEMMA_PROMPT_LOG_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "HR Endless Sampler last-run Gemma chunk prompts\n"
+            f"HR Endless Sampler last-run {director_name} chunk prompts\n"
             f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
             f"Configuration: chunk_frames={chunk_frames}, context_keyframes={context_keyframes}, "
             f"guide_overlap={guide_overlap}, video_continuation={video_continuation}, "
             f"video_continuation_res={video_continuation_res}, "
             f"fps={fps:g}, chunks={chunk_count}, "
+            f"director={director_name}, director_model={director_model}, "
             f"cache_gemma_preproduction={bool(cache_gemma_preproduction)}, "
             f"gemma4_mtp={bool(gemma4_mtp)}\n\n",
             encoding="utf-8",
@@ -246,9 +254,17 @@ def _replay_plan_signature(plan):
     return [{key: chunk.get(key) for key in keys} for chunk in plan]
 
 
+def _director_file_fingerprint(path):
+    if path is None:
+        return None
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
                         context_keyframes, guide_overlap, video_continuation,
-                        video_continuation_res, ref2va):
+                        video_continuation_res, ref2va, director_backend="gemma4",
+                        director_model="auto", director_mmproj="auto"):
     """Describe the immutable tensor/layout inputs required for an exact replay.
 
     The source prompt intentionally is not part of this signature: editing it
@@ -267,6 +283,9 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
         "video_continuation": int(video_continuation),
         "video_continuation_res": str(video_continuation_res),
         "ref2va": bool(ref2va),
+        "director_backend": str(director_backend),
+        "director_model": director_model,
+        "director_mmproj": director_mmproj,
         "plan": _replay_plan_signature(plan),
     }
 
@@ -873,9 +892,9 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
     return rewritten
 
 
-def _gemma_report(chunk_number, result):
+def _gemma_report(chunk_number, result, director_name="Gemma 4"):
     report = (
-        f"=== Gemma 4 chunk prompt director: Chunk {chunk_number} ===\n"
+        f"=== {director_name} chunk prompt director: Chunk {chunk_number} ===\n"
         f"confidence: {result.confidence}\n"
         f"progress summary: {result.analysis or 'none'}\n"
         f"timing plan: {result.timing_plan or 'none'}\n"
@@ -933,12 +952,14 @@ def _gemma_timing_plan_transcript(result):
 
 
 def _resize(image, width, height, crop):
+    image = image.reshape(-1, *image.shape[-3:])
     samples = image[..., :3].movedim(-1, 1)
     samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop)
     return samples.movedim(1, -1)
 
 
 def _reference_image(image, width, height):
+    image = image.reshape(-1, *image.shape[-3:])[:1]
     source_height, source_width = image.shape[1:3]
     scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
     target_width = max(CANVAS_MULTIPLE, round(source_width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
@@ -946,15 +967,19 @@ def _reference_image(image, width, height):
     return _resize(image, target_width, target_height, "disabled")
 
 
-def _reference_video_canvas(width, height):
-    """Match ComfyUI's native MiniMax H3 reference-video presentation.
+def _source_images(images, source_images):
+    if images is not None and source_images:
+        raise ValueError("Connect either images or source_images, not both")
+    if source_images:
+        def index(item):
+            match = re.search(r"_(\d+)$", item[0])
+            return int(match.group(1)) if match else -1
+        return [image[:1] for _, image in sorted(source_images.items(), key=index) if image is not None]
+    return [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
 
-    H3 reference videos use a 768-pixel nominal short edge with a 768x1344
-    area cap, aligned to 32 pixels. Smaller sources are never enlarged. This
-    keeps internally generated Video1 frames equivalent to videos supplied to
-    the stock H3 Ref2VA conditioning node instead of applying an undocumented
-    lower-resolution sampler-only path.
-    """
+
+def _reference_video_canvas(width, height):
+    """Match ComfyUI's native MiniMax H3 reference-video presentation."""
     ratio = width / height
     if ratio >= 1.0:
         nominal_width = H3_REFERENCE_VIDEO_SHORT_EDGE * ratio
@@ -974,10 +999,11 @@ def _reference_video_canvas(width, height):
     return target_width, target_height
 
 
-def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items=()):
+def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
     refs = positive[0].get("minimax_refs") if positive else None
-    image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
     if refs:
+        if base_reference_items is not None:
+            return clip.tokenize(prompt, minimax_ref_items=[*base_reference_items, *video_items])
         ref_items = []
         image_index = 0
         for ref in refs:
@@ -1005,8 +1031,10 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, images, positive, width, height, continuation, video_items=()):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items))
+def _encode_prompt(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(
+        clip, prompt, image_list, positive, width, height, continuation, video_items, base_reference_items
+    ))
     if len(conditioning) != 1:
         raise ValueError("HR Endless Sampler expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -1157,6 +1185,7 @@ def _sample_decoded_video_frames(frames, include_final=False, start_frame=0, ret
     target_width, target_height = _reference_video_canvas(width, height)
     if (target_width, target_height) != (width, height):
         sampled_frames = _resize(sampled_frames, target_width, target_height, "disabled")
+    sampled_frames = sampled_frames.detach().to(device="cpu", copy=True)
     if return_final_frame:
         return sampled_frames, sample_indices, final_frame
     return sampled_frames, sample_indices
@@ -2286,7 +2315,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum frames sampled at once. MiniMax H3 values are snapped down to its 17k+5 frame grid."),
                 io.Image.Input("images", optional=True,
-                               tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
+                               tooltip="Legacy batch input containing the original backend conditioning images."),
+                io.Autogrow.Input("source_images", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("source_image", tooltip="One original Ref2VA reference image, in conditioning order."),
+                        prefix="source_image_", min=0, max=9)),
                 io.Int.Input("video_continuation", default=22, min=5, max=3600, step=17,
                              tooltip="Completed continuation tail length. MiniMax H3 currently uses the synchronized Ref2VA <Audio N> + <Video N> continuation path; values at or above chunk_frames are clamped to the effective chunk size."),
                 io.Combo.Input(
@@ -2305,19 +2338,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
-                                 tooltip="Use native Gemma 4 draft-MTP with four speculative tokens. Disable it to compare against the original non-MTP decoder."),
+                                 tooltip="Use native MTP speculative decoding when the selected Gemma or Qwen GGUF supports it. Qwen uses MTP only for text-only timing preproduction; visual chunk directing remains MTMD."),
                 io.Float.Input(
                     "pytorch_memory_fraction",
                     default=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                    min=0.50,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        "Global PyTorch CUDA allocator limit applied when this sampler starts. 0.85 reserves "
-                        "15% of VRAM outside PyTorch so cached memory is pressured before a driver-level OOM. "
-                        "The setting remains active for the ComfyUI process until another run changes it; "
-                        "set 1.0 for the normal unrestricted allocator limit."
-                    ),
+                    tooltip="Compatibility placeholder retained to preserve old workflow widget positions; execution always uses the internal 0.85 limit.",
                 ),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots. Before a multi-chunk render, also run a disposable three-step continuation preflight to test the expected Chunk 2 memory footprint, then unload it completely. chunk_prompts is returned whether debug is enabled or not."),
@@ -2325,6 +2350,32 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Int.Input("debug_start_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Resume or rerun from this 1-based chunk using the automatically recorded last-run recovery cache. Leave this at 0 to automatically continue a compatible interrupted render; nonzero forces a specific chunk for debugging."),
+                io.Combo.Input("director_backend", options=list(DIRECTOR_BACKENDS), default="gemma4",
+                               tooltip="Local multimodal model used to plan and direct chunks."),
+                io.Combo.Input("director_model", options=director_model_options(), default="auto",
+                               tooltip="Local GGUF director model. Auto keeps the selected backend's existing default."),
+                io.Combo.Input("director_mmproj", options=director_model_options(projector=True), default="auto",
+                               tooltip="Local multimodal projector. Auto keeps the selected backend's existing default."),
+                io.Int.Input("director_mtp_draft_tokens", default=2, min=1, max=8, step=1,
+                             tooltip="Maximum Qwen3.6/Qwen3.8 MTP draft tokens per step. Qwen3.5 does not support MTP; Gemma keeps its native fixed configuration."),
+                io.Combo.Input("director_reasoning_effort", options=["xhigh", "medium", "low"], default="xhigh",
+                               tooltip="Qwen3.8 reasoning effort. The Qwen director disables free-form thinking for JSON reliability but passes this native template setting."),
+                io.Boolean.Input("director_cpu_moe", default=False,
+                                 tooltip="Qwen3.6/Qwen3.8: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
+                io.Int.Input("director_n_cpu_moe", default=0, min=0, max=256, step=1,
+                             tooltip="Qwen3.6/Qwen3.8: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
+                HRDirectorConfig.Input(
+                    "director_config",
+                    optional=True,
+                    tooltip=("Optional shared HR Qwen3.8 configuration. When connected, it overrides the legacy "
+                             "director widgets so Planner and Sampler use the same model and runtime settings."),
+                ),
+                HRReferenceSet.Input(
+                    "reference_set",
+                    optional=True,
+                    tooltip=("Optional shared MiniMax H3 image/video/audio references. Connect the Reference Conditioning "
+                             "passthrough output so Planner, conditioning, and Sampler use one media connection."),
+                ),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -2341,16 +2392,46 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=22, video_continuation_res="full", vae=None, cache_gemma_preproduction=False,
-                gemma4_mtp=True,
+                source_images=None, video_continuation=22, video_continuation_res="full", vae=None,
+                cache_gemma_preproduction=False, gemma4_mtp=True, director_mtp_draft_tokens=2,
+                director_reasoning_effort="xhigh", director_cpu_moe=False, director_n_cpu_moe=0,
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                debug=False, debug_stop_chunk=0, debug_start_chunk=0,
-                **_deprecated_inputs):
-        _set_pytorch_memory_fraction(pytorch_memory_fraction, guider.model_patcher.load_device)
+                debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
+                director_model="auto", director_mmproj="auto", director_config=None, reference_set=None, **_deprecated_inputs):
+        _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
+        if director_config is not None:
+            shared = normalize_qwen38_config(director_config)
+            director_backend = shared["backend"]
+            director_model = shared["model"]
+            director_mmproj = shared["mmproj"]
+            gemma4_mtp = shared["mtp"]
+            director_mtp_draft_tokens = shared["mtp_draft_tokens"]
+            director_reasoning_effort = shared["reasoning_effort"]
+            director_cpu_moe = shared["cpu_moe"]
+            director_n_cpu_moe = shared["n_cpu_moe"]
+            debug = shared["debug"]
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
         # serialized legacy values too: an old workflow must not quietly enable
         # an experimental overlap, keyframe, Qwen-history, or preview-only path.
+        director_selection = resolve_director_selection(director_backend, director_model, director_mmproj)
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+            if director_selection.model_path is None or director_selection.mmproj_path is None:
+                raise ValueError("Qwen requires a local GGUF model and mmproj")
+            if cache_gemma_preproduction:
+                raise ValueError("Qwen does not support the Gemma preproduction KV cache")
+        elif (director_selection.model_path is None) != (director_selection.mmproj_path is None):
+            raise ValueError("Gemma 4 requires both a local GGUF model and mmproj, or auto for both")
+        elif gemma4_mtp and director_selection.model_path is not None and not is_official_gemma4_pair(
+            director_selection.model_path,
+            director_selection.mmproj_path,
+        ):
+            raise ValueError("gemma4_mtp is supported only by the official Gemma 4 model/projector pair")
+
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+            director_name = director_selection.backend.replace("qwen", "Qwen")
+        else:
+            director_name = "Gemma 4"
         prompt_preview_only = False
         context_keyframes_enable = False
         context_keyframes = 5
@@ -2425,6 +2506,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if positive is None:
             raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
+        if reference_set is not None and (images is not None or source_images):
+            raise ValueError("Connect reference_set or legacy images/source_images, not both")
+        image_list = list(reference_images(reference_set)) if reference_set is not None else _source_images(images, source_images)
+        base_reference_items = reference_presentation_items(reference_set, width, height) if reference_set is not None else None
         if len(active_plan) > 1 and (use_video_continuation or qwen_full_history) and not ref2va:
             raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
         original_refs = positive[0].get("minimax_refs", ())
@@ -2504,6 +2589,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
             video_continuation=video_continuation,
             video_continuation_res=video_continuation_res,
             ref2va=ref2va,
+            director_backend=director_selection.backend,
+            director_model=_director_file_fingerprint(director_selection.model_path),
+            director_mmproj=_director_file_fingerprint(director_selection.mmproj_path),
         )
         replay_cached_initial = None
         auto_resumed = False
@@ -2613,6 +2701,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
             len(active_plan),
             cache_gemma_preproduction=cache_gemma_preproduction,
             gemma4_mtp=gemma4_mtp,
+            director_name=director_name,
+            director_model=(
+                director_selection.model_path.name
+                if director_selection.model_path is not None
+                else "auto"
+            ),
         )
         gemma_image_log = _reset_last_gemma_image_log()
         timing = _SamplerTiming(guider.model_patcher.load_device)
@@ -2704,7 +2798,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 previous_gemma_timing_plan = previous_state.get("gemma_timing_plan")
                 previous_gemma_end_state = previous_state.get("gemma_end_state")
                 previous_gemma_last_seen_character_state = previous_state.get("gemma_last_seen_character_state")
-                if replay_prompt_changed:
+                previous_prompt_changed = previous_state.get("source_prompt_sha256") != hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest()
+                if replay_prompt_changed or previous_prompt_changed:
                     # These were authored against the old source prompt. The
                     # predecessor still remains available as chronological
                     # rendered stills, which are more reliable evidence for
@@ -2722,19 +2819,50 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 completed_chunks = replay_start_index
             except (KeyError, RuntimeError, ValueError) as error:
                 raise RuntimeError(f"HR Endless Sampler replay cache has invalid completed chunk state: {error}") from error
-        gemma_director = (
-            Gemma4ContinuityDirector(
-                debug=debug,
-                gemma4_mtp=bool(gemma4_mtp),
-                observation_image_directory=gemma_image_log,
-            )
-            if gemma_director_needed else None
-        )
+        gemma_director = None
+        if gemma_director_needed:
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+                gemma_director = Qwen35ContinuityDirector(
+                    director_selection.model_path,
+                    director_selection.mmproj_path,
+                    debug=debug,
+                    observation_image_directory=gemma_image_log,
+                    mtp_enabled=gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"},
+                    mtp_draft_tokens=director_mtp_draft_tokens,
+                    reasoning_effort=director_reasoning_effort,
+                    cpu_moe=director_cpu_moe,
+                    n_cpu_moe=director_n_cpu_moe,
+                    backend=director_selection.backend,
+                )
+            else:
+                gemma_director = Gemma4ContinuityDirector(
+                    debug=debug,
+                    gemma4_mtp=bool(gemma4_mtp),
+                    observation_image_directory=gemma_image_log,
+                    model_path=director_selection.model_path,
+                    mmproj_path=director_selection.mmproj_path,
+                )
         if gemma_director is not None:
-            logging.info(
-                "HR Endless Sampler Gemma 4 mode: %s.",
-                "native draft-MTP (4 draft tokens)" if gemma4_mtp else "original non-MTP decoding",
-            )
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+                logging.info(
+                    "HR Endless Sampler director: %s (%s, context %d, CPU vision projector, MTP=%s, draft tokens=%d).",
+                    director_name,
+                    director_selection.model_path.name,
+                    65536 if director_selection.backend == "qwen3.5" else 32768,
+                    bool(gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"}),
+                    int(director_mtp_draft_tokens),
+                )
+            else:
+                logging.info(
+                    "HR Endless Sampler director: Gemma 4 (%s).",
+                    (
+                        director_selection.model_path.name
+                        if director_selection.model_path is not None
+                        else "default model"
+                    ) + ", " + (
+                        "native draft-MTP (4 draft tokens)" if gemma4_mtp else "original non-MTP decoding"
+                    ),
+                )
         gemma_preproduction_timing_plan = None
         gemma_preproduction_cache = None
         gemma_preproduction_cache_ready = False
@@ -2846,7 +2974,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         chunk_noise=preflight_noise,
                         clip=clip,
                         vae=vae,
-                        images=images,
+                        images=image_list,
                         positive=positive,
                         original_conds=original_conds,
                         chunk_prompt=planned_prompts[0][0],
@@ -2911,14 +3039,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     if vae is not None:
                         comfy.model_management.unload_model_and_clones(vae.patcher)
                     comfy.model_management.soft_empty_cache(force=True)
-                    vram_monitor.report("before Gemma 4 shot-timing preproduction")
+                    vram_monitor.report(f"before {director_name} shot-timing preproduction")
                     timer_started = time.perf_counter()
                     try:
                         with _PreparationProgress(
                             (
-                                "Restoring cached Gemma 4 timing plan"
+                                f"Restoring cached {director_name} timing plan"
                                 if replay_timing_plan is not None
-                                else f"Gemma 4 is planning {len(preproduction_shots)} source shots for "
+                                else f"{director_name} is planning {len(preproduction_shots)} source shots for "
                                 f"{len(active_plan)} chunks before H3 sampling"
                             ),
                             preview_execution,
@@ -2951,7 +3079,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         validation_warnings=gemma_preproduction_timing_plan.validation_warnings,
                     )
                     logging.info(
-                        "HR Endless Sampler Gemma 4 preproduction timing plan is ready for %d source shots.",
+                        "HR Endless Sampler %s preproduction timing plan is ready for %d source shots.",
+                        director_name,
                         len(gemma_preproduction_timing_plan.shots),
                     )
                     if gemma_preproduction_cache is not None and replay_timing_plan is not None:
@@ -2996,10 +3125,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "HR Endless Sampler Gemma 4 clean preproduction KV cache was not produced; "
                                 "each chunk will receive the ordinary full directing request."
                             )
-                    vram_monitor.report("after Gemma 4 shot-timing preproduction release")
-                except Gemma4DependencyError:
+                    vram_monitor.report(f"after {director_name} shot-timing preproduction release")
+                except (Gemma4DependencyError, DirectorDependencyError):
                     raise
-                except Gemma4ObservationError as error:
+                except (Gemma4ObservationError, DirectorObservationError) as error:
                     logging.warning(
                         "HR Endless Sampler Gemma 4 shot-timing preproduction failed; "
                         "sampling is stopping before Chunk 1 and no sampler-authored timing fallback will be used: %s",
@@ -3052,7 +3181,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         comfy.model_management.soft_empty_cache(force=True)
                         if vram_monitor is not None:
                             vram_monitor.report(
-                                f"chunk {index + 1}/{len(active_plan)} before Gemma 4 prompt directing",
+                                f"chunk {index + 1}/{len(active_plan)} before {director_name} prompt directing",
                                 {"previous chunk": previous_video},
                             )
 
@@ -3150,7 +3279,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         timer_started = time.perf_counter()
                         try:
                             with _PreparationProgress(
-                                f"{chunk_label}: Gemma 4 is directing the chunk prompt",
+                                f"{chunk_label}: {director_name} is directing the chunk prompt",
                                 preview_execution,
                                 chunk=index,
                                 live_console_bar=True,
@@ -3167,20 +3296,21 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         gemma_response = _gemma_response_transcript(result)
                         gemma_description = result.detailed_description
                         gemma_validation_warnings = result.validation_warnings
-                        gemma_report = _gemma_report(index + 1, result)
+                        gemma_report = _gemma_report(index + 1, result, director_name)
                         if vram_monitor is not None:
                             vram_monitor.report(
-                                f"chunk {index + 1}/{len(active_plan)} after Gemma 4 release",
+                                f"chunk {index + 1}/{len(active_plan)} after {director_name} release",
                             )
-                    except Gemma4DependencyError:
+                    except (Gemma4DependencyError, DirectorDependencyError):
                         raise
-                    except Gemma4ObservationError as error:
+                    except (Gemma4ObservationError, DirectorObservationError) as error:
                         gemma_system_prompt = gemma_director.last_system_prompt
                         gemma_observation_prompt = gemma_director.last_observation_prompt
                         gemma_response = error.raw_json or f"{type(error).__name__}: {error}"
                         logging.warning(
-                            "HR Endless Sampler Gemma 4 prompt directing for chunk %d/%d failed; "
+                            "HR Endless Sampler %s prompt directing for chunk %d/%d failed; "
                             "sampling is stopping and no algorithmic source-prompt fallback will be used: %s",
+                            director_name,
                             index + 1,
                             len(active_plan),
                             error,
@@ -3436,7 +3566,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     preview_execution.set_phase(qwen_message, chunk=index)
                 timer_started = time.perf_counter()
                 try:
-                    encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation, video_items)
+                    encoded_prompt = _encode_prompt(
+                        clip, chunk_prompt, image_list, positive, width, height, continuation, video_items,
+                        base_reference_items,
+                    )
                 finally:
                     timing.add("qwen", timer_started)
                 if continuation and include_video1_reference:
@@ -3609,6 +3742,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "denoised_audio": assembled_denoised_audio,
                                 "output_template": output_template,
                                 "denoised_template": denoised_template,
+                                "source_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                                 "gemma_description": previous_gemma_description,
                                 "gemma_timing_plan": previous_gemma_timing_plan,
                                 "gemma_end_state": previous_gemma_end_state,

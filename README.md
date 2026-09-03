@@ -1,5 +1,7 @@
-# ComfyUI-HR-Endless-Sampler 
-## (the older ComfyUI MiniMax H3 Sampler Unlimited)
+# ComfyUI-MiniMax-H3-Sampler-Unlimited (mickeylan fork)
+## 适用于中文用户和低显存环境的增强版
+
+> ⚠️ **注意**：这是 [hradec/ComfyUI-HR-Endless-Sampler](https://github.com/hradec/ComfyUI-HR-Endless-Sampler) 的中文用户/低显存优化分支。
 
 
 
@@ -7,7 +9,50 @@ https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
 
 - video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
 
+## JZL 多媒体提示词测试工作流
 
+加载 `example_workflows/HR-JZL-MVP.json`。将图片、视频帧批次、视频音轨和独立音频接入 `HR MiniMax H3 Reference Set`，再运行 `HR MiniMax H3 JZL Storyboard`：
+
+- Qwen3.5/Qwen3.8直接分析图片及均匀抽取的视频帧；
+- `faster-whisper`在本地转写视频音轨与独立音频；
+- 输出原生JZL `[SHOT_START]...[SHOT_END]`四合一块；
+- `JZL Segment Dispatcher`选择一段并把H3提示词送入Reference Conditioning。
+
+有音频时，`whisper_model_path`必须填写ComfyUI `models`目录下的本地faster-whisper模型相对路径。示例工作流中的CLIP、视频VAE和音频VAE端口需连接现有MiniMax H3加载节点。
+
+## 🎯 本分支特色
+
+本分支专为 **中文用户** 和 **低显存（12GB）用户** 设计：
+
+| 特性 | 原版 | 本分支 |
+|------|------|--------|
+| Gemma 4 导演 | ✅ 支持 | ✅ 支持 |
+| Qwen3.5 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.6 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.8 导演 | ❌ 不支持 | ✅ 支持 |
+| 12GB VRAM 支持 | ❌ Gemma 12B 太大 | ✅ Qwen 27B MoE + UD-IQ2-mtp |
+| 中文提示词 | ⚠️ 需要翻译 | ✅ 原生支持 |
+| MoE CPU Offload | ❌ 不支持 | ✅ 支持 |
+
+### 为什么选择 Qwen3.6/3.8？
+
+- **Qwen3.6/3.8 是 27B MoE 模型**，使用 UD-IQ2-mtp 量化后仅需 ~8-9GB 显存
+- **速度与 9B 模型相当**（MoE 架构，激活参数 ~3-4B）
+- **Gemma 4 12B 在 12GB 显存上根本无法使用**
+- 内置 MTP 推测解码，加速生成
+
+### 12GB VRAM 推荐配置
+
+```text
+director_backend = qwen3.8           # 27B MoE + UD-IQ2-mtp
+director_mtp = true                  # 内置 MTP
+director_reasoning_effort = medium   # 平衡质量与速度
+chunk_frames = 56-62                 # 1080p 推荐值
+video_continuation = 22
+pytorch_memory_fraction = 0.82
+```
+
+---
 
 `HR Endless Sampler` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long video/audio latents, currently supports 
@@ -15,10 +60,11 @@ Minimax H3 only. The plan is to add support to LTX 2.5 in the near future.
 
 `HR Endless Sampler` is able to render videos of any length by automatically 
 splitting the inference into small chunks of the same long latent. It uses 
-Gemma4 12B QAT internally to analyze the original prompt and all references, 
-plan the action-timing for each shot and each chunk, then analyzes previous 
-rendered frames and writes new small prompts for each chunk, maintaining 
-the continuity and coherence of the entire video. 
+a user-selected local Gemma 4 or Qwen3.5 multimodal director to analyze the
+original prompt and references, plan action timing for every shot and chunk,
+then inspect previous rendered frames and write the next H3 prompt while
+maintaining continuity and coherence. Gemma 4 remains the default for old
+workflows.
 
 Using `HR Endless Sampler Preview` node (based on the amazing KJ Live preview node) 
 allows to visualize the whole video as it is infered, with a timeslider that displays
@@ -51,7 +97,7 @@ The extension installs four nodes:
 
 | Node | Purpose |
 | --- | --- |
-| `HR Endless Sampler` | Samples a long latent serially, asks Gemma to plan the complete production and direct each chunk, and outputs the finished latent, chunk prompts, and timeline metadata. |
+| `HR Endless Sampler` | Samples a long latent serially, asks the selected local director to plan the complete production and direct each chunk, and outputs the finished latent, chunk prompts, and timeline metadata. |
 | `HR Endless Sampler Preview` | Patches the model with the live accumulated preview, ordered chunk playback, shot brackets, prompt/timing tooltips, frame stepping, performance graphs, and browser-refresh recovery. |
 | `HR Endless Sampler Save Video` | Saves ordinary video, animated VHS formats, or float EXR sequences while preserving the Endless timeline, prompts, shot/chunk mapping, render timing, and optional audio. |
 | `HR Endless Sampler Load Video` | Browses or uploads finished media, restores its interactive timeline immediately in the browser, and outputs decoded video/images, audio, dimensions, FPS, frame count, filename, and timeline to a queued workflow. |
@@ -95,6 +141,14 @@ presentation and does not change when only `video_continuation_res` changes.
 The sampler also uses the previous chunk's final five frames as a small H3
 boundary keyframe. This is automatic. It helps adjacent chunks meet cleanly.
 
+`director_backend` explicitly selects `gemma4`, `qwen3.5`, `qwen3.6`, or
+`qwen3.8`. The existing `qwen3.5` value remains compatible with old workflows.
+`director_model` and `director_mmproj` select local files discovered recursively
+beneath `models/llama_cpp` and `models/LLM/GGUF`. For each Qwen backend, `auto`
+selects only a same-directory model/projector pair from that exact Qwen series.
+Explicit Qwen selections must match the selected series and directory. URLs, external paths, and non-GGUF files
+are rejected. Qwen never downloads a model.
+
 `cache_gemma_preproduction` saves Gemma's static preproduction context in
 system RAM. This can make later Gemma requests much faster because they do not
 need the full source prompt and shot plan again. Linux uses `/dev/shm` when it
@@ -102,8 +156,13 @@ has enough free RAM; otherwise the normal temporary directory is used. The
 cache uses several GiB of RAM, never VRAM. It is optional and does not change
 the generated video.
 
-`gemma4_mtp` enables Gemma's native four-token draft-MTP decoder. Turn it off
-to run the original non-MTP decoder and compare speed on the same workflow.
+`gemma4_mtp` enables native MTP where the selected director supports it.
+Gemma uses its four-token configuration. Qwen3.5 does not support MTP.
+Qwen3.6 and Qwen3.8 use embedded NextN/MTP layers for both text timing and visual
+MTMD requests. `director_mtp_draft_tokens` controls their draft length. A native Qwen
+MTP failure is retried once in a fresh non-MTP worker; invalid model-authored
+JSON is not repeatedly regenerated. Turn the setting off to compare ordinary
+decoding on the same workflow.
 The console reports generated tokens/second and, in MTP mode, the assistant's
 draft-token acceptance rate, proposal count, verification work, rollback
 replays, and checkpoint time. This is real speculative decoding: the matching
@@ -176,9 +235,38 @@ ${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_chunk_prompts.txt
 ${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_images/
 ```
 
-The text file includes the preproduction plan, each request to Gemma, Gemma's
-JSON response, any correction request, and the final prompt sent to H3. The
-image directory contains the stills that Gemma saw. A new render replaces both.
+The text file includes the preproduction plan, each request to the selected
+director, its JSON response, any correction request, and the final prompt sent
+to H3. The image directory contains the stills that the director saw. The legacy
+`last_gemma_*` filenames remain unchanged for workflow/tool compatibility. A new
+render replaces both.
+
+## Qwen3.5, Qwen3.6, and Qwen3.8 setup
+
+Place the local model and projector beneath `models/LLM/GGUF`, for example:
+
+```text
+models/LLM/GGUF/qwen3.5-9B/
+├── Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf
+└── mmproj-Huihui-Qwen3.5-9B-abliterated.gguf
+```
+
+Select the matching `qwen3.5`, `qwen3.6`, or `qwen3.8` value in
+`director_backend`; `auto` then discovers only that series. Qwen uses a disposable llama.cpp worker
+with a 256-token batch. Qwen3.5 uses a 65536-token context; Qwen3.6 and Qwen3.8
+use 32768 to match Gemma 4's director context. Qwen3.8 reads the GGUF's native
+chat template, supports `xhigh`, `medium`, and `low` reasoning effort, and adapts
+that template for its mmproj. Qwen3.6 and Qwen3.8 can optionally pass `cpu_moe` or
+`n_cpu_moe`. The Gemma preproduction KV cache remains unsupported. The same
+directing contract accepts Chinese source prompts, writes H3 visual/action/
+camera prose in English, and preserves original dialogue, lyrics, visible text,
+required shot markers, and prior chunk continuity context.
+
+The Qwen worker exits before H3 sampling resumes, so its llama.cpp CUDA context
+cannot remain allocated beside H3. The plugin does not use Transformers,
+Hugging Face fallback loading, or any Qwen network request. Runtime support for
+a particular GGUF/mmproj pair still depends on the installed pinned
+`llama-cpp-python` build.
 
 ## Gemma 4 setup
 
