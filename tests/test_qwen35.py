@@ -267,6 +267,51 @@ class Qwen35Tests(unittest.TestCase):
         self.assertNotIn("cpu_moe", captured)
         self.assertEqual(captured["n_ctx"], 32768)
 
+    def test_qwen38_storyboard_uses_gpu_vision_with_bounded_tokens(self):
+        handler_kwargs = {}
+
+        class FakeHandler:
+            def __init__(self, **kwargs):
+                handler_kwargs.update(kwargs)
+
+        class FakeLlama:
+            metadata = {"tokenizer.chat_template": "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"}
+
+            def __init__(self, **kwargs):
+                pass
+
+            def create_chat_completion(self, **kwargs):
+                value = {
+                    "image_subjects": [{"picture": 1, "subject": 1, "name": "hero", "observable_features": "coat"}],
+                    "shots": [{"shot": 1, "start_frame": 0, "end_frame": 124, "pictures": [1], "description": "walk"}],
+                }
+                return {"choices": [{"message": {"content": json.dumps(value)}, "finish_reason": "stop"}], "usage": {}}
+
+            def close(self):
+                pass
+
+        request = {
+            "operation": "storyboard",
+            "director_backend": "qwen3.8",
+            "director_model_path": "qwen3.8-model.gguf",
+            "director_mmproj_path": "mmproj-qwen3.8.gguf",
+            "director_mtp": False,
+            "story": "story",
+            "style": "cinematic",
+            "shot_density": "medium",
+            "fps": 24.0,
+            "total_frames": 124,
+            "duration_seconds": 5.0,
+            "image_count": 1,
+            "image_urls": ["data:image/jpeg;base64,test"],
+        }
+        runtime = (FakeLlama, object, FakeHandler, object, object, object, object)
+        with patch.object(qwen35, "_load_runtime", return_value=runtime):
+            qwen35._complete(request)
+        self.assertTrue(handler_kwargs["use_gpu"])
+        self.assertEqual(handler_kwargs["image_min_tokens"], 256)
+        self.assertEqual(handler_kwargs["image_max_tokens"], 1344)
+
     def test_qwen35_configuration_always_disables_mtp(self):
         director = qwen35.Qwen35ContinuityDirector(
             Path("qwen3.5-model.gguf"), Path("mmproj-qwen3.5.gguf"), mtp_enabled=True, backend="qwen3.5",

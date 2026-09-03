@@ -2,8 +2,21 @@
 
 > 项目：ComfyUI-MiniMax-H3-Sampler-Unlimited（mickeylan fork）
 > 计划日期：2026-09-03（Asia/Singapore）
-> 状态：待实施
+> 状态：实施中
 > 目标：以 HR Endless Sampler 的低显存连续分块采样为核心，整合 JZL 的剧本处理、提示词增强、素材调度、漫剧资产管理和 `ref_scale`。
+
+---
+
+## 架构决策记录：原生 JZL 四合一工作流
+
+- **状态**：已接受
+- **日期**：2026-09-03
+- **决策**：完整迁移 JZL 的独立分段工作流，以 `[SHOT_START]...[SHOT_END]` 及其中的 `H3_PROMPT`、`SCENE_INSTRUCTION`、`VIDEO_INSTRUCTION`、`AUDIO_INSTRUCTION` 为权威接口。
+- **编号所有权**：`<Picture N>`、`<Subject N>`、`<Video N>` 和 `<Audio N>` 由每个 JZL 分段及其有序 `slots` 决定，不让模型输出额外的整数映射字段。
+- **状态所有权**：剧本生成和四合一解析属于规划层；素材名称到媒体槽位的确定性映射属于调度层；编码属于 Conditioning；显存管理和物理分块属于 HR Endless Sampler。
+- **兼容边界**：保留 Qwen3.5/Qwen3.8 disposable worker 和现有 HR 采样能力，但不把多个 JZL 独立视频段伪装成一条全局 Storyboard JSON。
+- **拒绝方案**：删除自创的 `image_subjects/shots` JSON 协议及其整数校验，不在 sampler 内解析或猜测素材名称。
+- **后果**：每个 JZL 分段保持独立 `[Shot 1]` 和局部时间轴；场景、视频、音频引用按调度指令分别绑定；若需要跨段成片，由外层顺序执行与保存层组合，而不是改写段内语义。
 
 ---
 

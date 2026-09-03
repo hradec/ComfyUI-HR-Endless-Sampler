@@ -48,7 +48,7 @@ class HRMiniMaxH3StoryboardPlanner(io.ComfyNode):
                 ),
                 HRDirectorConfig.Input(
                     "director_config",
-                    tooltip="Connect HR Qwen3.8 Director Config. Connect the same output to HR Endless Sampler.",
+                    tooltip="Connect HR Qwen Director Config. Connect the same output to HR Endless Sampler.",
                 ),
                 io.String.Input(
                     "style",
@@ -92,7 +92,7 @@ class HRMiniMaxH3StoryboardPlanner(io.ComfyNode):
         if not images:
             raise ValueError("HR MiniMax H3 Storyboard Planner requires at least one picture in reference_set")
         config = normalize_qwen38_config(director_config)
-        selection = resolve_director_selection("qwen3.8", config["model"], config["mmproj"])
+        selection = resolve_director_selection(config["backend"], config["model"], config["mmproj"])
         if selection.model_path is None or selection.mmproj_path is None:
             raise ValueError("Storyboard Planner requires a local Qwen GGUF model and same-family mmproj")
 
@@ -111,7 +111,7 @@ class HRMiniMaxH3StoryboardPlanner(io.ComfyNode):
             reasoning_effort=config["reasoning_effort"],
             cpu_moe=config["cpu_moe"],
             n_cpu_moe=config["n_cpu_moe"],
-            backend="qwen3.8",
+            backend=config["backend"],
         )
         result = director.plan_storyboard(
             story,

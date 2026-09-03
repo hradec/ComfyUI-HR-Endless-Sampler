@@ -57,6 +57,12 @@ detailed_description: second
         self.assertEqual(story_format.parse_slots({"slots": expected}), expected)
         self.assertEqual(story_format.parse_slots("not json"), [])
 
+    def test_material_and_dispatch_slots_preserve_declared_order(self):
+        materials = "场景A = 夜市\n角色B：女孩\ninvalid\n道具c=雨伞"
+        self.assertEqual(story_format.parse_material_slots(materials), ("场景A", "角色B", "道具C"))
+        instruction = '{"slots":["角色:角色B","场景:场景A","角色:角色B"]}'
+        self.assertEqual(story_format.dispatch_slot_names(instruction), ("角色B", "场景A"))
+
     def test_normalize_slots_matches_jzl_compatibility_rules(self):
         source = json.dumps(
             {"shot": 1, "slots": ["角色:A", "道具:C", "音频:D:", "literal"]},
@@ -117,6 +123,15 @@ detailed_description: second
         self.assertEqual(prompt.count("[Shot 1]"), 1)
         self.assertEqual(prompt.count("[Shot 2]"), 1)
 
+    def test_validate_storyboard_accepts_picture_labels(self):
+        value = {
+            "image_subjects": [{"picture": "<Picture 1>", "subject": "<Subject 1>", "name": "hero", "observable_features": "coat"}],
+            "shots": [{"shot": 1, "start_frame": 0, "end_frame": 124, "pictures": ["Picture 1"], "description": "walk"}],
+        }
+        plan = story_format.validate_storyboard_plan(value, image_count=1, total_frames=124)
+        self.assertEqual(plan["image_subjects"][0]["picture"], 1)
+        self.assertEqual(plan["shots"][0]["pictures"], [1])
+
     def test_validate_storyboard_rejects_unknown_picture(self):
         value = {
             "image_subjects": [{"picture": 1, "subject": 1, "name": "hero", "observable_features": "coat"}],
@@ -125,6 +140,21 @@ detailed_description: second
         with self.assertRaisesRegex(ValueError, "Picture 2"):
             story_format.validate_storyboard_plan(value, image_count=1, total_frames=124)
 
+    def test_dispatch_material_indices_preserves_request_order(self):
+        self.assertEqual(
+            story_format.dispatch_material_indices(("角色B", "场景A", "角色B"), ("场景A", "角色B", "道具A")),
+            (1, 0),
+        )
+
+    def test_dispatch_material_indices_rejects_undeclared_slot(self):
+        with self.assertRaisesRegex(ValueError, "角色C"):
+            story_format.dispatch_material_indices(("角色C",), ("角色A", "角色B"))
+
+    def test_parse_material_slots_matches_reference_input_order(self):
+        self.assertEqual(
+            story_format.parse_material_slots("场景A = 夜市\n角色B：女孩\n道具c=雨伞"),
+            ("场景A", "角色B", "道具C"),
+        )
 
 if __name__ == "__main__":
     unittest.main()

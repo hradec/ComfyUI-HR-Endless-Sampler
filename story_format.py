@@ -104,6 +104,44 @@ def parse_slots(raw: Any) -> list[Any]:
     return []
 
 
+def parse_material_slots(materials: Any) -> tuple[str, ...]:
+    """Return declared JZL slot names in their reference-input order."""
+
+    slots = []
+    for line in str(materials or "").splitlines():
+        match = re.match(r"^(角色|场景|道具|视频|音频|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]", line.strip())
+        if match:
+            slots.append(f"{match.group(1)}{match.group(2).upper()}")
+    return tuple(slots)
+
+
+def dispatch_slot_names(info_json: Any) -> tuple[str, ...]:
+    """Return the material slot names requested by one JZL instruction."""
+
+    names = []
+    for slot in parse_slots(info_json):
+        if not isinstance(slot, str) or ":" not in slot:
+            continue
+        name = slot.split(":", 1)[1].strip().rstrip(":：")
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def dispatch_material_indices(requested: Any, declared: Any) -> tuple[int, ...]:
+    """Map requested slot names to declared material positions in request order."""
+
+    declared_indices = {name: index for index, name in enumerate(declared)}
+    indices = []
+    for name in requested:
+        if name not in declared_indices:
+            raise ValueError(f"JZL slot {name!r} is not declared in the connected material list")
+        index = declared_indices[name]
+        if index not in indices:
+            indices.append(index)
+    return tuple(indices)
+
+
 def normalize_slots(info_json: Any) -> Any:
     """Apply JZL's compatibility repairs without changing valid input."""
 
@@ -157,131 +195,76 @@ def _positive_int(value: Any, label: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{label} must be an integer")
     try:
-        result = int(value)
+        return int(value)
     except (TypeError, ValueError, OverflowError) as error:
         raise ValueError(f"{label} must be an integer") from error
-    return result
 
 
 def validate_storyboard_plan(value: Any, *, image_count: int, total_frames: int) -> dict[str, Any]:
-    """Validate and normalize one model-authored storyboard plan."""
+    """Temporary compatibility for saved MVP workflows while native JZL nodes replace it."""
 
     if not isinstance(value, dict):
         raise ValueError("storyboard response must be a JSON object")
-    image_count = _positive_int(image_count, "image_count")
-    total_frames = _positive_int(total_frames, "total_frames")
-    if image_count < 1 or image_count > 9:
-        raise ValueError("image_count must be between 1 and 9")
-    if total_frames < 5:
-        raise ValueError("total_frames must be at least 5")
-
     subjects = value.get("image_subjects")
-    if not isinstance(subjects, list) or not subjects:
-        raise ValueError("image_subjects must be a non-empty array")
+    shots = value.get("shots")
+    if not isinstance(subjects, list) or not subjects or not isinstance(shots, list) or not shots:
+        raise ValueError("storyboard response needs image_subjects and shots")
     normalized_subjects = []
-    seen_pictures = set()
-    seen_subjects = set()
     for index, item in enumerate(subjects, 1):
         if not isinstance(item, dict):
             raise ValueError(f"image_subjects[{index}] must be an object")
-        picture = _positive_int(item.get("picture"), f"image_subjects[{index}].picture")
-        subject = _positive_int(item.get("subject", picture), f"image_subjects[{index}].subject")
+        picture_value = item.get("picture")
+        if isinstance(picture_value, str):
+            match = re.search(r"\d+", picture_value)
+            picture_value = match.group() if match else picture_value
+        picture = _positive_int(picture_value, f"image_subjects[{index}].picture")
         if picture < 1 or picture > image_count:
             raise ValueError(f"Picture {picture} is outside the {image_count} connected images")
-        if picture in seen_pictures or subject in seen_subjects:
-            raise ValueError("image subject picture and subject numbers must be unique")
-        name = str(item.get("name", "")).strip()
-        features = str(item.get("observable_features", item.get("description", ""))).strip()
-        if not name or not features:
-            raise ValueError(f"image_subjects[{index}] needs name and observable_features")
-        seen_pictures.add(picture)
-        seen_subjects.add(subject)
-        normalized_subjects.append({"picture": picture, "subject": subject, "name": name, "observable_features": features})
-
-    shots = value.get("shots")
-    if not isinstance(shots, list) or not shots:
-        raise ValueError("shots must be a non-empty array")
+        normalized_subjects.append({
+            "picture": picture,
+            "subject": picture,
+            "name": str(item.get("name", "")).strip(),
+            "observable_features": str(item.get("observable_features", item.get("description", ""))).strip(),
+        })
     normalized_shots = []
     previous_end = 0
     for index, item in enumerate(shots, 1):
-        if not isinstance(item, dict):
-            raise ValueError(f"shots[{index}] must be an object")
-        number = _positive_int(item.get("shot", index), f"shots[{index}].shot")
         start = _positive_int(item.get("start_frame"), f"shots[{index}].start_frame")
         end = _positive_int(item.get("end_frame"), f"shots[{index}].end_frame")
-        if number != index:
-            raise ValueError(f"storyboard shots must be sequential; expected Shot {index}, got {number}")
-        if start != previous_end:
-            raise ValueError(f"storyboard shots must be contiguous; Shot {index} starts at {start} after {previous_end}")
-        if end <= start or end > total_frames:
-            raise ValueError(f"Shot {index} has invalid frame interval [{start},{end})")
-        raw_pictures = item.get("pictures", [])
-        if not isinstance(raw_pictures, list):
-            raise ValueError(f"shots[{index}].pictures must be an array")
+        if start != previous_end or end <= start or end > total_frames:
+            raise ValueError(f"Shot {index} has invalid or non-contiguous frame interval [{start},{end})")
         pictures = []
-        for raw_picture in raw_pictures:
-            picture = _positive_int(raw_picture, f"shots[{index}].pictures")
+        for raw in item.get("pictures", []):
+            match = re.search(r"\d+", raw) if isinstance(raw, str) else None
+            picture = _positive_int(match.group() if match else raw, f"shots[{index}].pictures")
             if picture < 1 or picture > image_count:
                 raise ValueError(f"Picture {picture} is outside the {image_count} connected images")
-            if picture not in pictures:
-                pictures.append(picture)
-        description = str(item.get("description", item.get("visual_action", ""))).strip()
-        if not description:
-            raise ValueError(f"Shot {index} needs a description")
-        normalized_shots.append({"shot": number, "start_frame": start, "end_frame": end, "pictures": pictures, "description": description})
+            pictures.append(picture)
+        normalized_shots.append({"shot": index, "start_frame": start, "end_frame": end, "pictures": pictures, "description": str(item.get("description", "")).strip()})
         previous_end = end
     if previous_end != total_frames:
         raise ValueError(f"storyboard shots must cover the complete target; ended at {previous_end}, expected {total_frames}")
-
     result = dict(value)
-    result["image_subjects"] = normalized_subjects
-    result["shots"] = normalized_shots
-    result["total_frames"] = total_frames
+    result.update(image_subjects=normalized_subjects, shots=normalized_shots, total_frames=total_frames)
     return result
 
 
-def frame_timestamp(frame: int, fps: float) -> str:
-    """Format a global frame as the sampler's millisecond shot timestamp."""
-
-    frame = _positive_int(frame, "frame")
-    fps = float(fps)
-    if frame < 0 or fps <= 0:
-        raise ValueError("frame must be non-negative and fps must be positive")
-    milliseconds = int(round(frame * 1000.0 / fps))
-    minutes, remainder = divmod(milliseconds, 60_000)
-    seconds, milliseconds = divmod(remainder, 1_000)
-    return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-
 def compile_h3_prompt(plan: dict[str, Any], *, fps: float) -> str:
-    """Compile validated storyboard data into a deterministic Ref2VA H3 prompt."""
-
-    subjects = []
-    for item in plan["image_subjects"]:
-        subjects.append(
-            f"<Subject {item['subject']}> is {item['name']} from <Picture {item['picture']}>: "
-            f"{item['observable_features']}."
-        )
-    shot_lines = []
+    subjects = [f"<Subject {item['subject']}> is {item['name']} from <Picture {item['picture']}>: {item['observable_features']}." for item in plan["image_subjects"]]
+    shots = []
     for item in plan["shots"]:
         marker = f"[Shot {item['shot']}]"
         if item["shot"] > 1:
-            marker += f" At {frame_timestamp(item['start_frame'], fps)},"
-        shot_lines.append(f"{marker} {item['description']}")
-    summary = str(plan.get("summary", "[reference generation] Generate the planned continuous story using the supplied picture references.")).strip()
-    retention = str(plan.get("retention_analysis", "")).strip()
-    if not retention:
-        retention = "\n".join(
-            f"<Subject {item['subject']}>: fully_preserved - {item['observable_features']}."
-            for item in plan["image_subjects"]
-        )
-    soundscape = str(plan.get("overall_soundscape", "Use synchronized diegetic sound appropriate to the visible actions and preserve supplied dialogue exactly.")).strip()
-    music = str(plan.get("non_diegetic_music", "No non-diegetic music unless explicitly required by the story.")).strip()
+            milliseconds = round(item["start_frame"] * 1000 / fps)
+            minutes, remainder = divmod(milliseconds, 60000)
+            seconds, milliseconds = divmod(remainder, 1000)
+            marker += f" At {minutes:02d}:{seconds:02d}.{milliseconds:03d},"
+        shots.append(f"{marker} {item['description']}")
     return "\n\n".join((
         "subject_definitions:\n" + "\n".join(subjects),
-        "summary:\n" + summary,
-        "retention_analysis:\n" + retention,
-        "detailed_description:\n" + "\n".join(shot_lines),
-        "overall_soundscape:\n" + soundscape,
-        "non_diegetic_music:\n" + music,
+        "summary:\n" + str(plan.get("summary", "")),
+        "retention_analysis:\n" + str(plan.get("retention_analysis", "")),
+        "detailed_description:\n" + "\n".join(shots),
+        "overall_soundscape:\n" + str(plan.get("overall_soundscape", "")),
+        "non_diegetic_music:\n" + str(plan.get("non_diegetic_music", "")),
     ))

@@ -9,6 +9,17 @@ https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
 
 - video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
 
+## JZL 多媒体提示词测试工作流
+
+加载 `example_workflows/HR-JZL-MVP.json`。将图片、视频帧批次、视频音轨和独立音频接入 `HR MiniMax H3 Reference Set`，再运行 `HR MiniMax H3 JZL Storyboard`：
+
+- Qwen3.5/Qwen3.8直接分析图片及均匀抽取的视频帧；
+- `faster-whisper`在本地转写视频音轨与独立音频；
+- 输出原生JZL `[SHOT_START]...[SHOT_END]`四合一块；
+- `JZL Segment Dispatcher`选择一段并把H3提示词送入Reference Conditioning。
+
+有音频时，`whisper_model_path`必须填写ComfyUI `models`目录下的本地faster-whisper模型相对路径。示例工作流中的CLIP、视频VAE和音频VAE端口需连接现有MiniMax H3加载节点。
+
 ## 🎯 本分支特色
 
 本分支专为 **中文用户** 和 **低显存（12GB）用户** 设计：

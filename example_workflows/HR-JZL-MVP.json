@@ -1,0 +1,115 @@
+{
+  "last_node_id": 5,
+  "last_link_id": 10,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "HRMiniMaxH3ReferenceSet",
+      "pos": [0, 0],
+      "size": [360, 360],
+      "inputs": [],
+      "outputs": [{"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "links": [1]}],
+      "widgets_values": ["match", 1.0]
+    },
+    {
+      "id": 2,
+      "type": "HRQwen38DirectorConfig",
+      "pos": [0, 430],
+      "size": [360, 300],
+      "inputs": [],
+      "outputs": [{"name": "director_config", "type": "HR_DIRECTOR_CONFIG", "links": [2]}],
+      "widgets_values": ["auto", "auto", true, 2, "medium", false, 0, false, "qwen3.8"]
+    },
+    {
+      "id": 3,
+      "type": "HRMiniMaxH3JZLStoryboard",
+      "pos": [450, 20],
+      "size": [500, 650],
+      "inputs": [
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "link": 1},
+        {"name": "director_config", "type": "HR_DIRECTOR_CONFIG", "link": 2}
+      ],
+      "outputs": [
+        {"name": "jzl_four_in_one", "type": "HR_JZL_STORYBOARD", "links": [3]},
+        {"name": "h3_segments", "type": "STRING", "links": [4]},
+        {"name": "scene_segments", "type": "STRING", "links": [5]},
+        {"name": "video_segments", "type": "STRING", "links": [6]},
+        {"name": "audio_segments", "type": "STRING", "links": [7]},
+        {"name": "transcripts", "type": "STRING", "links": null},
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "links": [8]}
+      ],
+      "widgets_values": [
+        "在这里填写用户故事。",
+        4,
+        8,
+        "whisper/faster-whisper-large-v3",
+        "zh",
+        "热血战斗",
+        "角色A = 主角（填写参考图中可见特征）",
+        "视频A = 动作与运镜参考",
+        "音频A = 主角对白与音色参考",
+        ""
+      ]
+    },
+    {
+      "id": 4,
+      "type": "HRMiniMaxH3JZLSegmentDispatcher",
+      "pos": [1030, 20],
+      "size": [410, 470],
+      "inputs": [
+        {"name": "jzl_four_in_one", "type": "HR_JZL_STORYBOARD", "link": 3},
+        {"name": "h3_segments", "type": "STRING", "link": 4},
+        {"name": "scene_segments", "type": "STRING", "link": 5},
+        {"name": "video_segments", "type": "STRING", "link": 6},
+        {"name": "audio_segments", "type": "STRING", "link": 7},
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "link": 8},
+        {"name": "segment_index", "type": "INT", "widget": {"name": "segment_index"}}
+      ],
+      "outputs": [
+        {"name": "h3_prompt", "type": "STRING", "links": [9]},
+        {"name": "scene_instruction", "type": "STRING", "links": null},
+        {"name": "video_instruction", "type": "STRING", "links": null},
+        {"name": "audio_instruction", "type": "STRING", "links": null},
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "links": [10]}
+      ],
+      "widgets_values": [1]
+    },
+    {
+      "id": 5,
+      "type": "HRMiniMaxH3ReferenceConditioning",
+      "pos": [1510, 20],
+      "size": [430, 440],
+      "inputs": [
+        {"name": "clip", "type": "CLIP", "link": null},
+        {"name": "vae", "type": "VAE", "link": null},
+        {"name": "audio_vae", "type": "VAE", "link": null},
+        {"name": "prompt", "type": "STRING", "link": 9},
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "link": 10}
+      ],
+      "outputs": [
+        {"name": "positive", "type": "CONDITIONING", "links": null},
+        {"name": "latent", "type": "LATENT", "links": null},
+        {"name": "reference_set", "type": "HR_MINIMAX_H3_REFERENCE_SET", "links": null}
+      ],
+      "widgets_values": [1344, 768, 192]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 0, "HR_MINIMAX_H3_REFERENCE_SET"],
+    [2, 2, 0, 3, 1, "HR_DIRECTOR_CONFIG"],
+    [3, 3, 0, 4, 0, "HR_JZL_STORYBOARD"],
+    [4, 3, 1, 4, 1, "STRING"],
+    [5, 3, 2, 4, 2, "STRING"],
+    [6, 3, 3, 4, 3, "STRING"],
+    [7, 3, 4, 4, 4, "STRING"],
+    [8, 3, 6, 4, 5, "HR_MINIMAX_H3_REFERENCE_SET"],
+    [9, 4, 0, 5, 3, "STRING"],
+    [10, 4, 4, 5, 4, "HR_MINIMAX_H3_REFERENCE_SET"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "description": "Connect image/video/audio loaders to Reference Set, select local Qwen and Whisper models, run JZL media planning, select a segment, then connect H3 CLIP/video VAE/audio VAE and the existing HR Endless Sampler."
+  },
+  "version": 0.4
+}

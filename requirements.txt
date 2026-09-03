@@ -5,3 +5,5 @@ llama-cpp-python>=0.3.35
 # Finished-video EXR sequences and their float-WAV audio sidecar use PyAV.
 # ComfyUI currently supplies this too, but declare the direct runtime use here.
 av>=16.0.0
+# Local reference-audio transcription for the JZL media planner.
+faster-whisper>=1.2.1
