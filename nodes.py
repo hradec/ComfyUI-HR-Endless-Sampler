@@ -2942,7 +2942,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         chunk_noise=preflight_noise,
                         clip=clip,
                         vae=vae,
-                        images=images,
+                        images=image_list,
                         positive=positive,
                         original_conds=original_conds,
                         chunk_prompt=planned_prompts[0][0],
