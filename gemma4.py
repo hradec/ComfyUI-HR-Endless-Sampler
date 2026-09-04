@@ -14,21 +14,26 @@ again.
 from __future__ import annotations
 
 import base64
+import codecs
 import gc
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 from PIL import Image
@@ -39,11 +44,16 @@ import folder_paths
 
 GEMMA4_REPOSITORY = "google/gemma-4-12B-it-qat-q4_0-gguf"
 GEMMA4_MODEL_FILENAME = "gemma-4-12b-it-qat-q4_0.gguf"
+GEMMA4_DEBUG_CAPTURE_PREFIX = "hr-endless-sampler-gemma4-"
+# Older worker/capture experiments used sibling names under this owned prefix.
+# Keep cleanup broad enough to remove those disposable directories too, while
+# never touching the durable ``comfyui-hr-endless-sampler`` replay/log root.
+GEMMA4_OWNED_TEMP_PREFIX = "hr-endless-sampler-"
 GEMMA4_MMPROJ_FILENAME = "mmproj-gemma-4-12b-it-qat-q4_0.gguf"
 GEMMA4_MTP_REPOSITORY = "Janvitos/gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF"
 GEMMA4_MTP_FILENAME = "gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf"
 GEMMA4_MODEL_DIRECTORY = "llama_cpp/gemma-4-12b-it-qat-q4_0"
-GEMMA4_REQUIRED_VERSION = "0.3.35"
+GEMMA4_REQUIRED_VERSION = "0.3.49"
 GEMMA4_IMAGE_MIN_TOKENS = 70
 GEMMA4_IMAGE_MAX_TOKENS = 1120
 GEMMA4_BATCH_SIZE = GEMMA4_IMAGE_MAX_TOKENS
@@ -64,7 +74,28 @@ GEMMA4_KV_CACHE_Q8_0 = 8
 GEMMA4_CONTEXT_TOKENS = 32768
 GEMMA4_WORKER_RETRY_LIMIT = 10
 GEMMA4_RESPONSE_REPAIR_LIMIT = 10
-GEMMA4_CHUNK_RESPONSE_TOKENS = 2048
+# Gemma receives a native 4K thought budget, then emits its structured answer.
+# The two pre-production passes therefore retain the full 32K completion room
+# rather than treating thought tokens as their entire response allowance.
+GEMMA4_CHUNK_RESPONSE_TOKENS = 8132
+GEMMA4_GLOBAL_PREPRODUCTION_RESPONSE_TOKENS = 32768
+GEMMA4_SHOT_PREPRODUCTION_RESPONSE_TOKENS = 32768
+GEMMA4_TIMING_RESPONSE_TOKENS = 16384
+GEMMA4_REASONING_BUDGET = 4096
+# Gemma 4's native template puts this marker in the prompt when thinking is
+# enabled.  The first generated reasoning channel is then closed by
+# ``<channel|>``.  These are model tokens, not prose strings.
+GEMMA4_REASONING_START = "<|think|>"
+GEMMA4_REASONING_END = "<channel|>"
+GEMMA4_REASONING_BUDGET_MESSAGE = (
+    "\n...Wait, I have been thinking long enough. Let me start answering the user's question.\n"
+)
+# This is a permissive structural ceiling, not the desired performance pace.
+# Natural dramatic speech is normally slower; the small fixed allowance keeps
+# brief exclamations from failing merely because their overlay is very short.
+GEMMA4_MAX_DIALOGUE_WORDS_PER_SECOND = 4.0
+GEMMA4_DIALOGUE_BURST_WORD_ALLOWANCE = 4
+GEMMA4_DIALOGUE_ELLIPSIS_SECONDS = 0.5
 # A valid JSON response is normally produced by the unconstrained decoder. If
 # Gemma accidentally answers in its private thought channel, correct it as a
 # real next chat turn first.  That keeps the already encoded request, images,
@@ -90,6 +121,146 @@ _WORKER_PROGRESS_PREFIX = "HR_ENDLESS_SAMPLER_GEMMA4_PROGRESS="
 _PREPRODUCTION_CACHE_FORMAT = "hr-endless-sampler-gemma4-preproduction-kv-v1"
 _PREPRODUCTION_CACHE_DIRECTORY = "comfyui-hr-endless-sampler/gemma4_preproduction_kv"
 _PREPRODUCTION_CACHE_MIN_FREE_BYTES = 6 * 1024 ** 3
+GEMMA4_RAW_OUTPUT_DIRECTORY = "comfyui-hr-endless-sampler"
+GEMMA4_RAW_OUTPUT_FILENAME = "last_gemma_raw_output.txt"
+GEMMA4_LIVE_OUTPUT_FILENAME = "last_gemma_live_output.txt"
+_ACTIVE_RAW_OUTPUT_PATH: Path | None = None
+_ACTIVE_RAW_OUTPUT_OPERATION = "unknown operation"
+_ACTIVE_LIVE_OUTPUT_PATH: Path | None = None
+_ACTIVE_LIVE_OUTPUT_OPERATION = "unknown operation"
+
+
+def gemma4_raw_output_path() -> Path:
+    """Return the fixed, latest-render raw Gemma transcript path."""
+    return Path(tempfile.gettempdir()) / GEMMA4_RAW_OUTPUT_DIRECTORY / GEMMA4_RAW_OUTPUT_FILENAME
+
+
+def gemma4_live_output_path() -> Path:
+    """Return the append-only, currently-decoding Gemma transcript path."""
+    return Path(tempfile.gettempdir()) / GEMMA4_RAW_OUTPUT_DIRECTORY / GEMMA4_LIVE_OUTPUT_FILENAME
+
+
+def reset_gemma4_live_output_log() -> Path | None:
+    """Create the live transcript before a sampler run starts its Gemma workers."""
+    path = gemma4_live_output_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "HR Endless Sampler live Gemma token stream\n"
+            f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            "This file is appended while Gemma decodes; completed structured responses are in last_gemma_raw_output.txt.\n\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        logging.warning("HR Endless Sampler could not reset live Gemma output log %s: %s", path, error)
+        return None
+    logging.info("HR Endless Sampler writing live Gemma output to %s", path)
+    return path
+
+
+def reset_gemma4_raw_output_log(enabled: bool) -> Path | None:
+    """Start a debug transcript, or remove a stale transcript for a non-debug run."""
+    path = gemma4_raw_output_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not enabled:
+            path.unlink(missing_ok=True)
+            return None
+        path.write_text(
+            "HR Endless Sampler raw Gemma worker responses\n"
+            f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            "This debug-only file records every complete llama.cpp response before JSON parsing.\n\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        logging.warning("HR Endless Sampler could not reset raw Gemma output log %s: %s", path, error)
+        return None
+    logging.info("HR Endless Sampler writing raw Gemma worker responses to %s", path)
+    return path
+
+
+def _configure_raw_output_log(request: dict[str, Any]) -> None:
+    """Enable the fixed transcript inside one disposable debug worker."""
+    global _ACTIVE_RAW_OUTPUT_PATH, _ACTIVE_RAW_OUTPUT_OPERATION
+    global _ACTIVE_LIVE_OUTPUT_PATH, _ACTIVE_LIVE_OUTPUT_OPERATION
+    _ACTIVE_RAW_OUTPUT_PATH = gemma4_raw_output_path() if bool(request.get("debug", False)) else None
+    _ACTIVE_LIVE_OUTPUT_PATH = gemma4_live_output_path()
+    operation = str(request.get("operation") or "chunk_prompt")
+    chunk_number = request.get("chunk_number")
+    _ACTIVE_RAW_OUTPUT_OPERATION = (
+        f"{operation} chunk={int(chunk_number)}"
+        if chunk_number is not None
+        else operation
+    )
+    _ACTIVE_LIVE_OUTPUT_OPERATION = _ACTIVE_RAW_OUTPUT_OPERATION
+
+
+def _append_raw_gemma_response(stage: str, response: Any) -> None:
+    """Persist one unparsed llama.cpp response without affecting worker success."""
+    if _ACTIVE_RAW_OUTPUT_PATH is None:
+        return
+    try:
+        with _ACTIVE_RAW_OUTPUT_PATH.open("a", encoding="utf-8") as output_file:
+            output_file.write("=" * 200)
+            output_file.write("\n")
+            output_file.write(
+                f"{datetime.now(timezone.utc).isoformat()} | worker_pid={os.getpid()} | "
+                f"{_ACTIVE_RAW_OUTPUT_OPERATION} | {stage}\n"
+            )
+            output_file.write(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+            output_file.write("\n\n")
+    except OSError as error:
+        logging.warning(
+            "HR Endless Sampler could not append raw Gemma response to %s: %s",
+            _ACTIVE_RAW_OUTPUT_PATH,
+            error,
+        )
+
+
+def _begin_live_gemma_generation(generation: int) -> None:
+    """Mark one live llama.cpp decoder turn without delaying token generation."""
+    if _ACTIVE_LIVE_OUTPUT_PATH is None:
+        return
+    try:
+        with _ACTIVE_LIVE_OUTPUT_PATH.open("a", encoding="utf-8") as output_file:
+            output_file.write("=" * 200)
+            output_file.write("\n")
+            output_file.write(
+                f"{datetime.now(timezone.utc).isoformat()} | worker_pid={os.getpid()} | "
+                f"{_ACTIVE_LIVE_OUTPUT_OPERATION} | decoder generation {generation}\n"
+            )
+    except OSError as error:
+        logging.warning(
+            "HR Endless Sampler could not start live Gemma output in %s: %s",
+            _ACTIVE_LIVE_OUTPUT_PATH,
+            error,
+        )
+
+
+def _append_live_gemma_text(text: str) -> None:
+    """Flush decoded Gemma text so ``tail -f`` can inspect an active worker."""
+    if not text or _ACTIVE_LIVE_OUTPUT_PATH is None:
+        return
+    try:
+        with _ACTIVE_LIVE_OUTPUT_PATH.open("a", encoding="utf-8") as output_file:
+            output_file.write(text)
+    except OSError as error:
+        logging.warning(
+            "HR Endless Sampler could not append live Gemma output to %s: %s",
+            _ACTIVE_LIVE_OUTPUT_PATH,
+            error,
+        )
+
+
+def _gemma_reasoning_budget_kwargs() -> dict[str, Any]:
+    """Return the native first-thought-block budget shared by every Gemma turn."""
+    return {
+        "reasoning_budget": GEMMA4_REASONING_BUDGET,
+        "reasoning_start": GEMMA4_REASONING_START,
+        "reasoning_end": GEMMA4_REASONING_END,
+        "reasoning_budget_message": GEMMA4_REASONING_BUDGET_MESSAGE,
+        "reasoning_start_in_prompt": True,
+    }
 
 
 class Gemma4DependencyError(RuntimeError):
@@ -227,6 +398,7 @@ class GemmaChunkPrompt:
     raw_json: str
     timing_plan: str = ""
     end_state: str = ""
+    retention_analysis: str = ""
     last_seen_character_state: tuple[dict[str, Any], ...] = ()
     system_prompt: str = ""
     observation_prompt: str = ""
@@ -251,6 +423,36 @@ class GemmaShotTimingOverlay:
     end_frame: int
     overlay_type: str
     content: str
+    dialogue_segments: tuple["GemmaDialogueSegment", ...] = ()
+    continues_source_dialogue: bool = False
+
+
+@dataclass(frozen=True)
+class GemmaDialogueSegment:
+    """One word-exact piece of a dialogue owned by one retained chunk slice."""
+
+    start_frame: int
+    end_frame: int
+    content: str
+
+
+@dataclass(frozen=True)
+class GemmaCharacterContinuity:
+    """Planned physical state for one character across one retained slice."""
+
+    character_name: str
+    subject: str
+    entry_state: str
+    expected_exit_state: str
+
+
+@dataclass(frozen=True)
+class GemmaShotContinuitySlice:
+    """Preproduction character-state contract for one chunk-owned shot slice."""
+
+    start_frame: int
+    end_frame: int
+    characters: tuple[GemmaCharacterContinuity, ...]
 
 
 @dataclass(frozen=True)
@@ -267,6 +469,11 @@ class GemmaShotTimingShot:
     shot_end_frame: int
     visual_beats: tuple[GemmaShotTimingBeat, ...]
     overlays: tuple[GemmaShotTimingOverlay, ...] = ()
+    continuity_slices: tuple[GemmaShotContinuitySlice, ...] = ()
+    # True only when the original prompt requires lighting or color to change
+    # within this source shot. The sampler uses false as permission for a
+    # final output-only shot-grade stabilization pass.
+    light_change: bool = True
 
 
 @dataclass(frozen=True)
@@ -286,6 +493,8 @@ class GemmaShotTimingPlan:
     shots: tuple[GemmaShotTimingShot, ...]
     character_name_table: tuple[GemmaCharacterSubject, ...]
     raw_json: str
+    production_bible_json: str = ""
+    shot_planning_prompts: tuple[str, ...] = ()
     system_prompt: str = ""
     planning_prompt: str = ""
     validation_warnings: tuple[str, ...] = ()
@@ -299,6 +508,75 @@ class GemmaShotTimingPlan:
             f"- {entry.character_name} -> {entry.subject}"
             for entry in self.character_name_table
         )
+
+    def production_bible_text(self) -> str:
+        """Return the immutable global preproduction context for chunk directing."""
+        return self.production_bible_json or (
+            "No separate global production bible is available; use the validated shot schedules."
+        )
+
+    @staticmethod
+    def _matching_continuity_slice(
+        shot: GemmaShotTimingShot,
+        target: dict[str, Any],
+    ) -> GemmaShotContinuitySlice | None:
+        start = int(target["target_start"]) - shot.shot_start_frame
+        end = int(target["target_end"]) - shot.shot_start_frame
+        return next(
+            (
+                item for item in shot.continuity_slices
+                if item.start_frame == start and item.end_frame == end
+            ),
+            None,
+        )
+
+    def current_character_subjects(
+        self,
+        target_shots: Sequence[dict[str, Any]],
+    ) -> tuple[GemmaCharacterSubject, ...]:
+        """Return every planned character participating in the current slice."""
+        targets = {int(item["shot_number"]): item for item in target_shots}
+        seen: set[str] = set()
+        result: list[GemmaCharacterSubject] = []
+        for shot in self.shots:
+            target = targets.get(shot.source_shot)
+            if target is None:
+                continue
+            continuity = self._matching_continuity_slice(shot, target)
+            if continuity is None:
+                continue
+            for character in continuity.characters:
+                key = character.character_name.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(GemmaCharacterSubject(character.character_name, character.subject))
+        return tuple(result)
+
+    def continuity_for_target_shots(self, target_shots: Sequence[dict[str, Any]]) -> str:
+        """Render planned entry/exit states for Gemma's observed-state comparison."""
+        targets = {int(item["shot_number"]): item for item in target_shots}
+        blocks: list[str] = []
+        for shot in self.shots:
+            target = targets.get(shot.source_shot)
+            if target is None:
+                continue
+            continuity = self._matching_continuity_slice(shot, target)
+            if continuity is None:
+                continue
+            lines = [
+                f"Source Shot {shot.source_shot}, source-relative frames "
+                f"{continuity.start_frame}-{continuity.end_frame - 1}:"
+            ]
+            if not continuity.characters:
+                lines.append("- No mapped character is physically present in this slice.")
+            for character in continuity.characters:
+                lines.append(
+                    f"- {character.character_name} ({character.subject}) — planned entry: "
+                    f"{character.entry_state}; expected by slice end: {character.expected_exit_state}"
+                )
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks) if blocks else "No planned character continuity applies to this slice."
 
     @staticmethod
     def _beat_identifier(source_shot: int, kind: str, index: int) -> str:
@@ -321,24 +599,52 @@ class GemmaShotTimingPlan:
             target_end = int(target["target_end"])
             for kind, entries in (("V", shot.visual_beats), ("O", shot.overlays)):
                 for index, entry in enumerate(entries, 1):
-                    entry_start = shot.shot_start_frame + entry.start_frame
-                    entry_end = shot.shot_start_frame + entry.end_frame
+                    coverage_entry = entry
+                    identifier = self._beat_identifier(shot.source_shot, kind, index)
+                    dialogue_segment_index = None
+                    if (
+                        kind == "O"
+                        and entry.overlay_type == "dialogue"
+                        and entry.dialogue_segments
+                    ):
+                        target_relative_start = target_start - shot.shot_start_frame
+                        target_relative_end = target_end - shot.shot_start_frame
+                        matching_segments = [
+                            (segment_index, segment)
+                            for segment_index, segment in enumerate(entry.dialogue_segments, 1)
+                            if max(target_relative_start, segment.start_frame)
+                            < min(target_relative_end, segment.end_frame)
+                        ]
+                        if not matching_segments:
+                            continue
+                        # Retained ownership intervals do not overlap, so a
+                        # live source-shot slice owns at most one segment.
+                        dialogue_segment_index, coverage_entry = matching_segments[0]
+                        identifier += f".D{dialogue_segment_index}"
+                    entry_start = shot.shot_start_frame + coverage_entry.start_frame
+                    entry_end = shot.shot_start_frame + coverage_entry.end_frame
                     overlap_start = max(target_start, entry_start)
                     overlap_end = min(target_end, entry_end)
                     if overlap_start >= overlap_end:
                         continue
                     item: dict[str, Any] = {
-                        "id": self._beat_identifier(shot.source_shot, kind, index),
+                        "id": identifier,
                         "kind": "visual" if kind == "V" else "overlay",
                         "source_shot": shot.source_shot,
-                        "source_start_frame": entry.start_frame,
-                        "source_end_frame": entry.end_frame,
+                        "source_start_frame": coverage_entry.start_frame,
+                        "source_end_frame": coverage_entry.end_frame,
                         "overlap_start_frame": overlap_start - shot.shot_start_frame,
                         "overlap_end_frame": overlap_end - shot.shot_start_frame,
-                        "action": entry.action if kind == "V" else entry.content,
+                        "action": coverage_entry.action if kind == "V" else coverage_entry.content,
                     }
                     if kind == "O":
                         item["overlay_type"] = entry.overlay_type
+                        if dialogue_segment_index is not None:
+                            item["dialogue_segment_index"] = dialogue_segment_index
+                            item["dialogue_segment_count"] = len(entry.dialogue_segments)
+                            item["dialogue_continuation"] = (
+                                entry.continues_source_dialogue or dialogue_segment_index > 1
+                            )
                     required.append(item)
         return required
 
@@ -384,8 +690,30 @@ class GemmaShotTimingPlan:
                         f"at source-relative frames {overlay.start_frame}-{overlay.end_frame - 1} "
                         f"(global {global_start}-{global_end}): {overlay.content}"
                     )
+                    if overlay.overlay_type == "dialogue":
+                        lines.append("  Immutable retained-slice dialogue segments:")
+                        for segment_index, segment in enumerate(overlay.dialogue_segments, 1):
+                            segment_global_start = shot.shot_start_frame + segment.start_frame
+                            segment_global_end = shot.shot_start_frame + segment.end_frame - 1
+                            lines.append(
+                                f"  - [{self._beat_identifier(shot.source_shot, 'O', index)}.D{segment_index}] "
+                                f"source-relative frames {segment.start_frame}-{segment.end_frame - 1} "
+                                f"(global {segment_global_start}-{segment_global_end}): {segment.content}"
+                            )
             else:
                 lines.append("Concurrent overlays: none planned.")
+            lines.append("Character continuity by retained physical slice:")
+            for continuity in shot.continuity_slices:
+                lines.append(
+                    f"- source-relative frames {continuity.start_frame}-{continuity.end_frame - 1}:"
+                )
+                if not continuity.characters:
+                    lines.append("  - no mapped character is physically present")
+                for character in continuity.characters:
+                    lines.append(
+                        f"  - {character.character_name} ({character.subject}) entry: {character.entry_state}; "
+                        f"expected exit: {character.expected_exit_state}"
+                    )
             blocks.append("\n".join(lines))
 
             # The preproduction transcript renders this same method with
@@ -402,7 +730,9 @@ class GemmaShotTimingPlan:
                 f"{target_start - shot.shot_start_frame}-{target_end - shot.shot_start_frame - 1})."
             ]
             for item in self.mandatory_coverage((target,)):
-                phase = "begins" if item["source_start_frame"] >= item["overlap_start_frame"] else "continues"
+                phase = "continues without restarting" if item.get("dialogue_continuation") else (
+                    "begins" if item["source_start_frame"] >= item["overlap_start_frame"] else "continues"
+                )
                 descriptor = item["kind"]
                 if item["kind"] == "overlay":
                     descriptor += f"/{item['overlay_type']}"
@@ -411,6 +741,16 @@ class GemmaShotTimingPlan:
                     f"{item['overlap_start_frame']}-{item['overlap_end_frame'] - 1}: "
                     f"this planned beat {phase} here — {item['action']}"
                 )
+            continuity = self._matching_continuity_slice(shot, target)
+            if continuity is not None:
+                required_lines.append("Planned character continuity for this retained slice:")
+                if not continuity.characters:
+                    required_lines.append("- no mapped character is physically present")
+                for character in continuity.characters:
+                    required_lines.append(
+                        f"- {character.character_name} ({character.subject}) entry: {character.entry_state}; "
+                        f"expected exit: {character.expected_exit_state}"
+                    )
             required_blocks.append("\n".join(required_lines))
 
         if not blocks:
@@ -434,6 +774,9 @@ class GemmaShotTimingPlan:
         for shot_number, target in targets_by_number.items():
             if "target_start" not in target or "target_end" not in target:
                 continue
+            shot = next((item for item in self.shots if item.source_shot == shot_number), None)
+            if shot is None:
+                continue
             matching = [item for item in self.mandatory_coverage((target,)) if item["source_shot"] == shot_number]
             if not matching:
                 continue
@@ -443,7 +786,9 @@ class GemmaShotTimingPlan:
                 f"{int(target['target_end']) - int(target['shot_start']) - 1}."
             ]
             for item in matching:
-                phase = "begins" if item["source_start_frame"] >= item["overlap_start_frame"] else "continues"
+                phase = "continues without restarting" if item.get("dialogue_continuation") else (
+                    "begins" if item["source_start_frame"] >= item["overlap_start_frame"] else "continues"
+                )
                 descriptor = item["kind"]
                 if item["kind"] == "overlay":
                     descriptor += f"/{item['overlay_type']}"
@@ -452,6 +797,16 @@ class GemmaShotTimingPlan:
                     f"{item['overlap_start_frame']}-{item['overlap_end_frame'] - 1}: "
                     f"this planned beat {phase} here — {item['action']}"
                 )
+            continuity = self._matching_continuity_slice(shot, target)
+            if continuity is not None:
+                lines.append("Planned character continuity for this retained slice:")
+                if not continuity.characters:
+                    lines.append("- no mapped character is physically present")
+                for character in continuity.characters:
+                    lines.append(
+                        f"- {character.character_name} ({character.subject}) entry: {character.entry_state}; "
+                        f"expected exit: {character.expected_exit_state}"
+                    )
             blocks.append("\n".join(lines))
         if not blocks:
             return "No mandatory current-slice beat coverage is required."
@@ -535,22 +890,6 @@ def _model_paths() -> tuple[Path, Path]:
     return model_dir / GEMMA4_MODEL_FILENAME, model_dir / GEMMA4_MMPROJ_FILENAME
 
 
-def _normalize_gemma4_generation_suffix(text: str) -> str:
-    """Keep this GGUF's proven visible-answer delimiter on a model turn.
-
-    The installed QAT GGUF behaves differently from newer canonical Gemma
-    templates: a bare ``<|turn>model`` causes it to open a thought channel and
-    consume the whole output budget before a final answer. A closed empty
-    thought block is its tested transition into ordinary visible content. Do
-    not touch real historical thought content; add the delimiter only at the
-    terminal model generation boundary when it is missing.
-    """
-    stub = "<|channel>thought\n<channel|>"
-    if text.endswith(stub):
-        return text
-    return text + stub if text.endswith("<|turn>model\n") else text
-
-
 def _ensure_model_files() -> tuple[Path, Path]:
     model_path, mmproj_path = _model_paths()
     if model_path.is_file() and mmproj_path.is_file():
@@ -615,63 +954,15 @@ def _ensure_mtp_model_file() -> Path:
     )
 
 
-def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
-    """Expose Gemma 4's visual-token budget missing from the pinned handler.
+def _gemma4_mtmd_handler_type(base_handler):
+    """Add only Endless's append-only turn helper to the current MTMD handler.
 
-    llama-cpp-python 0.3.35 binds ``image_min_tokens`` and
-    ``image_max_tokens`` in ``mtmd_context_params``, but its public
-    ``MTMDChatHandler`` constructor does not expose them. Keep this narrow
-    subclass local to the disposable worker instead of modifying the installed
-    package.
+    JamePeng 0.3.49 already exposes Gemma 4's complete MTMD initializer,
+    including visual-token and batch budgets. Inherit it unchanged so its
+    private multimodal state stays compatible with the installed runtime.
     """
 
     class Gemma4MTMDChatHandler(base_handler):
-        def _postprocess_template_text(self, text, image_urls, media_marker):
-            text = super()._postprocess_template_text(text, image_urls, media_marker)
-            return _normalize_gemma4_generation_suffix(text)
-
-        def _init_mtmd_context(self, llama_model):
-            self.verbose = llama_model.verbose
-            if self.mtmd_ctx is not None:
-                return
-
-            with suppress_output(disable=self.verbose):
-                ctx_params = self._mtmd_cpp.mtmd_context_params_default()
-                ctx_params.use_gpu = self.use_gpu
-                ctx_params.print_timings = self.verbose
-                ctx_params.n_threads = llama_model.n_threads
-                ctx_params.flash_attn_type = (
-                    llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_ENABLED
-                    if (
-                        llama_model.context_params.flash_attn_type
-                        == llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_ENABLED
-                    )
-                    else llama_cpp_module.LLAMA_FLASH_ATTN_TYPE_DISABLED
-                )
-                ctx_params.image_min_tokens = GEMMA4_IMAGE_MIN_TOKENS
-                ctx_params.image_max_tokens = GEMMA4_IMAGE_MAX_TOKENS
-                ctx_params.batch_max_tokens = max(
-                    int(ctx_params.batch_max_tokens),
-                    GEMMA4_IMAGE_MAX_TOKENS,
-                )
-
-                self.mtmd_ctx = self._mtmd_cpp.mtmd_init_from_file(
-                    self.clip_model_path.encode(), llama_model.model, ctx_params
-                )
-
-                if self.mtmd_ctx is None:
-                    raise ValueError(f"Failed to load mtmd context from: {self.clip_model_path}")
-                if not self._mtmd_cpp.mtmd_support_vision(self.mtmd_ctx):
-                    raise ValueError("Vision is not supported by this model")
-
-                def mtmd_free():
-                    with suppress_output(disable=self.verbose):
-                        if self.mtmd_ctx is not None:
-                            self._mtmd_cpp.mtmd_free(self.mtmd_ctx)
-                            self.mtmd_ctx = None
-
-                llama_model._stack.callback(mtmd_free)
-
         def append_user_chat_completion(
             self,
             *,
@@ -682,10 +973,15 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
             top_k: int = GEMMA4_TOP_K,
             max_tokens: int = 1024,
             response_format: dict[str, Any] | None = None,
+            reasoning_budget: int = GEMMA4_REASONING_BUDGET,
+            reasoning_start: str = GEMMA4_REASONING_START,
+            reasoning_end: str = GEMMA4_REASONING_END,
+            reasoning_budget_message: str | None = GEMMA4_REASONING_BUDGET_MESSAGE,
+            reasoning_start_in_prompt: bool = False,
         ) -> dict[str, Any]:
             """Append one user turn to an existing Gemma MTMD conversation.
 
-            ``MTMDChatHandler.__call__`` always resets Llama and clears the
+            ``Gemma4ChatHandler.__call__`` always resets Llama and clears the
             KV cache.  That is correct for a new request but wasteful (and
             semantically wrong) for a correction to the answer it just
             produced.  This narrow companion mirrors its media tokenisation
@@ -698,12 +994,7 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
             turn, rather than hard-coding Gemma special-token spelling.
             """
             import ctypes
-            import jinja2
-            from llama_cpp.llama_chat_format import (
-                ImmutableSandboxedEnvironment,
-                Jinja2ChatFormatter,
-                _grammar_for_response_format,
-            )
+            from llama_cpp.llama_chat_format import _grammar_for_response_format
 
             self._init_mtmd_context(llama)
             assert self.mtmd_ctx is not None
@@ -723,35 +1014,13 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                 {"role": "assistant", "content": anchor},
                 {"role": "user", "content": user_content},
             ]
-            image_urls = self.get_image_urls(messages)
-            media_marker = self._mtmd_cpp.mtmd_default_marker().decode("utf-8")
-            template_env = ImmutableSandboxedEnvironment(
-                trim_blocks=True,
-                lstrip_blocks=True,
-                extensions=[
-                    Jinja2ChatFormatter.IgnoreGenerationTags,
-                    jinja2.ext.loopcontrols,
-                ],
-            )
-            template_env.filters["tojson"] = Jinja2ChatFormatter.tojson
-            template = template_env.from_string(self._get_chat_template(llama))
-
-            def raise_exception(message: str):
-                raise ValueError(message)
-
-            text = template.render(
-                messages=self._get_template_messages(messages, media_marker),
-                add_generation_prompt=True,
-                eos_token=self._decode_token_piece(llama.detokenize([llama.token_eos()])),
-                bos_token=self._decode_token_piece(llama.detokenize([llama.token_bos()])),
-                raise_exception=raise_exception,
-                functions=None,
-                function_call=None,
-                tools=None,
-                tool_choice=None,
-                strftime_now=Jinja2ChatFormatter.strftime_now,
-            )
-            text = self._postprocess_template_text(text, image_urls, media_marker)
+            # A repair is always a text-only user turn. Re-evaluating media
+            # would defeat the cached conversation and requires a separate
+            # physical-media checkpoint protocol.
+            media_items = self._get_media_items(messages)
+            if media_items:
+                raise ValueError("Gemma append-only repair accepts text content only")
+            text = self._render_and_replace_media(messages=messages, media_items=media_items)
             if text.count(anchor) != 1:
                 raise ValueError("Could not derive an append-only Gemma chat-template turn")
             # Keep the template's exact assistant closing sequence, then the
@@ -761,39 +1030,18 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
             if not suffix:
                 raise ValueError("Gemma chat template produced an empty append suffix")
 
-            bitmaps = []
+            chunks = None
             try:
-                for image_url in image_urls:
-                    bitmaps.append(self._create_bitmap_from_bytes(self.load_image(image_url)))
-
-                input_text = self._mtmd_cpp.mtmd_input_text()
-                input_bytes = suffix.encode("utf-8")
-                input_text.text = input_bytes
-                input_text.text_len = len(input_bytes)
-                # Unlike a fresh full prompt, the suffix must not add a BOS
-                # token: it continues the restored/pre-existing conversation.
-                input_text.add_special = False
-                input_text.parse_special = True
-                chunks = self._mtmd_cpp.mtmd_input_chunks_init()
-                if chunks is None:
-                    raise ValueError("Failed to create append input chunks")
+                # The native tokenizer keeps Gemma's special-token rules.
+                # ``llama.n_tokens`` is nonzero, so it omits BOS naturally.
+                chunks = self._mtmd_tokenize(llama=llama, text=suffix, bitmaps=[])
                 try:
-                    bitmap_array = (self._mtmd_cpp.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
-                    result = self._mtmd_cpp.mtmd_tokenize(
-                        self.mtmd_ctx,
-                        chunks,
-                        ctypes.byref(input_text),
-                        bitmap_array,
-                        len(bitmaps),
-                    )
-                    if result != 0:
-                        raise ValueError(f"Failed to tokenize appended input: error code {result}")
                     for index in range(self._mtmd_cpp.mtmd_input_chunks_size(chunks)):
                         chunk = self._mtmd_cpp.mtmd_input_chunks_get(chunks, index)
                         if chunk is None:
                             continue
                         chunk_type = self._mtmd_cpp.mtmd_input_chunk_get_type(chunk)
-                        if chunk_type == self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_TEXT:
+                        if self._is_text_chunk(chunk_type):
                             n_tokens_out = ctypes.c_size_t()
                             tokens_ptr = self._mtmd_cpp.mtmd_input_chunk_get_tokens_text(
                                 chunk, ctypes.byref(n_tokens_out)
@@ -805,34 +1053,14 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                                         f"Appended prompt exceeds n_ctx: {llama.n_tokens + len(tokens)} > {llama.n_ctx()}"
                                     )
                                 llama.eval(tokens)
-                        elif chunk_type in (
-                            self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                            self._mtmd_cpp.MTMD_INPUT_CHUNK_TYPE_AUDIO,
-                        ):
-                            chunk_n_tokens = self._mtmd_cpp.mtmd_input_chunk_get_n_tokens(chunk)
-                            if llama.n_tokens + chunk_n_tokens > llama.n_ctx():
-                                raise ValueError(
-                                    f"Appended prompt exceeds n_ctx: {llama.n_tokens + chunk_n_tokens} > {llama.n_ctx()}"
-                                )
-                            new_n_past = llama_cpp_module.llama_pos(0)
-                            result = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
-                                self.mtmd_ctx,
-                                llama._ctx.ctx,
-                                chunk,
-                                llama_cpp_module.llama_pos(llama.n_tokens),
-                                llama_cpp_module.llama_seq_id(0),
-                                llama.n_batch,
-                                False,
-                                ctypes.byref(new_n_past),
-                            )
-                            if result != 0:
-                                raise ValueError(f"Failed to evaluate appended media: error code {result}")
-                            llama.n_tokens = new_n_past.value
+                        else:
+                            raise ValueError("Gemma append-only repair unexpectedly rendered media")
                 finally:
                     self._mtmd_cpp.mtmd_input_chunks_free(chunks)
+                    chunks = None
             finally:
-                for bitmap in bitmaps:
-                    self._mtmd_cpp.mtmd_bitmap_free(bitmap)
+                if chunks is not None:
+                    self._mtmd_cpp.mtmd_input_chunks_free(chunks)
 
             grammar = None
             if response_format is not None and response_format.get("type") == "json_object":
@@ -844,6 +1072,12 @@ def _gemma4_mtmd_handler_type(base_handler, llama_cpp_module, suppress_output):
                 top_k=top_k,
                 max_tokens=max_tokens,
                 grammar=grammar,
+                stop=[self.GEMMA4_EOS_TOKEN, self.GEMMA4_EOT_TOKEN, self.GEMMA4_STR_TOKEN],
+                reasoning_budget=reasoning_budget,
+                reasoning_start=reasoning_start,
+                reasoning_end=reasoning_end,
+                reasoning_budget_message=reasoning_budget_message,
+                reasoning_start_in_prompt=reasoning_start_in_prompt,
             )
             return {
                 "choices": [{"message": {"content": completion["choices"][0]["text"]}}],
@@ -857,26 +1091,21 @@ def _load_runtime():
     try:
         import llama_cpp
         from llama_cpp import Llama
-        from llama_cpp.llama_chat_format import MTMDChatHandler
-        from llama_cpp._utils import suppress_stdout_stderr
+        from llama_cpp.llama_multimodal import Gemma4ChatHandler
         import llama_cpp.mtmd_cpp
     except ImportError as error:
         raise Gemma4DependencyError(
-            "Gemma 4 continuity requires llama-cpp-python==0.3.35 with CUDA support. "
+            "Gemma 4 continuity requires JamePeng llama-cpp-python==0.3.49 with CUDA support. "
             "Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
         ) from error
 
     version = getattr(llama_cpp, "__version__", "unknown")
-    if version != GEMMA4_REQUIRED_VERSION:
+    if version.split("+", 1)[0] != GEMMA4_REQUIRED_VERSION:
         raise Gemma4DependencyError(
-            f"Gemma 4 continuity requires llama-cpp-python=={GEMMA4_REQUIRED_VERSION} with MTMD vision support; "
+            f"Gemma 4 continuity requires JamePeng llama-cpp-python=={GEMMA4_REQUIRED_VERSION} with MTMD vision support; "
             f"found {version}. Install this custom node's requirements.txt with ~/comfyui/tools/python.sh."
         )
-    return Llama, _gemma4_mtmd_handler_type(
-        MTMDChatHandler,
-        llama_cpp,
-        suppress_stdout_stderr,
-    )
+    return Llama, _gemma4_mtmd_handler_type(Gemma4ChatHandler)
 
 
 def _create_runtime_llm(
@@ -886,6 +1115,7 @@ def _create_runtime_llm(
     handler: Any,
     debug: bool,
     gemma4_mtp: bool = False,
+    seed: int = 0,
 ) -> Any:
     """Create either the original runtime or a target born as native MTP."""
     real_runtime = str(getattr(Llama, "__module__", "")).startswith("llama_cpp")
@@ -905,6 +1135,10 @@ def _create_runtime_llm(
         # instead of forcing the full-size SWA allocation seen in the worker
         # diagnostics.
         "swa_full": False,
+        # The same per-render seed reaches both the ordinary decoder and the
+        # native-MTP target constructor. Worker retries reuse the request, so
+        # a MTP fallback starts from the identical sampling seed too.
+        "seed": int(seed) & 0x7fffffff,
         # Sampler debug controls our captures, validation warnings, progress,
         # and MTP summary.  It must not enable llama.cpp's native trace stream:
         # native verbosity prints for every one-token MTP assistant decode and
@@ -913,22 +1147,29 @@ def _create_runtime_llm(
         "verbose": False,
     }
     if gemma4_mtp and real_runtime:
-        # Download before allocating the target. Unlike the retired adapter,
-        # failure is fatal: an enabled comparison toggle must never silently
-        # run the ordinary decoder and report it as MTP.
+        # JamePeng's native MTP engine owns target verification, recurrent
+        # checkpoints, and rollback. Do not layer the retired local adapter
+        # on top of it: only one speculative owner may control the target KV.
         mtp_path = _ensure_mtp_model_file()
-        from gemma4_mtp import create_native_mtp_llama
+        from llama_cpp.llama_speculative import SpecConfig, SpeculativeType
 
-        llm = create_native_mtp_llama(
-            Llama,
-            model_path=model_path,
-            draft_model_path=mtp_path,
-            num_pred_tokens=4,
-            **llama_kwargs,
+        llama_kwargs["speculative"] = SpecConfig(
+            spec_type=SpeculativeType.DRAFT_MTP,
+            draft_model_path=str(mtp_path),
+            draft_n_max=4,
+            draft_p_min=0.0,
+            # Match llama.cpp's working ``ngl=999`` setup: MTP's small
+            # assistant must be fully offloaded too. ``-1`` means the fork's
+            # heuristic "auto" mode here, which can leave it CPU-bound.
+            draft_n_gpu_layers="all",
+            draft_type_k=GEMMA4_KV_CACHE_Q8_0,
+            draft_type_v=GEMMA4_KV_CACHE_Q8_0,
+            draft_backend_sampling=True,
         )
+        llm = Llama(model_path=str(model_path), **llama_kwargs)
         print(
             "HR Endless Sampler Gemma 4 decoding mode: native draft-mtp "
-            "(spec-draft-n-max=4, reference host checkpoints; operation-local non-MTP retry enabled).",
+            "(JamePeng SpecConfig, spec-draft-n-max=4; operation-local non-MTP retry enabled).",
             file=sys.stderr,
             flush=True,
         )
@@ -968,6 +1209,8 @@ def _install_worker_token_progress(llm: Any) -> None:
         last_emitted_count = 0
         send_value = None
         first_iteration = True
+        live_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        _begin_live_gemma_generation(current_generation)
         try:
             while True:
                 try:
@@ -975,6 +1218,13 @@ def _install_worker_token_progress(llm: Any) -> None:
                 except StopIteration:
                     return
                 first_iteration = False
+                # llama.cpp yields token ids. Decode their original byte pieces
+                # incrementally so UTF-8 characters remain intact in the live log.
+                token_bytes = llm.detokenize([int(token)], special=True)
+                if isinstance(token_bytes, bytes):
+                    _append_live_gemma_text(live_decoder.decode(token_bytes, final=False))
+                else:
+                    _append_live_gemma_text(str(token_bytes))
                 now = time.perf_counter()
                 generated += 1
                 if first_token_at is None:
@@ -1000,6 +1250,8 @@ def _install_worker_token_progress(llm: Any) -> None:
                     last_emitted_count = generated
                 send_value = yield token
         finally:
+            _append_live_gemma_text(live_decoder.decode(b"", final=True))
+            _append_live_gemma_text("\n\n")
             if first_token_at is not None and generated >= 2 and generated != last_emitted_count:
                 now = time.perf_counter()
                 rate = (generated - 1) / max(now - first_token_at, 1e-9)
@@ -1037,24 +1289,27 @@ def _extract_json_object(content: str) -> tuple[dict[str, Any], str]:
     """Decode the response's outer JSON object, never a nested truncation.
 
     Gemma may prefix its answer with a short channel marker or Markdown fence,
-    so the first opening brace need not be byte zero. Once that brace appears,
-    however, it is the instructed root object. If the output budget cuts that
-    object off, scanning later braces can incorrectly accept a complete nested
-    ``last_seen_character_state`` entry as the whole response. Reject the
-    incomplete root so the caller can retry with the appropriate decoder and
-    token budget.
+    so the first opening brace need not be byte zero. When a completed Gemma
+    thought channel exists, the visible answer begins after its final close;
+    ignore illustrative JSON inside that thought. Once the visible root brace
+    appears, reject an incomplete object rather than accepting a later nested
+    ``last_seen_character_state`` entry as the whole response.
     """
     decoder = json.JSONDecoder()
-    match = re.search(r"\{", content)
+    visible_content = content
+    thought_end = content.rfind(GEMMA4_REASONING_END)
+    if thought_end >= 0 and "{" in content[thought_end + len(GEMMA4_REASONING_END):]:
+        visible_content = content[thought_end + len(GEMMA4_REASONING_END):]
+    match = re.search(r"\{", visible_content)
     if match is not None:
         try:
-            value, end = decoder.raw_decode(content[match.start():])
+            value, end = decoder.raw_decode(visible_content[match.start():])
         except json.JSONDecodeError as error:
             raise Gemma4ObservationError(
                 "Gemma 4 returned an incomplete or malformed top-level JSON object"
             ) from error
         if isinstance(value, dict):
-            return value, content[match.start():match.start() + end]
+            return value, visible_content[match.start():match.start() + end]
     raise Gemma4ObservationError("Gemma 4 did not return a JSON object")
 
 
@@ -1082,7 +1337,9 @@ def _shot_context(shots: Sequence[dict[str, Any]], fps: float, include_target: b
             )
             required_marker = shot.get("required_marker")
             if required_marker:
-                lines.append(f"Required local H3 marker: {required_marker}")
+                lines.append(
+                    f"Required H3 marker using this shot's global label and the chunk-local clock: {required_marker}"
+                )
             else:
                 lines.append(
                     "This shot was already in progress before this physical chunk; begin it as unmarked continuation prose."
@@ -1103,7 +1360,7 @@ def _current_chunk_shot_timeline(shots: Sequence[dict[str, Any]], current: dict[
     """Summarize exact source-shot positions on the physical chunk timeline."""
     sampled_start = int(current["sampled_start"])
     lines = []
-    for local_index, shot in enumerate(shots, 1):
+    for shot in shots:
         source_start = int(shot["shot_start"])
         target_start = int(shot["target_start"])
         target_end = int(shot["target_end"])
@@ -1121,14 +1378,14 @@ def _current_chunk_shot_timeline(shots: Sequence[dict[str, Any]], current: dict[
                 f"(physical local frame {source_local})"
             )
         lines.append(
-            f"- local [Shot {local_index}] / source Shot {int(shot['shot_number'])}: {source_position}; "
+            f"- global [Shot {int(shot['shot_number'])}]: {source_position}; "
             f"this chunk must author its global frames {target_start}-{target_end - 1} "
             f"(physical local frames {target_local_start}-{target_local_end})."
         )
     return "\n".join(lines) if lines else "none"
 
 
-def _slice_portion_name(shot: dict[str, Any], local_index: int) -> str:
+def _slice_portion_name(shot: dict[str, Any]) -> str:
     """Describe how the retained chunk interval intersects one source shot."""
     has_prior = int(shot["target_start"]) > int(shot["shot_start"])
     has_later = int(shot["target_end"]) < int(shot["shot_end"])
@@ -1140,7 +1397,7 @@ def _slice_portion_name(shot: dict[str, Any], local_index: int) -> str:
         portion = "the opening portion of"
     else:
         portion = "all of"
-    return f"{portion} local [Shot {local_index}] (source Shot {int(shot['shot_number'])})"
+    return f"{portion} global [Shot {int(shot['shot_number'])}]"
 
 
 def _slice_portion_kind(shot: dict[str, Any]) -> str:
@@ -1161,7 +1418,7 @@ def _current_shot_timing_contract(shots: Sequence[dict[str, Any]], fps: float) -
         "Before writing, allocate the source events across each complete source-shot duration below. "
         "Do not state an action's final outcome before this slice reaches the part of the shot where it belongs.",
     ]
-    for local_index, shot in enumerate(shots, 1):
+    for shot in shots:
         shot_start = int(shot["shot_start"])
         shot_end = int(shot["shot_end"])
         target_start = int(shot["target_start"])
@@ -1173,13 +1430,13 @@ def _current_shot_timing_contract(shots: Sequence[dict[str, Any]], fps: float) -
         start_percent = 100.0 * relative_start / shot_frames
         end_percent = 100.0 * (relative_end + 1) / shot_frames
         lines.append(
-            f"- local [Shot {local_index}] / source Shot {int(shot['shot_number'])}: full source shot "
+            f"- global [Shot {int(shot['shot_number'])}]: full source shot "
             f"global frames {shot_start}-{shot_end - 1} ({shot_frames} frames, {shot_frames / fps:.3f} s). "
             f"This chunk owns its {_slice_portion_kind(shot)} {target_frames} frames: "
             f"source-relative frames {relative_start}-{relative_end} ({start_percent:.1f}%-{end_percent:.1f}% of the shot)."
         )
     lines.append(
-        "In timing_plan, state the concrete events to cover now and the concrete later events to defer for every local shot. "
+        "In timing_plan, state the concrete events to cover now and the concrete later events to defer for every global source shot. "
         "end_state must describe only the visible state reachable at this slice's final retained frame."
     )
     return "\n".join(lines)
@@ -1203,8 +1460,8 @@ def _chunk_generation_request(shots: Sequence[dict[str, Any]], current: dict[str
     output_local_start = output_start - sampled_start
     output_local_end = output_end - sampled_start - 1
     portions = _joined_phrases([
-        _slice_portion_name(shot, local_index)
-        for local_index, shot in enumerate(shots, 1)
+        _slice_portion_name(shot)
+        for shot in shots
     ])
     return (
         f"Write one complete chunk-local detailed_description for {portions}. "
@@ -1217,19 +1474,19 @@ def _chunk_generation_request(shots: Sequence[dict[str, Any]], current: dict[str
 
 
 def _required_local_markers(shots: Sequence[dict[str, Any]]) -> str:
-    """Render literal H3-local marker tokens, separate from global source prose.
+    """Render global shot labels with sampler-calculated local timecodes.
 
     The complete source prompt necessarily contains its original full-video
-    timecodes.  This small copy-only block makes the sampler-calculated local
-    tokens visually and semantically distinct, so Gemma need not infer which
-    clock H3 expects for this physical window.
+    timecodes. This copy-only block preserves every source shot number while
+    making the sampler-calculated chunk-local clock visually distinct, so
+    Gemma need not translate shot identity or infer which time H3 expects.
     """
     marked_shots = [shot for shot in shots if shot.get("required_marker")]
     lines = [
-        "IMMUTABLE H3-LOCAL SHOT MARKERS — COPY THE QUOTED TOKEN EXACTLY",
-        "These markers use H3's physical chunk-local clock, whose zero is the first sampled frame.",
+        "IMMUTABLE H3 SHOT MARKERS — GLOBAL SHOT LABELS, CHUNK-LOCAL TIMES",
+        "Every [Shot N] keeps N from the original full-video prompt. Only each At timecode is recalculated on H3's physical chunk-local clock, whose zero is the first sampled frame.",
         "For detailed_description, write every quoted token exactly once and in this order; do not copy the leading hyphen or quotes.",
-        "Original source/global timestamps elsewhere are context only and are forbidden as H3 markers unless they are identical to the token below.",
+        "Original full-video timestamps elsewhere are planning context only and are forbidden as H3 markers unless identical to a quoted token below.",
     ]
     if marked_shots:
         lines.extend(f'- exact token: "{str(shot["required_marker"])}"' for shot in marked_shots)
@@ -1238,43 +1495,42 @@ def _required_local_markers(shots: Sequence[dict[str, Any]]) -> str:
             "There is no H3 shot marker in this physical chunk: it begins inside an already established source shot. "
             "Begin detailed_description as plain continuation prose; do not add [Shot 1] or any other [Shot N] marker."
         )
-    lines.extend(("", _local_marker_transition_map(shots)))
+    lines.extend(("", _global_marker_transition_map(shots)))
     return "\n".join(lines)
 
 
-def _local_marker_transition_map(shots: Sequence[dict[str, Any]]) -> str:
-    """Explain the sampler-owned global-to-local cut mapping in plain prose.
+def _global_marker_transition_map(shots: Sequence[dict[str, Any]]) -> str:
+    """Explain global shot identity and the sampler-owned local cut clock.
 
     Literal tokens alone are insufficient when a physical chunk begins in the
-    middle of a global source shot: Gemma can mistake the one allowed local
-    marker for a restart of that continuing shot. Keep Python authoritative
-    about the tokens while also stating which global shot ends before each
-    token and which global shot the token actually introduces.
+    middle of a source shot. Keep Python authoritative about the tokens while
+    stating which global shot continues unmarked and which global shot each
+    subsequent chunk-local timestamp introduces.
     """
     if not shots:
         return "SEMANTIC SHOT-TRANSITION MAP\n- This chunk contains no source shots."
 
-    lines = ["SEMANTIC SHOT-TRANSITION MAP — USE THE TOKENS AT THESE BOUNDARIES"]
+    lines = ["SHOT-TRANSITION MAP — GLOBAL LABELS ON THE CHUNK-LOCAL CLOCK"]
     first = shots[0]
     first_global = int(first["shot_number"])
     first_marker = first.get("required_marker")
     if first_marker:
         lines.append(
-            f"- Global Source Shot {first_global} begins at the physical chunk opening as local chunk Shot 1. "
-            f"Put {str(first_marker)!r} immediately before its first action."
+            f"- Global Source Shot {first_global} begins at the physical chunk opening. Put "
+            f"{str(first_marker)!r} immediately before its first action; its Shot number remains {first_global}."
         )
     else:
         lines.append(
-            f"- This chunk time-slice begins inside global Source Shot {first_global}, represented as local chunk "
-            "Shot 1. Continue and/or finish that global shot as plain unmarked prose. Do not restart it and do not "
+            f"- This chunk time-slice begins inside global Source Shot {first_global}. Continue and/or finish that "
+            "same global shot as plain unmarked prose. Do not restart it and do not "
             "put a [Shot] marker before its remaining action."
         )
 
-    for local_index, shot in enumerate(shots[1:], 2):
+    for shot_index, shot in enumerate(shots[1:], 1):
         marker = str(shot.get("required_marker") or "").strip()
         if not marker:
             continue
-        previous_global = int(shots[local_index - 2]["shot_number"])
+        previous_global = int(shots[shot_index - 1]["shot_number"])
         current_global = int(shot["shot_number"])
         match = _SHOT_MARKER.fullmatch(marker)
         if match and match.group(2) is not None:
@@ -1283,20 +1539,28 @@ def _local_marker_transition_map(shots: Sequence[dict[str, Any]]) -> str:
             position = "the supplied local position"
         lines.append(
             f"- The chunk time-slice encompasses the end of global Source Shot {previous_global}. Next, global "
-            f"Source Shot {current_global} begins as local chunk Shot {local_index} at position {position}. Put the "
+            f"Source Shot {current_global} begins at chunk-local position {position}. Put the "
             f"exact token {marker!r} immediately before the first action of global Source Shot {current_global}, "
             f"never before remaining action from global Source Shot {previous_global}."
         )
     lines.append(
-        "- Emit no other [Shot] marker. In particular, never copy a global/source shot number or its full-video "
-        "timecode from the original prompt into this chunk-local detailed_description."
+        "- Emit no other [Shot] marker. Preserve global shot numbers, but never copy their original full-video "
+        "timecodes into this chunk-local detailed_description."
     )
     return "\n".join(lines)
 
 
 def _marker_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
-    """Return only errors that a focused local-marker rewrite can repair."""
+    """Return only errors that a focused shot-marker rewrite can repair."""
     return tuple(warning for warning in warnings if "marker" in warning.lower())
+
+
+def _character_state_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
+    """Return H3 retention defects that must never silently reach H3."""
+    return tuple(
+        warning for warning in warnings
+        if "retention_analysis" in warning.lower()
+    )
 
 
 def _contract_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
@@ -1308,6 +1572,8 @@ def _contract_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
             or "mandatory coverage" in warning.lower()
             or "dialogue speaker form" in warning.lower()
             or "last-seen character state" in warning.lower()
+            or "retention_analysis" in warning.lower()
+            or "character continuity" in warning.lower()
         )
     )
 
@@ -1425,6 +1691,26 @@ def _normalized_prompt_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
+def _request_voice_profiles(request: dict[str, Any]) -> dict[str, str]:
+    """Read immutable S# delivery phrases from the raw production bible."""
+    raw = request.get("production_bible")
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    result: dict[str, str] = {}
+    for item in value.get("speaker_voice_profiles", ()) if isinstance(value, dict) else ():
+        if not isinstance(item, dict):
+            continue
+        speaker_id = str(item.get("speaker_id") or "").strip().upper().strip("()")
+        profile = item.get("voice_profile")
+        if re.fullmatch(r"S\d+", speaker_id) and isinstance(profile, str) and profile.strip():
+            result[speaker_id] = profile.strip()
+    return result
+
+
 def _mandatory_coverage_warnings(value: dict[str, Any], request: dict[str, Any], description: str) -> list[str]:
     """Check Gemma's own attestation of the current planned beat intersections.
 
@@ -1443,6 +1729,7 @@ def _mandatory_coverage_warnings(value: dict[str, Any], request: dict[str, Any],
     }
     if not required:
         return []
+    voice_profiles = _request_voice_profiles(request)
     supplied = value.get("coverage")
     if not isinstance(supplied, list):
         return ["Gemma 4 mandatory coverage requires a coverage JSON array"]
@@ -1486,8 +1773,34 @@ def _mandatory_coverage_warnings(value: dict[str, Any], request: dict[str, Any],
             for dialogue in expected_dialogues:
                 if dialogue and dialogue not in actual_dialogues:
                     warnings.append(
-                        f"Gemma 4 mandatory coverage {beat_id} requires its exact dialogue in detailed_description"
+                        f"Gemma 4 mandatory coverage {beat_id} requires its exact assigned dialogue segment in detailed_description"
                     )
+                    continue
+                action = str(expected.get("action", ""))
+                source_match = next(
+                    (match for match in _DIALOGUE.finditer(action) if _dialogue_text(match.group(1)) == dialogue),
+                    None,
+                )
+                speaker_id = "" if source_match is None else _dialogue_speaker_id(action, source_match.start())
+                voice_profile = voice_profiles.get(speaker_id)
+                for match in _DIALOGUE.finditer(description):
+                    if _dialogue_text(match.group(1)) != dialogue:
+                        continue
+                    prefix = description[:match.start()]
+                    previous_dialogue_end = prefix.rfind("</d>")
+                    local_prefix = prefix[previous_dialogue_end + 4:] if previous_dialogue_end >= 0 else prefix
+                    normalized_prefix = _normalized_prompt_text(local_prefix)
+                    if voice_profile and _normalized_prompt_text(voice_profile) not in normalized_prefix:
+                        warnings.append(
+                            f"Gemma 4 mandatory coverage {beat_id} must repeat immutable {speaker_id} voice profile "
+                            f"{voice_profile!r} outside its <d> block"
+                        )
+                    if expected.get("dialogue_continuation") and "continues uninterrupted" not in normalized_prefix:
+                        warnings.append(
+                            f"Gemma 4 mandatory coverage {beat_id} must state that {speaker_id or 'the speaker'} "
+                            "continues uninterrupted"
+                        )
+                    break
 
     for beat_id in records.keys() - required.keys():
         warnings.append(f"Gemma 4 mandatory coverage includes unknown beat {beat_id}")
@@ -1500,7 +1813,8 @@ def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequen
     mandatory = request.get("mandatory_coverage", ())
     required_coverage = "\n".join(
         f"- {item['id']} ({item['kind']}{'/' + str(item['overlay_type']) if item.get('overlay_type') else ''}): "
-        f"source-relative frames {item['overlap_start_frame']}-{item['overlap_end_frame'] - 1}; {item['action']}"
+        f"source-relative frames {item['overlap_start_frame']}-{item['overlap_end_frame'] - 1}; "
+        f"{item['action']}"
         for item in mandatory
         if isinstance(item, dict) and item.get("id")
     ) or "- No current-slice coverage entries are required."
@@ -1518,26 +1832,42 @@ def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequen
         for dialogue, subject, speaker_id in _mapped_dialogue_speaker_requirements(request)
         if dialogue in current_dialogue
     ) or "- No mapped dialogue speaker form is required in this slice."
+    voice_profiles = _request_voice_profiles(request)
+    voice_profile_text = "\n".join(
+        f"- {speaker_id}: repeat verbatim outside <d>: {profile}"
+        for speaker_id, profile in sorted(voice_profiles.items())
+    ) or "- No immutable voice profile is available."
     return (
         "CHUNK CONTRACT CORRECTION REQUIRED\n"
-        "Your immediately preceding JSON was missing a required field or violated the H3 local-marker, persistent-state, "
+        "Your immediately preceding JSON was missing a required field or violated the H3 shot-marker, persistent-state, "
         "dialogue, or mandatory current-slice coverage contract. "
         "Return one complete replacement JSON object "
-        "with all seven required fields, not an explanation and not a textual patch. Keep the same current-frame-slice "
+        "with all eight required fields, not an explanation and not a textual patch. Keep the same current-frame-slice "
         "creative intent and continuity reasoning, but rewrite detailed_description and coverage so every current beat "
         "is explicitly started or continued now. A current beat may never be marked deferred. For dialogue coverage, "
-        "include the exact <d>...</d> line in detailed_description now. A mapped visual speaker must use the immediate "
+        "include only the exact assigned dialogue-segment <d>...</d> line in detailed_description now. Never expand it "
+        "back to the complete source utterance or repeat words assigned to a previous chunk. A mapped visual speaker "
+        "must use the immediate "
         "official form <Subject N> (Sx) before that line, not Name (<Subject N>) (Sx). Use evidence copied exactly "
-        "from your rewritten detailed_description.\n\nMapped dialogue speaker form:\n"
+        "from your rewritten detailed_description. For a continuation segment, state that the speaker `continues "
+        "uninterrupted`. Never add an At timecode to dialogue.\n\nMapped dialogue speaker form:\n"
         + speaker_forms
-        + "\n\nH3 local marker contract:\n"
+        + "\n\nImmutable speaker voice profiles:\n"
+        + voice_profile_text
+        + "\n\nH3 marker contract (global shot labels, chunk-local timecodes):\n"
         f"{_required_local_markers(shots)}\n\n"
         "Persistent last-seen character state contract:\n"
         f"{_last_seen_character_state_contract(request)}\n\n"
+        "H3-facing retention_analysis contract:\n"
+        f"{request.get('planned_character_continuity') or 'No planned characters apply to this slice.'}\n"
+        "Return a short retention_analysis value covering every participating mapped character's actual entry "
+        "location and physical state. Do not mention Gemma, last-seen memory, tables, plans, or future transitions. "
+        "Also include every participating character in detailed_description and describe how current action moves "
+        "from the latest rendered state toward that character's expected slice-exit state.\n\n"
         "Mandatory current-slice coverage:\n"
         + required_coverage
-        + "\n\nThe source/global timestamps in the original prompt describe the full video and must not be used as markers "
-        "inside this physical chunk. Do not add, remove, renumber, or move cuts.\n\n"
+        + "\n\nThe original full-video timestamps must not be used as markers inside this physical chunk. Preserve every "
+        "global shot number exactly, use only the supplied chunk-local timecodes, and do not add, remove, or move cuts.\n\n"
         "Detected validation errors in the preceding JSON:\n"
         + "\n".join(f"- {warning}" for warning in warnings)
     )
@@ -1548,8 +1878,10 @@ def _chunk_contract_followup_request(warnings: Sequence[str]) -> str:
     return (
         "CHUNK JSON REPAIR STILL REQUIRED\n"
         "The complete chunk contract is in the immediately preceding user turn. Do not repeat or explain it. "
-        "Return one complete JSON object now with exactly these seven fields: confidence, analysis, timing_plan, "
-        "end_state, last_seen_character_state, coverage, and detailed_description. detailed_description must be "
+        "Return one complete JSON object now with exactly these eight fields: confidence, analysis, timing_plan, "
+        "end_state, retention_analysis, last_seen_character_state, coverage, and detailed_description. "
+        "retention_analysis must be a short H3-facing string covering every participating character. "
+        "detailed_description must be "
         "a non-empty JSON string containing the complete H3-facing prompt; coverage and "
         "last_seen_character_state must be arrays. Correct these remaining errors:\n"
         + "\n".join(f"- {warning}" for warning in warnings)
@@ -1563,13 +1895,14 @@ def _marker_contract_followup_request(
     return (
         "H3 SHOT-MARKER REPAIR STILL REQUIRED\n"
         "Python rejected the marker structure in your immediately preceding JSON. Return one complete replacement "
-        "JSON object with the same seven fields. Preserve the intended actions, dialogue, continuity, coverage, and "
-        "observed character state, but rewrite detailed_description so its [Shot] markers obey this exact semantic "
+        "JSON object with the same eight fields. Preserve the intended actions, dialogue, continuity, retention, coverage, and "
+        "observed character state, but rewrite detailed_description so its global [Shot N] labels and chunk-local "
+        "At timecodes obey this exact semantic "
         "transition map:\n\n"
         f"{_required_local_markers(request['target_shots'])}\n\n"
         "The prose before the first supplied marker belongs only to the already-continuing global source shot. "
         "The exact marker introduces the next global source shot shown in the map; it must not restart or relabel "
-        "the preceding shot. Delete every invented or copied global marker.\n\n"
+        "the preceding shot. Delete every invented marker and every marker carrying an original full-video timecode.\n\n"
         "Detected marker errors in the preceding JSON:\n"
         + "\n".join(f"- {warning}" for warning in warnings)
     )
@@ -1614,7 +1947,36 @@ def _mapped_dialogue_speaker_requirements(request: dict[str, Any]) -> tuple[tupl
                 if requirement not in requirements:
                     requirements.append(requirement)
                 break
+    # A later physical chunk receives only its immutable dialogue fragment.
+    # Carry the source speaker binding onto that fragment so the official H3
+    # speaker form remains validated without requiring the full utterance.
+    for item in request.get("mandatory_coverage", ()):
+        if not isinstance(item, dict) or item.get("overlay_type") != "dialogue":
+            continue
+        segment_matches = _DIALOGUE.findall(str(item.get("action") or ""))
+        if len(segment_matches) != 1:
+            continue
+        segment_dialogue = _dialogue_text(segment_matches[0])
+        segment_language, segment_spoken = _dialogue_language_and_spoken_text(segment_matches[0])
+        for full_dialogue, subject, speaker_id in tuple(requirements):
+            full_language, full_spoken = _dialogue_language_and_spoken_text(full_dialogue)
+            if segment_language == full_language and segment_spoken and segment_spoken in full_spoken:
+                requirement = (segment_dialogue, subject, speaker_id)
+                if requirement not in requirements:
+                    requirements.append(requirement)
+                break
     return tuple(requirements)
+
+
+def _dialogue_is_source_fragment(output_dialogue: str, source_dialogue: str) -> bool:
+    """Return whether one chunk-owned dialogue fragment is exact source text."""
+    output_language, output_spoken = _dialogue_language_and_spoken_text(output_dialogue)
+    source_language, source_spoken = _dialogue_language_and_spoken_text(source_dialogue)
+    return (
+        bool(output_spoken)
+        and output_language == source_language
+        and output_spoken in source_spoken
+    )
 
 
 def _dialogue_speaker_form_warnings(request: dict[str, Any], description: str) -> list[str]:
@@ -1690,6 +2052,35 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
         end_state = ""
     else:
         end_state = end_state.strip()
+    retention_analysis = value.get("retention_analysis", "")
+    if not isinstance(retention_analysis, str):
+        warnings.append("Gemma 4 retention_analysis must be a string")
+        retention_analysis = ""
+    else:
+        retention_analysis = retention_analysis.strip()
+    expected_characters = tuple(
+        item for item in request.get("current_character_subjects", ())
+        if isinstance(item, dict)
+    )
+    if expected_characters and not retention_analysis:
+        warnings.append("Gemma 4 retention_analysis is empty despite planned characters in this slice")
+    if retention_analysis:
+        if len(retention_analysis) > 1600:
+            warnings.append("Gemma 4 retention_analysis is too long; keep it short and physical")
+        if re.search(
+            r"(?i)\b(?:Gemma|last[- ]seen|continuity state relevant|bookkeeping|preproduction table)\b",
+            retention_analysis,
+        ):
+            warnings.append("Gemma 4 retention_analysis exposes internal Gemma/bookkeeping language to H3")
+        if re.search(r"(?i)\bretention_analysis\s*:", retention_analysis):
+            warnings.append("Gemma 4 retention_analysis must contain only its value, not the field label")
+        for character in expected_characters:
+            name = str(character.get("character_name") or "").strip()
+            subject = str(character.get("subject") or "").strip()
+            if subject and re.search(re.escape(subject), retention_analysis, re.IGNORECASE) is None:
+                warnings.append(
+                    f"Gemma 4 retention_analysis omits planned character {name or subject} ({subject})"
+                )
     last_seen_character_state, state_warnings = _validate_last_seen_character_state(value, request)
     warnings.extend(state_warnings)
     description = value.get("detailed_description")
@@ -1713,6 +2104,14 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
             )
     if not description:
         raise Gemma4ObservationError("Gemma 4 detailed_description contains only Gemma-only end-state metadata")
+    for character in expected_characters:
+        name = str(character.get("character_name") or "").strip()
+        subject = str(character.get("subject") or "").strip()
+        if subject and re.search(re.escape(subject), description, re.IGNORECASE) is None:
+            warnings.append(
+                f"Gemma 4 character continuity detailed_description omits planned character "
+                f"{name or subject} ({subject}) and cannot describe that character's current-to-expected transition"
+            )
     if not end_state:
         warnings.append("Gemma 4 response has no usable end_state after legacy extraction")
     if len(description) > 12000:
@@ -1744,7 +2143,7 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
     source_dialogue = [_dialogue_text(item) for item in _DIALOGUE.findall(str(request["original_prompt"]))]
     for output_dialogue in _DIALOGUE.findall(description):
         text = _dialogue_text(output_dialogue)
-        if not text or not any(text in source or source in text for source in source_dialogue):
+        if not text or not any(_dialogue_is_source_fragment(text, source) for source in source_dialogue):
             warnings.append("Gemma 4 modified or invented dialogue instead of preserving source words")
     warnings.extend(_dialogue_speaker_form_warnings(request, description))
     warnings.extend(_mandatory_coverage_warnings(value, request, description))
@@ -1756,6 +2155,7 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
         raw_json=raw_json,
         timing_plan=timing_plan,
         end_state=end_state,
+        retention_analysis=retention_analysis,
         last_seen_character_state=last_seen_character_state,
         system_prompt=system_prompt,
         observation_prompt=observation_prompt,
@@ -1771,6 +2171,7 @@ def _chunk_prompt_payload(result: GemmaChunkPrompt) -> dict[str, Any]:
         "raw_json": result.raw_json,
         "timing_plan": result.timing_plan,
         "end_state": result.end_state,
+        "retention_analysis": result.retention_analysis,
         "last_seen_character_state": list(result.last_seen_character_state),
         "system_prompt": result.system_prompt,
         "observation_prompt": result.observation_prompt,
@@ -1795,6 +2196,7 @@ def _chunk_prompt_from_payload(value: dict[str, Any]) -> GemmaChunkPrompt:
         raw_json=str(value["raw_json"]),
         timing_plan=str(value.get("timing_plan", "")),
         end_state=str(value.get("end_state", "")),
+        retention_analysis=str(value.get("retention_analysis", "")),
         last_seen_character_state=tuple(
             dict(item) for item in value.get("last_seen_character_state", ()) if isinstance(item, dict)
         ),
@@ -1830,6 +2232,7 @@ def _timing_plan_payload(result: GemmaShotTimingPlan) -> dict[str, Any]:
                 "source_shot": shot.source_shot,
                 "shot_start_frame": shot.shot_start_frame,
                 "shot_end_frame": shot.shot_end_frame,
+                "light_change": shot.light_change,
                 "visual_beats": [
                     {
                         "start_frame": beat.start_frame,
@@ -1844,13 +2247,40 @@ def _timing_plan_payload(result: GemmaShotTimingPlan) -> dict[str, Any]:
                         "end_frame": overlay.end_frame,
                         "type": overlay.overlay_type,
                         "content": overlay.content,
+                        "continues_source_dialogue": overlay.continues_source_dialogue,
+                        "dialogue_segments": [
+                            {
+                                "start_frame": segment.start_frame,
+                                "end_frame": segment.end_frame,
+                                "content": segment.content,
+                            }
+                            for segment in overlay.dialogue_segments
+                        ],
                     }
                     for overlay in shot.overlays
+                ],
+                "continuity_slices": [
+                    {
+                        "start_frame": continuity.start_frame,
+                        "end_frame": continuity.end_frame,
+                        "characters": [
+                            {
+                                "character_name": character.character_name,
+                                "subject": character.subject,
+                                "entry_state": character.entry_state,
+                                "expected_exit_state": character.expected_exit_state,
+                            }
+                            for character in continuity.characters
+                        ],
+                    }
+                    for continuity in shot.continuity_slices
                 ],
             }
             for shot in result.shots
         ],
         "raw_json": result.raw_json,
+        "production_bible_json": result.production_bible_json,
+        "shot_planning_prompts": list(result.shot_planning_prompts),
         "system_prompt": result.system_prompt,
         "planning_prompt": result.planning_prompt,
         "validation_warnings": list(result.validation_warnings),
@@ -1894,9 +2324,37 @@ def _timing_plan_from_payload(value: dict[str, Any]) -> GemmaShotTimingPlan:
                 end_frame=int(overlay["end_frame"]),
                 overlay_type=str(overlay["type"]),
                 content=str(overlay["content"]),
+                dialogue_segments=tuple(
+                    GemmaDialogueSegment(
+                        start_frame=int(segment["start_frame"]),
+                        end_frame=int(segment["end_frame"]),
+                        content=str(segment["content"]),
+                    )
+                    for segment in overlay.get("dialogue_segments", ())
+                    if isinstance(segment, dict)
+                ),
+                continues_source_dialogue=bool(overlay.get("continues_source_dialogue", False)),
             )
             for overlay in item.get("overlays", ())
             if isinstance(overlay, dict)
+        )
+        continuity_slices = tuple(
+            GemmaShotContinuitySlice(
+                start_frame=int(continuity["start_frame"]),
+                end_frame=int(continuity["end_frame"]),
+                characters=tuple(
+                    GemmaCharacterContinuity(
+                        character_name=str(character["character_name"]),
+                        subject=str(character["subject"]),
+                        entry_state=str(character["entry_state"]),
+                        expected_exit_state=str(character["expected_exit_state"]),
+                    )
+                    for character in continuity.get("characters", ())
+                    if isinstance(character, dict)
+                ),
+            )
+            for continuity in item.get("continuity_slices", ())
+            if isinstance(continuity, dict)
         )
         shots.append(
             GemmaShotTimingShot(
@@ -1905,6 +2363,11 @@ def _timing_plan_from_payload(value: dict[str, Any]) -> GemmaShotTimingPlan:
                 shot_end_frame=int(item["shot_end_frame"]),
                 visual_beats=visual_beats,
                 overlays=overlays,
+                continuity_slices=continuity_slices,
+                # Old interrupted-render checkpoints have no lighting
+                # decision. Treat them conservatively: do not alter their
+                # completed output until Gemma rebuilds the timing plan.
+                light_change=bool(item.get("light_change", True)),
             )
         )
     return GemmaShotTimingPlan(
@@ -1913,6 +2376,8 @@ def _timing_plan_from_payload(value: dict[str, Any]) -> GemmaShotTimingPlan:
         shots=tuple(shots),
         character_name_table=character_name_table,
         raw_json=str(value.get("raw_json", "")),
+        production_bible_json=str(value.get("production_bible_json", "")),
+        shot_planning_prompts=tuple(str(item) for item in value.get("shot_planning_prompts", ())),
         system_prompt=str(value.get("system_prompt", "")),
         planning_prompt=str(value.get("planning_prompt", "")),
         validation_warnings=tuple(str(item) for item in value.get("validation_warnings", ())),
@@ -1961,6 +2426,608 @@ def _validate_character_name_table(value: dict[str, Any], raw_json: str) -> tupl
     return tuple(table)
 
 
+def _declared_character_subject_mappings(prompt: str) -> tuple[GemmaCharacterSubject, ...]:
+    """Extract unambiguous ``Name is <Subject N>`` declarations from source text."""
+    result: list[GemmaCharacterSubject] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"(?mi)^\s*([A-Za-z][A-Za-z0-9_' -]{0,80}?)\s+is\s+(<Subject\s+\d+>)\s*\.?\s*$",
+        prompt,
+    ):
+        name = match.group(1).strip()
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(GemmaCharacterSubject(name, match.group(2).strip()))
+    return tuple(result)
+
+
+def _declared_speaker_ids(prompt: str) -> tuple[str, ...]:
+    """Return explicit stable speaker IDs that introduce source dialogue."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for match in _DIALOGUE.finditer(prompt):
+        prefix = prompt[max(0, match.start() - 400):match.start()]
+        speaker = re.search(r"\(\s*(S\d+)\s*\)[^<]*$", prefix, re.IGNORECASE | re.DOTALL)
+        if speaker is None:
+            continue
+        speaker_id = speaker.group(1).upper()
+        if speaker_id not in seen:
+            seen.add(speaker_id)
+            result.append(speaker_id)
+    return tuple(result)
+
+
+def _validate_speaker_voice_profiles(value: dict[str, Any], prompt: str, raw_json: str) -> None:
+    """Require one immutable delivery profile for every explicitly numbered voice."""
+    raw_profiles = value.get("speaker_voice_profiles")
+    if not isinstance(raw_profiles, list):
+        raise _timing_plan_validation_error(
+            "response field 'speaker_voice_profiles' must be an array",
+            raw_json,
+        )
+    supplied: set[str] = set()
+    for item in raw_profiles:
+        if not isinstance(item, dict):
+            raise _timing_plan_validation_error(
+                "every speaker_voice_profiles entry must be an object",
+                raw_json,
+            )
+        speaker_id = str(item.get("speaker_id") or "").strip().upper().strip("()")
+        source = item.get("source")
+        profile = item.get("voice_profile")
+        if not re.fullmatch(r"S\d+", speaker_id):
+            raise _timing_plan_validation_error(
+                "speaker_voice_profiles entries need a valid S# speaker_id",
+                raw_json,
+            )
+        if speaker_id in supplied:
+            raise _timing_plan_validation_error(
+                f"speaker_voice_profiles repeats {speaker_id}",
+                raw_json,
+            )
+        if not isinstance(source, str) or not source.strip():
+            raise _timing_plan_validation_error(
+                f"speaker_voice_profiles {speaker_id} needs a non-empty source",
+                raw_json,
+            )
+        if not isinstance(profile, str) or not profile.strip():
+            raise _timing_plan_validation_error(
+                f"speaker_voice_profiles {speaker_id} needs a non-empty voice_profile",
+                raw_json,
+            )
+        supplied.add(speaker_id)
+    missing = set(_declared_speaker_ids(prompt)) - supplied
+    if missing:
+        raise _timing_plan_validation_error(
+            "speaker_voice_profiles omits explicit source speaker(s): " + ", ".join(sorted(missing)),
+            raw_json,
+        )
+
+
+def _validate_production_bible(
+    value: dict[str, Any], request: dict[str, Any], raw_json: str,
+) -> tuple[str, str, tuple[GemmaCharacterSubject, ...]]:
+    """Validate the immutable global production pass without timing any shot."""
+    confidence = value.get("confidence", "unknown")
+    if confidence not in {"high", "medium", "low", "unknown"}:
+        confidence = "unknown"
+    analysis = value.get("analysis")
+    if not isinstance(analysis, str) or not analysis.strip():
+        raise _timing_plan_validation_error("global production bible needs a concise analysis string", raw_json)
+    table = _validate_character_name_table(value, raw_json)
+    _validate_speaker_voice_profiles(
+        value,
+        str(request.get("original_prompt") or ""),
+        raw_json,
+    )
+    known = {item.character_name.casefold(): item for item in table}
+    declared = _declared_character_subject_mappings(str(request.get("original_prompt") or ""))
+    declared_by_name = {item.character_name.casefold(): item for item in declared}
+    missing_declarations = set(declared_by_name) - set(known)
+    wrong_declarations = {
+        key for key in set(declared_by_name) & set(known)
+        if declared_by_name[key].subject.casefold() != known[key].subject.casefold()
+    }
+    if missing_declarations or wrong_declarations:
+        missing_text = ", ".join(
+            f"{declared_by_name[key].character_name} -> {declared_by_name[key].subject}"
+            for key in sorted(missing_declarations | wrong_declarations)
+        )
+        raise _timing_plan_validation_error(
+            f"global character_name_table omits or changes explicit source mapping(s): {missing_text}", raw_json
+        )
+    expected_shots = list(request.get("source_shots", ()))
+    supplied_shots = value.get("shots")
+    if not isinstance(supplied_shots, list) or len(supplied_shots) != len(expected_shots):
+        count = len(supplied_shots) if isinstance(supplied_shots, list) else "non-array"
+        raise _timing_plan_validation_error(
+            f"global production bible has {count} shot records; expected {len(expected_shots)}", raw_json
+        )
+    for expected, supplied in zip(expected_shots, supplied_shots, strict=True):
+        if not isinstance(supplied, dict):
+            raise _timing_plan_validation_error("every global shot record must be an object", raw_json)
+        shot_number = int(expected["shot_number"])
+        try:
+            supplied_number = int(supplied["source_shot"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise _timing_plan_validation_error(
+                f"global Source Shot {shot_number} record needs its integer source_shot", raw_json
+            ) from error
+        if supplied_number != shot_number:
+            raise _timing_plan_validation_error(
+                f"global production bible expected Source Shot {shot_number}, received {supplied_number}", raw_json
+            )
+        for field in ("shot_intent", "environment", "camera_and_cut"):
+            text = supplied.get(field)
+            if not isinstance(text, str) or not text.strip():
+                raise _timing_plan_validation_error(
+                    f"global Source Shot {shot_number} needs a non-empty {field}", raw_json
+                )
+        raw_characters = supplied.get("characters")
+        if not isinstance(raw_characters, list):
+            raise _timing_plan_validation_error(
+                f"global Source Shot {shot_number} characters must be an array", raw_json
+            )
+        seen: set[str] = set()
+        for character in raw_characters:
+            if not isinstance(character, dict):
+                raise _timing_plan_validation_error(
+                    f"global Source Shot {shot_number} has a non-object character state", raw_json
+                )
+            name = character.get("character_name")
+            if not isinstance(name, str) or name.strip().casefold() not in known:
+                raise _timing_plan_validation_error(
+                    f"global Source Shot {shot_number} character_name must use the immutable table", raw_json
+                )
+            table_entry = known[name.strip().casefold()]
+            key = table_entry.character_name.casefold()
+            if key in seen:
+                raise _timing_plan_validation_error(
+                    f"global Source Shot {shot_number} repeats {table_entry.character_name!r}", raw_json
+                )
+            seen.add(key)
+            if str(character.get("subject") or "").strip().casefold() != table_entry.subject.casefold():
+                raise _timing_plan_validation_error(
+                    f"global Source Shot {shot_number} maps {table_entry.character_name!r} to the wrong subject",
+                    raw_json,
+                )
+            for field in ("opening_state", "closing_state"):
+                text = character.get(field)
+                if not isinstance(text, str) or not text.strip():
+                    raise _timing_plan_validation_error(
+                        f"global Source Shot {shot_number} needs {field} for {table_entry.character_name}", raw_json
+                    )
+        source_body = str(expected.get("source_body") or "")
+        explicitly_named = {
+            item.character_name.casefold()
+            for item in table
+            if re.search(rf"(?i)(?<!\w){re.escape(item.character_name)}(?!\w)", source_body)
+        }
+        missing = explicitly_named - seen
+        if missing:
+            names = ", ".join(known[key].character_name for key in sorted(missing))
+            raise _timing_plan_validation_error(
+                f"global Source Shot {shot_number} omits explicitly participating character(s): {names}", raw_json
+            )
+    return str(confidence), analysis.strip(), table
+
+
+def _expected_continuity_intervals(
+    source_shot: dict[str, Any],
+    request: dict[str, Any],
+) -> tuple[tuple[int, int], ...]:
+    """Return exact source-relative pieces owned by physical output chunks."""
+    shot_start = int(source_shot["shot_start"])
+    shot_end = int(source_shot["shot_end"])
+    intervals: list[tuple[int, int]] = []
+    for chunk in request.get("chunks", ()):
+        start = max(shot_start, int(chunk["output_start"]))
+        end = min(shot_end, int(chunk["output_end"]))
+        if start < end:
+            intervals.append((start - shot_start, end - shot_start))
+    return tuple(intervals)
+
+
+def _dialogue_language_and_spoken_text(value: str) -> tuple[str, str]:
+    """Split normalized ``<d>`` content into its language tag and spoken text."""
+    normalized = _dialogue_text(value)
+    match = re.match(r"^(\[[^\]\r\n]+\])(?:\s+|$)(.*)$", normalized, re.DOTALL)
+    if match is None:
+        return "", normalized
+    return match.group(1), match.group(2).strip()
+
+
+def _dialogue_segment_intervals(
+    start_frame: int,
+    end_frame: int,
+    expected_shot: dict[str, Any],
+    request: dict[str, Any],
+) -> tuple[tuple[int, int], ...]:
+    """Intersect one utterance with non-overlapping retained chunk ownership."""
+    return tuple(
+        (max(start_frame, owned_start), min(end_frame, owned_end))
+        for owned_start, owned_end in _expected_continuity_intervals(expected_shot, request)
+        if max(start_frame, owned_start) < min(end_frame, owned_end)
+    )
+
+
+def _validate_dialogue_segments(
+    raw_overlay: dict[str, Any],
+    *,
+    shot_number: int,
+    overlay_index: int,
+    start_frame: int,
+    end_frame: int,
+    full_content: str,
+    expected_shot: dict[str, Any],
+    request: dict[str, Any],
+    raw_json: str,
+) -> tuple[GemmaDialogueSegment, ...]:
+    """Validate a word-exact, retained-slice partition of one utterance.
+
+    Gemma chooses natural phrase boundaries during preproduction. Python owns
+    only the immutable physical ownership intervals and verifies that the
+    resulting pieces neither repeat nor lose any source dialogue tokens.
+    """
+    full_matches = _DIALOGUE.findall(full_content)
+    if len(full_matches) != 1:
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} dialogue overlay {overlay_index} content must contain exactly one <d>...</d> line",
+            raw_json,
+        )
+    full_language, full_spoken = _dialogue_language_and_spoken_text(full_matches[0])
+    if not full_spoken:
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} dialogue overlay {overlay_index} has no spoken words",
+            raw_json,
+        )
+    expected_intervals = _dialogue_segment_intervals(
+        start_frame,
+        end_frame,
+        expected_shot,
+        request,
+    )
+    supplied_segments = raw_overlay.get("dialogue_segments")
+    if not isinstance(supplied_segments, list):
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} dialogue overlay {overlay_index} dialogue_segments must be an array",
+            raw_json,
+        )
+    if len(supplied_segments) != len(expected_intervals):
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} dialogue overlay {overlay_index} needs {len(expected_intervals)} "
+            f"dialogue_segments matching retained chunk ownership; received {len(supplied_segments)}",
+            raw_json,
+        )
+
+    normalized: list[GemmaDialogueSegment] = []
+    spoken_parts: list[str] = []
+    for segment_index, (raw_segment, expected_interval) in enumerate(
+        zip(supplied_segments, expected_intervals, strict=True), 1
+    ):
+        if not isinstance(raw_segment, dict):
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} must be an object",
+                raw_json,
+            )
+        try:
+            segment_start = int(raw_segment["start_frame"])
+            segment_end = int(raw_segment["end_frame"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} needs integer frames",
+                raw_json,
+            ) from error
+        if (segment_start, segment_end) != expected_interval:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} must cover "
+                f"source-relative half-open interval {expected_interval[0]}-{expected_interval[1]}; "
+                f"received {segment_start}-{segment_end}",
+                raw_json,
+            )
+        segment_content = raw_segment.get("content")
+        if not isinstance(segment_content, str) or not segment_content.strip():
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} needs content",
+                raw_json,
+            )
+        segment_matches = _DIALOGUE.findall(segment_content)
+        if len(segment_matches) != 1:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} must contain exactly one <d>...</d> line",
+                raw_json,
+            )
+        segment_language, segment_spoken = _dialogue_language_and_spoken_text(segment_matches[0])
+        if segment_language != full_language or not segment_spoken:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} segment {segment_index} must preserve "
+                f"the {full_language or 'source'} language tag and contain spoken words",
+                raw_json,
+            )
+        spoken_parts.append(segment_spoken)
+        normalized.append(GemmaDialogueSegment(segment_start, segment_end, segment_content.strip()))
+
+    if " ".join(spoken_parts).split() != full_spoken.split():
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} dialogue overlay {overlay_index} dialogue_segments must concatenate to "
+            "every original dialogue word and punctuation token exactly once, in order",
+            raw_json,
+        )
+    return tuple(normalized)
+
+
+def _dialogue_speaker_id(source: str, dialogue_start: int) -> str:
+    """Return the stable ``S#`` immediately introducing one dialogue tag."""
+    prefix = source[max(0, dialogue_start - 400):dialogue_start]
+    match = re.search(r"\(\s*(S\d+)\s*\)[^<]*$", prefix, re.IGNORECASE | re.DOTALL)
+    return match.group(1).upper() if match is not None else ""
+
+
+def _dialogue_token_stream(source: str) -> list[tuple[str, str, str]]:
+    """Represent dialogue as speaker/language/token triples in source order."""
+    result: list[tuple[str, str, str]] = []
+    for match in _DIALOGUE.finditer(source):
+        language, spoken = _dialogue_language_and_spoken_text(match.group(1))
+        speaker = _dialogue_speaker_id(source, match.start())
+        result.extend((speaker, language, token) for token in spoken.split())
+    return result
+
+
+def _validate_shot_dialogue_reconstruction(
+    overlays: Sequence[GemmaShotTimingOverlay],
+    expected_shot: dict[str, Any],
+    raw_json: str,
+) -> tuple[GemmaShotTimingOverlay, ...]:
+    """Require chronological overlay fragments to reconstruct source speech.
+
+    One source ``<d>`` block may be many minutes long. Gemma is free to split
+    it into multiple time-owned overlays, but those overlays collectively must
+    preserve speaker, language, words, punctuation, and order exactly once.
+    """
+    shot_number = int(expected_shot["shot_number"])
+    expected_stream = _dialogue_token_stream(str(expected_shot.get("source_body") or ""))
+    indexed_dialogue = [
+        (index, overlay)
+        for index, overlay in enumerate(overlays)
+        if overlay.overlay_type == "dialogue"
+    ]
+    chronological = [
+        overlay
+        for _index, overlay in sorted(
+            indexed_dialogue,
+            key=lambda item: (item[1].start_frame, item[1].end_frame, item[0]),
+        )
+    ]
+    actual_stream: list[tuple[str, str, str]] = []
+    for overlay in chronological:
+        actual_stream.extend(_dialogue_token_stream(overlay.content))
+    def token_matches(actual: tuple[str, str, str], expected: tuple[str, str, str]) -> bool:
+        actual_speaker, actual_language, actual_token = actual
+        expected_speaker, expected_language, expected_token = expected
+        return (
+            actual_language == expected_language
+            and actual_token == expected_token
+            and (not expected_speaker or actual_speaker == expected_speaker)
+        )
+
+    streams_match = len(actual_stream) == len(expected_stream) and all(
+        token_matches(actual, expected)
+        for actual, expected in zip(actual_stream, expected_stream, strict=True)
+    )
+    if not streams_match:
+        mismatch = next(
+            (
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(actual_stream, expected_stream, strict=False),
+                )
+                if not token_matches(actual, expected)
+            ),
+            min(len(actual_stream), len(expected_stream)),
+        )
+        expected_near = expected_stream[mismatch:mismatch + 5]
+        actual_near = actual_stream[mismatch:mismatch + 5]
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} chronological dialogue overlay contents must reconstruct every source "
+            f"<d> speaker/language/word/punctuation token exactly once; first mismatch at token {mismatch + 1} "
+            f"(expected {expected_near!r}, received {actual_near!r})",
+            raw_json,
+        )
+    source_dialogue_starts: set[int] = set()
+    source_offset = 0
+    source_body = str(expected_shot.get("source_body") or "")
+    for match in _DIALOGUE.finditer(source_body):
+        source_dialogue_starts.add(source_offset)
+        _language, spoken = _dialogue_language_and_spoken_text(match.group(1))
+        source_offset += len(spoken.split())
+
+    normalized = list(overlays)
+    actual_offset = 0
+    for original_index, overlay in sorted(
+        indexed_dialogue,
+        key=lambda item: (item[1].start_frame, item[1].end_frame, item[0]),
+    ):
+        normalized[original_index] = replace(
+            overlay,
+            continues_source_dialogue=actual_offset not in source_dialogue_starts,
+        )
+        actual_offset += len(_dialogue_token_stream(overlay.content))
+    return tuple(normalized)
+
+
+def _validate_dialogue_speaking_density(
+    overlays: Sequence[GemmaShotTimingOverlay],
+    expected_shot: dict[str, Any],
+    request: dict[str, Any],
+    raw_json: str,
+) -> None:
+    """Reject dialogue schedules too dense for H3 to deliver naturally.
+
+    Gemma owns phrase boundaries and dramatic pacing, but a hard upper guard
+    prevents a correction pass from satisfying structural frame coverage by
+    cramming a long speech into the first few chunks and padding the remaining
+    source shot with silence.
+    """
+    try:
+        fps = float(request.get("fps", 24.0))
+    except (TypeError, ValueError):
+        fps = 24.0
+    if fps <= 0:
+        fps = 24.0
+    shot_number = int(expected_shot["shot_number"])
+    for overlay_index, overlay in enumerate(overlays, 1):
+        if overlay.overlay_type != "dialogue":
+            continue
+        word_count = len(_dialogue_token_stream(overlay.content))
+        duration_seconds = (overlay.end_frame - overlay.start_frame) / fps
+        spoken_text = " ".join(
+            _dialogue_language_and_spoken_text(item)[1]
+            for item in _DIALOGUE.findall(overlay.content)
+        )
+        ellipsis_count = len(re.findall(r"(?:\.{3,}|…+)", spoken_text))
+        pause_seconds = ellipsis_count * GEMMA4_DIALOGUE_ELLIPSIS_SECONDS
+        delivery_seconds = max(0.0, duration_seconds - pause_seconds)
+        capacity = (
+            math.ceil(delivery_seconds * GEMMA4_MAX_DIALOGUE_WORDS_PER_SECOND)
+            + GEMMA4_DIALOGUE_BURST_WORD_ALLOWANCE
+        )
+        if word_count > capacity:
+            rate = word_count / delivery_seconds if delivery_seconds > 0 else math.inf
+            pause_detail = (
+                f" after reserving {pause_seconds:.3f}s for {ellipsis_count} ellipsis pause(s)"
+                if ellipsis_count else ""
+            )
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} dialogue overlay {overlay_index} compresses {word_count} spoken "
+                f"words into {duration_seconds:.3f}s{pause_detail} ({rate:.2f} words/s); the permissive maximum is "
+                f"{GEMMA4_MAX_DIALOGUE_WORDS_PER_SECOND:g} words/s plus a "
+                f"{GEMMA4_DIALOGUE_BURST_WORD_ALLOWANCE}-word short-phrase allowance. Extend this dialogue "
+                "across more of the source shot and split its exact words among chronological overlays/segments",
+                raw_json,
+            )
+
+
+def _validate_continuity_slices(
+    supplied: dict[str, Any],
+    expected_shot: dict[str, Any],
+    request: dict[str, Any],
+    character_name_table: tuple[GemmaCharacterSubject, ...],
+    raw_json: str,
+) -> tuple[GemmaShotContinuitySlice, ...]:
+    """Validate Gemma-owned per-slice entry/exit character state planning."""
+    shot_number = int(expected_shot["shot_number"])
+    expected_intervals = _expected_continuity_intervals(expected_shot, request)
+    raw_slices = supplied.get("continuity_slices")
+    if not isinstance(raw_slices, list):
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} continuity_slices must be an array", raw_json
+        )
+    if len(raw_slices) != len(expected_intervals):
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} needs {len(expected_intervals)} continuity_slices matching its physical "
+            f"output ownership; received {len(raw_slices)}", raw_json
+        )
+    known = {item.character_name.casefold(): item for item in character_name_table}
+    source_body = str(expected_shot.get("source_body") or "")
+    explicitly_named = {
+        item.character_name.casefold()
+        for item in character_name_table
+        if re.search(rf"(?i)(?<!\w){re.escape(item.character_name)}(?!\w)", source_body)
+    }
+    normalized: list[GemmaShotContinuitySlice] = []
+    seen_across_shot: set[str] = set()
+    for index, (raw_slice, expected_interval) in enumerate(
+        zip(raw_slices, expected_intervals, strict=True), 1
+    ):
+        if not isinstance(raw_slice, dict):
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} continuity slice {index} must be an object", raw_json
+            )
+        try:
+            start = int(raw_slice["start_frame"])
+            end = int(raw_slice["end_frame"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} continuity slice {index} needs integer start_frame and end_frame",
+                raw_json,
+            ) from error
+        if (start, end) != expected_interval:
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} continuity slice {index} must cover source-relative half-open "
+                f"interval {expected_interval[0]}-{expected_interval[1]}; received {start}-{end}", raw_json
+            )
+        raw_characters = raw_slice.get("characters")
+        if not isinstance(raw_characters, list):
+            raise _timing_plan_validation_error(
+                f"Source Shot {shot_number} continuity slice {index} characters must be an array", raw_json
+            )
+        characters: list[GemmaCharacterContinuity] = []
+        seen: set[str] = set()
+        for raw_character in raw_characters:
+            if not isinstance(raw_character, dict):
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} has a non-object character", raw_json
+                )
+            name = raw_character.get("character_name")
+            if not isinstance(name, str) or name.strip().casefold() not in known:
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} character_name must use the immutable table",
+                    raw_json,
+                )
+            table_entry = known[name.strip().casefold()]
+            key = table_entry.character_name.casefold()
+            if key in seen:
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} repeats {table_entry.character_name!r}",
+                    raw_json,
+                )
+            seen.add(key)
+            seen_across_shot.add(key)
+            subject = str(raw_character.get("subject") or "").strip()
+            if subject.casefold() != table_entry.subject.casefold():
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} maps {table_entry.character_name!r} "
+                    f"to {subject!r}; expected {table_entry.subject}", raw_json
+                )
+            entry_state = raw_character.get("entry_state")
+            exit_state = raw_character.get("expected_exit_state")
+            if not isinstance(entry_state, str) or not entry_state.strip():
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} needs a concise entry_state for "
+                    f"{table_entry.character_name}", raw_json
+                )
+            if not isinstance(exit_state, str) or not exit_state.strip():
+                raise _timing_plan_validation_error(
+                    f"Source Shot {shot_number} continuity slice {index} needs a concise expected_exit_state for "
+                    f"{table_entry.character_name}", raw_json
+                )
+            characters.append(
+                GemmaCharacterContinuity(
+                    table_entry.character_name,
+                    table_entry.subject,
+                    entry_state.strip(),
+                    exit_state.strip(),
+                )
+            )
+        normalized.append(GemmaShotContinuitySlice(start, end, tuple(characters)))
+    # A character named anywhere in the source shot must be tracked somewhere
+    # in that shot's continuity plan, but need not be invented in every physical
+    # slice.  For example, Tiamat is legitimately still hidden before emerging
+    # in Shot 7.  Requiring her in the opening slice was a false-positive render
+    # stopper; requiring her at least once still catches a genuinely incomplete
+    # continuity plan.
+    missing = explicitly_named - seen_across_shot
+    if missing:
+        names = ", ".join(known[key].character_name for key in sorted(missing))
+        raise _timing_plan_validation_error(
+            f"Source Shot {shot_number} continuity_slices omit explicitly named character(s) entirely: {names}",
+            raw_json,
+        )
+    return tuple(normalized)
+
+
 def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_json: str,
                           system_prompt: str = "", planning_prompt: str = "") -> GemmaShotTimingPlan:
     """Validate a complete Gemma-authored action schedule without rewriting it.
@@ -2007,6 +3074,11 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
         if not isinstance(raw_visual_beats, list) or not raw_visual_beats:
             raise _timing_plan_validation_error(
                 f"Source Shot {expected_number} needs one or more visual_beats objects", raw_json
+            )
+        light_change = supplied.get("light_change")
+        if not isinstance(light_change, bool):
+            raise _timing_plan_validation_error(
+                f"Source Shot {expected_number} light_change must be true or false", raw_json
             )
         previous_end = 0
         visual_beats: list[GemmaShotTimingBeat] = []
@@ -2079,18 +3151,49 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
                 raise _timing_plan_validation_error(
                     f"Source Shot {expected_number} overlay {overlay_index} must fit source-relative frames 0-{duration}", raw_json
                 )
-            overlays.append(GemmaShotTimingOverlay(start, end, overlay_type, content.strip()))
+            dialogue_segments = ()
+            if overlay_type == "dialogue":
+                dialogue_segments = _validate_dialogue_segments(
+                    raw_overlay,
+                    shot_number=expected_number,
+                    overlay_index=overlay_index,
+                    start_frame=start,
+                    end_frame=end,
+                    full_content=content.strip(),
+                    expected_shot=expected,
+                    request=request,
+                    raw_json=raw_json,
+                )
+            elif "dialogue_segments" in raw_overlay:
+                raise _timing_plan_validation_error(
+                    f"Source Shot {expected_number} non-dialogue overlay {overlay_index} must not include dialogue_segments",
+                    raw_json,
+                )
+            overlays.append(
+                GemmaShotTimingOverlay(start, end, overlay_type, content.strip(), dialogue_segments)
+            )
+        overlays = list(_validate_shot_dialogue_reconstruction(overlays, expected, raw_json))
+        _validate_dialogue_speaking_density(overlays, expected, request, raw_json)
+        continuity_slices = _validate_continuity_slices(
+            supplied,
+            expected,
+            request,
+            character_name_table,
+            raw_json,
+        )
         # Global source-shot boundaries are immutable sampler facts, not
         # generated timing content.  Do not require Gemma to echo a redundant
         # inclusive/exclusive endpoint field: that ambiguity cost a full
         # preproduction retry despite an otherwise valid action schedule.
         schedules.append(
             GemmaShotTimingShot(
-                source_shot,
-                expected_start,
-                expected_end,
-                tuple(visual_beats),
-                tuple(overlays),
+                source_shot=source_shot,
+                shot_start_frame=expected_start,
+                shot_end_frame=expected_end,
+                visual_beats=tuple(visual_beats),
+                overlays=tuple(overlays),
+                continuity_slices=continuity_slices,
+                light_change=light_change,
             )
         )
     return GemmaShotTimingPlan(
@@ -2104,13 +3207,78 @@ def _validate_timing_plan(value: dict[str, Any], request: dict[str, Any], raw_js
     )
 
 
+def _validate_single_shot_plan(
+    value: dict[str, Any],
+    expected_shot: dict[str, Any],
+    request: dict[str, Any],
+    character_name_table: tuple[GemmaCharacterSubject, ...],
+    raw_json: str,
+) -> tuple[str, str, GemmaShotTimingShot]:
+    """Validate one independently generated source-shot schedule."""
+    synthetic_value = dict(value)
+    synthetic_value["character_name_table"] = [
+        {"character_name": item.character_name, "subject": item.subject}
+        for item in character_name_table
+    ]
+    synthetic_value["shots"] = [{
+        key: synthetic_value[key]
+        for key in ("source_shot", "light_change", "visual_beats", "overlays", "continuity_slices")
+        if key in synthetic_value
+    }]
+    synthetic_request = dict(request)
+    synthetic_request["source_shots"] = [expected_shot]
+    validated = _validate_timing_plan(synthetic_value, synthetic_request, raw_json)
+    return validated.confidence, validated.analysis, validated.shots[0]
+
+
+def _production_bible_correction_request(error: Gemma4ObservationError) -> str:
+    return (
+        "GLOBAL PREPRODUCTION CORRECTION REQUIRED\n"
+        "Return one complete replacement global-production-bible JSON object, not a patch or explanation. "
+        "Keep all supplied source shots in exact order. Include every explicit character-name-to-<Subject N> "
+        "mapping, one immutable speaker_voice_profiles entry for every actual S# vocal source, and each shot's "
+        "shot_intent, environment, camera_and_cut, and complete participating-character "
+        "opening/closing states. Do not include frame-level timing. Correct this error:\n- "
+        + str(error)
+    )
+
+
+def _single_shot_correction_request(
+    expected_shot: dict[str, Any], request: dict[str, Any], error: Gemma4ObservationError,
+) -> str:
+    shot_number = int(expected_shot["shot_number"])
+    intervals = ", ".join(
+        f"[{start},{end})" for start, end in _expected_continuity_intervals(expected_shot, request)
+    ) or "none"
+    duration = int(expected_shot["shot_end"]) - int(expected_shot["shot_start"])
+    return (
+        f"SOURCE SHOT {shot_number} PLAN CORRECTION REQUIRED\n"
+        "Return one complete replacement JSON object for this source shot only, not a patch, explanation, global "
+        "bible, or another shot. Preserve the immutable global production. Required root fields are confidence, "
+        "analysis, source_shot, light_change, visual_beats, overlays, and continuity_slices. light_change must be a boolean. visual_beats must contiguously cover "
+        f"source-relative [0,{duration}); continuity_slices must be exactly {intervals}. Every dialogue overlay must "
+        "contain dialogue_segments matching each retained ownership intersection. Split only at natural word boundaries, "
+        "repeat the language tag in each segment, and make its segment words concatenate to that overlay's content "
+        "exactly once. One source speech may span multiple chronological overlays, but all dialogue overlay contents "
+        "together must reconstruct every source dialogue token exactly once. Correct this error:\n- "
+        + str(error)
+    )
+
+
 def _timing_plan_correction_request(request: dict[str, Any], error: Gemma4ObservationError) -> str:
     """Give Gemma one precise opportunity to repair its complete schedule."""
-    expected = "\n".join(
-        f"- Source Shot {int(shot['shot_number'])}: global frames {int(shot['shot_start'])}-{int(shot['shot_end']) - 1}; "
-        f"visual_beats must exactly and contiguously cover source-relative frames 0-{int(shot['shot_end']) - int(shot['shot_start']) - 1}."
-        for shot in request.get("source_shots", ())
-    )
+    expected_lines = []
+    for shot in request.get("source_shots", ()):
+        intervals = ", ".join(
+            f"[{start},{end})"
+            for start, end in _expected_continuity_intervals(shot, request)
+        ) or "none"
+        expected_lines.append(
+            f"- Source Shot {int(shot['shot_number'])}: global frames {int(shot['shot_start'])}-{int(shot['shot_end']) - 1}; "
+            f"visual_beats must exactly and contiguously cover source-relative frames "
+            f"0-{int(shot['shot_end']) - int(shot['shot_start']) - 1}; continuity_slices must exactly be: {intervals}."
+        )
+    expected = "\n".join(expected_lines)
     return (
         "TIMING-PLAN CORRECTION REQUIRED\n"
         "Your immediately preceding JSON does not form a complete usable schedule. Return one complete replacement "
@@ -2119,11 +3287,16 @@ def _timing_plan_correction_request(request: dict[str, Any], error: Gemma4Observ
         "[start_frame, end_frame). Overlays may overlap those visual intervals:\n"
         '{"confidence":"high|medium|low", "analysis":"...", '
         '"character_name_table":[{"character_name":"Heman", "subject":"<Subject 1>"}], '
-        '"shots":[{"source_shot":1, '
+        '"shots":[{"source_shot":1, "light_change":false, '
         '"visual_beats":[{"start_frame":0, "end_frame":34, "action":"..."}], '
-        '"overlays":[{"start_frame":4, "end_frame":20, "type":"dialogue|sound|action", "content":"..."}]}]}\n\n'
+        '"overlays":[{"start_frame":4, "end_frame":20, "type":"dialogue|sound|action", "content":"...", '
+        '"dialogue_segments":[{"start_frame":4,"end_frame":20,"content":"speaker says: <d>[English] exact assigned words</d>"}]}], '
+        '"continuity_slices":[{"start_frame":0,"end_frame":34,"characters":['
+        '{"character_name":"Heman","subject":"<Subject 1>","entry_state":"...",'
+        '"expected_exit_state":"..."}]}]}]}\n\n'
         "`character_name_table` must be an array. Preserve only explicit name-to-<Subject N> mappings "
-        "from the original prompt; use [] when there are none.\n\n"
+        "from the original prompt; use [] when there are none. Every continuity_slices interval must match the "
+        "physical output ownership exactly and include every mapped character physically participating there.\n\n"
         "Required source-shot coverage:\n"
         + expected
         + "\n\nDetected error:\n- "
@@ -2201,6 +3374,9 @@ def _render_observation_messages(
             "conditioning_context": str(request["conditioning_context"]),
             "current_shot_timeline": _current_chunk_shot_timeline(target_shots, current),
             "current_shot_timing_contract": _current_shot_timing_contract(target_shots, fps),
+            "production_bible": str(request.get("production_bible") or (
+                "No separate global production bible is available."
+            )),
             "preproduction_timing_plan": str(request.get("preproduction_timing_plan") or (
                 "No preproduction timing schedule is available. Allocate the complete source-shot intent "
                 "carefully from the timing contract and the rendered evidence."
@@ -2211,6 +3387,9 @@ def _render_observation_messages(
             )),
             "character_name_table": str(request.get("character_name_table") or (
                 "No explicit named-character-to-subject mapping was found in the original prompt."
+            )),
+            "planned_character_continuity": str(request.get("planned_character_continuity") or (
+                "No planned character-continuity state is available for this slice."
             )),
             "required_local_markers": _required_local_markers(target_shots),
             "previous_context": previous_context,
@@ -2263,9 +3442,10 @@ def _preproduction_chunk_map(chunks: Sequence[dict[str, Any]], shots: Sequence[d
             if start >= end:
                 continue
             relative_start = start - int(shot["shot_start"])
-            relative_end = end - int(shot["shot_start"]) - 1
+            relative_end = end - int(shot["shot_start"])
             portions.append(
-                f"Source Shot {int(shot['shot_number'])} source-relative frames {relative_start}-{relative_end}"
+                f"Source Shot {int(shot['shot_number'])} source-relative half-open interval "
+                f"[{relative_start},{relative_end}) (inclusive frames {relative_start}-{relative_end - 1})"
             )
         ownership = "; ".join(portions) if portions else "no retained source-shot frames"
         lines.append(
@@ -2276,7 +3456,7 @@ def _preproduction_chunk_map(chunks: Sequence[dict[str, Any]], shots: Sequence[d
 
 
 def _render_timing_plan_messages(request: dict[str, Any]) -> tuple[str, str]:
-    """Render the text-only preproduction request sent before Chunk 1."""
+    """Render the immutable global-production request sent before shot planning."""
     templates = _gemma_prompt_templates()
     try:
         planning_system = templates["PREPRODUCTION_SYSTEM"]
@@ -2301,6 +3481,40 @@ def _render_timing_plan_messages(request: dict[str, Any]) -> tuple[str, str]:
     return system, message
 
 
+def _render_single_shot_plan_messages(
+    request: dict[str, Any], production_bible_json: str, shot: dict[str, Any],
+) -> tuple[str, str]:
+    """Render an independently retryable preproduction request for one shot."""
+    templates = _gemma_prompt_templates()
+    try:
+        system_template = templates["PREPRODUCTION_SHOT_SYSTEM"]
+        prompt_template = templates["PREPRODUCTION_SHOT"]
+    except KeyError as error:
+        raise Gemma4ObservationError(
+            f"Gemma 4 prompt file {GEMMA4_PROMPTS_PATH} is missing {error.args[0]!r} "
+            "for independent source-shot planning"
+        ) from error
+    fps = float(request["fps"])
+    intervals = _expected_continuity_intervals(shot, request)
+    ownership = "\n".join(
+        f"- source-relative half-open [{start},{end}) (inclusive frames {start}-{end - 1})"
+        for start, end in intervals
+    ) or "- no retained physical output interval"
+    message = _render_gemma_prompt(
+        prompt_template,
+        {
+            "shot_number": str(int(shot["shot_number"])),
+            "fps": f"{fps:g}",
+            "production_bible": production_bible_json,
+            "source_shot": _preproduction_source_shots([shot], fps),
+            "shot_ownership": ownership,
+            "original_prompt": str(request["original_prompt"]),
+        },
+    )
+    system = system_template + "\n\n" + _minimax_prompt_reference(str(request["prompt_mode"]))
+    return system, message
+
+
 def _render_preproduction_memory_messages(
     request: dict[str, Any], timing_plan: GemmaShotTimingPlan,
 ) -> tuple[str, str]:
@@ -2319,9 +3533,9 @@ def _render_preproduction_memory_messages(
         memory_template,
         {
             "character_name_table": timing_plan.character_name_table_text(),
+            "production_bible": timing_plan.production_bible_text(),
             "source_shots": _preproduction_source_shots(source_shots, fps),
             "physical_chunk_map": _preproduction_chunk_map(request.get("chunks", ()), source_shots),
-            "preproduction_memory": timing_plan.for_target_shots(source_shots, fps),
             "original_prompt": str(request["original_prompt"]),
         },
     )
@@ -2471,7 +3685,7 @@ def _gemma_chat_json(
     runtimes with no append API, and as a final guard after two chat repairs.
     """
 
-    def complete(response_format: dict[str, Any] | None = None) -> str:
+    def complete(response_format: dict[str, Any] | None = None, *, stage: str) -> str:
         kwargs: dict[str, Any] = {
             "messages": list(messages),
             "temperature": GEMMA4_TEMPERATURE,
@@ -2481,11 +3695,13 @@ def _gemma_chat_json(
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
+        kwargs.update(_gemma_reasoning_budget_kwargs())
         response = llm.create_chat_completion(**kwargs)
+        _append_raw_gemma_response(stage, response)
         choice = response["choices"][0]["message"]
         return _gemma_response_text(choice)
 
-    text = complete()
+    text = complete(stage="initial unconstrained response")
     try:
         return _extract_json_object(text)
     except Gemma4ObservationError as error:
@@ -2510,8 +3726,13 @@ def _gemma_chat_json(
                     content=_json_format_repair_request(latest_error),
                     temperature=GEMMA4_TEMPERATURE,
                     top_p=GEMMA4_TOP_P,
-                    top_k=GEMMA4_TOP_K,
-                    max_tokens=max_tokens,
+                top_k=GEMMA4_TOP_K,
+                max_tokens=max_tokens,
+                **_gemma_reasoning_budget_kwargs(),
+            )
+                _append_raw_gemma_response(
+                    f"append-only JSON format repair {repair_index}/{GEMMA4_JSON_FORMAT_REPAIR_LIMIT}",
+                    response,
                 )
                 candidate = _gemma_response_text(response["choices"][0]["message"])
                 try:
@@ -2531,7 +3752,9 @@ def _gemma_chat_json(
                 top_k=GEMMA4_TOP_K,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
+                **_gemma_reasoning_budget_kwargs(),
             )
+            _append_raw_gemma_response("final grammar-constrained JSON fallback", response)
             candidate = _gemma_response_text(response["choices"][0]["message"])
             return _extract_json_object(candidate)
 
@@ -2540,7 +3763,12 @@ def _gemma_chat_json(
             "the runtime has no append-only chat API, so retrying with llama.cpp's slower JSON grammar: %s",
             error,
         )
-        return _extract_json_object(complete({"type": "json_object"}))
+        return _extract_json_object(
+            complete(
+                {"type": "json_object"},
+                stage="compatibility grammar-constrained JSON fallback",
+            )
+        )
 
 
 def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict[str, Any]], *,
@@ -2551,7 +3779,16 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
     if not callable(append):
         raise Gemma4ObservationError("Gemma runtime does not support append-only chat turns")
 
-    def complete(next_content: str | Sequence[dict[str, Any]], response_format: dict[str, Any] | None = None) -> str:
+    completion_sequence = 0
+
+    def complete(
+        next_content: str | Sequence[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+        *,
+        stage: str,
+    ) -> str:
+        nonlocal completion_sequence
+        completion_sequence += 1
         response = append(
             llama=llm,
             content=next_content,
@@ -2560,11 +3797,13 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
             top_k=GEMMA4_TOP_K,
             max_tokens=max_tokens,
             response_format=response_format,
+            **_gemma_reasoning_budget_kwargs(),
         )
+        _append_raw_gemma_response(f"{stage} (append call {completion_sequence})", response)
         choice = response["choices"][0]["message"]
         return _gemma_response_text(choice)
 
-    text = complete(content)
+    text = complete(content, stage="initial appended response")
     try:
         return _extract_json_object(text)
     except Gemma4ObservationError as error:
@@ -2582,7 +3821,10 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
                 GEMMA4_JSON_FORMAT_REPAIR_LIMIT,
                 latest_error,
             )
-            candidate = complete(_json_format_repair_request(latest_error))
+            candidate = complete(
+                _json_format_repair_request(latest_error),
+                stage=f"append-only JSON format repair {repair_index}/{GEMMA4_JSON_FORMAT_REPAIR_LIMIT}",
+            )
             try:
                 return _extract_json_object(candidate)
             except Gemma4ObservationError as repair_error:
@@ -2593,7 +3835,11 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
             latest_error,
         )
         return _extract_json_object(
-            complete(_json_format_repair_request(latest_error), {"type": "json_object"})
+            complete(
+                _json_format_repair_request(latest_error),
+                {"type": "json_object"},
+                stage="final grammar-constrained JSON fallback",
+            )
         )
 
 
@@ -2737,7 +3983,7 @@ def _observe_in_process(
     debug: bool,
 ) -> GemmaChunkPrompt:
     """Run one observation inside the disposable worker process."""
-    Llama, MTMDChatHandler = _load_runtime()
+    Llama, Gemma4ChatHandler = _load_runtime()
     model_path, mmproj_path = _ensure_model_files()
     system_prompt, message = _render_observation_messages(request)
     # Gemma 4's official modality order is images before user text. Preserve
@@ -2754,13 +4000,14 @@ def _observe_in_process(
     try:
         # Keep llama.cpp/MTMD native timing traces separate from the sampler's
         # useful debug mode.  The latter is preserved by our own diagnostics.
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            seed=int(request.get("gemma4_seed", 0)),
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
@@ -2816,7 +4063,7 @@ def _observe_in_process(
         attempts: list[GemmaPromptAttempt] = []
         response_repairs = 0
         contract_correction_used = False
-        marker_repairs = 0
+        structural_repairs = 0
         pending_correction_prompt = ""
 
         def request_replacement(correction_prompt: str) -> tuple[dict[str, Any], str]:
@@ -2902,6 +4149,7 @@ def _observe_in_process(
             )
             contract_warnings = _contract_validation_warnings(candidate.validation_warnings)
             marker_warnings = _marker_validation_warnings(contract_warnings)
+            character_state_warnings = _character_state_validation_warnings(contract_warnings)
             if not contract_warnings:
                 return replace(candidate, attempts=tuple(attempts))
 
@@ -2911,23 +4159,40 @@ def _observe_in_process(
                 # exact sequence and may reinforce them again below without
                 # substituting algorithmic H3 prose.
                 contract_correction_used = True
-                marker_repairs = 1 if marker_warnings else 0
+                structural_repairs = 1 if (marker_warnings or character_state_warnings) else 0
                 pending_correction_prompt = _chunk_contract_correction_request(request, contract_warnings)
             elif marker_warnings:
-                if marker_repairs >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                if structural_repairs >= GEMMA4_RESPONSE_REPAIR_LIMIT:
                     raise Gemma4ObservationError(
                         "Gemma 4 still violates the sampler-owned H3 shot-marker contract after "
-                        f"{marker_repairs} model-authored marker repairs: " + "; ".join(marker_warnings),
+                        f"{structural_repairs} model-authored repairs: " + "; ".join(marker_warnings),
                         raw_json=candidate.raw_json,
                     )
-                marker_repairs += 1
+                structural_repairs += 1
                 pending_correction_prompt = _marker_contract_followup_request(request, marker_warnings)
                 logging.warning(
                     "HR Endless Sampler Gemma 4 still returned invalid H3 shot markers. "
                     "Requesting focused model-authored marker repair %d/%d in the same conversation:\n- %s",
-                    marker_repairs,
+                    structural_repairs,
                     GEMMA4_RESPONSE_REPAIR_LIMIT,
                     "\n- ".join(marker_warnings),
+                )
+            elif character_state_warnings:
+                if structural_repairs >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                    raise Gemma4ObservationError(
+                        "Gemma 4 still violates the character continuity contract after "
+                        f"{structural_repairs} model-authored repairs: "
+                        + "; ".join(character_state_warnings),
+                        raw_json=candidate.raw_json,
+                    )
+                structural_repairs += 1
+                pending_correction_prompt = _chunk_contract_followup_request(character_state_warnings)
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 still returned invalid character continuity state. "
+                    "Requesting model-authored repair %d/%d in the same conversation:\n- %s",
+                    structural_repairs,
+                    GEMMA4_RESPONSE_REPAIR_LIMIT,
+                    "\n- ".join(character_state_warnings),
                 )
             else:
                 # Non-marker creative findings stay visible after the single
@@ -2959,18 +4224,19 @@ def _materialize_preproduction_cache_in_process(
     this static directorial conversation after the render-local cache reset.
     Otherwise every replayed chunk falls back to a full self-contained prompt.
     """
-    Llama, MTMDChatHandler = _load_runtime()
+    Llama, Gemma4ChatHandler = _load_runtime()
     model_path, mmproj_path = _ensure_model_files()
     handler = None
     llm = None
     try:
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            seed=int(request.get("gemma4_seed", 0)),
         )
         state_bytes = _populate_preproduction_cache_state(llm, request, timing_plan)
         logging.info(
@@ -2991,8 +4257,8 @@ def _materialize_preproduction_cache_in_process(
 
 
 def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTimingPlan:
-    """Run the one-time text-only source-shot timing plan in the worker."""
-    Llama, MTMDChatHandler = _load_runtime()
+    """Build a global production bible, then independently plan each shot."""
+    Llama, Gemma4ChatHandler = _load_runtime()
     model_path, mmproj_path = _ensure_model_files()
     system_prompt, message = _render_timing_plan_messages(request)
     handler = None
@@ -3001,84 +4267,239 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
         # Keep the official Gemma multimodal chat handler even though this pass
         # has no images.  It supplies the same model-specific conversation
         # formatting as the later image-and-text requests.
-        handler = MTMDChatHandler(clip_model_path=str(mmproj_path), verbose=False, use_gpu=True)
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
             handler=handler,
             debug=debug,
             gemma4_mtp=bool(request.get("gemma4_mtp", False)),
+            seed=int(request.get("gemma4_seed", 0)),
         )
-        initial_messages = [
+        global_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ]
-        latest_raw_json = ""
+        logging.info(
+            "HR Endless Sampler Gemma 4 preproduction phase 1: building the immutable global production bible."
+        )
         payload, raw_json = _gemma_chat_json(
             llm,
-            initial_messages,
+            global_messages,
             handler=handler,
-            max_tokens=2048,
+            max_tokens=GEMMA4_GLOBAL_PREPRODUCTION_RESPONSE_TOKENS,
             mtp_active=bool(request.get("gemma4_mtp", False)),
         )
-        latest_raw_json = raw_json
-        try:
-            initial = _validate_timing_plan(
-                payload,
-                request,
-                raw_json,
-                system_prompt=system_prompt,
-                planning_prompt=message,
-            )
-            attempts = [GemmaPromptAttempt(kind="initial response", raw_json=initial.raw_json)]
-            result = replace(initial, attempts=tuple(attempts))
-        except Gemma4ObservationError as error:
-            correction_prompt = _timing_plan_correction_request(request, error)
-            if callable(getattr(handler, "append_user_chat_completion", None)):
-                corrected_payload, corrected_raw_json = _gemma_append_chat_json(
-                    handler,
-                    llm,
-                    correction_prompt,
-                    max_tokens=2048,
-                    mtp_active=bool(request.get("gemma4_mtp", False)),
-                )
-            else:
-                correction_messages = [
-                    *initial_messages,
-                    {"role": "assistant", "content": latest_raw_json},
-                    {"role": "user", "content": correction_prompt},
-                ]
-                corrected_payload, corrected_raw_json = _gemma_chat_json(
-                    llm,
-                    correction_messages,
-                    handler=handler,
-                    max_tokens=2048,
-                    mtp_active=bool(request.get("gemma4_mtp", False)),
-                )
-            latest_raw_json = corrected_raw_json
+        current_payload = payload
+        current_raw_json = raw_json
+        correction_prompt = ""
+        attempts: list[GemmaPromptAttempt] = []
+        global_result = None
+        for repair_index in range(GEMMA4_RESPONSE_REPAIR_LIMIT + 1):
             try:
-                corrected = _validate_timing_plan(
-                    corrected_payload,
+                confidence, analysis, character_name_table = _validate_production_bible(
+                    current_payload,
                     request,
-                    corrected_raw_json,
-                    system_prompt=system_prompt,
-                    planning_prompt=message,
+                    current_raw_json,
                 )
-            except Gemma4ObservationError as corrected_error:
-                raise Gemma4ObservationError(str(corrected_error), raw_json=latest_raw_json) from corrected_error
-            attempts = (
+            except Gemma4ObservationError as error:
+                attempts.append(
+                    GemmaPromptAttempt(
+                        kind=("global production-bible response" if repair_index == 0 else
+                              f"global production-bible correction {repair_index}"),
+                        raw_json=current_raw_json,
+                        validation_warnings=(str(error),),
+                        correction_prompt=correction_prompt,
+                    )
+                )
+                if repair_index >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                    raise Gemma4ObservationError(str(error), raw_json=current_raw_json) from error
+                correction_prompt = _production_bible_correction_request(error)
+                logging.warning(
+                    "HR Endless Sampler Gemma 4 global production bible failed validation; "
+                    "requesting global correction %d/%d: %s",
+                    repair_index + 1,
+                    GEMMA4_RESPONSE_REPAIR_LIMIT,
+                    error,
+                )
+                if callable(getattr(handler, "append_user_chat_completion", None)):
+                    current_payload, current_raw_json = _gemma_append_chat_json(
+                        handler,
+                        llm,
+                        correction_prompt,
+                        max_tokens=GEMMA4_GLOBAL_PREPRODUCTION_RESPONSE_TOKENS,
+                        mtp_active=bool(request.get("gemma4_mtp", False)),
+                    )
+                else:
+                    correction_messages = [
+                        *global_messages,
+                        {"role": "assistant", "content": current_raw_json},
+                        {"role": "user", "content": correction_prompt},
+                    ]
+                    current_payload, current_raw_json = _gemma_chat_json(
+                        llm,
+                        correction_messages,
+                        handler=handler,
+                        max_tokens=GEMMA4_GLOBAL_PREPRODUCTION_RESPONSE_TOKENS,
+                        mtp_active=bool(request.get("gemma4_mtp", False)),
+                    )
+                continue
+            attempts.append(
                 GemmaPromptAttempt(
-                    kind="initial response",
-                    raw_json=raw_json,
-                    validation_warnings=(str(error),),
-                ),
-                GemmaPromptAttempt(
-                    kind="timing-plan correction response",
-                    raw_json=corrected.raw_json,
+                    kind=("global production-bible response" if repair_index == 0 else
+                          f"global production-bible correction {repair_index}"),
+                    raw_json=current_raw_json,
                     correction_prompt=correction_prompt,
-                ),
+                )
             )
-            result = replace(corrected, attempts=attempts)
+            global_result = (
+                confidence,
+                analysis,
+                character_name_table,
+                json.dumps(current_payload, ensure_ascii=False, indent=2),
+            )
+            break
+
+        if global_result is None:  # Defensive: the loop either validates or raises.
+            raise Gemma4ObservationError(
+                "Gemma 4 global-production correction loop ended without a usable result",
+                raw_json=current_raw_json,
+            )
+
+        confidence, analysis, character_name_table, production_bible_json = global_result
+        finalized_shots: list[GemmaShotTimingShot] = []
+        shot_planning_prompts: list[str] = []
+        assembled_raw: dict[str, Any] = {
+            "global_production_bible": current_payload,
+            "shot_plans": [],
+        }
+        source_shots = tuple(request.get("source_shots", ()))
+        for shot_index, expected_shot in enumerate(source_shots, 1):
+            shot_number = int(expected_shot["shot_number"])
+            logging.info(
+                "HR Endless Sampler Gemma 4 preproduction phase 2: planning Source Shot %d independently (%d/%d).",
+                shot_number,
+                shot_index,
+                len(source_shots),
+            )
+            shot_system, shot_message = _render_single_shot_plan_messages(
+                request,
+                production_bible_json,
+                expected_shot,
+            )
+            shot_planning_prompts.append(shot_message)
+            shot_messages = [
+                {"role": "system", "content": shot_system},
+                {"role": "user", "content": shot_message},
+            ]
+            shot_payload, shot_raw_json = _gemma_chat_json(
+                llm,
+                shot_messages,
+                handler=handler,
+                max_tokens=GEMMA4_SHOT_PREPRODUCTION_RESPONSE_TOKENS,
+                mtp_active=bool(request.get("gemma4_mtp", False)),
+            )
+            shot_correction_prompt = ""
+            finalized_shot = None
+            for repair_index in range(GEMMA4_RESPONSE_REPAIR_LIMIT + 1):
+                try:
+                    _shot_confidence, _shot_analysis, validated_shot = _validate_single_shot_plan(
+                        shot_payload,
+                        expected_shot,
+                        request,
+                        character_name_table,
+                        shot_raw_json,
+                    )
+                except Gemma4ObservationError as error:
+                    attempts.append(
+                        GemmaPromptAttempt(
+                            kind=(f"Source Shot {shot_number} response" if repair_index == 0 else
+                                  f"Source Shot {shot_number} correction {repair_index}"),
+                            raw_json=shot_raw_json,
+                            validation_warnings=(str(error),),
+                            correction_prompt=shot_correction_prompt,
+                        )
+                    )
+                    if repair_index >= GEMMA4_RESPONSE_REPAIR_LIMIT:
+                        raise Gemma4ObservationError(str(error), raw_json=shot_raw_json) from error
+                    shot_correction_prompt = _single_shot_correction_request(
+                        expected_shot, request, error,
+                    )
+                    logging.warning(
+                        "HR Endless Sampler Gemma 4 Source Shot %d plan failed validation; "
+                        "retrying only Source Shot %d (%d/%d): %s",
+                        shot_number,
+                        shot_number,
+                        repair_index + 1,
+                        GEMMA4_RESPONSE_REPAIR_LIMIT,
+                        error,
+                    )
+                    if callable(getattr(handler, "append_user_chat_completion", None)):
+                        shot_payload, shot_raw_json = _gemma_append_chat_json(
+                            handler,
+                            llm,
+                            shot_correction_prompt,
+                            max_tokens=GEMMA4_SHOT_PREPRODUCTION_RESPONSE_TOKENS,
+                            mtp_active=bool(request.get("gemma4_mtp", False)),
+                        )
+                    else:
+                        shot_payload, shot_raw_json = _gemma_chat_json(
+                            llm,
+                            [
+                                *shot_messages,
+                                {"role": "assistant", "content": shot_raw_json},
+                                {"role": "user", "content": shot_correction_prompt},
+                            ],
+                            handler=handler,
+                            max_tokens=GEMMA4_SHOT_PREPRODUCTION_RESPONSE_TOKENS,
+                            mtp_active=bool(request.get("gemma4_mtp", False)),
+                        )
+                    continue
+                attempts.append(
+                    GemmaPromptAttempt(
+                        kind=(f"Source Shot {shot_number} response" if repair_index == 0 else
+                              f"Source Shot {shot_number} correction {repair_index}"),
+                        raw_json=shot_raw_json,
+                        correction_prompt=shot_correction_prompt,
+                    )
+                )
+                finalized_shot = validated_shot
+                assembled_raw["shot_plans"].append(shot_payload)
+                break
+            if finalized_shot is None:
+                raise Gemma4ObservationError(
+                    f"Gemma 4 Source Shot {shot_number} correction loop ended without a usable result",
+                    raw_json=shot_raw_json,
+                )
+            finalized_shots.append(finalized_shot)
+
+        result = GemmaShotTimingPlan(
+            confidence=confidence,
+            analysis=analysis,
+            shots=tuple(finalized_shots),
+            character_name_table=character_name_table,
+            raw_json=json.dumps(assembled_raw, ensure_ascii=False, indent=2),
+            production_bible_json=production_bible_json,
+            shot_planning_prompts=tuple(shot_planning_prompts),
+            system_prompt=(
+                "=== GLOBAL PREPRODUCTION SYSTEM ===\n"
+                + system_prompt
+                + "\n\n=== INDEPENDENT SOURCE-SHOT SYSTEM ===\n"
+                + shot_system
+            ),
+            planning_prompt=(
+                "=== GLOBAL PRODUCTION-BIBLE REQUEST ===\n"
+                + message
+                + "\n\n"
+                + "\n\n".join(
+                    f"=== SOURCE SHOT {int(shot['shot_number'])} PREPRODUCTION REQUEST ===\n{prompt}"
+                    for shot, prompt in zip(
+                        request.get("source_shots", ()), shot_planning_prompts, strict=True
+                    )
+                )
+            ),
+            attempts=tuple(attempts),
+        )
 
         if request.get("preproduction_cache"):
             try:
@@ -3111,12 +4532,31 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
 
 def _worker_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    # The parent always decodes the private worker protocol as UTF-8. Force
+    # the child to use the same encoding even on Windows, where an inherited
+    # console locale can otherwise emit CP-1252 bytes such as 0x93.
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
     comfy_root = str(Path(folder_paths.__file__).resolve().parent)
     current_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
         comfy_root if not current_pythonpath else comfy_root + os.pathsep + current_pythonpath
     )
     return environment
+
+
+def _start_worker_process() -> subprocess.Popen:
+    """Start one isolated Gemma worker with a stable UTF-8 text protocol."""
+    command = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"]
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_worker_environment(),
+    )
 
 
 def _stream_worker_output(
@@ -3128,6 +4568,30 @@ def _stream_worker_output(
     if process.stdin is None or process.stdout is None:
         raise Gemma4ObservationError("Gemma 4 worker pipes were not created")
     output: list[str] = []
+    stop_watcher = threading.Event()
+    cancel_requested = threading.Event()
+
+    def watch_for_comfy_cancel() -> None:
+        """Kill a blocking Gemma subprocess when ComfyUI interrupts the job."""
+        poll = getattr(process, "poll", None)
+        while not stop_watcher.wait(0.05):
+            if callable(poll) and poll() is not None:
+                return
+            if comfy.model_management.processing_interrupted():
+                cancel_requested.set()
+                if not callable(poll) or poll() is None:
+                    process.kill()
+                return
+
+    # Reading a pipe line-by-line can block while llama.cpp loads a model or
+    # computes a token. A tiny watcher keeps cancellation responsive during
+    # those periods instead of waiting for Gemma's next progress line.
+    watcher = threading.Thread(
+        target=watch_for_comfy_cancel,
+        name="hr_endless_sampler_gemma_cancel",
+        daemon=True,
+    )
+    watcher.start()
     try:
         process.stdin.write(json.dumps(request, ensure_ascii=False))
         process.stdin.close()
@@ -3148,27 +4612,26 @@ def _stream_worker_output(
             output.append(line)
         process.wait()
     except BaseException:
-        process.kill()
+        if process.poll() is None:
+            process.kill()
         process.wait()
         raise
     finally:
+        stop_watcher.set()
+        watcher.join(timeout=1.0)
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
+    if cancel_requested.is_set():
+        # Consume/reset ComfyUI's interrupt flag and raise its canonical
+        # cancellation exception. This is intentionally not a Gemma retry.
+        comfy.model_management.throw_exception_if_processing_interrupted()
     return "".join(output)
 
 
 def _observe_in_worker(request: dict[str, Any], progress_callback: Any = None) -> GemmaChunkPrompt:
-    command = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=_worker_environment(),
-    )
+    process = _start_worker_process()
     try:
         stdout = _stream_worker_output(process, request, progress_callback)
     finally:
@@ -3214,15 +4677,7 @@ def _plan_timing_in_worker(request: dict[str, Any], progress_callback: Any = Non
     """Run one isolated preproduction worker and decode its validated schedule."""
     request = json.loads(json.dumps(request, ensure_ascii=False))
     request["operation"] = "timing_plan"
-    command = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=_worker_environment(),
-    )
+    process = _start_worker_process()
     stdout = _stream_worker_output(process, request, progress_callback)
 
     result_line = next(
@@ -3272,15 +4727,7 @@ def _materialize_preproduction_cache_in_worker(
     worker_request = json.loads(json.dumps(request, ensure_ascii=False))
     worker_request["operation"] = "preproduction_cache"
     worker_request["timing_plan"] = _timing_plan_payload(timing_plan)
-    command = [sys.executable, "-u", str(Path(__file__).resolve()), "--worker"]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        env=_worker_environment(),
-    )
+    process = _start_worker_process()
     stdout = _stream_worker_output(process, worker_request, progress_callback)
 
     result_line = next(
@@ -3323,14 +4770,40 @@ def _materialize_preproduction_cache_in_worker(
     return state_bytes
 
 
+def _clear_previous_debug_captures():
+    """Delete only disposable sampler directories from earlier runs."""
+    root = tempfile.gettempdir()
+    removed = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if not entry.name.startswith(GEMMA4_OWNED_TEMP_PREFIX):
+                    continue
+                # The prefix is owned by this node. Never follow a symlink
+                # during cleanup, even when it happens to use that prefix.
+                if entry.is_symlink():
+                    os.unlink(entry.path)
+                elif entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+                else:
+                    continue
+                removed += 1
+    except OSError as error:
+        logging.warning("HR Endless Sampler could not clear old Gemma debug captures in %s: %s", root, error)
+        return
+    if removed:
+        logging.info("HR Endless Sampler removed %d old Gemma debug capture directories.", removed)
+
+
 class Gemma4ContinuityDirector:
     """Preproduction timing planner plus one-shot local prompt director."""
 
-    def __init__(self, debug: bool = False, gemma4_mtp: bool = False,
+    def __init__(self, debug: bool = False, gemma4_mtp: bool = False, seed: int = 0,
                  capture_directory: str | Path | None = None,
                  observation_image_directory: str | Path | None = None):
         self.debug = debug
         self.gemma4_mtp = bool(gemma4_mtp)
+        self.seed = int(seed) & 0x7fffffff
         self._capture_sequence = 0
         self.last_system_prompt = ""
         self.last_observation_prompt = ""
@@ -3341,9 +4814,14 @@ class Gemma4ContinuityDirector:
         if observation_image_directory is not None:
             self.observation_image_directory = Path(observation_image_directory)
             self.observation_image_directory.mkdir(parents=True, exist_ok=True)
+        # Automatic captures are useful only for the active render. Clear an
+        # earlier run before this director starts, even when this render's
+        # Debug switch is off and therefore creates no replacement capture.
+        if capture_directory is None:
+            _clear_previous_debug_captures()
         if debug:
             if capture_directory is None:
-                capture_directory = tempfile.mkdtemp(prefix="hr-endless-sampler-gemma4-")
+                capture_directory = tempfile.mkdtemp(prefix=GEMMA4_DEBUG_CAPTURE_PREFIX)
             self.capture_directory = Path(capture_directory)
             self.capture_directory.mkdir(parents=True, exist_ok=True)
             logging.info("HR Endless Sampler Gemma capture directory: %s", self.capture_directory)
@@ -3449,6 +4927,7 @@ class Gemma4ContinuityDirector:
         self.last_timing_system_prompt, self.last_timing_planning_prompt = _render_timing_plan_messages(request)
         request["debug"] = self.debug
         request["gemma4_mtp"] = self.gemma4_mtp
+        request["gemma4_seed"] = self.seed
         result = self._run_worker_with_mtp_fallback(
             "shot-timing preproduction",
             request,
@@ -3460,10 +4939,12 @@ class Gemma4ContinuityDirector:
         )
         self.last_timing_system_prompt = result.system_prompt or self.last_timing_system_prompt
         self.last_timing_planning_prompt = result.planning_prompt or self.last_timing_planning_prompt
-        if len(result.attempts) > 1:
+        corrected_attempts = [attempt for attempt in result.attempts if attempt.validation_warnings]
+        if corrected_attempts:
             logging.warning(
-                "HR Endless Sampler Gemma 4 preproduction timing plan needed one model-authored correction; "
-                "the corrected complete schedule will be used."
+                "HR Endless Sampler Gemma 4 preproduction needed %d model-authored correction(s); "
+                "only the affected global or source-shot plan was retried.",
+                len(corrected_attempts),
             )
         return result
 
@@ -3477,6 +4958,7 @@ class Gemma4ContinuityDirector:
             raise Gemma4ObservationError("Gemma preproduction cache is not configured for this replay")
         request["debug"] = self.debug
         request["gemma4_mtp"] = self.gemma4_mtp
+        request["gemma4_seed"] = self.seed
         return self._run_worker_with_mtp_fallback(
             "clean preproduction-cache creation",
             request,
@@ -3518,6 +5000,7 @@ class Gemma4ContinuityDirector:
         request["image_urls"] = image_urls
         request["debug"] = self.debug
         request["gemma4_mtp"] = self.gemma4_mtp
+        request["gemma4_seed"] = self.seed
         if self.observation_image_directory is not None and image_urls:
             try:
                 _capture_last_observation_images(
@@ -3562,7 +5045,7 @@ class Gemma4ContinuityDirector:
             if initial_contract_warnings:
                 logging.warning(
                     "HR Endless Sampler Gemma 4 initial response for chunk %d violated "
-                    "the H3 local marker/current-slice coverage contract; requested one Gemma-generated correction and will use "
+                    "the H3 global-label/local-time marker or current-slice coverage contract; requested one Gemma-generated correction and will use "
                     "that response:\n- %s",
                     chunk_number,
                     "\n- ".join(initial_contract_warnings),
@@ -3582,6 +5065,7 @@ class Gemma4ContinuityDirector:
 def _worker_main() -> int:
     try:
         request = json.load(sys.stdin)
+        _configure_raw_output_log(request)
         if request.get("operation") == "timing_plan":
             timing_plan = _plan_timing_in_process(
                 request=request,

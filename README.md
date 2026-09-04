@@ -30,10 +30,18 @@ by holding the mouse pointer over a chunk bar.
 
 The `HR Endless Sampler Save Video` and `HR Endless Sampler Load Video` also display the timeslider with all the features of the preview node. They also have an extra button "Macthing Videos" that display a list of the last videos with the same filename prefix, so we can quickly compare previous renders with newer ones, also seeing the chunks, prompts, time to render, etc.:
 
-<img width="350" alt="image" src="https://github.com/user-attachments/assets/9e1e1312-0493-4a10-a750-1e92b94451a7" />
-<img width="350" alt="image" src="https://github.com/user-attachments/assets/d0c37c83-06e0-4582-b240-ae8199194d2d" />
-<img width="350" alt="image" src="https://github.com/user-attachments/assets/d0a39920-647b-4891-90cb-b172c5e73c16" />
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/54e1f553-b7e5-470e-ade8-aafe333ce075" />
+<table>
+  <tr>
+    <td width="170" valign="top">
+      <img width="170" alt="HR Endless Sampler Save Video" src="https://github.com/user-attachments/assets/9e1e1312-0493-4a10-a750-1e92b94451a7" />
+      <img width="170" alt="HR Endless Sampler Load Video" src="https://github.com/user-attachments/assets/d0c37c83-06e0-4582-b240-ae8199194d2d" />
+      <img width="170" alt="Matching videos browser" src="https://github.com/user-attachments/assets/d0a39920-647b-4891-90cb-b172c5e73c16" />
+    </td>
+    <td valign="top">
+      <img width="650" alt="Chunk and shot prompt tooltip" src="https://github.com/user-attachments/assets/54e1f553-b7e5-470e-ade8-aafe333ce075" />
+    </td>
+  </tr>
+</table>
 
 
 ## Quick HELP as I don't have a workflow template yet!
@@ -68,10 +76,22 @@ For example, 39 frames is a practical 1080p starting point on a 16 GB GPU.
 H3 uses a `5 + 17k` frame grid, so the effective size is aligned to that grid.
 
 `video_continuation` is the number of completed frames carried from the last
-chunk into the next one. H3 sees them as a synchronized `<Video N>` and
-`<Audio N>` reference. `22` frames is a good default for continuity. `5` is
-the minimum. Larger values use more VRAM. If it is larger than the current
-chunk, the sampler caps it to the chunk size.
+chunk into the next one. `22` frames is a good starting point and `5` is the
+minimum.
+
+`video_continuation_method` chooses how those frames are used:
+
+- `Video1 reference (current)` is the established method. H3 sees the tail as
+  a separate synchronized `<Video N>` and `<Audio N>` reference, plus an
+  automatic five-frame visual boundary prefix. Larger references use more
+  VRAM. Values larger than the current chunk are capped to its effective size.
+- `Masked AV overlap (experimental)` copies the completed latent tail directly
+  into the beginning of the next sampled chunk. The video overlap is preserved;
+  most audio is preserved and its final eight 40 Hz latent ticks are released
+  with a half-cosine feather. It adds no Video1/Audio1 reference and no
+  `[video continuation]` prompt text. The overlap is part of `chunk_frames`, so
+  it must be smaller than the chunk and reduces the number of new frames
+  produced by each later call.
 
 `video_continuation_res` controls only the spatial size of the clean Video1
 latent passed to H3. `full` reuses the generated latent exactly and performs no
@@ -138,8 +158,9 @@ moving dialogue earlier in a shot affect the rerun chunk.
 ## How the sampler works
 
 The sampler runs chunks in order. A chunk finishes all H3 sampling steps before
-the next chunk begins. The completed tail becomes the next chunk's Video1/Audio1
-continuation reference.
+the next chunk begins. Depending on `video_continuation_method`, the completed
+tail becomes either the next chunk's Video1/Audio1 reference or its masked
+physical AV prefix.
 
 Before Chunk 1, Gemma reads the complete prompt and plans the timing of every
 source shot. It knows every physical chunk boundary before H3 starts. This gives
@@ -335,9 +356,12 @@ chunk. The generated Video1 continuation reference is added separately.
 
 ## Memory and performance
 
-The first chunk can fit while the second chunk fails. Later chunks include the
-Video1/Audio1 continuation tail, so they use more VRAM than Chunk 1. Choose a
-`chunk_frames` and `video_continuation` pair that fits Chunk 2 as well.
+With the Video1 method, the first chunk can fit while the second fails because
+later chunks add the Video1/Audio1 reference rows. Choose a `chunk_frames` and
+`video_continuation` pair that fits Chunk 2 as well. The experimental masked AV
+method keeps the sampled target at `chunk_frames` with no separate continuation
+reference, but spends part of that target on overlap and therefore needs more
+chunks to finish the same video.
 
 Chunking reduces the temporal part of H3's memory use. It cannot make an
 arbitrary resolution fit: one full-resolution H3 sampling step must still fit

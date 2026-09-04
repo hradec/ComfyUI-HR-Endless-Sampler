@@ -147,7 +147,7 @@ function createFinishedChunkTooltip() {
     }
 
     return {
-        show(event, { help, chunk, timing, description, shotRanges }) {
+        show(event, { help, chunk, timing, description, retentionAnalysis, shotRanges }) {
             tooltip.replaceChildren();
             line(help, "color:#999;margin-bottom:6px;");
             const chunkNumber = Number(chunk.chunk) || 1;
@@ -157,6 +157,10 @@ function createFinishedChunkTooltip() {
                 for (const item of timing) line(item, "color:#bbb;");
             } else {
                 line("No render timing was saved for this chunk.", "color:#888;");
+            }
+            if (retentionAnalysis) {
+                line("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+                line(retentionAnalysis, "color:#d8c7a0;");
             }
             line("Gemma detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
             if (description) {
@@ -420,7 +424,7 @@ function openEndlessOutputBrowser(initialPath = "") {
 let closeActiveMatchingVideoDropdown = null;
 
 
-function openMatchingVideoDropdown(button, value, stripCounter) {
+function openMatchingVideoDropdown(button, value, stripCounter, direction = "down", includeNoSelection = false) {
     return new Promise(async resolve => {
         closeActiveMatchingVideoDropdown?.();
         const popup = document.createElement("div");
@@ -428,7 +432,12 @@ function openMatchingVideoDropdown(button, value, stripCounter) {
         popup.style.cssText = "position:fixed;z-index:100001;width:min(540px,90vw);max-height:360px;overflow:auto;border:1px solid #555;border-radius:6px;background:#171717;color:#ddd;box-shadow:0 12px 36px #000;font:12px sans-serif;";
         const rect = button.getBoundingClientRect();
         popup.style.left = `${Math.max(6, Math.min(window.innerWidth - Math.min(540, window.innerWidth * .9) - 6, rect.left))}px`;
-        popup.style.top = `${Math.max(6, Math.min(window.innerHeight - 366, rect.bottom + 4))}px`;
+        if (direction === "up") {
+            popup.style.bottom = `${Math.max(6, window.innerHeight - rect.top + 4)}px`;
+            popup.style.maxHeight = `${Math.max(100, Math.min(360, rect.top - 10))}px`;
+        } else {
+            popup.style.top = `${Math.max(6, Math.min(window.innerHeight - 366, rect.bottom + 4))}px`;
+        }
         popup.textContent = "Finding matching renders…";
         popup.style.padding = "8px";
         document.body.appendChild(popup);
@@ -469,6 +478,16 @@ function openMatchingVideoDropdown(button, value, stripCounter) {
             title.style.cssText = "position:sticky;top:0;padding:7px 9px;border-bottom:1px solid #333;background:#222;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;";
             title.textContent = `output/${payload.prefix || ""}* · newest first`;
             popup.appendChild(title);
+            if (includeNoSelection) {
+                const clearRow = document.createElement("button");
+                clearRow.type = "button";
+                clearRow.textContent = "No video selected";
+                clearRow.style.cssText = "display:block;width:100%;padding:8px 9px;border:0;border-bottom:1px solid #393939;background:#242424;color:#bbb;text-align:left;cursor:pointer;font-style:italic;";
+                clearRow.addEventListener("mouseenter", () => { clearRow.style.background = "#3a321c"; });
+                clearRow.addEventListener("mouseleave", () => { clearRow.style.background = "#242424"; });
+                clearRow.addEventListener("click", () => close(""));
+                popup.appendChild(clearRow);
+            }
             if (!payload.entries?.length) {
                 const empty = document.createElement("div");
                 empty.style.cssText = "padding:12px;color:#888;";
@@ -528,6 +547,8 @@ app.registerExtension({
             let uploadInput = null;
             let matchingButton = null;
             let downloadButton = null;
+            let compareButton = null;
+            let comparePathLabel = null;
             if (isLoadNode || isSaveNode) {
                 const picker = document.createElement("div");
                 picker.style.cssText = "display:flex;align-items:center;gap:6px;box-sizing:border-box;padding:6px 8px;border-bottom:1px solid #2d2d2d;background:#1b1b1b;";
@@ -592,6 +613,31 @@ app.registerExtension({
             media.playsInline = true;
             viewport.appendChild(media);
 
+            const compareMedia = document.createElement("video");
+            compareMedia.style.cssText = "position:absolute;inset:0;display:none;width:100%;height:100%;object-fit:contain;background:#090909;pointer-events:none;clip-path:polygon(50% 0,100% 0,100% 100%,50% 100%);";
+            compareMedia.preload = "metadata";
+            compareMedia.playsInline = true;
+            compareMedia.muted = true;
+            viewport.appendChild(compareMedia);
+
+            const wipeSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            wipeSvg.setAttribute("viewBox", "0 0 1000 1000");
+            wipeSvg.setAttribute("preserveAspectRatio", "none");
+            wipeSvg.style.cssText = "position:absolute;inset:0;display:none;width:100%;height:100%;overflow:visible;pointer-events:none;z-index:4;";
+            const wipeLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            wipeLine.setAttribute("stroke", "#f5f5f5");
+            wipeLine.setAttribute("stroke-width", "3");
+            wipeLine.setAttribute("vector-effect", "non-scaling-stroke");
+            wipeLine.setAttribute("style", "filter:drop-shadow(0 0 2px #000);pointer-events:none;");
+            const wipeHitLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            wipeHitLine.setAttribute("stroke", "rgba(0,0,0,0)");
+            wipeHitLine.setAttribute("stroke-width", "28");
+            wipeHitLine.setAttribute("vector-effect", "non-scaling-stroke");
+            wipeHitLine.setAttribute("style", "pointer-events:stroke;cursor:ew-resize;");
+            wipeSvg.appendChild(wipeLine);
+            wipeSvg.appendChild(wipeHitLine);
+            viewport.appendChild(wipeSvg);
+
             const frameLabel = document.createElement("div");
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
             viewport.appendChild(frameLabel);
@@ -634,6 +680,23 @@ app.registerExtension({
             status.textContent = "Waiting for a saved HR Endless Sampler render…";
             root.appendChild(status);
 
+            if (isSaveNode) {
+                const compareFooter = document.createElement("div");
+                compareFooter.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;min-height:31px;padding:4px 8px;border-top:1px solid #292929;background:#171717;";
+                root.appendChild(compareFooter);
+                compareButton = document.createElement("button");
+                compareButton.type = "button";
+                compareButton.textContent = "Compare with ▴";
+                compareButton.title = "Choose a matching render for the right side of an interactive comparison wipe. The menu opens upward.";
+                compareButton.style.cssText = "padding:4px 8px;border:1px solid #555;border-radius:4px;background:#292929;color:#eee;cursor:pointer;white-space:nowrap;";
+                comparePathLabel = document.createElement("div");
+                comparePathLabel.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#888;font:10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;";
+                comparePathLabel.textContent = "No comparison video selected";
+                comparePathLabel.title = "The normal Save/Matching video is shown on the first side; this selection is shown on the other side.";
+                compareFooter.appendChild(comparePathLabel);
+                compareFooter.appendChild(compareButton);
+            }
+
             let state = null;
             let timeline = null;
             let sourceFps = 24;
@@ -642,6 +705,13 @@ app.registerExtension({
             let animation = null;
             let bracketKey = null;
             let loadRequestSerial = 0;
+            let compareRequestSerial = 0;
+            let lastSavedStateId = null;
+            let compareState = null;
+            let compareSourceFps = 24;
+            let wipePosition = 0.5;
+            let wipeModeIndex = 0;
+            let wipeDragging = false;
             let tooltipChunk = null;
             let tooltipSignature = null;
 
@@ -692,6 +762,136 @@ app.registerExtension({
 
             function applyPlaybackRate() {
                 media.playbackRate = Math.max(0.01, desiredFps() / Math.max(0.001, sourceFps));
+                compareMedia.playbackRate = Math.max(0.01, desiredFps() / Math.max(0.001, compareSourceFps));
+            }
+
+            const wipeModes = [
+                { id: "vertical", label: "vertical" },
+                { id: "horizontal", label: "horizontal" },
+                { id: "diagonal_left", label: "diagonal left" },
+                { id: "diagonal_right", label: "diagonal right" },
+            ];
+
+            function wipeSignedDistance(x, y) {
+                const mode = wipeModes[wipeModeIndex].id;
+                if (mode === "vertical") return x - wipePosition;
+                if (mode === "horizontal") return y - wipePosition;
+                if (mode === "diagonal_left") return x + y - 2 * wipePosition;
+                return x - y - (2 * wipePosition - 1);
+            }
+
+            function clippedComparisonPolygon() {
+                let polygon = [[0, 0], [1, 0], [1, 1], [0, 1]];
+                const output = [];
+                for (let index = 0; index < polygon.length; index++) {
+                    const start = polygon[index];
+                    const end = polygon[(index + 1) % polygon.length];
+                    const startDistance = wipeSignedDistance(start[0], start[1]);
+                    const endDistance = wipeSignedDistance(end[0], end[1]);
+                    const startInside = startDistance >= -1e-9;
+                    const endInside = endDistance >= -1e-9;
+                    if (startInside && endInside) {
+                        output.push(end);
+                    } else if (startInside !== endInside) {
+                        const amount = startDistance / (startDistance - endDistance);
+                        output.push([
+                            start[0] + (end[0] - start[0]) * amount,
+                            start[1] + (end[1] - start[1]) * amount,
+                        ]);
+                        if (endInside) output.push(end);
+                    }
+                }
+                return output;
+            }
+
+            function wipeBoundaryEndpoints() {
+                const corners = [[0, 0], [1, 0], [1, 1], [0, 1]];
+                const points = [];
+                function add(point) {
+                    if (!points.some(existing => Math.hypot(existing[0] - point[0], existing[1] - point[1]) < 1e-7)) {
+                        points.push(point);
+                    }
+                }
+                for (let index = 0; index < corners.length; index++) {
+                    const start = corners[index];
+                    const end = corners[(index + 1) % corners.length];
+                    const startDistance = wipeSignedDistance(start[0], start[1]);
+                    const endDistance = wipeSignedDistance(end[0], end[1]);
+                    if (Math.abs(startDistance) < 1e-9) add(start);
+                    if (startDistance * endDistance < 0) {
+                        const amount = startDistance / (startDistance - endDistance);
+                        add([
+                            start[0] + (end[0] - start[0]) * amount,
+                            start[1] + (end[1] - start[1]) * amount,
+                        ]);
+                    }
+                    if (Math.abs(endDistance) < 1e-9) add(end);
+                }
+                return points.slice(0, 2);
+            }
+
+            function renderComparisonWipe() {
+                const active = Boolean(compareState?.media_url);
+                compareMedia.style.display = active ? "block" : "none";
+                wipeSvg.style.display = active ? "block" : "none";
+                if (!active) return;
+                const polygon = clippedComparisonPolygon();
+                compareMedia.style.clipPath = polygon.length
+                    ? `polygon(${polygon.map(point => `${point[0] * 100}% ${point[1] * 100}%`).join(",")})`
+                    : "polygon(0 0,0 0,0 0)";
+                const endpoints = wipeBoundaryEndpoints();
+                if (endpoints.length === 2) {
+                    for (const line of [wipeLine, wipeHitLine]) {
+                        line.setAttribute("x1", String(endpoints[0][0] * 1000));
+                        line.setAttribute("y1", String(endpoints[0][1] * 1000));
+                        line.setAttribute("x2", String(endpoints[1][0] * 1000));
+                        line.setAttribute("y2", String(endpoints[1][1] * 1000));
+                    }
+                }
+                const mode = wipeModes[wipeModeIndex];
+                wipeHitLine.style.cursor = mode.id === "horizontal" ? "ns-resize" : "ew-resize";
+                wipeHitLine.setAttribute(
+                    "aria-label",
+                    `${mode.label} comparison divider at ${Math.round(wipePosition * 100)} percent`,
+                );
+                wipeSvg.title = `Drag to move the ${mode.label} comparison divider. Right-click it to change orientation.`;
+            }
+
+            function setWipePositionFromPointer(event) {
+                const rect = viewport.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                const mode = wipeModes[wipeModeIndex].id;
+                if (mode === "vertical") wipePosition = x;
+                else if (mode === "horizontal") wipePosition = y;
+                else if (mode === "diagonal_left") wipePosition = (x + y) / 2;
+                else wipePosition = (x - y + 1) / 2;
+                wipePosition = Math.max(0, Math.min(1, wipePosition));
+                renderComparisonWipe();
+            }
+
+            function comparisonTargetTime() {
+                const frame = currentFrame();
+                return frame == null ? 0 : frame / Math.max(0.001, compareSourceFps);
+            }
+
+            function syncComparison(force = false) {
+                if (!compareState || compareMedia.readyState < 1) return;
+                applyPlaybackRate();
+                const target = Math.max(0, Math.min(
+                    Number.isFinite(compareMedia.duration) ? compareMedia.duration : Number.MAX_SAFE_INTEGER,
+                    comparisonTargetTime(),
+                ));
+                const tolerance = 0.55 / Math.max(1, compareSourceFps);
+                if (force || Math.abs((compareMedia.currentTime || 0) - target) > tolerance) {
+                    compareMedia.currentTime = target;
+                }
+                if (media.paused || media.ended) {
+                    compareMedia.pause();
+                } else if (compareMedia.paused) {
+                    compareMedia.play().catch(error => console.warn("HR Endless Sampler comparison playback failed", error));
+                }
             }
 
             function currentFrame() {
@@ -783,6 +983,7 @@ app.registerExtension({
             }
 
             function tick() {
+                syncComparison();
                 renderStatus();
                 if (!media.paused && !media.ended) animation = requestAnimationFrame(tick);
                 else animation = null;
@@ -797,6 +998,7 @@ app.registerExtension({
                 if (!total) return;
                 const target = Math.max(0, Math.min(total - 1, Math.round(frame)));
                 media.currentTime = target / sourceFps;
+                syncComparison(true);
                 renderStatus();
             }
 
@@ -817,8 +1019,9 @@ app.registerExtension({
                     return;
                 }
                 const description = String(chunk.gemma_detailed_description || "").trim();
+                const retentionAnalysis = String(chunk.gemma_retention_analysis || "").trim();
                 const timing = finishedChunkTimingLines(chunk);
-                const signature = JSON.stringify([description, timing, shots()]);
+                const signature = JSON.stringify([description, retentionAnalysis, timing, shots()]);
                 if (tooltipChunk === chunk && tooltipSignature === signature) {
                     chunkTooltip.move(event);
                     return;
@@ -830,6 +1033,7 @@ app.registerExtension({
                     chunk,
                     timing,
                     description,
+                    retentionAnalysis,
                     shotRanges: shots(),
                 });
             }
@@ -846,7 +1050,33 @@ app.registerExtension({
                 media.src = data.media_url;
                 media.load();
                 applyPlaybackRate();
+                syncComparison(true);
                 renderStatus();
+            }
+
+            function savedStateWithCacheBust(data) {
+                const stateId = String(data?.state_id || "").trim();
+                if (!stateId || !data?.media_url) return data;
+                const separator = String(data.media_url).includes("?") ? "&" : "?";
+                return {
+                    ...data,
+                    media_url: `${data.media_url}${separator}_hr_saved=${encodeURIComponent(stateId)}`,
+                };
+            }
+
+            function applyAuthoritativeSavedState(data) {
+                if (!data?.media_url || !data?.timeline) return;
+                const stateId = String(data.state_id || "").trim();
+                if (stateId && stateId === lastSavedStateId) return;
+                if (stateId) lastSavedStateId = stateId;
+                // A completed save always wins over a matching-video preview
+                // request that may still be decoding on the server.
+                loadRequestSerial += 1;
+                setState(savedStateWithCacheBust(data));
+                if (selectedPathLabel) {
+                    selectedPathLabel.textContent = String(data.title || "Saved render");
+                    selectedPathLabel.title = selectedPathLabel.textContent;
+                }
             }
 
             async function previewSelectedPath(path, updateLoadWidget = false) {
@@ -888,7 +1118,77 @@ app.registerExtension({
                 }
             }
 
-            node._hrEndlessSamplerFinishedVideo = setState;
+            async function previewComparisonPath(path) {
+                if (!path || !isSaveNode) return;
+                const requestSerial = ++compareRequestSerial;
+                compareButton.disabled = true;
+                comparePathLabel.textContent = `Loading ${path}…`;
+                comparePathLabel.title = path;
+                try {
+                    const response = await api.fetchApi("/hr_endless_sampler_video/load_preview", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            video: path,
+                            fps: 0,
+                            node_id: String(node.id),
+                            store_state: false,
+                        }),
+                    });
+                    const payload = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(payload.error || `Could not load comparison video (${response.status})`);
+                    if (requestSerial !== compareRequestSerial) return;
+                    compareState = payload;
+                    compareSourceFps = validEndlessFps(payload.source_fps)
+                        || validEndlessFps(payload.timeline?.fps)
+                        || 24;
+                    const separator = String(payload.media_url).includes("?") ? "&" : "?";
+                    compareMedia.pause();
+                    compareMedia.removeAttribute("src");
+                    compareMedia.src = `${payload.media_url}${separator}_hr_compare=${requestSerial}-${Date.now()}`;
+                    compareMedia.load();
+                    comparePathLabel.textContent = path;
+                    comparePathLabel.title = path;
+                    renderComparisonWipe();
+                    applyPlaybackRate();
+                } catch (error) {
+                    if (requestSerial !== compareRequestSerial) return;
+                    const detail = String(error?.message || error);
+                    comparePathLabel.textContent = `Comparison failed: ${detail}`;
+                    comparePathLabel.title = detail;
+                } finally {
+                    if (requestSerial === compareRequestSerial) compareButton.disabled = false;
+                }
+            }
+
+            function clearComparison() {
+                ++compareRequestSerial;
+                compareState = null;
+                compareSourceFps = 24;
+                compareMedia.pause();
+                compareMedia.removeAttribute("src");
+                compareMedia.load();
+                comparePathLabel.textContent = "No comparison video selected";
+                comparePathLabel.title = "The normal Save/Matching video is shown on the first side; choose a comparison video to enable the interactive wipe.";
+                compareButton.disabled = false;
+                renderComparisonWipe();
+            }
+
+            node._hrEndlessSamplerFinishedVideo = data => {
+                if (isSaveNode && data?.origin === "saved") applyAuthoritativeSavedState(data);
+                else setState(data);
+            };
+
+            const previousExecuted = node.onExecuted;
+            node.onExecuted = function (message) {
+                const result = previousExecuted?.apply(this, arguments);
+                if (isSaveNode) {
+                    const values = message?.hr_endless_sampler_saved_video;
+                    const saved = Array.isArray(values) ? values[values.length - 1] : values;
+                    if (saved) applyAuthoritativeSavedState(saved);
+                }
+                return result;
+            };
 
             downloadButton?.addEventListener("click", event => {
                 event.preventDefault();
@@ -958,6 +1258,19 @@ app.registerExtension({
                 if (selected) await previewSelectedPath(selected, isLoadNode);
             });
 
+            compareButton?.addEventListener("click", async event => {
+                event.preventDefault();
+                event.stopPropagation();
+                const source = filenamePrefixWidget?.value;
+                if (!String(source || "").trim()) {
+                    comparePathLabel.textContent = "Enter a filename_prefix before comparing renders.";
+                    return;
+                }
+                const selected = await openMatchingVideoDropdown(compareButton, source, false, "up", true);
+                if (selected === "") clearComparison();
+                else if (selected) await previewComparisonPath(selected);
+            });
+
             playButton.addEventListener("click", event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -966,6 +1279,34 @@ app.registerExtension({
                 root.focus({ preventScroll: true });
             });
             viewport.addEventListener("click", () => root.focus({ preventScroll: true }));
+            wipeHitLine.addEventListener("pointerdown", event => {
+                if (event.button !== 0 || !compareState) return;
+                event.preventDefault();
+                event.stopPropagation();
+                wipeDragging = true;
+                wipeHitLine.setPointerCapture?.(event.pointerId);
+                setWipePositionFromPointer(event);
+                root.focus({ preventScroll: true });
+            });
+            wipeHitLine.addEventListener("pointermove", event => {
+                if (!wipeDragging) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setWipePositionFromPointer(event);
+            });
+            for (const eventName of ["pointerup", "pointercancel"]) {
+                wipeHitLine.addEventListener(eventName, event => {
+                    wipeDragging = false;
+                    wipeHitLine.releasePointerCapture?.(event.pointerId);
+                });
+            }
+            wipeHitLine.addEventListener("contextmenu", event => {
+                if (!compareState) return;
+                event.preventDefault();
+                event.stopPropagation();
+                wipeModeIndex = (wipeModeIndex + 1) % wipeModes.length;
+                renderComparisonWipe();
+            });
             timelineShell.addEventListener("pointerdown", event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -1006,13 +1347,25 @@ app.registerExtension({
             for (const eventName of ["loadedmetadata", "loadeddata", "timeupdate", "seeking", "seeked", "pause", "play", "ended", "ratechange"]) {
                 media.addEventListener(eventName, () => {
                     applyPlaybackRate();
+                    if (["loadedmetadata", "loadeddata", "seeking", "seeked", "pause", "play", "ended"].includes(eventName)) {
+                        syncComparison(true);
+                    }
                     renderStatus();
                     if (eventName === "play") startTick();
                 });
             }
+            for (const eventName of ["loadedmetadata", "loadeddata"]) {
+                compareMedia.addEventListener(eventName, () => {
+                    renderComparisonWipe();
+                    syncComparison(true);
+                });
+            }
 
             node.addDOMWidget("player", "hr_endless_sampler_finished_video", root, { serialize: false });
-            node.setSize([Math.max(node.size?.[0] || 480, 480), Math.max(node.size?.[1] || 420, 420)]);
+            node.setSize([
+                Math.max(node.size?.[0] || 480, 480),
+                Math.max(node.size?.[1] || (isSaveNode ? 452 : 420), isSaveNode ? 452 : 420),
+            ]);
             fpsWidget = node.widgets?.find(widget => widget.name === "fps");
             const previousFpsCallback = fpsWidget?.callback;
             if (fpsWidget) {
@@ -1043,7 +1396,11 @@ app.registerExtension({
                         `/hr_endless_sampler_video/state?node_id=${encodeURIComponent(node.id)}`,
                         { cache: "no-store" },
                     );
-                    if (response.ok) setState(await response.json());
+                    if (response.ok) {
+                        const restored = await response.json();
+                        if (isSaveNode && restored?.origin === "saved") applyAuthoritativeSavedState(restored);
+                        else setState(restored);
+                    }
                 } catch (error) {
                     console.warn("HR Endless Sampler finished-video state restore failed", error);
                 }
@@ -1055,6 +1412,8 @@ app.registerExtension({
                 if (animation != null) cancelAnimationFrame(animation);
                 media.pause();
                 media.removeAttribute("src");
+                compareMedia.pause();
+                compareMedia.removeAttribute("src");
                 chunkTooltip.remove();
                 node._hrEndlessSamplerFinishedVideo = null;
                 previousRemoved?.apply(this, arguments);

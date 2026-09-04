@@ -1,9 +1,18 @@
-# The CUDA 12.5 release channel publishes both Linux and Windows 0.3.35 wheels.
-# Newer CUDA 12 runtimes and NVIDIA drivers remain compatible with this wheel.
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
+# JamePeng's 0.3.49 CUDA 12.4 wheels include native Gemma reasoning budgets
+# and external MTP on both Linux and Windows. CUDA 12.4 is the lowest shared
+# published wheel channel; it runs on newer CUDA 12 NVIDIA drivers too.
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-linux-20260831/llama_cpp_python-0.3.49%2Bcu124-cp310-cp310-linux_x86_64.whl ; sys_platform == "linux" and python_version == "3.10"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-linux-20260831/llama_cpp_python-0.3.49%2Bcu124-cp311-cp311-linux_x86_64.whl ; sys_platform == "linux" and python_version == "3.11"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-linux-20260831/llama_cpp_python-0.3.49%2Bcu124-cp312-cp312-linux_x86_64.whl ; sys_platform == "linux" and python_version == "3.12"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-linux-20260831/llama_cpp_python-0.3.49%2Bcu124-cp313-cp313-linux_x86_64.whl ; sys_platform == "linux" and python_version == "3.13"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-linux-20260831/llama_cpp_python-0.3.49%2Bcu124-cp314-cp314-linux_x86_64.whl ; sys_platform == "linux" and python_version == "3.14"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp310-cp310-win_amd64.whl ; sys_platform == "win32" and python_version == "3.10"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp311-cp311-win_amd64.whl ; sys_platform == "win32" and python_version == "3.11"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp312-cp312-win_amd64.whl ; sys_platform == "win32" and python_version == "3.12"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp313-cp313-win_amd64.whl ; sys_platform == "win32" and python_version == "3.13"
+llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp314-cp314-win_amd64.whl ; sys_platform == "win32" and python_version == "3.14"
 
 huggingface-hub>=0.34.0
-llama-cpp-python==0.3.35
 # Finished-video EXR sequences and their float-WAV audio sidecar use PyAV.
 # ComfyUI currently supplies this too, but declare the direct runtime use here.
 av>=16.0.0

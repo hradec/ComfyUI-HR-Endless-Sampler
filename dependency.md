@@ -98,10 +98,12 @@ registration.
 
 ## Gemma 4 MTMD and MTP runtime
 
-The local director pins `llama-cpp-python==0.3.35` and Google's official
-`google/gemma-4-12B-it-qat-q4_0-gguf` model/projector pair. Runtime integration
-uses the `cu125` wheel channel because release 0.3.35 publishes both Linux and
-Windows CUDA wheels on that channel. It was reviewed on 2026-08-27 against:
+The local director pins JamePeng's fork of `llama-cpp-python==0.3.49` and
+Google's official `google/gemma-4-12B-it-qat-q4_0-gguf` model/projector pair.
+Runtime integration uses the `cu124` binary-wheel channel: this is the lowest
+CUDA channel published by that fork for both Linux and Windows, and remains
+driver-compatible with the existing CUDA 12.5 system. It was initially
+reviewed on 2026-08-27 against:
 
 - <https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf>, especially
   image-before-text modality ordering and the supported 70, 140, 280, 560, and
@@ -141,20 +143,25 @@ image batching behavior remain compatible. Prefer an upstream public budget
 API when one becomes available, then remove the local override and rerun the
 real model plus unit tests.
 
-`gemma4_mtp.py` uses the 0.3.35 low-level MTP/NextN bindings rather than
-starting an HTTP server. It intentionally adapts only the linked-context,
-single-sequence path used by the disposable director worker. When updating the
-binding, verify `load_mtp`, `LLAMA_CONTEXT_TYPE_MTP`, `ctx_other`, the NextN
-embedding functions, `PARTIAL_ONLY` target checkpoints and accepted-prefix
-replay after a rejected draft, JSON grammar generation, and teardown order.
-The fast path currently adds `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`, but it is
-allowed only inside the disposable worker: llama.cpp can abort before its C API
-returns an error. The parent must preserve the exact request and retry that
-operation up to ten times in fresh non-MTP workers after a native worker exit.
-The retries change only the copied request's MTP flag: all cache fields remain
-intact, and the next independent operation attempts MTP again. Generated
-target logits stay inside llama.cpp—the director never requests logprobs, so
-copying every verification row into NumPy is prohibited on this path.
+Runtime MTP now uses JamePeng's high-level native `SpecConfig` with
+`SpeculativeType.DRAFT_MTP`, the official Q8 MTP draft model, and
+`draft_n_max=4`. This replaces runtime use of the former local low-level
+`gemma4_mtp.py` adapter; retain that file only while its historical tests and
+captures still need it. The fast path stays inside a disposable worker because
+native MTP can still abort before its C API returns an error. The parent must
+preserve the exact request and retry that operation up to ten times in fresh
+non-MTP workers after a native worker exit. The retries change only the copied
+request's MTP flag: all cache fields remain intact, and the next independent
+operation attempts MTP again.
+
+Every normal and append-only Gemma completion uses JamePeng's native Gemma
+first-reasoning-block controls: `reasoning_budget=4096`, start
+`<|think|>`, end `<channel|>`, and the explicit budget message that ends the
+thought block and requests the visible answer. `reasoning_start_in_prompt` is
+true because `Gemma4ChatHandler(enable_thinking=True)` inserts `<|think|>` into
+the rendered assistant prefix before generation. This is not a generic
+OpenAI-compatible setting: retain the exact Gemma tags when revising the
+model/template.
 
 ### Periodic Gemma MTP upstream check
 
@@ -235,6 +242,34 @@ review date, versions/commits checked, and outcome below.
   multimodal replay: the running ComfyUI process held 14,954 MiB of the GPU, so
   a separate Gemma worker could not load for the live test. Keep the fallback
   until the next real Chunk 2 operation confirms the host-checkpoint path.
+- 2026-08-29 (global-shot-label prompt session): issue #27439 remains open,
+  labeled `bug-unconfirmed`, with no assignee, linked fix, or pull request.
+  PyPI and the repository tags still identify `llama-cpp-python==0.3.35` as
+  current; tag `v0.3.35` is package commit `3691546f1c9e0c1bf93323dff02230bd959cf562`
+  and its `vendor/llama.cpp` submodule is `4df29be4f4c3673f428170fda944a5b19f743bb8`.
+  No package with a confirmed #27439 fix exists. Preserve the disposable
+  worker and operation-local non-MTP retry unchanged.
+- 2026-08-30 (Windows worker-encoding fix): issue #27439 remains open,
+  labeled `bug-unconfirmed`, with no linked fix or pull request. PyPI and the
+  repository tags still report `llama-cpp-python==0.3.35`, which vendors
+  llama.cpp `4df29be4f4c3673f428170fda944a5b19f743bb8`; no confirmed fix is
+  available. Preserve the disposable worker and operation-local non-MTP retry.
+- 2026-08-30 (character-continuity planning session): issue #27439 remains
+  open (last updated 2026-08-20) with no close reason or confirmed fix. The
+  GitHub latest-release endpoint still reports `v0.3.35-hip-radeon` (published
+  2026-08-17), so there is no newer `llama-cpp-python` package known to vendor
+  a fix beyond the already recorded 0.3.35 llama.cpp commit. Preserve the
+  disposable worker, request/cache fields, and operation-local non-MTP retry
+  unchanged while revising only Gemma's prompt/response continuity contract.
+- 2026-08-30 (preproduction output-truncation diagnosis): issue #27439 remains
+  open, labeled `bug-unconfirmed`, with no linked fix or pull request. GitHub's
+  latest-release endpoint still reports `v0.3.35-hip-radeon` at package commit
+  `3691546`; no newer `llama-cpp-python` release containing a confirmed fix is
+  available. The current render failure is independent of that upstream bug:
+  MTP, the operation-local original-decoder retry, both append-only repairs,
+  and the final grammar fallback each reached the local 4,096-token timing-plan
+  response ceiling without closing the expanded continuity-plan JSON. Preserve
+  the disposable worker and operation-local non-MTP retry unchanged.
 
 The runtime was compared against `llama-cpp-python` tag `0.3.35` at commit
 `3691546f1c9e0c1bf93323dff02230bd959cf562`; that package vendors llama.cpp at
@@ -268,6 +303,44 @@ explicit fallback: when it is false, use the original high-level runtime; when
 it is true, missing native symbols or invalid target setup must stop the Gemma
 pass instead of silently running and reporting the non-MTP decoder.
 
+- 2026-08-31 (retained-slice dialogue segmentation session): llama.cpp issue
+  #27439 remains open with no state reason or upstream fix and was last updated
+  2026-08-20. The newest published llama-cpp-python GitHub release remains
+  `v0.3.35-hip-radeon`, published 2026-08-17; no newer package with a confirmed
+  fix is available. This session changes only Gemma's preproduction dialogue
+  schedule and chunk contract. Preserve the disposable worker and the
+  operation-local non-MTP retry without modification.
+
+- 2026-09-01 (overlap-keyframe/dialogue-timecode session): llama.cpp issue
+  #27439 remains open, labeled `bug-unconfirmed`, with no linked fix or pull
+  request. GitHub's latest `llama-cpp-python` release endpoint still resolves
+  to `v0.3.35-hip-radeon` at package commit `3691546`; the already recorded
+  0.3.35 package vendors llama.cpp `4df29be4f4c3673f428170fda944a5b19f743bb8`.
+  No newer Python package with a confirmed #27439 fix is available. Preserve
+  the disposable worker, all request/cache fields, and the operation-local
+  non-MTP retry unchanged while revising only Gemma's dialogue timing contract.
+
+- 2026-09-03 (minimal chunk-prompt wording session): issue #27439 remains
+  open and labeled `bug-unconfirmed`; its public report still identifies the
+  unsafe `ON_DEVICE` restore path and contains no linked fix. GitHub's latest
+  llama-cpp-python release endpoint did not report a newer package than the
+  recorded 0.3.35 release. This session changes only Gemma's H3-facing wording
+  contract: no llama.cpp, MTP, worker, cache, or retry behavior changed.
+  Preserve the disposable worker and operation-local non-MTP retry.
+
+- 2026-09-03 (JamePeng native MTP/reasoning-budget migration): issue #27439
+  remains open and labeled `bug-unconfirmed`; no linked upstream fix or close
+  state exists. JamePeng release `v0.3.49-cu124-linux-20260831`, tag commit
+  `34c1bfbce3ad485d31e67039fa9200e6ab49882e`, provides Linux and Windows
+  CUDA 12.4 wheels and exposes the required high-level `SpecConfig` external
+  `DRAFT_MTP` API plus `reasoning_budget`, `reasoning_start`,
+  `reasoning_end`, and `reasoning_budget_message` completion parameters.
+  The local CUDA 12.5 system successfully imports its Python 3.11 Linux wheel
+  and those APIs. The fast native MTP route therefore uses that public API with
+  four draft tokens. Preserve the disposable worker and operation-local
+  non-MTP retry until this package passes the captured multimodal Chunk 2
+  replay; this API availability does not prove the #27439 abort is fixed.
+
 The 2026-08-29 live 625-frame integration replay confirmed the distinction.
 MTP produced no complete JSON after one 1,024-token response (622 of 1,608
 draft tokens accepted, 38.7%); the new typed MTP-output failure immediately
@@ -276,3 +349,34 @@ which returned usable JSON and completed the test. The former 20–30 token/s
 reports came from repeatedly generating maximum-length unusable responses and
 then entering the expensive grammar sampler, not from the clean non-MTP
 decoder. Preserve the typed early handoff until upstream MTP is reliable.
+
+- 2026-09-04 (JamePeng MTP configuration/performance audit): llama.cpp issue
+  #27439 remains open and has no confirmed fix. JamePeng's newest published
+  release remains `v0.3.49-cu124-linux-20260831` at package commit
+  `34c1bfbce3ad485d31e67039fa9200e6ab49882e`; it vendors llama.cpp commit
+  `9723942adc518b43c4b95dc4dce6906903eb5e09`. The installed wheel is that exact
+  Python 3.11 CUDA 12.4 release. Fork `main` is currently `c31ed303`; changes
+  since the release contain no Gemma MTP checkpoint/rollback fix. Its
+  documented external Gemma 4 MTP setup uses
+  `SpecConfig(DRAFT_MTP, draft_model_path=..., draft_n_gpu_layers="all",
+  draft_backend_sampling=True)` and warns that stateful MTP is text-only and
+  that public prompt-cache restoration does not restore speculative-engine
+  state. In this fork `n_gpu_layers=-1` means `auto`, while `"all"` maps to the
+  native all-layers value. Real local profiling found 64.6 token/s without MTP
+  but only 2.3 token/s through the high-level MTP path: Gemma 4 exposes no
+  target recurrent snapshot slots, so the Python verifier deep-copies roughly
+  170 MiB host checkpoints during rejection rollback. A disposable one-buffer
+  prototype removed that catastrophic copy cost but reached only 44.8 token/s,
+  still below the original decoder. Do not describe the Python `SpecConfig`
+  route as equivalent in performance to native llama.cpp server MTP. An exact
+  text-only test of the fork's documented all-GPU setup drafted at normal GPU
+  speed but failed on its first partial rejection with `Failed to restore the
+  exact hybrid checkpoint for speculative rejection`; the same failure occurs
+  without the MTMD handler, so it is not caused by this project's image prompt
+  path. Preserve the currently usable target-loading policy, disposable worker,
+  and operation-local non-MTP retry until the fork fixes this rollback path.
+  A subsequent identical 100-token long-prompt comparison with
+  `draft_n_max=2` completed at 1.98-1.99 token/s (66.3% draft-token
+  acceptance), versus roughly 2.3 token/s at `draft_n_max=4`; changing draft
+  GPU placement between `auto` and `all` did not materially affect that result.
+  Keep four draft tokens.

@@ -16,6 +16,7 @@ receives the timeline header tag when ComfyUI's OpenEXR helper is available.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import json
 import logging
@@ -24,6 +25,7 @@ import re
 import shutil
 import sys
 import threading
+import uuid
 from collections import OrderedDict
 from fractions import Fraction
 from pathlib import Path
@@ -54,6 +56,7 @@ OUTPUT_BROWSER_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4
 OUTPUT_UPLOAD_VIDEO_EXTENSIONS = OUTPUT_BROWSER_VIDEO_EXTENSIONS - {".gif", ".webp"}
 OUTPUT_UPLOAD_SUBFOLDER = "hr_endless_sampler_uploads"
 OUTPUT_UPLOAD_CHUNK_DIRECTORY = "hr_endless_sampler_video_upload_chunks"
+INTERMEDIATE_CHUNK_MARKER = "_TEMP_chunk_"
 _SAFE_UPLOAD_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _SAFE_UPLOAD_NAME = re.compile(r"[^A-Za-z0-9._()\- ]+")
 
@@ -214,9 +217,15 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
             "start": start,
             "end": end,
         }
+        for key in ("source_start", "source_end"):
+            if key in item:
+                chunk[key] = int(item[key])
         description = item.get("gemma_detailed_description")
         if isinstance(description, str) and description.strip():
             chunk["gemma_detailed_description"] = description.strip()
+        retention_analysis = item.get("gemma_retention_analysis")
+        if isinstance(retention_analysis, str) and retention_analysis.strip():
+            chunk["gemma_retention_analysis"] = retention_analysis.strip()
         for key in (
             "h3_render_seconds",
             "gemma_seconds",
@@ -238,12 +247,15 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
         end = min(resolved_total - 1, int(item.get("end", start)))
         if end < start:
             continue
-        shots.append({
+        shot = {
             "shot": int(item.get("shot", index + 1)),
             "start": start,
             "end": end,
             "source_end": int(item.get("source_end", end)),
-        })
+        }
+        if "source_start" in item:
+            shot["source_start"] = int(item["source_start"])
+        shots.append(shot)
 
     normalized = {
         "schema_version": TIMELINE_SCHEMA_VERSION,
@@ -256,6 +268,8 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
     render_total_seconds = _number(source.get("render_total_seconds"), -1.0)
     if render_total_seconds >= 0:
         normalized["render_total_seconds"] = render_total_seconds
+    if isinstance(source.get("settings"), dict):
+        normalized["settings"] = source["settings"]
     return _copy_json(normalized)
 
 
@@ -408,7 +422,8 @@ if _PROMPT_SERVER is not None:
             # The requesting browser applies this response directly. Persist it
             # for refresh recovery without also broadcasting a duplicate event;
             # duplicate events can race when the user switches files quickly.
-            _store_player_state(node_id, response)
+            if body.get("store_state", True) is not False:
+                _store_player_state(node_id, response)
             return web.json_response(response)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return web.json_response({"error": str(error)}, status=400)
@@ -669,6 +684,224 @@ def _save_native_h264(images: torch.Tensor, filename_prefix: str, fps: float,
     return output_path
 
 
+def _intermediate_chunk_destination(filename_prefix: str, width: int, height: int) -> tuple[Path, str]:
+    """Resolve the output directory on ComfyUI's execution thread."""
+    full_output_folder, filename, _counter, _subfolder, _resolved_prefix = folder_paths.get_save_image_path(
+        filename_prefix,
+        folder_paths.get_output_directory(),
+        int(width),
+        int(height),
+    )
+    return Path(full_output_folder), filename
+
+
+def _intermediate_chunk_path(filename_prefix: str, width: int, height: int, *,
+                             chunk_number: int, chunk_count: int,
+                             frame_start: int, frame_end: int,
+                             destination: tuple[Path, str] | None = None) -> Path:
+    """Build one deterministic chunk filename from an already-resolved destination."""
+    if destination is None:
+        destination = _intermediate_chunk_destination(filename_prefix, width, height)
+    full_output_folder, filename = destination
+    return full_output_folder / (
+        f"{filename}{INTERMEDIATE_CHUNK_MARKER}{int(chunk_number):03d}-of-{int(chunk_count):03d}"
+        f"_frames_{int(frame_start):06d}-{int(frame_end):06d}.mp4"
+    )
+
+
+def _remove_intermediate_chunk_files(filename_prefix: str, width: int, height: int, *,
+                                     destination: tuple[Path, str] | None = None) -> int:
+    """Remove only this prefix's disposable chunk movies and their sidecars."""
+    example = _intermediate_chunk_path(
+        filename_prefix,
+        width,
+        height,
+        chunk_number=1,
+        chunk_count=1,
+        frame_start=0,
+        frame_end=0,
+        destination=destination,
+    )
+    removed = 0
+    pattern = f"{example.name.split(INTERMEDIATE_CHUNK_MARKER, 1)[0]}{INTERMEDIATE_CHUNK_MARKER}*.mp4"
+    for path in example.parent.glob(pattern):
+        for candidate in (path, _timeline_sidecar_path(path)):
+            try:
+                candidate.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def _save_intermediate_chunk_video(images: torch.Tensor, filename_prefix: str, fps: float, *,
+                                   chunk_number: int, chunk_count: int,
+                                   frame_start: int, frame_end: int,
+                                   chunk_metadata: dict | None = None,
+                                   shot_ranges=(), audio_waveform=None,
+                                   audio_sample_rate=None, crf: int = 23,
+                                   destination: tuple[Path, str] | None = None) -> Path:
+    """Encode one already-decoded sampler chunk without another VAE pass."""
+    frames = _normalize_frames(images).detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if not int(frames.shape[0]):
+        raise ValueError("an intermediate chunk video needs at least one frame")
+    frame_start = int(frame_start)
+    frame_end = frame_start + int(frames.shape[0]) - 1
+    output_path = _intermediate_chunk_path(
+        filename_prefix,
+        int(frames.shape[2]),
+        int(frames.shape[1]),
+        chunk_number=chunk_number,
+        chunk_count=chunk_count,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        destination=destination,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = output_path.with_name(output_path.stem + ".part.mp4")
+
+    chunk_record = dict(chunk_metadata or {})
+    chunk_record.update({
+        "chunk": int(chunk_number),
+        "start": 0,
+        "end": int(frames.shape[0]) - 1,
+        "source_start": frame_start,
+        "source_end": frame_end,
+    })
+    local_shots = []
+    for shot in shot_ranges or ():
+        source_start = max(frame_start, int(shot.get("start", frame_start)))
+        source_end = min(frame_end, int(shot.get("end", frame_end)))
+        if source_end < source_start:
+            continue
+        local = dict(shot)
+        local["start"] = source_start - frame_start
+        local["end"] = source_end - frame_start
+        local["source_start"] = source_start
+        local["source_end"] = source_end
+        local_shots.append(local)
+    timeline = normalize_timeline(
+        {
+            "fps": float(fps),
+            "total_frames": int(frames.shape[0]),
+            "chunks": [chunk_record],
+            "shots": local_shots,
+            "settings": {
+                "temporary_intermediate_chunk": True,
+                "source_frame_start": frame_start,
+                "source_frame_end": frame_end,
+                "source_chunk_count": int(chunk_count),
+            },
+        },
+        fps=float(fps),
+        total_frames=int(frames.shape[0]),
+    )
+    audio = None
+    if audio_waveform is not None and audio_sample_rate is not None:
+        audio = {
+            "waveform": audio_waveform.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            "sample_rate": int(audio_sample_rate),
+        }
+    video = InputImpl.VideoFromComponents(
+        Types.VideoComponents(
+            images=frames,
+            audio=audio,
+            frame_rate=Fraction(round(float(fps) * 1000), 1000),
+        ),
+        bit_depth=8,
+    )
+    try:
+        video.save_to(
+            str(partial_path),
+            format=Types.VideoContainer.MP4,
+            codec=Types.VideoCodec.H264,
+            metadata={TIMELINE_TAG: timeline},
+            crf=float(crf),
+        )
+        os.replace(partial_path, output_path)
+        _write_sidecar(output_path, timeline, {"kind": "video", "filename": output_path.name})
+    finally:
+        try:
+            partial_path.unlink()
+        except FileNotFoundError:
+            pass
+    logging.info(
+        "HR Endless Sampler intermediate: wrote Chunk %d/%d to %s",
+        int(chunk_number),
+        int(chunk_count),
+        output_path,
+    )
+    return output_path
+
+
+class IntermediateChunkVideoWriter:
+    """Serial background H.264 writer for the sampler's finalized chunk media."""
+
+    def __init__(self, filename_prefix: str, fps: float, chunk_count: int,
+                 width: int, height: int, *, fresh_run: bool):
+        self.filename_prefix = str(filename_prefix)
+        self.fps = float(fps)
+        self.chunk_count = int(chunk_count)
+        self.width = int(width)
+        self.height = int(height)
+        # Multi-user ComfyUI resolves output folders from execution-local
+        # context. Resolve here, before the background encoder loses it.
+        self.destination = _intermediate_chunk_destination(
+            self.filename_prefix,
+            self.width,
+            self.height,
+        )
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="hr-endless-intermediate-video",
+        )
+        self._futures = []
+        if fresh_run:
+            removed = _remove_intermediate_chunk_files(
+                self.filename_prefix,
+                self.width,
+                self.height,
+                destination=self.destination,
+            )
+            if removed:
+                logging.info(
+                    "HR Endless Sampler intermediate: removed %d stale file(s) for prefix %s",
+                    removed,
+                    self.filename_prefix,
+                )
+
+    def submit(self, index: int, frames: torch.Tensor, frame_start: int, frame_end: int, *,
+               chunk_metadata=None, shot_ranges=(), audio_waveform=None, audio_sample_rate=None):
+        future = self._executor.submit(
+            _save_intermediate_chunk_video,
+            frames,
+            self.filename_prefix,
+            self.fps,
+            chunk_number=int(index) + 1,
+            chunk_count=self.chunk_count,
+            frame_start=int(frame_start),
+            frame_end=int(frame_end),
+            chunk_metadata=chunk_metadata,
+            shot_ranges=shot_ranges,
+            audio_waveform=audio_waveform,
+            audio_sample_rate=audio_sample_rate,
+            destination=self.destination,
+        )
+        self._futures.append(future)
+
+    def close(self):
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        for future in self._futures:
+            try:
+                future.result()
+            except Exception as error:
+                logging.warning(
+                    "HR Endless Sampler could not save an intermediate chunk video: %s",
+                    error,
+                )
+        self._futures.clear()
+
+
 def _safe_relative(path: Path, root: Path) -> str | None:
     try:
         return str(path.resolve().relative_to(root.resolve()))
@@ -897,7 +1130,9 @@ class HREndlessSamplerSaveVideo(io.ComfyNode):
                 pixel_format="auto", crf=19, exr_compression="zip16", exr_gamma=1.0):
         if images is None and (latent is None or vae is None):
             raise ValueError("connect images, or connect both latent and vae for direct H3 EXR decoding")
-        if format == "video/exr" and latent is not None and vae is not None:
+        # The sampler's IMAGE output is the final seam- and shot-corrected
+        # float master. Use raw latent decoding only when no IMAGE is wired.
+        if format == "video/exr" and images is None and latent is not None and vae is not None:
             frames = cls._raw_h3_decode(latent, vae)
         else:
             frames = images
@@ -927,6 +1162,8 @@ class HREndlessSamplerSaveVideo(io.ComfyNode):
                     **({"audio_filename": audio_path.name} if audio_path is not None else {}),
                 },
             )
+            # Browser H.264 previews require display-range pixels. The EXR
+            # sequence above already received the untouched float master.
             proxy_path = _make_proxy(frames.clamp(0.0, 1.0), resolved_fps, normalized_timeline, audio=audio)
             media_url = _view_url(proxy_path)
             media_kind = "exr_sequence"
@@ -960,15 +1197,27 @@ class HREndlessSamplerSaveVideo(io.ComfyNode):
         if media_url is None:
             raise RuntimeError(f"saved media is outside ComfyUI's viewable folders: {primary_path}")
         logging.info("HR Endless Sampler Save Video: wrote %s and timeline sidecar %s", primary_path, sidecar)
-        _publish_player_state(_node_unique_id(cls), {
+        player_state = {
             "action": "media",
+            "origin": "saved",
+            "state_id": uuid.uuid4().hex,
             "title": primary_path.name,
             "media_url": media_url,
             "media_kind": media_kind,
             "source_fps": normalized_timeline["fps"],
             "timeline": normalized_timeline,
-        })
-        return io.NodeOutput(normalized_timeline, str(primary_path), float(normalized_timeline["fps"]))
+        }
+        _publish_player_state(_node_unique_id(cls), player_state)
+        # Also return the finished player state through ComfyUI's ordinary
+        # per-node UI result. A custom websocket event can be missed after a
+        # browser reconnect or race an older manually selected preview; the
+        # executed-node payload is the durable authoritative handoff.
+        return io.NodeOutput(
+            normalized_timeline,
+            str(primary_path),
+            float(normalized_timeline["fps"]),
+            ui={PLAYER_EVENT: [player_state]},
+        )
 
 
 def _load_video_payload(video: str, fps: float = 0.0, *, decoded: dict | None = None) -> tuple[dict, str, float, dict]:
@@ -1013,6 +1262,8 @@ def _load_video_payload(video: str, fps: float = 0.0, *, decoded: dict | None = 
                 audio = _decode_audio_file(audio_path)
             else:
                 logging.warning("HR Endless Sampler Load Video: EXR soundtrack is missing: %s", audio_path)
+        # This is a disposable browser proxy for an already-loaded EXR; keep
+        # the decoded EXR tensor itself unmodified for the node outputs.
         proxy_path = _make_proxy(frames.clamp(0.0, 1.0), normalized_timeline["fps"], normalized_timeline, audio=audio)
         media_url = _view_url(proxy_path)
         if media_url is None:

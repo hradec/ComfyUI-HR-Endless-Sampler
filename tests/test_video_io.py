@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -22,10 +23,17 @@ nodes = importlib.import_module(PLUGIN_ROOT.name + ".nodes")
 
 
 class FinishedVideoIOTest(unittest.TestCase):
-    def test_sampler_exposes_timeline_as_an_additive_fourth_output(self):
+    def test_sampler_preserves_legacy_outputs_and_appends_decoded_media(self):
         schema = nodes.HREndlessSampler.define_schema()
-        self.assertEqual(len(schema.outputs), 4)
-        self.assertEqual(schema.outputs[-1].io_type, "HRENDLESS_TIMELINE")
+        self.assertEqual(len(schema.outputs), 6)
+        self.assertEqual(
+            [item.io_type for item in schema.outputs],
+            ["LATENT", "LATENT", "STRING", "HRENDLESS_TIMELINE", "IMAGE", "AUDIO"],
+        )
+        self.assertEqual(
+            [item.display_name for item in schema.outputs],
+            ["output", "denoised_output", "chunk_prompts", "timeline", "images", "audio"],
+        )
 
     def test_load_video_preserves_existing_outputs_and_adds_media_components_and_geometry(self):
         schema = video_io.HREndlessSamplerLoadVideo.define_schema()
@@ -79,6 +87,7 @@ class FinishedVideoIOTest(unittest.TestCase):
                         "start": -2,
                         "end": 4,
                         "gemma_detailed_description": "  Continue the action.  ",
+                        "gemma_retention_analysis": "  Preserve Tila's mounted pose.  ",
                         "h3_render_seconds": 42.5,
                         "gemma_seconds": 3.25,
                         "gemma_preproduction_seconds": 2.0,
@@ -97,6 +106,7 @@ class FinishedVideoIOTest(unittest.TestCase):
             "start": 0,
             "end": 4,
             "gemma_detailed_description": "Continue the action.",
+            "gemma_retention_analysis": "Preserve Tila's mounted pose.",
             "h3_render_seconds": 42.5,
             "gemma_seconds": 3.25,
             "gemma_preproduction_seconds": 2.0,
@@ -204,6 +214,84 @@ class FinishedVideoIOTest(unittest.TestCase):
         self.assertEqual(captured["crf"], 17.0)
         self.assertEqual(captured["metadata"], {video_io.TIMELINE_TAG: timeline})
 
+    def test_intermediate_chunk_video_uses_deterministic_temp_name_audio_and_timeline(self):
+        captured = {}
+
+        class FakeVideo:
+            def save_to(self, path, **kwargs):
+                captured["path"] = Path(path)
+                captured.update(kwargs)
+                Path(path).write_bytes(b"temporary mp4")
+
+        def make_video(components, bit_depth):
+            captured["components"] = components
+            captured["bit_depth"] = bit_depth
+            return FakeVideo()
+
+        frames = torch.zeros((5, 16, 32, 3), dtype=torch.float32)
+        waveform = torch.zeros((1, 2, 10_000), dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(video_io.folder_paths, "get_output_directory", return_value=directory), \
+                patch.object(
+                    video_io.folder_paths,
+                    "get_save_image_path",
+                    return_value=(directory, "workflow", 1, "", "workflow"),
+                ), \
+                patch.object(video_io.InputImpl, "VideoFromComponents", side_effect=make_video):
+            path = video_io._save_intermediate_chunk_video(
+                frames,
+                "workflow",
+                24,
+                chunk_number=2,
+                chunk_count=7,
+                frame_start=39,
+                frame_end=43,
+                chunk_metadata={"gemma_detailed_description": "Continue walking."},
+                shot_ranges=[{"shot": 3, "start": 40, "end": 50}],
+                audio_waveform=waveform,
+                audio_sample_rate=48_000,
+            )
+            timeline, media = video_io._read_sidecar(path)
+
+        self.assertEqual(path.name, "workflow_TEMP_chunk_002-of-007_frames_000039-000043.mp4")
+        self.assertEqual(captured["path"].name, "workflow_TEMP_chunk_002-of-007_frames_000039-000043.part.mp4")
+        self.assertEqual(captured["bit_depth"], 8)
+        self.assertTrue(torch.equal(captured["components"].audio["waveform"], waveform))
+        self.assertEqual(timeline["chunks"][0]["source_start"], 39)
+        self.assertEqual(timeline["chunks"][0]["source_end"], 43)
+        self.assertEqual(timeline["shots"][0]["start"], 1)
+        self.assertEqual(timeline["shots"][0]["source_start"], 40)
+        self.assertTrue(timeline["settings"]["temporary_intermediate_chunk"])
+        self.assertEqual(media, {"kind": "video", "filename": path.name})
+
+    def test_intermediate_writer_keeps_the_execution_thread_output_destination(self):
+        """Background encoding must not re-resolve multi-user output context."""
+        calls = []
+
+        class FakeVideo:
+            def save_to(self, path, **_kwargs):
+                Path(path).write_bytes(b"temporary mp4")
+
+        def get_save_image_path(*_args):
+            calls.append(threading.current_thread().name)
+            return output_directory, "workflow", 1, "", "workflow"
+
+        frames = torch.zeros((5, 16, 32, 3), dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "per_user_output"
+            output_directory.mkdir()
+            with patch.object(video_io.folder_paths, "get_save_image_path", side_effect=get_save_image_path), \
+                    patch.object(video_io.InputImpl, "VideoFromComponents", return_value=FakeVideo()):
+                writer = video_io.IntermediateChunkVideoWriter(
+                    "workflow", 24, 1, 32, 16, fresh_run=False,
+                )
+                writer.submit(0, frames, 0, 4)
+                writer.close()
+
+            saved = output_directory / "workflow_TEMP_chunk_001-of-001_frames_000000-000004.mp4"
+            self.assertTrue(saved.is_file())
+        self.assertEqual(calls, [threading.current_thread().name])
+
     def test_output_browser_lists_folders_videos_and_one_entry_per_exr_sequence(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             video_io.folder_paths, "get_output_directory", return_value=directory,
@@ -306,6 +394,52 @@ class FinishedVideoIOTest(unittest.TestCase):
         schema = video_io.HREndlessSamplerSaveVideo.define_schema()
         audio = next(item for item in schema.inputs if item.id == "audio")
         self.assertTrue(audio.optional)
+
+    def test_save_execute_returns_authoritative_player_ui_state(self):
+        images = torch.zeros((2, 4, 6, 3), dtype=torch.float32)
+        timeline = video_io.normalize_timeline(None, fps=24, total_frames=2)
+        output_path = Path("/tmp/new_render_00007_.mp4")
+        sidecar_path = Path(str(output_path) + video_io.SIDECAR_SUFFIX)
+        with patch.object(video_io, "_save_native_h264", return_value=output_path), \
+                patch.object(video_io, "_write_sidecar", return_value=sidecar_path), \
+                patch.object(video_io, "_view_url", return_value="/view?filename=new_render_00007_.mp4&type=output"), \
+                patch.object(video_io, "_node_unique_id", return_value="144"), \
+                patch.object(video_io, "_publish_player_state") as publish:
+            result = video_io.HREndlessSamplerSaveVideo.execute(
+                images=images,
+                timeline=timeline,
+                fps=24,
+                filename_prefix="new_render",
+                format="video/h264-mp4",
+            )
+
+        payload = result.ui[video_io.PLAYER_EVENT][0]
+        self.assertEqual(payload["origin"], "saved")
+        self.assertTrue(payload["state_id"])
+        self.assertEqual(payload["title"], output_path.name)
+        self.assertEqual(payload["timeline"], timeline)
+        publish.assert_called_once_with("144", payload)
+
+    def test_exr_prefers_final_sampler_images_over_a_connected_raw_latent(self):
+        images = torch.full((2, 4, 6, 3), 1.25, dtype=torch.float32)
+        output_path = Path("/tmp/final_grade_00001_000000.exr")
+        sidecar_path = Path(str(output_path) + video_io.SIDECAR_SUFFIX)
+        with patch.object(video_io.HREndlessSamplerSaveVideo, "_raw_h3_decode") as raw_decode, \
+                patch.object(video_io, "_save_exr_sequence", return_value=(output_path, [output_path], "")) as save_exr, \
+                patch.object(video_io, "_write_sidecar", return_value=sidecar_path), \
+                patch.object(video_io, "_make_proxy", return_value=Path("/tmp/final_grade_preview.mp4")), \
+                patch.object(video_io, "_view_url", return_value="/view?filename=final_grade_preview.mp4&type=temp"), \
+                patch.object(video_io, "_node_unique_id", return_value="144"), \
+                patch.object(video_io, "_publish_player_state"):
+            video_io.HREndlessSamplerSaveVideo.execute(
+                images=images,
+                latent={"samples": object()},
+                vae=object(),
+                format="video/exr",
+            )
+
+        raw_decode.assert_not_called()
+        self.assertTrue(torch.equal(save_exr.call_args.args[0], images))
 
     def test_exr_audio_sidecar_round_trip_keeps_float_audio(self):
         audio = {
