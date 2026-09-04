@@ -42,34 +42,6 @@ class _FakeAudioVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
-    def test_replay_cached_decoded_media_preserves_raw_corrected_and_audio(self):
-        raw = torch.zeros((10, 2, 3, 3), dtype=torch.float32)
-        corrected = torch.ones((10, 2, 3, 3), dtype=torch.float32)
-        audio = torch.ones((1, 2, 100), dtype=torch.float32)
-        overlap = torch.zeros((1, 2, 10), dtype=torch.float32)
-        media = nodes._replay_cached_decoded_media({
-            "decoded_video_frames": raw,
-            "corrected_video_frames": corrected,
-            "decoded_preview_start": 25,
-            "decoded_preview_end": 31,
-            "decoded_preview_offset": 3,
-            "decoded_preview_audio": audio,
-            "decoded_preview_audio_rate": 48000,
-            "decoded_preview_overlap_audio": overlap,
-        })
-        self.assertIsNotNone(media)
-        self.assertTrue(torch.equal(media["raw_frames"], raw))
-        self.assertTrue(torch.equal(media["corrected_frames"], corrected))
-        self.assertTrue(torch.equal(media["preview_frames"], corrected[3:10]))
-        self.assertEqual(media["preview_start"], 25)
-        self.assertEqual(media["preview_end"], 31)
-        self.assertIs(media["audio"], audio)
-        self.assertEqual(media["audio_sample_rate"], 48000)
-        self.assertIs(media["overlap_audio"], overlap)
-
-    def test_replay_cached_decoded_media_rejects_incomplete_checkpoint(self):
-        self.assertIsNone(nodes._replay_cached_decoded_media({}))
-
     def test_dormant_preview_restores_finalized_cpu_media_from_replay_cache(self):
         """A browser refresh must not require a model execution to show cache."""
         with tempfile.TemporaryDirectory() as directory:
@@ -89,7 +61,8 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             }
             with patch.object(nodes, "_replay_cache_root", return_value=root), \
                     patch.object(nodes, "REPLAY_CACHE_ENABLED", True), \
-                    patch.object(nodes, "_REPLAY_CACHE_ACTIVE_RUNS", 0):
+                    patch.object(nodes, "_REPLAY_CACHE_ACTIVE_RUNS", 0), \
+                    patch.object(nodes, "load_replay_preview_proxy", return_value=(state["corrected_video_frames"], None, None)):
                 cache = nodes._LastRunReplayCache()
                 cache.create(fingerprint, "source", {"video": torch.zeros(1)})
                 cache.save_chunk(1, state)
@@ -375,6 +348,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("gemma4_mtp", input_ids)
         gemma4_mtp_input = next(item for item in schema.inputs if item.id == "gemma4_mtp")
         self.assertFalse(gemma4_mtp_input.default)
+        self.assertFalse(nodes.ENABLE_GEMMA4_MTP)
         self.assertIn("pytorch_memory_fraction", input_ids)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
@@ -449,7 +423,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertIsNone(nodes._set_pytorch_memory_fraction(0.85, torch.device("cpu")))
         setter.assert_not_called()
 
-    def test_last_run_replay_cache_keeps_exact_cpu_tensors_and_truncates_replayed_suffix(self):
+    def test_last_run_replay_cache_keeps_exact_latents_and_moves_decodes_to_proxy(self):
         video = torch.arange(24, dtype=torch.float16).reshape(1, 1, 2, 3, 4)
         audio = torch.arange(16, dtype=torch.float16).reshape(1, 1, 2, 8)
         plan = [{
@@ -484,7 +458,8 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         corrected_frames = decoded_frames + 0.25
         decoded_audio = torch.arange(100, dtype=torch.float32).reshape(1, 2, 50)
         with tempfile.TemporaryDirectory() as temp_root, \
-                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root):
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes, "save_replay_preview_proxy") as save_proxy:
             cache = nodes._LastRunReplayCache()
             cache.create(
                 fingerprint,
@@ -521,17 +496,18 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 "decoded_preview_audio": decoded_audio,
                 "decoded_preview_audio_rate": 48000,
                 "decoded_preview_overlap_audio": None,
-            })
+            }, fps=24.0)
             loaded, reason = cache.load_if_compatible(fingerprint)
             self.assertIsNone(reason)
             self.assertEqual(loaded["initial"]["noise_seed"], 123)
             self.assertEqual(loaded["initial"]["video"].device.type, "cpu")
             cached_chunk = cache.load_chunk(1)
             self.assertTrue(torch.equal(cached_chunk["sampled_video"], video.cpu()))
-            cached_media = nodes._replay_cached_decoded_media(cached_chunk)
-            self.assertIsNotNone(cached_media)
-            self.assertTrue(torch.equal(cached_media["preview_frames"], corrected_frames))
-            self.assertTrue(torch.equal(cached_media["audio"], decoded_audio))
+            self.assertNotIn("decoded_video_frames", cached_chunk)
+            self.assertNotIn("corrected_video_frames", cached_chunk)
+            self.assertNotIn("decoded_preview_audio", cached_chunk)
+            self.assertTrue(torch.equal(save_proxy.call_args.args[1], corrected_frames))
+            self.assertTrue(torch.equal(save_proxy.call_args.kwargs["audio_waveform"], decoded_audio))
             self.assertIsNone(cache.load_if_compatible({"different": True})[0])
             cache.truncate_from(1)
             self.assertFalse(cache.has_chunk(1))

@@ -81,7 +81,7 @@ GEMMA4_CHUNK_RESPONSE_TOKENS = 8132
 GEMMA4_GLOBAL_PREPRODUCTION_RESPONSE_TOKENS = 32768
 GEMMA4_SHOT_PREPRODUCTION_RESPONSE_TOKENS = 32768
 GEMMA4_TIMING_RESPONSE_TOKENS = 16384
-GEMMA4_REASONING_BUDGET = 4096
+GEMMA4_REASONING_BUDGET = 2048
 # Gemma 4's native template puts this marker in the prompt when thinking is
 # enabled.  The first generated reasoning channel is then closed by
 # ``<channel|>``.  These are model tokens, not prose strings.
@@ -1463,7 +1463,7 @@ def _chunk_generation_request(shots: Sequence[dict[str, Any]], current: dict[str
         _slice_portion_name(shot)
         for shot in shots
     ])
-    return (
+    request = (
         f"Write one complete chunk-local detailed_description for {portions}. "
         f"All requested action belongs to physical global timeslice {sampled_start}-{sampled_end - 1} inclusive, "
         f"physical chunk-local timeslice 0-{physical_frames - 1} ({physical_frames} frames). "
@@ -1471,6 +1471,28 @@ def _chunk_generation_request(shots: Sequence[dict[str, Any]], current: dict[str
         f"physical local frames {output_local_start}-{output_local_end}; do not restage completed opening "
         f"conditioning frames outside that retained interval."
     )
+    establishment = _first_frame_establishment(shots, current)
+    if establishment:
+        request += (
+            " This is the first generated frame of the production, not a continuation. Immediately after the "
+            "required opening [Shot N] marker, copy this authoritative source establishment exactly: "
+            f"`{establishment}` Do not replace it with `The camera remains static in the established framing.`"
+        )
+    return request
+
+
+def _first_frame_establishment(shots: Sequence[dict[str, Any]], current: dict[str, Any]) -> str:
+    """Return an explicit source opening that must establish global frame zero."""
+    if int(current["output_start"]) != 0 or not shots:
+        return ""
+    first = shots[0]
+    if int(first["shot_start"]) != 0 or int(first["target_start"]) != 0:
+        return ""
+    body = str(first.get("source_body") or "").strip()
+    opening = re.split(r"(?<=[.!?])\s+", body, maxsplit=1)[0].strip()
+    if not re.search(r"(?i)(?:exact\s+first\s+frame|first\s+frame.*<Picture\s+\d+>|<Picture\s+\d+>.*camera)", opening):
+        return ""
+    return opening
 
 
 def _required_local_markers(shots: Sequence[dict[str, Any]]) -> str:
@@ -1574,6 +1596,7 @@ def _contract_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
             or "last-seen character state" in warning.lower()
             or "retention_analysis" in warning.lower()
             or "character continuity" in warning.lower()
+            or "first-frame establishment" in warning.lower()
         )
     )
 
@@ -2118,6 +2141,14 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
         warnings.append("Gemma 4 detailed_description is unexpectedly long")
     if re.search(r"\b(?:detailed_description|overall_soundscape|non_diegetic_music|subject_definitions|summary|retention_analysis)\s*:", description, re.IGNORECASE):
         warnings.append("Gemma 4 returned a structured field label inside detailed_description")
+
+    establishment = _first_frame_establishment(request["target_shots"], request["current_chunk"])
+    if establishment and establishment.lower() not in description.lower():
+        warnings.append(
+            "Gemma 4 first-frame establishment must copy the authoritative source opening exactly after the "
+            f"opening shot marker: {establishment!r}; do not substitute continuation wording about an already "
+            "established framing"
+        )
 
     expected = [shot for shot in request["target_shots"] if shot.get("required_marker")]
     markers = list(_SHOT_MARKER.finditer(description))

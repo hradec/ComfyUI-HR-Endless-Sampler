@@ -46,7 +46,7 @@ from .gemma4 import (
     reset_gemma4_raw_output_log,
 )
 from .preview import begin_preview_execution, build_cached_final_preview_snapshot
-from .video_io import HREndlessTimeline, IntermediateChunkVideoWriter, normalize_timeline
+from .video_io import HREndlessTimeline, IntermediateChunkVideoWriter, load_replay_preview_proxy, normalize_timeline, save_replay_preview_proxy
 
 
 AUDIO_LATENT_FPS = 40
@@ -103,6 +103,10 @@ VIDEO_CONTINUATION_CANVASES = {
 }
 DEFAULT_PYTORCH_MEMORY_FRACTION = 0.85
 VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
+# The current llama-cpp-python Gemma 4 MTP verifier is slower than ordinary
+# decoding and can fail hybrid-state rollback. Keep its implementation intact,
+# but reject stale workflow values until the upstream path is usable again.
+ENABLE_GEMMA4_MTP = False
 # Temporarily disable the disposable three-step continuation memory probe.  It
 # remains implemented below so the experiment can be restored by changing this
 # single flag after its startup cost is useful again.
@@ -127,7 +131,7 @@ GEMMA_PROMPT_LOG_DIRNAME = "comfyui-hr-endless-sampler"
 GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
-REPLAY_CACHE_FORMAT = 9
+REPLAY_CACHE_FORMAT = 10
 _REPLAY_CACHE_ACTIVITY_LOCK = threading.Lock()
 _REPLAY_CACHE_ACTIVE_RUNS = 0
 # Preview's cache button controls whether future sampler executions use or
@@ -515,43 +519,6 @@ def _replay_write_json(path, value):
     temporary.replace(path)
 
 
-def _replay_cached_decoded_media(state):
-    """Return one checkpoint's CPU final media, or ``None`` for older caches.
-
-    The raw decode remains necessary for the next Qwen/Gemma handoff, while
-    the corrected decode is the authoritative source of preview and IMAGE
-    output frames.  Keeping both prevents a resumed render from changing its
-    pixel history by applying the boundary correction a second time.
-    """
-    raw_frames = state.get("decoded_video_frames")
-    corrected_frames = state.get("corrected_video_frames")
-    if not isinstance(raw_frames, torch.Tensor) or raw_frames.ndim != 4:
-        return None
-    if not isinstance(corrected_frames, torch.Tensor) or corrected_frames.shape != raw_frames.shape:
-        return None
-    try:
-        preview_start = int(state["decoded_preview_start"])
-        preview_end = int(state["decoded_preview_end"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    preview_count = max(0, preview_end - preview_start + 1)
-    preview_offset = int(state.get("decoded_preview_offset", 0))
-    if preview_offset < 0 or preview_offset + preview_count > int(corrected_frames.shape[0]):
-        return None
-    return {
-        "raw_frames": raw_frames.detach().to(device="cpu", dtype=torch.float32),
-        "corrected_frames": corrected_frames.detach().to(device="cpu", dtype=torch.float32),
-        "preview_frames": corrected_frames[preview_offset:preview_offset + preview_count].detach().to(
-            device="cpu", dtype=torch.float32
-        ),
-        "preview_start": preview_start,
-        "preview_end": preview_end,
-        "audio": state.get("decoded_preview_audio"),
-        "audio_sample_rate": state.get("decoded_preview_audio_rate"),
-        "overlap_audio": state.get("decoded_preview_overlap_audio"),
-    }
-
-
 def _replay_plan_signature(plan):
     """Keep only deterministic JSON-friendly physical chunk geometry."""
     keys = (
@@ -615,6 +582,9 @@ class _LastRunReplayCache:
 
     def chunk_path(self, chunk_number):
         return self.root / "chunks" / f"chunk_{int(chunk_number):04d}.pt"
+
+    def preview_path(self, chunk_number):
+        return self.root / "chunks" / f"chunk_{int(chunk_number):04d}.preview.mp4"
 
     def clear(self):
         _remove_replay_cache()
@@ -689,8 +659,41 @@ class _LastRunReplayCache:
                 source_prompt_sha256=hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
             )
 
-    def save_chunk(self, chunk_number, state):
+    def save_chunk(self, chunk_number, state, *, fps=None):
+        state = dict(state)
+        preview_frames = state.pop("corrected_video_frames", None)
+        state.pop("decoded_video_frames", None)
+        preview_audio = state.pop("decoded_preview_audio", None)
+        preview_audio_rate = state.pop("decoded_preview_audio_rate", None)
+        state.pop("decoded_preview_overlap_audio", None)
+        preview_offset = max(0, int(state.get("decoded_preview_offset", 0)))
+        try:
+            preview_count = max(0, int(state["decoded_preview_end"]) - int(state["decoded_preview_start"]) + 1)
+        except (KeyError, TypeError, ValueError):
+            preview_count = 0
+        # The latent checkpoint is authoritative; a browser proxy failure must
+        # never make an otherwise resumable render unrecoverable.
         _replay_write_tensor_file(self.chunk_path(chunk_number), state)
+        if isinstance(preview_frames, torch.Tensor) and preview_count and fps is not None:
+            proxy_frames = preview_frames[preview_offset:preview_offset + preview_count]
+            try:
+                save_replay_preview_proxy(
+                    self.preview_path(chunk_number),
+                    proxy_frames,
+                    fps,
+                    audio_waveform=preview_audio,
+                    audio_sample_rate=preview_audio_rate,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                try:
+                    self.preview_path(chunk_number).unlink()
+                except FileNotFoundError:
+                    pass
+                logging.warning(
+                    "HR Endless Sampler saved Chunk %d's latent checkpoint but could not encode its browser proxy: %s",
+                    int(chunk_number),
+                    error,
+                )
         self._update_manifest(status="recording", completed_chunks=int(chunk_number))
 
     def begin_from(self, chunk_number):
@@ -721,6 +724,10 @@ class _LastRunReplayCache:
                 continue
             if cached_number >= int(chunk_number):
                 path.unlink()
+                try:
+                    self.preview_path(cached_number).unlink()
+                except FileNotFoundError:
+                    pass
 
     def delete_chunk(self, chunk_number):
         """Remove one checkpoint while preserving later cache entries for replay."""
@@ -728,6 +735,10 @@ class _LastRunReplayCache:
         if chunk_number < 1 or not self.has_chunk(chunk_number):
             raise ValueError(f"Cached Chunk {chunk_number} is unavailable")
         self.chunk_path(chunk_number).unlink()
+        try:
+            self.preview_path(chunk_number).unlink()
+        except FileNotFoundError:
+            pass
         self.mark_interrupted(chunk_number - 1)
 
 
@@ -757,7 +768,7 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
 
         # Keep the complete physical geometry visible, including unrendered
         # suffix chunks of an interrupted cache. The encoder below publishes
-        # only checkpoints that carry finalized decoded media.
+        # only checkpoints that carry a browser-only preview proxy.
         chunk_ranges = []
         for index, item in enumerate(plan):
             if not isinstance(item, dict):
@@ -777,12 +788,19 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
                 state = cache.load_chunk(number)
             except (OSError, RuntimeError, ValueError):
                 continue
-            media = _replay_cached_decoded_media(state)
-            if media is None:
+            try:
+                preview_frames, preview_audio, preview_audio_rate = load_replay_preview_proxy(
+                    cache.preview_path(number)
+                )
+                preview_start = int(state["decoded_preview_start"])
+                preview_end = int(state["decoded_preview_end"])
+            except (FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if int(preview_frames.shape[0]) != preview_end - preview_start + 1:
                 continue
             range_item = chunk_ranges[number - 1]
-            range_item["start"] = media["preview_start"]
-            range_item["end"] = media["preview_end"]
+            range_item["start"] = preview_start
+            range_item["end"] = preview_end
             description = state.get("gemma_description")
             if isinstance(description, str) and description.strip():
                 range_item["gemma_detailed_description"] = description.strip()
@@ -801,10 +819,10 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
                     range_item[key] = float(value)
             cached_chunks.append({
                 "index": number - 1,
-                "frames": media["preview_frames"],
-                "output_start": media["preview_start"],
-                "audio": media["audio"],
-                "audio_sample_rate": media["audio_sample_rate"],
+                "frames": preview_frames,
+                "output_start": preview_start,
+                "audio": preview_audio,
+                "audio_sample_rate": preview_audio_rate,
                 "gemma_detailed_description": range_item.get("gemma_detailed_description"),
                 "gemma_retention_analysis": range_item.get("gemma_retention_analysis"),
                 "h3_render_seconds": range_item.get("h3_render_seconds"),
@@ -2212,10 +2230,9 @@ def _decode_replay_preview_media(vae, audio_vae, sampled_video, sampled_audio, *
                                  keep_masked_av_prefix=False):
     """Decode one cached physical chunk exactly like live finalization.
 
-    Replay checkpoints intentionally store the authoritative video/audio
-    latents rather than a second compressed browser copy. Resume preview must
-    therefore run the real VAEs again; using the fast latent preview here makes
-    restored chunks visibly different and drops their audio.
+    Replay checkpoints store authoritative video/audio latents plus a lossy
+    browser proxy. Resume output must therefore run the real VAEs again; proxy
+    pixels are never allowed into sampling, color correction, or IMAGE output.
     """
     decoded_frames = _decode_video_frames(vae, sampled_video).detach().to(
         device="cpu",
@@ -3721,7 +3738,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=False,
-                                 tooltip="Experimental native Gemma 4 draft-MTP with four speculative tokens. Disabled by default because the current Python runtime is slower and has hybrid-checkpoint failures."),
+                                 tooltip="Experimental native Gemma 4 draft-MTP with four speculative tokens. Temporarily disabled in this build because the current Python runtime is slower and has hybrid-checkpoint failures."),
                 io.Float.Input(
                     "pytorch_memory_fraction",
                     default=DEFAULT_PYTORCH_MEMORY_FRACTION,
@@ -3802,6 +3819,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
         guide_overlap = 5
         video_continuation_enable = True
         qwen_full_history = False
+        if gemma4_mtp and not ENABLE_GEMMA4_MTP:
+            logging.warning(
+                "HR Endless Sampler ignored saved gemma4_mtp=true: MTP is temporarily disabled; using the original decoder."
+            )
+        gemma4_mtp = bool(gemma4_mtp and ENABLE_GEMMA4_MTP)
         if video_continuation_method not in VIDEO_CONTINUATION_METHODS:
             raise ValueError(
                 f"Unknown video_continuation_method {video_continuation_method!r}; choose one of "
@@ -4082,21 +4104,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         logging.info("HR Endless Sampler replay: reusing the cached Gemma preproduction timing plan.")
                     # A right-click cache deletion leaves later completed
                     # chunks intact. Reuse that suffix only when it reaches
-                    # this run's end and every state includes final decoded
-                    # media; otherwise ordinary serial sampling remains the
-                    # only valid way to reach a later uncached chunk.
-                    if not replay_prompt_changed:
+                    # this run's end and the VAE can reconstruct authoritative
+                    # frames from its latent checkpoints. The MP4 proxies are
+                    # deliberately never accepted as render output.
+                    if not replay_prompt_changed and vae is not None:
                         suffix_numbers = list(range(debug_start_chunk + 1, len(active_plan) + 1))
                         if suffix_numbers and all(candidate_cache.has_chunk(number) for number in suffix_numbers):
-                            candidate_suffix = [candidate_cache.load_chunk(number) for number in suffix_numbers]
-                            if all(_replay_cached_decoded_media(state) is not None for state in candidate_suffix):
-                                replay_cached_suffix = candidate_suffix
-                                logging.info(
-                                    "HR Endless Sampler replay will sample Chunk %d only and reuse cached Chunks %d-%d.",
-                                    debug_start_chunk,
-                                    debug_start_chunk + 1,
-                                    len(active_plan),
-                                )
+                            replay_cached_suffix = [candidate_cache.load_chunk(number) for number in suffix_numbers]
+                            logging.info(
+                                "HR Endless Sampler replay will sample Chunk %d only and VAE-restore cached Chunks %d-%d.",
+                                debug_start_chunk,
+                                debug_start_chunk + 1,
+                                len(active_plan),
+                            )
                 except (OSError, RuntimeError, ValueError, KeyError) as error:
                     logging.warning(
                         "HR Endless Sampler replay cache could not restore Chunk %d; recording a fresh baseline from Chunk 1: %s",
@@ -4403,10 +4423,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         guider.model_patcher.model.latent_format,
                     )
             else:
-                # New checkpoints contain raw and corrected CPU decoded media,
-                # so normal restore never reloads either VAE. Older/incomplete
-                # checkpoints retain the original latent-VAE fallback; a bad
-                # preview restore must never prevent serial sampling recovery.
+                # MP4 is only the dormant browser preview. Rebuild exact float
+                # frames and audio from the authoritative latent checkpoints.
                 comfy.model_management.unload_model_and_clones(guider.model_patcher)
                 comfy.model_management.unload_model_and_clones(clip.patcher)
                 comfy.model_management.soft_empty_cache(force=True)
@@ -4427,89 +4445,60 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             and restored_index > 0
                             and not TRIM_MASKED_AV_PREFIX
                         )
-                        cached_media = _replay_cached_decoded_media(state)
-                        if cached_media is not None:
-                            decoded_frames = cached_media["raw_frames"]
-                            corrected_frames = cached_media["corrected_frames"]
-                            retained_frames = cached_media["preview_frames"]
-                            restored_audio = cached_media["audio"]
-                            restored_audio_rate = cached_media["audio_sample_rate"]
-                            restored_overlap_audio = cached_media["overlap_audio"]
-                            restored_preview_start = cached_media["preview_start"]
-                            restored_preview_end = cached_media["preview_end"]
-                            logging.info(
-                                "HR Endless Sampler restored cached decoded media for Chunk %d without VAE decoding.",
-                                restored_index + 1,
-                            )
-                        else:
-                            (
-                                decoded_frames,
-                                _unused_retained_frames,
-                                restored_audio,
-                                restored_audio_rate,
-                                restored_overlap_audio,
-                            ) = (
-                                _decode_replay_preview_media(
-                                    vae,
-                                    audio_vae,
-                                    state["sampled_video"],
-                                    state.get("sampled_audio"),
-                                    output_trim_frames=restored_plan.get("output_trim_frames", 0),
-                                    context_audio_t=(
-                                        0 if restored_index == 0
-                                        or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
-                                        else restored_plan.get("context_audio_t", 0)
-                                    ),
-                                    output_frames=restored["output_end"] - restored["output_start"] + 1,
-                                    fps=fps,
-                                    masked_audio_overlap_frames=(
-                                        restored_plan.get("output_trim_frames", 0)
-                                        if (
-                                            use_masked_av_overlap
-                                            and TRIM_MASKED_AV_PREFIX
-                                            and restored_index > 0
-                                        )
-                                        else 0
-                                    ),
-                                    keep_masked_av_prefix=keep_masked_av_prefix,
-                                )
-                            )
-                            retained_start = 0 if keep_masked_av_prefix else correction_overlap
-                            correction_reference = _decoded_frame_tail(decoded_output_frames, correction_overlap)
-                            correction_frame_count = _same_shot_correction_frames(
-                                gemma_shots,
-                                restored["output_start"],
-                                restored["output_end"] + 1,
-                            )
-                            (
-                                corrected_frames,
-                                color_transform,
-                                corrected_frame_count,
-                            ) = _correct_decoded_chunk_color(
-                                correction_reference,
-                                decoded_frames,
-                                correction_overlap,
-                                correction_frame_count,
-                            )
-                            retained_count = restored["output_end"] - restored["output_start"] + 1
-                            if keep_masked_av_prefix:
-                                retained_count += correction_overlap
-                            retained_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
-                            _log_output_color_correction(
-                                "restored Chunk %d" % (restored_index + 1),
-                                color_transform,
-                                corrected_frame_count,
-                            )
-                            restored_preview_start = (
-                                restored_plan["frame_start"]
-                                if keep_masked_av_prefix
-                                else restored["output_start"]
-                            )
-                            restored_preview_end = (
-                                restored_plan["frame_end"] - 1
-                                if keep_masked_av_prefix
-                                else restored["output_end"]
-                            )
+                        (
+                            decoded_frames,
+                            _unused_retained_frames,
+                            restored_audio,
+                            restored_audio_rate,
+                            restored_overlap_audio,
+                        ) = _decode_replay_preview_media(
+                            vae,
+                            audio_vae,
+                            state["sampled_video"],
+                            state.get("sampled_audio"),
+                            output_trim_frames=restored_plan.get("output_trim_frames", 0),
+                            context_audio_t=(
+                                0 if restored_index == 0
+                                or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
+                                else restored_plan.get("context_audio_t", 0)
+                            ),
+                            output_frames=restored["output_end"] - restored["output_start"] + 1,
+                            fps=fps,
+                            masked_audio_overlap_frames=(
+                                restored_plan.get("output_trim_frames", 0)
+                                if use_masked_av_overlap and TRIM_MASKED_AV_PREFIX and restored_index > 0
+                                else 0
+                            ),
+                            keep_masked_av_prefix=keep_masked_av_prefix,
+                        )
+                        retained_start = 0 if keep_masked_av_prefix else correction_overlap
+                        correction_reference = _decoded_frame_tail(decoded_output_frames, correction_overlap)
+                        correction_frame_count = _same_shot_correction_frames(
+                            gemma_shots,
+                            restored["output_start"],
+                            restored["output_end"] + 1,
+                        )
+                        corrected_frames, color_transform, corrected_frame_count = _correct_decoded_chunk_color(
+                            correction_reference,
+                            decoded_frames,
+                            correction_overlap,
+                            correction_frame_count,
+                        )
+                        retained_count = restored["output_end"] - restored["output_start"] + 1
+                        if keep_masked_av_prefix:
+                            retained_count += correction_overlap
+                        retained_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
+                        _log_output_color_correction(
+                            "restored Chunk %d" % (restored_index + 1),
+                            color_transform,
+                            corrected_frame_count,
+                        )
+                        restored_preview_start = (
+                            restored_plan["frame_start"] if keep_masked_av_prefix else restored["output_start"]
+                        )
+                        restored_preview_end = (
+                            restored_plan["frame_end"] - 1 if keep_masked_av_prefix else restored["output_end"]
+                        )
                         decoded_output_frames.append(retained_frames)
                         restored_color_diagnostics = _safe_video_color_diagnostics(
                             retained_frames,
@@ -5894,6 +5883,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "decoded_preview_audio_rate": final_preview_audio_rate,
                                 "decoded_preview_overlap_audio": final_preview_overlap_audio,
                             },
+                            fps=fps,
                         )
                     except (OSError, RuntimeError, ValueError) as error:
                         logging.warning(
@@ -5947,11 +5937,64 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             f"Restoring cached Chunk {index + 1}/{len(active_plan)} (H3 sampling skipped)",
                             chunk=index,
                         )
-                    media = _replay_cached_decoded_media(state)
-                    if media is None:
-                        raise RuntimeError(
-                            f"HR Endless Sampler cached Chunk {index + 1} lost its decoded media during replay"
-                        )
+                    restored_plan = active_plan[index]
+                    restored_range = preview_chunk_ranges[index]
+                    correction_overlap = max(0, int(restored_plan.get("output_trim_frames", 0)))
+                    keep_masked_av_prefix = (
+                        use_masked_av_overlap
+                        and index > 0
+                        and not TRIM_MASKED_AV_PREFIX
+                    )
+                    (
+                        raw_frames,
+                        _unused_retained_frames,
+                        cached_audio,
+                        cached_audio_rate,
+                        cached_overlap_audio,
+                    ) = _decode_replay_preview_media(
+                        vae,
+                        audio_vae,
+                        state["sampled_video"],
+                        state.get("sampled_audio"),
+                        output_trim_frames=restored_plan.get("output_trim_frames", 0),
+                        context_audio_t=(
+                            0 if index == 0 or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
+                            else restored_plan.get("context_audio_t", 0)
+                        ),
+                        output_frames=int(restored_range["end"]) - int(restored_range["start"]) + 1,
+                        fps=fps,
+                        masked_audio_overlap_frames=(
+                            restored_plan.get("output_trim_frames", 0)
+                            if use_masked_av_overlap and TRIM_MASKED_AV_PREFIX and index > 0
+                            else 0
+                        ),
+                        keep_masked_av_prefix=keep_masked_av_prefix,
+                    )
+                    retained_start = 0 if keep_masked_av_prefix else correction_overlap
+                    correction_reference = _decoded_frame_tail(decoded_output_frames, correction_overlap)
+                    correction_frame_count = _same_shot_correction_frames(
+                        gemma_shots,
+                        restored_range["start"],
+                        int(restored_range["end"]) + 1,
+                    )
+                    corrected_frames, color_transform, corrected_frame_count = _correct_decoded_chunk_color(
+                        correction_reference,
+                        raw_frames,
+                        correction_overlap,
+                        correction_frame_count,
+                    )
+                    retained_count = int(restored_range["end"]) - int(restored_range["start"]) + 1
+                    if keep_masked_av_prefix:
+                        retained_count += correction_overlap
+                    cached_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
+                    cached_preview_start = (
+                        restored_plan["frame_start"] if keep_masked_av_prefix else int(restored_range["start"])
+                    )
+                    _log_output_color_correction(
+                        "restored Chunk %d" % (index + 1),
+                        color_transform,
+                        corrected_frame_count,
+                    )
                     masked_audio_prefix = state.get("masked_audio_prefix")
                     masked_denoised_audio_prefix = state.get("masked_denoised_audio_prefix")
                     if masked_audio_prefix is not None:
@@ -5980,18 +6023,15 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
                             preview_chunk_ranges[index][key] = float(value)
 
-                    decoded_output_frames.append(media["preview_frames"])
-                    cached_color_diagnostics = _safe_video_color_diagnostics(media["preview_frames"], index + 1)
+                    decoded_output_frames.append(cached_frames)
+                    cached_color_diagnostics = _safe_video_color_diagnostics(cached_frames, index + 1)
                     if cached_color_diagnostics is not None:
                         _record_color_diagnostics(
                             color_diagnostics,
                             index,
                             cached_color_diagnostics,
-                            _color_boundary_context(gemma_shots, media["preview_start"]),
+                            _color_boundary_context(gemma_shots, cached_preview_start),
                         )
-                    cached_audio = media["audio"]
-                    cached_audio_rate = media["audio_sample_rate"]
-                    cached_overlap_audio = media["overlap_audio"]
                     if cached_audio is None or cached_audio_rate is None:
                         decoded_audio_complete = False
                     else:
@@ -6005,9 +6045,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     if preview_execution is not None:
                         preview_execution.finalize_chunk(
                             index,
-                            media["preview_frames"],
-                            media["preview_start"],
-                            media["preview_end"],
+                            cached_frames,
+                            cached_preview_start,
+                            cached_preview_start + int(cached_frames.shape[0]) - 1,
                             audio_waveform=cached_audio,
                             audio_sample_rate=cached_audio_rate,
                             gemma_detailed_description=description,
@@ -6018,9 +6058,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     if intermediate_writer is not None:
                         intermediate_writer.submit(
                             index,
-                            media["preview_frames"],
-                            media["preview_start"],
-                            media["preview_end"],
+                            cached_frames,
+                            cached_preview_start,
+                            cached_preview_start + int(cached_frames.shape[0]) - 1,
                             chunk_metadata=preview_chunk_ranges[index],
                             shot_ranges=preview_shot_ranges,
                             audio_waveform=cached_audio,

@@ -902,6 +902,58 @@ class IntermediateChunkVideoWriter:
         self._futures.clear()
 
 
+def save_replay_preview_proxy(path, images, fps, *, audio_waveform=None, audio_sample_rate=None, crf=18):
+    """Write a compact browser-only H.264 copy of finalized chunk media."""
+    frames = _normalize_frames(images).detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if not int(frames.shape[0]):
+        raise ValueError("a replay preview proxy needs at least one frame")
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial_path = os.path.splitext(path)[0] + ".part.mp4"
+    audio = None
+    if audio_waveform is not None and audio_sample_rate is not None:
+        audio = {
+            "waveform": audio_waveform.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            "sample_rate": int(audio_sample_rate),
+        }
+    video = InputImpl.VideoFromComponents(
+        Types.VideoComponents(
+            images=frames,
+            audio=audio,
+            frame_rate=Fraction(round(float(fps) * 1000), 1000),
+        ),
+        bit_depth=8,
+    )
+    try:
+        video.save_to(partial_path, format=Types.VideoContainer.MP4, codec=Types.VideoCodec.H264, crf=float(crf))
+        os.replace(partial_path, path)
+    finally:
+        if os.path.isfile(partial_path):
+            os.unlink(partial_path)
+
+
+def load_replay_preview_proxy(path):
+    """Decode a browser proxy; these pixels must never feed sampling or IMAGE output."""
+    path = os.fspath(path)
+    frames = []
+    with av.open(str(path)) as container:
+        stream = next((item for item in container.streams if item.type == "video"), None)
+        if stream is None:
+            raise ValueError("replay preview proxy has no video stream")
+        for frame in container.decode(stream):
+            frames.append(torch.from_numpy(np.ascontiguousarray(frame.to_ndarray(format="rgb24"))).to(dtype=torch.float32).div_(255.0))
+    if not frames:
+        raise ValueError("replay preview proxy contains no frames")
+    audio = None
+    audio_rate = None
+    with av.open(str(path)) as container:
+        if any(item.type == "audio" for item in container.streams):
+            decoded = _decode_audio_file(path)
+            audio = decoded["waveform"]
+            audio_rate = decoded["sample_rate"]
+    return torch.stack(frames), audio, audio_rate
+
+
 def _safe_relative(path: Path, root: Path) -> str | None:
     try:
         return str(path.resolve().relative_to(root.resolve()))

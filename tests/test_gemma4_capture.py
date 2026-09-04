@@ -615,7 +615,7 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("response_format", calls[0])
         self.assertEqual(calls[0]["max_tokens"], gemma4.GEMMA4_CHUNK_RESPONSE_TOKENS)
-        self.assertEqual(calls[0]["reasoning_budget"], 4096)
+        self.assertEqual(calls[0]["reasoning_budget"], gemma4.GEMMA4_REASONING_BUDGET)
         self.assertEqual(calls[0]["reasoning_start"], "<|think|>")
         self.assertEqual(calls[0]["reasoning_end"], "<channel|>")
         self.assertEqual(
@@ -794,7 +794,7 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(len(initial_calls), 1)
         self.assertEqual(len(append_calls), 1)
         self.assertNotIn("response_format", append_calls[0])
-        self.assertEqual(append_calls[0]["reasoning_budget"], 4096)
+        self.assertEqual(append_calls[0]["reasoning_budget"], gemma4.GEMMA4_REASONING_BUDGET)
         self.assertEqual(append_calls[0]["reasoning_start"], "<|think|>")
         self.assertEqual(append_calls[0]["reasoning_end"], "<channel|>")
         self.assertEqual(
@@ -1241,7 +1241,7 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn(request["previous_gemma_description"], cached_observation)
         self.assertIn("literal contiguous substring copied from your final detailed_description", cached_observation)
         self.assertIn("immediate `<Subject N> (Sx)` speaker form", cached_observation)
-        self.assertIn("Start each source-shot segment with its authoritative camera-continuity sentence", cached_observation)
+        self.assertIn("At global frame zero, copy the source's explicit first-frame/camera establishment", cached_observation)
         self.assertNotIn(request["original_prompt"], cached_observation)
         self.assertNotIn(request["target_shots"][1]["source_body"], cached_observation)
         self.assertNotIn("COMPLETE RELEVANT PREPRODUCTION SCHEDULE", cached_observation)
@@ -2391,6 +2391,72 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("never substitute a referenced animal", system)
         self.assertIn("Do not add camera movement.", planning_system)
         self.assertIn("`In a continuous movement,`", planning_system)
+
+    def test_first_chunk_preserves_source_first_frame_establishment(self):
+        opening = (
+            "using <Picture 1> as the exact first frame, the camera stays static at the same "
+            "position from start to end of the shot."
+        )
+        shots = [{
+            "shot_number": 1,
+            "shot_start": 0,
+            "shot_end": 100,
+            "target_start": 0,
+            "target_end": 39,
+            "required_marker": "[Shot 1]",
+            "source_body": opening + " <Subject 1> starts in silence.",
+        }]
+        current = {"sampled_start": 0, "sampled_end": 39, "output_start": 0, "output_end": 39}
+
+        request_text = gemma4._chunk_generation_request(shots, current)
+
+        self.assertIn("first generated frame of the production, not a continuation", request_text)
+        self.assertIn(f"`{opening}`", request_text)
+        self.assertIn("Do not replace it with `The camera remains static in the established framing.`", request_text)
+
+    def test_first_chunk_continuation_camera_wording_requests_correction(self):
+        opening = (
+            "using <Picture 1> as the exact first frame, the camera stays static at the same "
+            "position from start to end of the shot."
+        )
+        request = self.request()
+        request["current_chunk"] = {
+            "sampled_start": 0,
+            "sampled_end": 39,
+            "output_start": 0,
+            "output_end": 39,
+        }
+        request["target_shots"] = [{
+            "shot_number": 1,
+            "shot_start": 0,
+            "shot_end": 100,
+            "target_start": 0,
+            "target_end": 39,
+            "required_marker": "[Shot 1]",
+            "source_body": opening + " <Subject 1> starts in silence.",
+        }]
+        request["original_prompt"] = "detailed_description: [Shot 1] " + opening
+        value = {
+            "confidence": "high",
+            "analysis": "The opening is static.",
+            "timing_plan": "Begin the shot.",
+            "end_state": "The subject remains still.",
+            "retention_analysis": "",
+            "last_seen_character_state": [],
+            "coverage": [],
+            "detailed_description": (
+                "[Shot 1] The camera remains static in the established framing. "
+                "<Subject 1> starts in silence."
+            ),
+        }
+
+        wrong = gemma4._validate_chunk_prompt(value, request, json.dumps(value))
+        self.assertTrue(any("first-frame establishment" in item for item in wrong.validation_warnings))
+        self.assertTrue(gemma4._contract_validation_warnings(wrong.validation_warnings))
+
+        value["detailed_description"] = "[Shot 1] " + opening + " <Subject 1> starts in silence."
+        corrected = gemma4._validate_chunk_prompt(value, request, json.dumps(value))
+        self.assertFalse(any("first-frame establishment" in item for item in corrected.validation_warnings))
 
     def test_reports_marker_and_dialogue_warnings_without_replacing_gemma_text(self):
         request = self.request()
