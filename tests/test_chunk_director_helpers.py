@@ -282,6 +282,39 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
             self.assertIsNone(cache.automatic_resume_chunk(loaded["manifest"], 3))
 
+    def test_complete_replay_is_archived_and_survives_active_cache_clear(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes, "_replay_history_root", return_value=Path(temp_root) / "history"):
+            cache = nodes._LastRunReplayCache()
+            cache.create({"geometry": "stable"}, "prompt", {"video": torch.zeros(1)})
+            cache.save_chunk(1, {"output_video": torch.zeros(1)},
+                             metadata={"effective_h3_prompt": "final"})
+            cache.mark_complete(1)
+            manifest = json.loads(cache.manifest_path.read_text(encoding="utf-8"))
+            run_id = manifest["run_id"]
+            self.assertRegex(run_id, r"^[a-f0-9]{32}$")
+            archived = nodes._LastRunReplayCache(run_id)
+            self.assertEqual(archived.load_if_compatible({"geometry": "stable"})[0]["manifest"]["status"], "complete")
+            cache.clear()
+            self.assertTrue(archived.manifest_path.is_file())
+            cache.create({"geometry": "next"}, "next prompt", {"video": torch.ones(1)})
+            self.assertTrue(archived.manifest_path.is_file())
+            self.assertEqual(cache.load_if_compatible({"geometry": "next"})[0]["manifest"]["status"], "recording")
+
+    def test_replay_control_is_consumed_once_without_deleting_history(self):
+        with tempfile.TemporaryDirectory() as temp_root, \
+                patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
+                patch.object(nodes, "_replay_history_root", return_value=Path(temp_root) / "history"):
+            history = nodes._replay_history_root() / ("a" * 32)
+            history.mkdir(parents=True)
+            nodes._set_replay_control("restart")
+            self.assertEqual(nodes._consume_replay_control(), "restart")
+            self.assertEqual(nodes._consume_replay_control(), "keep")
+            self.assertTrue(history.is_dir())
+            with self.assertRaisesRegex(ValueError, "Unknown replay control action"):
+                nodes._set_replay_control("invalid")
+
     def test_rebuilt_replay_timing_plan_updates_the_source_prompt_hash(self):
         with tempfile.TemporaryDirectory() as temp_root, \
                 patch.object(nodes.tempfile, "gettempdir", return_value=temp_root), \
@@ -808,6 +841,17 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         keyframe = conds["positive"][0]["minimax_keyframes"][0]
         self.assertEqual(keyframe["resolved_frame_index"], 0)
         self.assertIs(keyframe["latent"], boundary_latent)
+
+    def test_continuation_keyframe_replaces_same_position_visual_anchor(self):
+        old = torch.zeros((1, 24, 2, 2, 2))
+        replacement = torch.ones((1, 24, 7, 2, 2))
+        conds = nodes._conditioning_for_chunk(
+            {"positive": [{"minimax_keyframes": [{"resolved_frame_index": 0, "latent": old}]}]},
+            0, 22, (torch.zeros((1, 1, 1)), {}), video_context=replacement,
+        )
+        keyframes = conds["positive"][0]["minimax_keyframes"]
+        self.assertEqual(len(keyframes), 1)
+        self.assertIs(keyframes[0]["latent"], replacement)
 
     def test_continuation_keyframe_matches_target_patch_padding(self):
         boundary = torch.arange(2 * 3 * 5, dtype=torch.float32).reshape(1, 1, 2, 3, 5)

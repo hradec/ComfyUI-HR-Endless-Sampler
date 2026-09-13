@@ -25,7 +25,8 @@ https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
 | 分块重拍与 Revision | ❌ 不支持 | ✅ 已实现，待实机验收 |
 | 持久续写 Checkpoint | ❌ 不支持 | ✅ 已实现，待实机验收 |
 | 统一参考媒体输入 | ❌ 分散接线 | ✅ 图片/视频/音轨/独立音频 |
-| Replay/断点重跑 | ⚠️ 基础能力 | ✅ 缓存、重拍和续写共用 |
+| Replay/断点重跑 | ⚠️ 基础能力 | ✅ 最近 5 次完整生成可选，缓存、重拍和续写共用 |
+| 生成中控制 | ❌ 不支持 | ✅ 停止保留、停止删除、删除后从头重排 |
 
 ### 为什么选择 Qwen3.6/3.8？
 
@@ -95,7 +96,11 @@ The way to use is pretty straight forward - just replace the normal "Sampler" no
 | `HR Endless Sampler Preview` | 实时累计预览、chunk 播放、Shot 标记、提示词/耗时悬停、逐帧控制、性能图表和刷新恢复。 |
 | `HR Endless Sampler Save Video` | 保存普通视频、VHS 格式或 float EXR 序列，同时保留 Timeline、提示词、渲染耗时和可选音频。 |
 | `HR Endless Sampler Load Video` | 浏览或上传成品媒体，恢复交互式 Timeline，并输出 VIDEO/IMAGE/AUDIO、尺寸、FPS、帧数和文件名。 |
+| `HR MiniMax H3 Continuation Analyzer` | 仅使用本地 Qwen3.5 分析普通视频最后 22 帧，输出 H3 prompt、尾帧上下文、分析 JSON 和预览；可选参考图只提供给 Qwen，不会成为 H3 reference。 |
+| `HR MiniMax H3 Continuation Apply` | 接收现有 MiniMax H3 conditioning 与 latent，使用 Analyzer 上下文编码并合并同位置 keyframe；原有 `cross_attn`、token tags 和 refs 原样保留，不重新 tokenization。输出可接 SelfLift，也保留 `external_continuation` 给 HR Endless Sampler。 |
 | `HR Endless Segment Retake Director` | 浏览最近一次完整 replay cache，选择 physical chunks、编辑 H3 prompt 并生成重拍计划。 |
+
+接线：`Analyzer.H3 prompt → 现有 MiniMax H3 conditioning`；`conditioning.positive + latent → Apply`；`Analyzer.context → Apply`；`Apply.positive + latent → SelfLift`。
 | `HR Endless Retake Assemble` | 根据每个 chunk 当前选中的原版/重拍 revision，无采样重新拼接 output、denoised output 和 Timeline。 |
 | `HR Endless Continuation Checkpoint` | 将最近一次完整 replay 固化为可跨重启保存的续写 checkpoint。 |
 | `HR Endless Continuation Plan` | 设置新提示词、音频策略以及参考媒体继承/替换/合并策略。 |

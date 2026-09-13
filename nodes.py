@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import psutil
@@ -44,6 +45,7 @@ from .video_io import HREndlessTimeline, normalize_timeline
 
 HREndlessRetakePlan = io.Custom("HR_RETAKE_PLAN")
 HREndlessContinuationPlan = io.Custom("HR_CONTINUATION_PLAN")
+HREndlessExternalContinuation = io.Custom("HR_H3_EXTERNAL_CONTINUATION")
 AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
 MIN_VIDEO_STEPS = 2
@@ -78,6 +80,9 @@ GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
 REPLAY_CACHE_FORMAT = 3
+REPLAY_HISTORY_DIRNAME = "history"
+REPLAY_HISTORY_LIMIT = 5
+_REPLAY_RUN_ID = re.compile(r"^[a-f0-9]{32}$")
 DETAILED_DESCRIPTION_FIELD = re.compile(r"detailed_description\s*:", re.IGNORECASE)
 INTEGRATED_DESCRIPTION_FIELD = re.compile(r"integrated_multimodal_description\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
@@ -193,19 +198,80 @@ def _reset_last_gemma_image_log():
     return path
 
 
-def _replay_cache_root():
-    """Return the bounded, disposable cache for debug chunk replays."""
-    return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / REPLAY_CACHE_DIRNAME
+def _replay_history_root():
+    try:
+        import folder_paths
+        output = Path(folder_paths.get_output_directory())
+    except ImportError:
+        output = Path.cwd() / "output"
+    return output / "hr_endless_sampler" / REPLAY_HISTORY_DIRNAME
+
+
+def _replay_cache_root(run_id=None):
+    """Return the active cache or one validated completed-run archive."""
+    if run_id is None:
+        return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / REPLAY_CACHE_DIRNAME
+    run_id = str(run_id)
+    if _REPLAY_RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("Invalid replay run ID")
+    return _replay_history_root() / run_id
+
+
+def _replay_history_runs():
+    result = []
+    history = _replay_history_root()
+    try:
+        paths = (path for path in history.iterdir() if path.is_dir() and _REPLAY_RUN_ID.fullmatch(path.name))
+        for path in paths:
+            try:
+                manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if manifest.get("status") == "complete" and manifest.get("run_id") == path.name:
+                result.append({"run_id": path.name, "created": manifest.get("created"),
+                               "completed_chunks": manifest.get("completed_chunks", 0),
+                               "archived_ns": path.stat().st_mtime_ns})
+    except OSError:
+        pass
+    return sorted(result, key=lambda item: item.get("archived_ns", 0), reverse=True)[:REPLAY_HISTORY_LIMIT]
+
+
+def _replay_control_path():
+    return _replay_cache_root() / "control.json"
+
+
+def _set_replay_control(action):
+    if action not in {"keep", "delete", "restart"}:
+        raise ValueError("Unknown replay control action")
+    _replay_write_json(_replay_control_path(), {"action": action, "created": time.time()})
+
+
+def _consume_replay_control():
+    path = _replay_control_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "keep"
+    except (OSError, json.JSONDecodeError):
+        return "keep"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    action = value.get("action")
+    return action if action in {"keep", "delete", "restart"} else "keep"
 
 
 def _remove_replay_cache():
-    """Remove only the sampler's fixed temporary replay cache."""
+    """Remove the active replay cache without deleting completed history."""
     path = _replay_cache_root()
     try:
         if path.is_symlink() or path.is_file():
             path.unlink()
         elif path.exists():
-            shutil.rmtree(path)
+            for child in path.iterdir():
+                if child.name != REPLAY_HISTORY_DIRNAME:
+                    shutil.rmtree(child) if child.is_dir() else child.unlink()
     except OSError as error:
         logging.warning("HR Endless Sampler could not clear replay cache %s: %s", path, error)
 
@@ -263,10 +329,32 @@ def _director_file_fingerprint(path):
     return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def _tensor_fingerprint(value):
+    if not isinstance(value, torch.Tensor):
+        return None
+    tensor = value.detach().to(device="cpu").contiguous()
+    return {"shape": list(tensor.shape), "dtype": str(tensor.dtype),
+            "sha256": hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()}
+
+
+def _reference_set_fingerprint(value):
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: [
+            _tensor_fingerprint(item) if isinstance(item, torch.Tensor)
+            else {"waveform": _tensor_fingerprint(item.get("waveform")), "sample_rate": item.get("sample_rate")}
+            if isinstance(item, dict) else None
+            for item in value.get(key, ())
+        ]
+        for key in ("images", "videos", "video_audios", "audios")
+    }
+
+
 def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
                         context_keyframes, guide_overlap, video_continuation,
                         video_continuation_res, ref2va, director_backend="gemma4",
-                        director_model="auto", director_mmproj="auto"):
+                        director_model="auto", director_mmproj="auto", external_continuation=None):
     """Describe the immutable tensor/layout inputs required for an exact replay.
 
     The source prompt intentionally is not part of this signature: editing it
@@ -289,6 +377,15 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
         "director_model": director_model,
         "director_mmproj": director_mmproj,
         "plan": _replay_plan_signature(plan),
+        "external_continuation": None if external_continuation is None else {
+            "type": external_continuation.get("type"),
+            "version": external_continuation.get("version"),
+            "prompt": external_continuation.get("prompt"),
+            "audio_mode": external_continuation.get("audio_mode", "mute"),
+            "video_context": _tensor_fingerprint(external_continuation.get("video_context")),
+            "audio_context": _tensor_fingerprint(external_continuation.get("audio_context")),
+            "reference_set": _reference_set_fingerprint(external_continuation.get("reference_set")),
+        },
     }
 
 
@@ -301,8 +398,9 @@ class _LastRunReplayCache:
     earlier H3 calls.
     """
 
-    def __init__(self):
-        self.root = _replay_cache_root()
+    def __init__(self, run_id=None):
+        self.run_id = None if run_id is None else str(run_id)
+        self.root = _replay_cache_root(self.run_id)
 
     @property
     def manifest_path(self):
@@ -337,11 +435,13 @@ class _LastRunReplayCache:
         return archived
 
     def clear(self):
+        if self.run_id is not None:
+            raise ValueError("Completed replay archives are immutable")
         _remove_replay_cache()
 
     def create(self, fingerprint, source_prompt, initial_tensors):
         self.clear()
-        self.root.mkdir(parents=True, exist_ok=False)
+        self.root.mkdir(parents=True, exist_ok=True)
         manifest = {
             "format": REPLAY_CACHE_FORMAT,
             "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -491,7 +591,41 @@ class _LastRunReplayCache:
         self._update_manifest(status="debug_stop", completed_chunks=max(0, int(completed_chunks)))
 
     def mark_complete(self, completed_chunks):
-        self._update_manifest(status="complete", completed_chunks=max(0, int(completed_chunks)))
+        completed_chunks = max(0, int(completed_chunks))
+        self._update_manifest(status="complete", completed_chunks=completed_chunks)
+        if completed_chunks and self.run_id is None:
+            self._archive_complete_run(completed_chunks)
+
+    def _archive_complete_run(self, completed_chunks):
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        entries = manifest.get("chunks", ())
+        if len(entries) != completed_chunks or any(
+            not self.chunk_path(int(entry.get("chunk", -1))).is_file()
+            or not self.chunk_metadata_path(int(entry.get("chunk", -1))).is_file()
+            for entry in entries
+        ):
+            return
+        run_id = manifest.get("run_id")
+        if not isinstance(run_id, str) or _REPLAY_RUN_ID.fullmatch(run_id) is None:
+            run_id = uuid.uuid4().hex
+            self._update_manifest(run_id=run_id)
+        history = _replay_history_root()
+        history.mkdir(parents=True, exist_ok=True)
+        target = history / run_id
+        if target.exists():
+            return
+        temporary = history / (run_id + ".tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        shutil.copytree(self.root, temporary, ignore=shutil.ignore_patterns(REPLAY_HISTORY_DIRNAME, "*.tmp"))
+        temporary.replace(target)
+        archives = sorted(
+            (path for path in history.iterdir() if path.is_dir() and _REPLAY_RUN_ID.fullmatch(path.name)),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in archives[REPLAY_HISTORY_LIMIT:]:
+            shutil.rmtree(stale, ignore_errors=True)
 
     def truncate_from(self, chunk_number):
         directory = self.root / "chunks"
@@ -1292,6 +1426,10 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
         if video_context is not None:
             if target_video is not None:
                 video_context = _pad_h3_keyframe_video(video_context, target_video)
+            keyframes = [keyframe for keyframe in keyframes if not (
+                keyframe.get("latent") is not None
+                and keyframe.get("resolved_frame_index") == video_context_start
+            )]
             keyframes.append({"resolved_frame_index": video_context_start, "latent": video_context})
         if audio_context is not None:
             audio_start = audio_end_frame - audio_context.shape[-1] / FRAME_RESCALE
@@ -2485,6 +2623,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 ),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
+                HREndlessExternalContinuation.Input("external_continuation", optional=True,
+                                                    tooltip="Qwen3.5-analyzed ordinary-video continuation. Applies its source tail only to the first physical chunk."),
                 HREndlessRetakePlan.Input("retake_plan", optional=True,
                                           tooltip="Optional validated chunk plan from HR Endless Segment Retake Director."),
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
@@ -2552,10 +2692,23 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
                 director_model="auto", director_mmproj="auto", director_config=None, reference_set=None,
-                continuation_plan=None, **_deprecated_inputs):
+                continuation_plan=None, external_continuation=None, **_deprecated_inputs):
         _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
         if retake_plan is not None and continuation_plan is not None:
             raise ValueError("retake_plan and continuation_plan cannot be used together")
+        if external_continuation is not None and (retake_plan is not None or continuation_plan is not None):
+            raise ValueError("external_continuation cannot be used with retake_plan or continuation_plan")
+        external_active = external_continuation is not None
+        if external_active:
+            if not isinstance(external_continuation, dict) or external_continuation.get("type") != "HR_H3_EXTERNAL_CONTINUATION":
+                raise ValueError("external_continuation must come from HR MiniMax H3 Continuation Apply")
+            if not isinstance(external_continuation.get("video_context"), torch.Tensor):
+                raise ValueError("external_continuation is missing its encoded source video tail")
+            prompt = str(external_continuation.get("prompt", prompt)).strip()
+            if not prompt:
+                raise ValueError("external_continuation has an empty H3 prompt")
+            if reference_set is None and external_continuation.get("reference_set") is not None:
+                reference_set = external_continuation["reference_set"]
         continuation_manifest = continuation_state = None
         continuation_audio_mode = "continue"
         if continuation_plan is not None:
@@ -2673,6 +2826,25 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if debug_start_chunk and debug_stop_chunk and debug_start_chunk > debug_stop_chunk:
             raise ValueError("debug_start_chunk cannot be greater than debug_stop_chunk")
         active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
+        external_frame_count = 0
+        external_audio_mode = "mute"
+        if external_active:
+            external_video = external_continuation["video_context"]
+            external_audio = external_continuation.get("audio_context")
+            external_frame_count = int(external_continuation.get("tail_frames", 0) or 0)
+            if external_frame_count <= 0:
+                external_frame_count = 5 + max(0, (int(external_video.shape[2]) - 2) // 5) * 17
+            external_audio_mode = str(external_continuation.get("audio_mode", "mute"))
+            if external_audio_mode not in {"continue", "mute"}:
+                raise ValueError(f"Unknown external continuation audio mode: {external_audio_mode}")
+            active_plan = [dict(chunk) for chunk in active_plan]
+            active_plan[0].update(
+                context_video_t=int(external_video.shape[2]),
+                context_audio_t=int(external_audio.shape[-1]) if isinstance(external_audio, torch.Tensor) else _audio_steps(external_frame_count),
+                output_trim_frames=0,
+                synthetic_prefix=True,
+            )
+            plan = active_plan if debug_stop_chunk == 0 else [*active_plan, *plan[len(active_plan):]]
         if continuation_state is not None:
             if abs(float(continuation_manifest["fps"]) - float(fps)) > 1e-6:
                 raise ValueError("Continuation checkpoint FPS does not match the new segment")
@@ -2681,14 +2853,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                   output_trim_frames=0, synthetic_prefix=True)
             plan = active_plan if debug_stop_chunk == 0 else [*active_plan, *plan[len(active_plan):]]
         _gemma_markers, gemma_shots, _gemma_description_end = _parse_prompt_shots(prompt, plan[-1]["frame_end"], fps)
-        gemma_director_needed = bool(gemma_shots) and continuation_state is None
+        gemma_director_needed = bool(gemma_shots) and continuation_state is None and not external_active
 
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
         if positive is None:
             raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
-        if reference_set is not None and (images is not None or source_images) and continuation_state is None:
+        if reference_set is not None and (images is not None or source_images) and continuation_state is None and not external_active:
             raise ValueError("Connect reference_set or legacy images/source_images, not both")
         image_list = list(reference_images(reference_set)) if reference_set is not None else _source_images(images, source_images)
         base_reference_items = reference_presentation_items(reference_set, width, height) if reference_set is not None else None
@@ -2782,6 +2954,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             director_backend=director_selection.backend,
             director_model=_director_file_fingerprint(director_selection.model_path),
             director_mmproj=_director_file_fingerprint(director_selection.mmproj_path),
+            external_continuation=external_continuation,
         )
         replay_cached_initial = None
         auto_resumed = False
@@ -2792,7 +2965,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             if not isinstance(retake_plan, dict) or retake_plan.get("mode") not in {"video_only", "isolated_av", "continuous_av"}:
                 raise ValueError("HR Endless Sampler received an unsupported retake plan")
             retake_mode = retake_plan["mode"]
-            candidate_cache = _LastRunReplayCache()
+            candidate_cache = _LastRunReplayCache(retake_plan.get("run_id"))
             loaded_cache, cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
             if loaded_cache is None:
                 raise ValueError(f"Retake cache is unavailable: {cache_reason}")
@@ -2991,6 +3164,16 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_video = None
         previous_audio = None
         previous_frame_count = None
+        if external_active:
+            previous_video = external_continuation["video_context"].to(device=video.device, dtype=video.dtype)
+            previous_audio = external_continuation.get("audio_context")
+            if isinstance(previous_audio, torch.Tensor):
+                previous_audio = previous_audio.to(device=audio.device, dtype=audio.dtype)
+            else:
+                previous_audio = audio.new_zeros((*audio.shape[:-1], _audio_steps(external_frame_count)))
+            if external_audio_mode == "mute":
+                previous_audio = torch.zeros_like(previous_audio)
+            previous_frame_count = external_frame_count
         if continuation_state is not None:
             previous_video = continuation_state["sampled_video"].to(device=video.device, dtype=video.dtype)
             previous_audio = continuation_state["sampled_audio"].to(device=audio.device, dtype=audio.dtype)
@@ -3410,7 +3593,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         "previous chunk": (previous_video, previous_audio),
                     },
                 )
-                continuation = index > 0 or continuation_state is not None
+                continuation = index > 0 or continuation_state is not None or external_active
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
                 chunk_label = f"Chunk {index + 1}/{len(active_plan)}"
                 if preview_execution is not None:
@@ -3657,6 +3840,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -guide_audio_t:].clone()
                 video_context_start = 0
                 audio_end_frame = float(keyframe_duration_frames)
+                if external_active and index == 0:
+                    video_context = previous_video.clone()
+                    audio_context = previous_audio.clone() if external_audio_mode == "continue" else None
+                    audio_end_frame = float(external_frame_count)
                 if audio_context is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
@@ -3792,6 +3979,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
                     chunk_prompt, debug_prompt = planned_prompts[index]
+                    if external_active and index == 0:
+                        chunk_prompt = str(external_continuation["prompt"])
+                        debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, None)
                     if retake_chunks:
                         retake_item = retake_chunks[index + 1]
                         chunk_prompt = retake_item.get("prompt_override") or retake_item["original_h3_prompt"]
@@ -3951,12 +4141,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 denoised_chunk_video, denoised_chunk_audio = denoised["samples"].unbind()
 
                 video_trim = context_video_t
-                audio_trim = 0 if index == 0 and continuation_state is None else context_audio_t
+                audio_trim = 0 if index == 0 and continuation_state is None and not external_active else context_audio_t
                 assembled_video = previous_video[:, :, video_trim:].clone()
                 assembled_audio = previous_audio[..., audio_trim:].clone()
                 assembled_denoised_video = denoised_chunk_video[:, :, video_trim:].clone()
                 assembled_denoised_audio = denoised_chunk_audio[..., audio_trim:].clone()
-                if continuation_state is not None and continuation_audio_mode == "mute":
+                if (continuation_state is not None and continuation_audio_mode == "mute") or (external_active and external_audio_mode == "mute" and index == 0):
                     assembled_audio = torch.zeros_like(assembled_audio)
                     assembled_denoised_audio = torch.zeros_like(assembled_denoised_audio)
                 if retake_chunks:
@@ -4135,23 +4325,29 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 },
             )
             if not sampling_completed and replay_cache is not None:
-                resume_chunk = min(completed_chunks + 1, len(active_plan))
-                try:
-                    replay_cache.mark_interrupted(completed_chunks)
-                except (OSError, RuntimeError, ValueError) as error:
-                    logging.warning(
-                        "HR Endless Sampler could not mark its recovery checkpoint as interrupted: %s",
-                        error,
+                control = _consume_replay_control()
+                if control in {"delete", "restart"}:
+                    replay_cache.clear()
+                    logging.warning("HR Endless Sampler deleted the interrupted render%s.",
+                                    " before restarting" if control == "restart" else "")
+                else:
+                    resume_chunk = min(completed_chunks + 1, len(active_plan))
+                    try:
+                        replay_cache.mark_interrupted(completed_chunks)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        logging.warning(
+                            "HR Endless Sampler could not mark its recovery checkpoint as interrupted: %s",
+                            error,
+                        )
+                    logging.error(
+                        "HR Endless Sampler preserved the interrupted render through Chunk %d in %s. "
+                        "Queue the same workflow again with debug_start_chunk=0 to continue automatically from Chunk %d "
+                        "without rerendering completed chunks. Set a nonzero debug_start_chunk only to force a specific "
+                        "debug replay point.",
+                        completed_chunks,
+                        replay_cache.root,
+                        resume_chunk,
                     )
-                logging.error(
-                    "HR Endless Sampler preserved the interrupted render through Chunk %d in %s. "
-                    "Queue the same workflow again with debug_start_chunk=0 to continue automatically from Chunk %d "
-                    "without rerendering completed chunks. Set a nonzero debug_start_chunk only to force a specific "
-                    "debug replay point.",
-                    completed_chunks,
-                    replay_cache.root,
-                    resume_chunk,
-                )
             elif sampling_completed and debug_stop_chunk and replay_cache is not None:
                 try:
                     replay_cache.mark_debug_stop(completed_chunks)

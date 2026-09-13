@@ -86,8 +86,10 @@ def _cache_identity(manifest: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def create_checkpoint_from_last_run(name: str = "", parent_checkpoint_id: str | None = None, reference_set=None) -> dict:
-    cache = _LastRunReplayCache()
+def create_checkpoint_from_last_run(name: str = "", parent_checkpoint_id: str | None = None,
+                                     reference_set=None, run_id: str | None = None) -> dict:
+    run_id = (str(run_id).strip() or None) if run_id is not None else None
+    cache = _LastRunReplayCache(run_id)
     try:
         replay_manifest = json.loads(cache.manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -135,6 +137,7 @@ def create_checkpoint_from_last_run(name: str = "", parent_checkpoint_id: str | 
         "total_frames": total_frames,
         "duration": total_frames / fps if fps > 0 else 0.0,
         "source_cache_identity": _cache_identity(replay_manifest),
+        "source_run_id": replay_manifest.get("run_id") or run_id,
         "source_prompt_sha256": replay_manifest.get("source_prompt_sha256"),
         "fingerprint": fingerprint,
         "final_chunk": last_number,
@@ -167,15 +170,17 @@ class HREndlessContinuationCheckpoint(io.ComfyNode):
             display_name="HR Endless Continuation Checkpoint",
             category="model/sampling/custom",
             description="Freeze the last completed HR Endless Sampler result as an immutable continuation starting point.",
-            inputs=[io.String.Input("name", default=""), io.Custom("HR_MINIMAX_H3_REFERENCE_SET").Input("reference_set", optional=True)],
+            inputs=[io.String.Input("name", default=""),
+                    io.Custom("HR_MINIMAX_H3_REFERENCE_SET").Input("reference_set", optional=True),
+                    io.String.Input("run_id", default="", optional=True)],
             outputs=[ContinuationCheckpoint.Output(display_name="checkpoint"), io.String.Output(display_name="checkpoint info")],
             is_experimental=True,
         )
 
     @classmethod
-    def execute(cls, name="", reference_set=None):
+    def execute(cls, name="", reference_set=None, run_id=None):
         try:
-            manifest = create_checkpoint_from_last_run(name, reference_set=reference_set)
+            manifest = create_checkpoint_from_last_run(name, reference_set=reference_set, run_id=run_id)
         except ValueError as error:
             if str(error) != "A complete current-format replay cache is required":
                 raise

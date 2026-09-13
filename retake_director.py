@@ -10,7 +10,7 @@ import comfy.nested_tensor
 from aiohttp import web
 from comfy_api.latest import io
 
-from .nodes import REPLAY_CACHE_FORMAT, _LastRunReplayCache, _replay_cache_root
+from .nodes import REPLAY_CACHE_FORMAT, _LastRunReplayCache, _replay_cache_root, _replay_history_runs, _set_replay_control
 from .video_io import HREndlessTimeline, normalize_timeline
 
 RetakePlan = io.Custom("HR_RETAKE_PLAN")
@@ -22,8 +22,11 @@ except ImportError:
     PromptServer = None
 
 
-def replay_cache_snapshot():
-    root = _replay_cache_root()
+def replay_cache_snapshot(run_id=None):
+    try:
+        root = _replay_cache_root(run_id)
+    except ValueError as error:
+        return {"available": False, "reason": str(error), "chunks": []}
     try:
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -67,6 +70,8 @@ def replay_cache_snapshot():
                         "source_prompt_sha256": manifest.get("source_prompt_sha256"), "created": manifest.get("created")}
     return {
         "available": True,
+        "run_id": manifest.get("run_id") if run_id is None else run_id,
+        "runs": _replay_history_runs() if run_id is None else [],
         "cache_identity": hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
         "format": manifest.get("format"),
         "supported_format": REPLAY_CACHE_FORMAT,
@@ -79,8 +84,11 @@ def replay_cache_snapshot():
     }
 
 
-def _asset_path(relative_value):
-    root = _replay_cache_root().resolve()
+def _asset_path(relative_value, run_id=None):
+    try:
+        root = _replay_cache_root(run_id).resolve()
+    except ValueError:
+        raise web.HTTPNotFound()
     relative = Path(str(relative_value))
     path = (root / relative).resolve()
     if relative.is_absolute() or root not in path.parents or not path.is_file():
@@ -90,16 +98,41 @@ def _asset_path(relative_value):
 
 _PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instance", None)
 if _PROMPT_SERVER is not None:
+    @_PROMPT_SERVER.routes.get("/hr_endless_sampler_retake/runs")
+    async def hr_endless_sampler_retake_runs(_request):
+        return web.json_response({"runs": _replay_history_runs()}, headers={"Cache-Control": "no-store"})
+
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_retake/cache")
-    async def hr_endless_sampler_retake_cache(_request):
-        return web.json_response(replay_cache_snapshot(), headers={"Cache-Control": "no-store"})
+    async def hr_endless_sampler_retake_cache(request):
+        return web.json_response(replay_cache_snapshot(request.rel_url.query.get("run_id")),
+                                 headers={"Cache-Control": "no-store"})
+
+    @_PROMPT_SERVER.routes.post("/hr_endless_sampler_retake/control")
+    async def hr_endless_sampler_retake_control(request):
+        try:
+            payload = await request.json()
+            action = str(payload.get("action", ""))
+            running, _pending = _PROMPT_SERVER.prompt_queue.get_current_queue()
+            if not running:
+                raise ValueError("No generation is currently running")
+            try:
+                manifest = json.loads((_replay_cache_root() / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError("The sampler has not started recording replay state") from error
+            if manifest.get("status") != "recording":
+                raise ValueError("The active replay is not recording")
+            _set_replay_control(action)
+            return web.json_response({"ok": True, "action": action}, headers={"Cache-Control": "no-store"})
+        except (TypeError, ValueError, OSError, RuntimeError, json.JSONDecodeError) as error:
+            return web.json_response({"ok": False, "error": str(error)}, status=400,
+                                     headers={"Cache-Control": "no-store"})
 
     @_PROMPT_SERVER.routes.post("/hr_endless_sampler_retake/activate")
     async def hr_endless_sampler_retake_activate(request):
         try:
             payload = await request.json()
             from .nodes import _LastRunReplayCache
-            _LastRunReplayCache().activate_revision(int(payload["chunk"]), int(payload["revision"]))
+            _LastRunReplayCache(payload.get("run_id")).activate_revision(int(payload["chunk"]), int(payload["revision"]))
             return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
         except (KeyError, TypeError, ValueError, OSError, RuntimeError, json.JSONDecodeError) as error:
             return web.json_response({"ok": False, "error": str(error)}, status=400,
@@ -107,20 +140,23 @@ if _PROMPT_SERVER is not None:
 
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_retake/asset")
     async def hr_endless_sampler_retake_asset(request):
-        return web.FileResponse(_asset_path(request.rel_url.query.get("path", "")),
+        return web.FileResponse(_asset_path(request.rel_url.query.get("path", ""), request.rel_url.query.get("run_id")),
                                 headers={"Cache-Control": "no-store"})
 
 
 def build_retake_plan(retake_state):
-    snapshot = replay_cache_snapshot()
-    if not snapshot.get("available") or not snapshot.get("compatible"):
-        raise ValueError(snapshot.get("reason") or "The last-run replay cache is unavailable or incompatible")
     try:
         state = json.loads(retake_state or "{}")
     except json.JSONDecodeError as error:
         raise ValueError(f"Invalid retake state JSON: {error.msg}") from error
     if not isinstance(state, dict):
         raise ValueError("Retake state must be a JSON object")
+    run_id = state.get("run_id")
+    if run_id is not None and not isinstance(run_id, str):
+        raise ValueError("Retake run_id must be text")
+    snapshot = replay_cache_snapshot(run_id)
+    if not snapshot.get("available") or not snapshot.get("compatible"):
+        raise ValueError(snapshot.get("reason") or "The last-run replay cache is unavailable or incompatible")
     mode = str(state.get("mode", "video_only"))
     if mode not in RETAKE_MODES:
         raise ValueError(f"Unknown retake mode: {mode}")
@@ -146,7 +182,8 @@ def build_retake_plan(retake_state):
     if not chunks:
         raise ValueError("Select at least one complete chunk for retake")
     chunks.sort(key=lambda item: item["chunk"])
-    return {"format": 1, "cache_identity": snapshot["cache_identity"], "mode": mode, "chunks": chunks}
+    return {"format": 1, "cache_identity": snapshot["cache_identity"], "run_id": run_id,
+            "mode": mode, "chunks": chunks}
 
 
 class HREndlessRetakeAssemble(io.ComfyNode):

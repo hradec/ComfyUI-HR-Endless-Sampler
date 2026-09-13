@@ -80,6 +80,18 @@ class QwenChunkPrompt:
 
 
 @dataclass(frozen=True)
+class QwenExternalContinuation:
+    confidence: str
+    observed_end_state: dict[str, Any]
+    transition_plan: dict[str, Any]
+    h3_prompt: str
+    raw_json: str
+    system_prompt: str = ""
+    observation_prompt: str = ""
+    validation_warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class QwenShotTimingBeat:
     start_frame: int
     end_frame: int
@@ -640,6 +652,51 @@ def _load_runtime():
     return Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, chat_formatter_to_chat_completion_handler, SpecConfig, SpeculativeType
 
 
+EXTERNAL_CONTINUATION_SCHEMA = "confidence, observed_end_state, transition_plan, h3_prompt"
+
+
+def _external_messages(request: dict[str, Any]) -> tuple[str, str]:
+    system = "Report only observable facts from chronological tail frames. The first new action must inherit the final visible action, camera, positions, lighting, and audio. References cannot reset proven pose or location. Return only JSON."
+    schema = ({"confidence": "high|medium|low", "observed_end_state": {
+        "subjects": [], "objects": [], "environment": "", "camera": "", "audio": "",
+        "last_visible_event": "", "must_continue": [], "must_not_assume": []},
+        "transition_plan": {"first_action": "", "camera_bridge": "", "identity_mapping": [], "reference_usage": []},
+        "h3_prompt": "[Shot 1] complete executable H3 continuation prompt"})
+    prompt = (f"User continuation intent:\n{request.get('user_prompt', '')}\n"
+              f"Source metadata: {json.dumps(request.get('source', {}), ensure_ascii=False)}\n"
+              f"Reference summary: {request.get('reference_summary', 'none')}\n"
+              f"Return exactly this JSON shape with every key present: {json.dumps(schema, ensure_ascii=False)}")
+    if request.get("structural_repair"):
+        prompt += ("\nCORRECTION: Repair the following previous JSON into the exact required shape. Preserve its observed facts "
+                   "and H3 continuation content; no markdown or prose outside JSON:\n"
+                   + str(request.get("previous_response", "")))
+    return system, prompt
+
+
+def _external_result(value: dict[str, Any], raw: str, system: str, prompt: str) -> QwenExternalContinuation:
+    if not isinstance(value, dict):
+        raise Qwen35ObservationError("external continuation response must be an object", raw_json=raw)
+    container = value.get("analysis") if isinstance(value.get("analysis"), dict) else value
+    confidence_value = value.get("confidence", container.get("confidence", "low"))
+    confidence = {"高": "high", "中": "medium", "低": "low"}.get(str(confidence_value).strip(), str(confidence_value).lower().strip())
+    end_state = value.get("observed_end_state", container.get("observed_end_state", container.get("end_state")))
+    transition = value.get("transition_plan", container.get("transition_plan", container.get("continuation_plan")))
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    if not isinstance(end_state, dict) or not isinstance(transition, dict):
+        types = {key: type(value.get(key)).__name__ for key in value}
+        raise Qwen35ObservationError(
+            f"external continuation response has invalid structure; keys={sorted(value)}, types={types}", raw_json=raw)
+    if not {"subjects", "objects", "environment", "camera", "audio", "last_visible_event", "must_continue", "must_not_assume"}.issubset(end_state):
+        raise Qwen35ObservationError("external continuation end state is incomplete", raw_json=raw)
+    if not {"first_action", "camera_bridge", "identity_mapping", "reference_usage"}.issubset(transition):
+        raise Qwen35ObservationError("external continuation transition plan is incomplete", raw_json=raw)
+    h3_prompt = str(value.get("h3_prompt", container.get("h3_prompt", value.get("detailed_description", "")))).strip()
+    if not h3_prompt or "shot" not in h3_prompt.lower() or not str(transition["first_action"]).strip():
+        raise Qwen35ObservationError("external continuation h3_prompt is incomplete", raw_json=raw)
+    return QwenExternalContinuation(confidence, end_state, transition, h3_prompt, raw, system, prompt)
+
+
 def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
     t0 = time.monotonic()
     try:
@@ -649,11 +706,12 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         raise Qwen35DependencyError("Qwen3.5 requires llama-cpp-python with MTMD support") from error
 
     operation = request["operation"]
-    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard"}:
+    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "external_video_continuation"}:
         raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
     timing = operation == "timing_plan"
     storyboard = operation == "storyboard"
     jzl_storyboard = operation == "jzl_storyboard"
+    external = operation == "external_video_continuation"
     handler = None if timing else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"],
         image_min_tokens=QWEN35_IMAGE_MIN_TOKENS,
@@ -676,6 +734,8 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
             system, prompt = str(request["system_prompt"]), str(request["user_prompt"])
         elif storyboard:
             system, prompt = _storyboard_messages(request)
+        elif external:
+            system, prompt = _external_messages(request)
         else:
             system, prompt = _chunk_messages(request)
         content: Any = prompt
@@ -697,6 +757,8 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         value, raw = _extract_json(text)
         if storyboard:
             return {"storyboard": _storyboard_result(value, request)}
+        if external:
+            return {"external_continuation": _payload(_external_result(value, raw, system, prompt))}
         result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
         return {"timing_plan" if timing else "chunk_prompt": _payload(result)}
     finally:
@@ -833,6 +895,11 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, QwenExternalContinuation):
+        return {"confidence": value.confidence, "observed_end_state": value.observed_end_state,
+                "transition_plan": value.transition_plan, "h3_prompt": value.h3_prompt,
+                "raw_json": value.raw_json, "system_prompt": value.system_prompt,
+                "observation_prompt": value.observation_prompt, "validation_warnings": value.validation_warnings}
     if isinstance(value, QwenShotTimingPlan):
         return {
             "confidence": value.confidence, "analysis": value.analysis, "raw_json": value.raw_json,
@@ -845,7 +912,9 @@ def _payload(value: Any) -> dict[str, Any]:
     return {name: getattr(value, name) for name in ("confidence", "analysis", "detailed_description", "raw_json", "timing_plan", "end_state", "last_seen_character_state", "system_prompt", "observation_prompt", "validation_warnings")}
 
 
-def _from_payload(value: dict[str, Any], timing: bool):
+def _from_payload(value: dict[str, Any], timing: bool, external: bool = False):
+    if external:
+        return QwenExternalContinuation(**{**value, "validation_warnings": tuple(value.get("validation_warnings", ()))})
     if not timing:
         return QwenChunkPrompt(**{**value, "last_seen_character_state": tuple(value.get("last_seen_character_state", ())), "validation_warnings": tuple(value.get("validation_warnings", ()))})
     shots = tuple(QwenShotTimingShot(
@@ -1034,6 +1103,31 @@ class Qwen35ContinuityDirector:
         self.last_system_prompt = result.system_prompt or self.last_system_prompt
         self.last_observation_prompt = result.observation_prompt or self.last_observation_prompt
         return result
+
+    def external_video_continuation(self, user_prompt: str, frames: torch.Tensor, *, source: dict[str, Any] | None = None,
+                                    reference_summary: str = "") -> QwenExternalContinuation:
+        if self.backend != "qwen3.5":
+            raise Qwen35ObservationError("external video continuation is available only with Qwen3.5")
+        if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or frames.shape[0] < 5:
+            raise Qwen35ObservationError("external continuation requires at least five NHWC frames")
+        request = {"operation": "external_video_continuation", "user_prompt": str(user_prompt),
+                   "source": source or {}, "reference_summary": str(reference_summary),
+                   "image_urls": [_image_url(frame) for frame in frames]}
+        system, prompt = _external_messages(request)
+        self._configure_request(request)
+        process, value = _run_worker_once(request)
+        if value is not None and not value.get("ok") and value.get("error_type") == "Qwen35ObservationError":
+            request["structural_repair"] = True
+            request["previous_response"] = str(value.get("raw_json", ""))
+            process, value = _run_worker_once(request)
+        if value is None:
+            raise DirectorWorkerError(f"Qwen external continuation worker exited with status {process.returncode}")
+        if not value.get("ok"):
+            raise Qwen35ObservationError(str(value.get("message", "Qwen external continuation failed")), raw_json=str(value.get("raw_json", "")))
+        result = _from_payload(value["external_continuation"], False, external=True)
+        return QwenExternalContinuation(result.confidence, result.observed_end_state, result.transition_plan,
+                                        result.h3_prompt, result.raw_json, result.system_prompt or system,
+                                        result.observation_prompt or prompt, result.validation_warnings)
 
     def plan_storyboard(self, story: str, frames: Sequence[torch.Tensor], *, duration_seconds: float, fps: float,
                         style: str = "cinematic realism", shot_density: str = "medium") -> dict[str, Any]:
