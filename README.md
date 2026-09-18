@@ -98,6 +98,10 @@ The way to use is pretty straight forward - just replace the normal "Sampler" no
 | `HR Endless Sampler Load Video` | 浏览或上传成品媒体，恢复交互式 Timeline，并输出 VIDEO/IMAGE/AUDIO、尺寸、FPS、帧数和文件名。 |
 | `HR MiniMax H3 Continuation Analyzer` | 仅使用本地 Qwen3.5 分析普通视频最后 22 帧，输出 H3 prompt、尾帧上下文、分析 JSON 和预览；可选参考图只提供给 Qwen，不会成为 H3 reference。 |
 | `HR MiniMax H3 Continuation Apply` | 接收现有 MiniMax H3 conditioning 与 latent，使用 Analyzer 上下文编码并合并同位置 keyframe；原有 `cross_attn`、token tags 和 refs 原样保留，不重新 tokenization。输出可接 SelfLift，也保留 `external_continuation` 给 HR Endless Sampler。 |
+| `HR Video Bridge Extract` | 提取视频 A 最后 22 帧、视频 B 最前 22 帧及对应音频，建立桥接源数据。 |
+| `HR Video Bridge Director` | 使用隔离的 Qwen3.6/3.8 分析人物参考图和 A/B 边界，输出结构化过渡计划及 H3 提示词。 |
+| `HR Video Bridge Conditioning` | 将人物图和 B 头作为 references、A 尾作为首端 continuation，输出可接 HR Endless Sampler 的 conditioning、latent 和 external continuation。 |
+| `HR Video Bridge Assemble` | 自动搜索 A/Bridge/B 的低差异接缝，组装帧、音频、Timeline 和接缝报告。 |
 | `HR Endless Segment Retake Director` | 浏览最近一次完整 replay cache，选择 physical chunks、编辑 H3 prompt 并生成重拍计划。 |
 
 接线：`Analyzer.H3 prompt → 现有 MiniMax H3 conditioning`；`conditioning.positive + latent → Apply`；`Analyzer.context → Apply`；`Apply.positive + latent → SelfLift`。
@@ -113,6 +117,8 @@ The way to use is pretty straight forward - just replace the normal "Sampler" no
 | `HR Qwen Director Config` | 为 Sampler 共享本地 Qwen model/mmproj/runtime 配置。 |
 | `HR MiniMax H3 Reference Set` | 统一输入最多 9 张图片、3 个视频及对应音轨、3 条独立音频。 |
 | `HR MiniMax H3 Reference Conditioning` | 创建 MiniMax H3 Ref2VA conditioning 和 nested AV latent。 |
+
+视频桥接接线：两个 `HR Endless Sampler Load Video.images/audio/fps` → `HR Video Bridge Extract`；人物图片 → `HR MiniMax H3 Reference Set`；Extract + Reference Set + `HR Qwen Director Config` → Director → Conditioning；Conditioning 的 `positive` 接 Guider，`latent`、`external_continuation`、`bridge_reference_set`、`prompt` 接 `HR Endless Sampler`；Sampler latent 经 VAE Decode 后与 Extract 输出一起接 `HR Video Bridge Assemble`。详细说明见 [`视频自然过渡节点实施计划.md`](视频自然过渡节点实施计划.md)。
 
 The Save and Load players use the same colored chunk timeline and shot brackets
 as the live Preview node, but omit the live sampling graphs. Hovering a chunk

@@ -68,7 +68,8 @@ class VideoBridgeExtractTests(unittest.TestCase):
         selection = types.SimpleNamespace(model_path=Path("model.gguf"), mmproj_path=Path("mmproj.gguf"))
         response = {"ok": True, "video_bridge": {"version": 1, "transition_frames": 39,
                     "strategy": "match_cut", "analysis": {}, "constraints": ["identity"],
-                    "h3_prompt": "subject_definitions: x", "risk_report": "low"}}
+                    "h3_prompt": "subject_definitions: x", "risk_report": "low",
+                    "reference_labels": {"pictures": [], "video_a": "<Video 2>", "video_b": "<Video 1>"}}}
         captured = {}
         def worker(request, timeout):
             captured.update(request)
@@ -82,6 +83,8 @@ class VideoBridgeExtractTests(unittest.TestCase):
         self.assertEqual(captured["director_backend"], "qwen3.8")
         self.assertEqual(len(captured["image_urls"]), 44)
         self.assertEqual(output.result[0]["type"], "HR_VIDEO_BRIDGE_PLAN")
+        self.assertEqual(output.result[0]["reference_labels"]["video_a"], "<Video 2>")
+        self.assertEqual(output.result[0]["reference_labels"]["video_b"], "<Video 1>")
 
     def test_director_rejects_qwen35_without_launching_worker(self):
         source = MODULE.HRVideoBridgeExtract.execute(self.frames(30), self.frames(30), 24.0, 24.0).result[0]

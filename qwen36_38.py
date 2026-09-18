@@ -724,8 +724,12 @@ def _video_bridge_messages(request: dict[str, Any]) -> tuple[str, str]:
     pictures = ", ".join(f"<Picture {index}>" for index in range(1, picture_count + 1)) or "none"
     prompt = f"""Media order in this request is authoritative:
 - identity pictures first: {pictures}
-- then {a_count} chronological frames from <Video 1>, the end of video A
-- then {b_count} chronological frames from <Video 2>, the start of video B
+- then {a_count} chronological analysis stills from the end of video A
+- then {b_count} chronological analysis stills from the start of video B
+
+For the final H3 prompt, the conditioning media labels are different from this analysis-image order:
+- <Video 1> is B's 22-frame destination reference
+- <Video 2> is A's 22-frame opening continuation reference
 
 Transition length: {int(request['transition_frames'])} frames.
 Requested strategy: {request.get('transition_strategy', 'auto')}.
@@ -744,7 +748,7 @@ Return this exact JSON shape:
     "motion_a": "...", "motion_b": "..."
   }},
   "constraints": ["identity and endpoint constraints"],
-  "h3_prompt": "A complete MiniMax H3 prompt containing subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, and non_diegetic_music; cite {pictures}, <Video 1>, and <Video 2> as applicable",
+  "h3_prompt": "A complete MiniMax H3 prompt containing subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, and non_diegetic_music; cite {pictures}; treat <Video 2> as the A opening state and <Video 1> as the B destination state",
   "risk_report": "brief honest risk assessment"
 }}"""
     return system, prompt
@@ -779,8 +783,8 @@ def _video_bridge_result(value: dict[str, Any], request: dict[str, Any]) -> dict
         "risk_report": str(value.get("risk_report", "")).strip(),
         "reference_labels": {
             "pictures": [f"<Picture {index}>" for index in range(1, int(request.get("reference_image_count", 0)) + 1)],
-            "video_a": "<Video 1>",
-            "video_b": "<Video 2>",
+            "video_a": "<Video 2>",
+            "video_b": "<Video 1>",
         },
     }
 

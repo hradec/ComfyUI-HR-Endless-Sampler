@@ -3860,6 +3860,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     if boundary_video_context is not None:
                         if include_video1_reference and not _h3_supports_keyframes_with_refs():
                             boundary_video_context = None
+                            video_context = None
+                            audio_context = None
                             logging.warning(
                                 "HR Endless Sampler chunk %d/%d: this ComfyUI H3 version overwrites visual "
                                 "keyframe latents when references are present; using Video1 without the optional "
