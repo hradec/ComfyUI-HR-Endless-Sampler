@@ -245,14 +245,45 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
             "source_end": int(item.get("source_end", end)),
         })
 
+    segments = []
+    for item in source.get("segments", ()):
+        if not isinstance(item, dict):
+            continue
+        start = max(0, int(item.get("start", 0)))
+        end = min(resolved_total - 1, int(item.get("end", start)))
+        if end < start:
+            continue
+        segments.append({
+            "type": str(item.get("type", "segment")), "start": start, "end": end,
+            "source_start": max(0, int(item.get("source_start", 0))),
+            "source_end": max(0, int(item.get("source_end", end - start))),
+        })
+    seams = []
+    for item in source.get("seams", ()):
+        if not isinstance(item, dict):
+            continue
+        seams.append({
+            "side": str(item.get("side", "")),
+            "frame": max(0, min(resolved_total, int(item.get("frame", 0)))),
+            "left_index": int(item.get("left_index", 0)),
+            "right_index": int(item.get("right_index", 0)),
+            "score": max(0.0, _number(item.get("score"), 0.0)),
+        })
+
     normalized = {
         "schema_version": TIMELINE_SCHEMA_VERSION,
-        "producer": "HR Endless Sampler",
+        "producer": str(source.get("producer") or "HR Endless Sampler"),
         "fps": resolved_fps,
         "total_frames": resolved_total,
         "chunks": chunks,
         "shots": shots,
     }
+    if segments:
+        normalized["segments"] = segments
+    if seams:
+        normalized["seams"] = seams
+    if isinstance(source.get("audio"), dict):
+        normalized["audio"] = _copy_json(source["audio"])
     render_total_seconds = _number(source.get("render_total_seconds"), -1.0)
     if render_total_seconds >= 0:
         normalized["render_total_seconds"] = render_total_seconds

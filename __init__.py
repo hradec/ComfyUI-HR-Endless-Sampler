@@ -10,6 +10,7 @@ from .retake_director import HREndlessRetakeAssemble, HREndlessSegmentRetakeDire
 from .reference_set import HRMiniMaxH3ReferenceConditioning, HRMiniMaxH3ReferenceSet
 from .storyboard import HRMiniMaxH3StoryboardPlanner
 from .video_io import HREndlessSamplerLoadVideo, HREndlessSamplerSaveVideo
+from .video_bridge import HRVideoBridgeAssemble, HRVideoBridgeConditioning, HRVideoBridgeDirector, HRVideoBridgeExtract
 from .jzl_storyboard import HRMiniMaxH3JZLStoryboard, HRMiniMaxH3JZLSegmentDispatcher
 
 __version__ = "0.9.0"
@@ -33,6 +34,10 @@ NODE_CLASS_MAPPINGS = {
     "HRMiniMaxH3ReferenceConditioning": HRMiniMaxH3ReferenceConditioning,
     "HRMiniMaxH3JZLStoryboard": HRMiniMaxH3JZLStoryboard,
     "HRMiniMaxH3JZLSegmentDispatcher": HRMiniMaxH3JZLSegmentDispatcher,
+    "HRVideoBridgeExtract": HRVideoBridgeExtract,
+    "HRVideoBridgeDirector": HRVideoBridgeDirector,
+    "HRVideoBridgeConditioning": HRVideoBridgeConditioning,
+    "HRVideoBridgeAssemble": HRVideoBridgeAssemble,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -53,6 +58,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HRMiniMaxH3ReferenceConditioning": "HR MiniMax H3 Reference Conditioning",
     "HRMiniMaxH3JZLStoryboard": "HR MiniMax H3 JZL Storyboard",
     "HRMiniMaxH3JZLSegmentDispatcher": "HR MiniMax H3 JZL Segment Dispatcher",
+    "HRVideoBridgeExtract": "HR Video Bridge Extract",
+    "HRVideoBridgeDirector": "HR Video Bridge Director",
+    "HRVideoBridgeConditioning": "HR Video Bridge Conditioning",
+    "HRVideoBridgeAssemble": "HR Video Bridge Assemble",
 }
 
 WEB_DIRECTORY = "./web"

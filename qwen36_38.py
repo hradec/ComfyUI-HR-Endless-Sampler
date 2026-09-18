@@ -706,17 +706,97 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
             close_handler()
 
 
+def _video_bridge_messages(request: dict[str, Any]) -> tuple[str, str]:
+    picture_count = int(request.get("reference_image_count", 0))
+    a_count = int(request.get("a_frame_count", 0))
+    b_count = int(request.get("b_frame_count", 0))
+    if a_count != 22 or b_count != 22:
+        raise Qwen35ObservationError("Video bridge analysis requires exactly 22 A-tail and 22 B-head frames")
+    language = "Chinese" if request.get("prompt_lang", "zh") == "zh" else "English"
+    system = (
+        "You are a MiniMax H3 video bridge director. Analyze identity reference pictures, then the final 22 "
+        "frames of source video A, then the first 22 frames of destination video B. Design a generated bridge "
+        "that begins from A's visible state and naturally reaches B's visible state. Identity comes from the "
+        "pictures; endpoint pose, composition, lighting, camera motion, and environment come from the videos. "
+        "Return exactly one JSON object and no markdown. Do not invent additional people. "
+        f"Write all descriptive values in {language}; preserve only required H3 field names and media labels in English."
+    )
+    pictures = ", ".join(f"<Picture {index}>" for index in range(1, picture_count + 1)) or "none"
+    prompt = f"""Media order in this request is authoritative:
+- identity pictures first: {pictures}
+- then {a_count} chronological frames from <Video 1>, the end of video A
+- then {b_count} chronological frames from <Video 2>, the start of video B
+
+Transition length: {int(request['transition_frames'])} frames.
+Requested strategy: {request.get('transition_strategy', 'auto')}.
+Identity policy: {request.get('identity_policy', 'strict')}.
+Clothing policy: {request.get('clothing_policy', 'follow_video')}.
+User instruction: {request.get('user_instruction') or 'none'}.
+
+Return this exact JSON shape:
+{{
+  "version": 1,
+  "transition_frames": {int(request['transition_frames'])},
+  "strategy": "chosen transition strategy",
+  "analysis": {{
+    "subjects": [{{"subject_id":"Subject 1","identity_features":"...","state_at_a_end":"...","state_at_b_start":"...","identity_risks":[]}}],
+    "camera_a": "...", "camera_b": "...", "environment_a": "...", "environment_b": "...",
+    "motion_a": "...", "motion_b": "..."
+  }},
+  "constraints": ["identity and endpoint constraints"],
+  "h3_prompt": "A complete MiniMax H3 prompt containing subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, and non_diegetic_music; cite {pictures}, <Video 1>, and <Video 2> as applicable",
+  "risk_report": "brief honest risk assessment"
+}}"""
+    return system, prompt
+
+
+def _video_bridge_result(value: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise Qwen35ObservationError("Qwen video bridge response must be a JSON object")
+    transition_frames = int(value.get("transition_frames", -1))
+    if transition_frames != int(request["transition_frames"]) or transition_frames not in {22, 39, 56, 73}:
+        raise Qwen35ObservationError("Qwen video bridge response changed the requested H3 frame count")
+    strategy = str(value.get("strategy", "")).strip()
+    h3_prompt = str(value.get("h3_prompt", "")).strip()
+    analysis = value.get("analysis")
+    constraints = value.get("constraints")
+    if not strategy or not h3_prompt or not isinstance(analysis, dict) or not isinstance(constraints, list):
+        raise Qwen35ObservationError("Qwen video bridge response is missing strategy, analysis, constraints, or h3_prompt")
+    required_fields = (
+        "subject_definitions:", "summary:", "retention_analysis:",
+        "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
+    )
+    missing = [field for field in required_fields if field not in h3_prompt.lower()]
+    if missing:
+        raise Qwen35ObservationError("Qwen video bridge H3 prompt is missing fields: " + ", ".join(missing))
+    return {
+        "version": 1,
+        "transition_frames": transition_frames,
+        "strategy": strategy,
+        "analysis": analysis,
+        "constraints": [str(item).strip() for item in constraints if str(item).strip()],
+        "h3_prompt": h3_prompt,
+        "risk_report": str(value.get("risk_report", "")).strip(),
+        "reference_labels": {
+            "pictures": [f"<Picture {index}>" for index in range(1, int(request.get("reference_image_count", 0)) + 1)],
+            "video_a": "<Video 1>",
+            "video_b": "<Video 2>",
+        },
+    }
+
+
 def _complete(request: dict[str, Any]) -> dict[str, Any]:
     if request.get("director_backend") not in {"qwen3.6", "qwen3.8"}:
         raise Qwen35ObservationError("Qwen3.6/3.8 worker received an unsupported backend")
 
     Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, handler_factory, SpecConfig, SpeculativeType = _load_runtime()
     operation = request["operation"]
-    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard"}:
+    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "video_bridge"}:
         raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
     timing = operation == "timing_plan"
     storyboard = operation == "storyboard"
     jzl_storyboard = operation == "jzl_storyboard"
+    video_bridge = operation == "video_bridge"
     family = _qwen_family(request["director_model_path"])
     handler = None if timing or family == "qwen3.8" else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
@@ -783,6 +863,8 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             system, prompt = str(request["system_prompt"]), str(request["user_prompt"])
         elif storyboard:
             system, prompt = _storyboard_messages(request)
+        elif video_bridge:
+            system, prompt = _video_bridge_messages(request)
         else:
             system, prompt = _chunk_messages(request)
         content: Any = prompt
@@ -812,11 +894,14 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             result = text
         else:
             value, raw = _extract_json(text)
-            result = _storyboard_result(value, request) if storyboard else (_timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request))
+            result = (_video_bridge_result(value, request) if video_bridge else
+                      _storyboard_result(value, request) if storyboard else
+                      _timing_plan(value, request, raw, system, prompt) if timing else
+                      _chunk_prompt(value, raw, system, prompt, request))
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         stats = getattr(llm, "last_speculative_stats", None)
         return {
-            "jzl_storyboard" if jzl_storyboard else ("storyboard" if storyboard else ("timing_plan" if timing else "chunk_prompt")): result if storyboard or jzl_storyboard else _payload(result),
+            "jzl_storyboard" if jzl_storyboard else ("video_bridge" if video_bridge else ("storyboard" if storyboard else ("timing_plan" if timing else "chunk_prompt"))): result if storyboard or jzl_storyboard or video_bridge else _payload(result),
             "generation": {
                 "finish_reason": choice.get("finish_reason"),
                 "prompt_tokens": usage.get("prompt_tokens"),

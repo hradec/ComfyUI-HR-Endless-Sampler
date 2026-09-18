@@ -21,7 +21,7 @@ def normalize_qwen38_config(value: Any) -> dict[str, Any]:
     if int(value.get("version", -1)) != CONFIG_VERSION:
         raise ValueError("Unsupported HR director_config version")
     backend = str(value.get("backend", "qwen3.8"))
-    if backend not in {"qwen3.5", "qwen3.8"}:
+    if backend not in {"qwen3.5", "qwen3.6", "qwen3.8"}:
         raise ValueError(f"The shared HR director configuration does not support {backend}")
     draft_tokens = int(value.get("mtp_draft_tokens", 2))
     if draft_tokens < 1 or draft_tokens > 8:
@@ -37,11 +37,11 @@ def normalize_qwen38_config(value: Any) -> dict[str, Any]:
         "backend": backend,
         "model": str(value.get("model", "auto")),
         "mmproj": str(value.get("mmproj", "auto")),
-        "mtp": bool(value.get("mtp", True)) if backend == "qwen3.8" else False,
+        "mtp": bool(value.get("mtp", True)) if backend in {"qwen3.6", "qwen3.8"} else False,
         "mtp_draft_tokens": draft_tokens,
         "reasoning_effort": reasoning,
-        "cpu_moe": bool(value.get("cpu_moe", False)) if backend == "qwen3.8" else False,
-        "n_cpu_moe": n_cpu_moe if backend == "qwen3.8" else 0,
+        "cpu_moe": bool(value.get("cpu_moe", False)) if backend in {"qwen3.6", "qwen3.8"} else False,
+        "n_cpu_moe": n_cpu_moe if backend in {"qwen3.6", "qwen3.8"} else 0,
         "debug": bool(value.get("debug", False)),
     }
 
@@ -68,7 +68,7 @@ class HRQwen38DirectorConfig(io.ComfyNode):
                 io.Boolean.Input("cpu_moe", default=False, advanced=True),
                 io.Int.Input("n_cpu_moe", default=0, min=0, max=256, step=1, advanced=True),
                 io.Boolean.Input("debug", default=False, advanced=True),
-                io.Combo.Input("backend", options=["qwen3.5", "qwen3.8"], default="qwen3.8"),
+                io.Combo.Input("backend", options=["qwen3.5", "qwen3.6", "qwen3.8"], default="qwen3.8"),
             ],
             outputs=[HRDirectorConfig.Output(display_name="director_config")],
         )
