@@ -127,6 +127,7 @@ def _cache_payload(payload):
                     chunk_ranges[chunk_index]["h3_prompt"] = h3_prompt.strip()
                 for key in (
                     "taomate_completed_frames",
+                    "taomate_completed_phases",
                     "h3_render_seconds",
                     "gemma_seconds",
                     "gemma_preproduction_seconds",
@@ -614,6 +615,7 @@ class _AccumulatedPreviewWrapper:
         self.decoder = None
         self.decoder_failed = False
         self.started_at = None
+        self.started_at_ms = None
         self.final_audio = {}
         self.final_audio_rates = {}
         self.live_subchunks = {}
@@ -640,6 +642,8 @@ class _AccumulatedPreviewWrapper:
         self.decoder = None
         self.decoder_failed = False
         self.started_at = time.perf_counter()
+        # Wall time survives browser reconnects, unlike perf_counter's local value.
+        self.started_at_ms = int(time.time() * 1000.0)
         self.final_audio = {}
         self.final_audio_rates = {}
         self.live_subchunks = {}
@@ -659,6 +663,7 @@ class _AccumulatedPreviewWrapper:
             "total_frames": max((int(item.get("end", -1)) for item in chunk_ranges), default=-1) + 1,
             "fps": self.fps,
             "elapsed_ms": 0.0,
+            "started_at_ms": self.started_at_ms,
             "phase": "Preparing sampler",
         })
         return self.execution_id

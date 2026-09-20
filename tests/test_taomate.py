@@ -20,6 +20,17 @@ module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate")
 class TaoMateTest(unittest.TestCase):
     """Check timing, state boundaries and real H3 forward integration."""
 
+    def test_kv_cache_report_accumulates_time_and_peak_ram(self):
+        """Final-report data retains cache timing after the live cache is released."""
+        state = module.TaoMateStreaming("none")
+        state.kv_cache_seconds = {"KV restore": 1.25, "KV commit": 2.5}
+        state.kv_cache_peak_stored_bytes = 4096
+        state.kv_cache_peak_raw_bytes = 8192
+        report = state.kv_cache_report()
+        self.assertEqual(report["seconds"], {"KV restore": 1.25, "KV commit": 2.5})
+        self.assertEqual(report["peak_stored_bytes"], 4096)
+        self.assertEqual(report["peak_raw_bytes"], 8192)
+
     def test_chunk_frames_controls_groups_without_enlarging_phases(self):
         """Different prompt durations preserve the global AV clock and bounded KV phases."""
         state = module.TaoMateStreaming
@@ -319,6 +330,8 @@ class TaoMateTest(unittest.TestCase):
             self.assertEqual(sum(item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan), frames)
         plan = module.TaoMateStreaming.plan(72, 405)
         self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [39, 34, 34, 17, 34, 34, 34, 17])
+        plan = module.TaoMateStreaming.plan(72, 405, continuation_frames=22)
+        self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [22] + [17] * 13)
 
     def test_request_prompts_cover_four_phases(self):
         """Two nominal five-second prompts cover eight phases without lost media."""

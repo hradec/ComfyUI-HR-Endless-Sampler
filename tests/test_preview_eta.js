@@ -9,6 +9,9 @@ assert.ok(start >= 0 && end > start, 'projectedRenderTiming must remain independ
 const projectedRenderTiming = new Function(`${source.slice(start, end)} return projectedRenderTiming;`)();
 
 assert.deepEqual(projectedRenderTiming(100, 1, 4), { etaSeconds: 300, totalSeconds: 400 });
+// Four completed/current TaoMate phases out of ten use elapsed/4 for each
+// remaining phase, regardless of unequal phase frame counts.
+assert.deepEqual(projectedRenderTiming(240, 4, 10), { etaSeconds: 360, totalSeconds: 600 });
 assert.deepEqual(projectedRenderTiming(100, 2.5, 5), { etaSeconds: 100, totalSeconds: 200 });
 assert.deepEqual(projectedRenderTiming(NaN, 0, 4, 12), { etaSeconds: 12, totalSeconds: NaN });
 console.log('Preview ETA projection checks passed.');

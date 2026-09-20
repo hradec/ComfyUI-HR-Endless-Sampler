@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(`${__dirname}/../web/unlimited_preview.js`, 'utf8');
+assert.match(source, /Date\.now\(\) - startedAtMs/, 'refresh elapsed time must use the server render start');
+assert.match(source, /function adoptElapsed\(data\)/, 'older renders must restore elapsed time from cached progress');
 const start = source.indexOf('async function restoreServerState(');
 const end = source.indexOf('function inspectFrameGroup(', start);
 

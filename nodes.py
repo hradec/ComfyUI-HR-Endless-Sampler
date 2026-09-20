@@ -4386,6 +4386,25 @@ class _SamplerTiming:
             "Time baseline:",
             f"  Unlimited sampler wall time: {self._clock_duration(total)}",
             f"  Average per completed chunk: {self._duration(total / completed_chunks) if completed_chunks else 'n/a'}",
+        ])
+        taomate_kv_cache = run.get("taomate_kv_cache")
+        if taomate_kv_cache is not None:
+            stored = int(taomate_kv_cache.get("stored_bytes", 0))
+            raw = int(taomate_kv_cache.get("raw_bytes", 0))
+            peak_stored = int(taomate_kv_cache.get("peak_stored_bytes", stored))
+            peak_raw = int(taomate_kv_cache.get("peak_raw_bytes", raw))
+            cache_seconds = taomate_kv_cache.get("seconds") or {}
+            lines.extend([
+                "",
+                "TaoMate KV cache:",
+                f"  CPU RAM retained: {self._memory_size(stored)} stored / {self._memory_size(raw)} uncompressed; "
+                f"peak {self._memory_size(peak_stored)} stored / {self._memory_size(peak_raw)} uncompressed "
+                f"({taomate_kv_cache.get('compression', 'none')})",
+                f"  KV-cache operations: {self._duration(sum(cache_seconds.values()))}",
+            ])
+            for name, seconds in sorted(cache_seconds.items()):
+                lines.append(f"    {name}: {self._duration(seconds)}")
+        lines.extend([
             "",
             "Breakdown:",
             "  Component                                  Total         Average/call",
@@ -4499,8 +4518,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         "many completed frames, then replaces the preceding decoded/latent tails with the new "
                         "prefix. It creates no Video1 or Audio1 reference text. The boundary is included inside "
                         "chunk_frames, so it must be smaller than chunk_frames and reduces new frames per chunk. "
-                        "TaoMate-H3 uses fixed small streaming phases and CPU KV memory, preserving the supplied sampler and sigmas. "
-                        "chunk_frames controls TaoMate prompt/audio group size; video_continuation/feathering do not control TaoMate. "
+                        "TaoMate-H3 uses small streaming phases and CPU KV memory, preserving the supplied sampler and sigmas. "
+                        "chunk_frames controls TaoMate prompt/audio group size. video_continuation controls its first "
+                        "sub-chunk; following sub-chunks use video_continuation minus 5 frames and the cadence ends on 17 frames. "
+                        "Set video_continuation to 39 to preserve the prior 39/34/34/17 cadence. "
                         "Uses native H3 references/keyframes; CFG 1 is recommended for the TaoMate LoRA. "
                         "Audio teacher uses the same model/LoRA and captures the selected sigma points; no disk replay."
                     ),
@@ -4579,6 +4600,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 **_deprecated_inputs):
         use_taomate = video_continuation_method == VIDEO_CONTINUATION_METHOD_TAOMATE
         taomate_backend = None
+        taomate_kv_cache = None
         if use_taomate:
             from .python.taomate import TaoMateStreaming
             TaoMateStreaming.validate(guider)
@@ -4741,7 +4763,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         # after sampling. Native masked mode uses the selected continuation
         # duration as its synthetic prefix; Video1 keeps its five-frame phase.
         if use_taomate:
-            plan = taomate_backend.request_plan(video.shape[2], audio.shape[-1], chunk_frames)
+            plan = taomate_backend.request_plan(video.shape[2], audio.shape[-1], chunk_frames, video_continuation)
         elif use_masked_av_overlap:
             plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, video_continuation)
         elif context_keyframes:
@@ -7269,6 +7291,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 # Upstream runner._publish joins the complete clean latent timeline
                 # before audio-VAE decoding. Group previews above are provisional.
                 # Release retained KV before loading the final decoder.
+                taomate_kv_cache = taomate_backend.kv_cache_report()
                 taomate_backend.close()
                 if preview_execution is not None:
                     preview_execution.set_phase("TaoMate: decoding continuous audio timeline")
@@ -7298,6 +7321,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
             sampling_completed = True
         finally:
             if taomate_backend is not None:
+                if taomate_kv_cache is None:
+                    taomate_kv_cache = taomate_backend.kv_cache_report()
                 taomate_backend.close()
             guider.original_conds = original_conds
             if vram_monitor is not None:
@@ -7331,6 +7356,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     "full_frames": plan[-1]["frame_end"],
                     "full_chunks": len(plan),
                     "color_diagnostics": color_diagnostics,
+                    "taomate_kv_cache": taomate_kv_cache,
                 },
             )
             if not sampling_completed and replay_cache is not None:

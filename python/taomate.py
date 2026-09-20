@@ -533,17 +533,22 @@ class TaoMateStreaming:
         return (tokens // 5) * 17 + sum(h3.FRAME_PER_TOKEN[:tokens % 5])
 
     @classmethod
-    def plan(cls, video_t, audio_t):
-        """Use 39/34/34/17 then 34/34/34/17; prefix only for VAE transport."""
+    def plan(cls, video_t, audio_t, continuation_frames=39):
+        """Use a configurable first phase, then its derived continuation phases."""
         if video_t < 2 or (video_t - 2) % 5 or audio_t != round(cls.frames(video_t) * h3.FRAME_RESCALE):
             raise ValueError("TaoMate-H3 needs a valid, synchronized H3 AV latent")
+        if isinstance(continuation_frames, bool) or int(continuation_frames) != continuation_frames or continuation_frames < 22 or (continuation_frames - 5) % 17:
+            raise ValueError("TaoMate video_continuation must use the H3 grid and be at least 22 frames: 22, 39, 56, ...")
+        continuation_frames = int(continuation_frames)
+        groups = (continuation_frames - 5) // 17
+        first_count = 2 + 5 * groups
+        continuation_count = 5 * groups
         plan = []
         start = 0
         while start < video_t:
             index = len(plan)
-            base = direct_5s_plan()
-            upstream = base if index < 4 else canonical_continuation_plan(base, request_index=index // 4)
-            count = upstream.phases[index % 4].video_latent_count
+            # 39 produces the upstream 39/34/34/17 then 34/34/34/17 cadence.
+            count = first_count if index == 0 else 5 if index % 4 == 3 else continuation_count
             end = min(start + count, video_t)
             first_frame, end_frame = cls.frames(start), cls.frames(end)
             audio_start, audio_end = round(first_frame * h3.FRAME_RESCALE), round(end_frame * h3.FRAME_RESCALE)
@@ -554,14 +559,14 @@ class TaoMateStreaming:
         return plan
 
     @classmethod
-    def request_plan(cls, video_t, audio_t, chunk_frames=124):
+    def request_plan(cls, video_t, audio_t, chunk_frames=124, continuation_frames=39):
         """Group bounded upstream sub-chunks into user-sized prompt/audio requests."""
         if isinstance(chunk_frames, bool) or int(chunk_frames) != chunk_frames or chunk_frames < 22:
             raise ValueError("TaoMate chunk_frames must be an integer of at least 22")
         chunk_frames = int(chunk_frames)
         chunk_frames -= (chunk_frames - 5) % 17
         capacity = (chunk_frames - 5) // 17 * 5
-        phases = cls.plan(video_t, audio_t)
+        phases = cls.plan(video_t, audio_t, continuation_frames)
         requests = []
         phase_index = 0
         start = 0
@@ -615,6 +620,9 @@ class TaoMateStreaming:
         self.prepared_model = None
         self.reuse_preparation = False
         self.phase_profile = None
+        self.kv_cache_seconds = {}
+        self.kv_cache_peak_stored_bytes = 0
+        self.kv_cache_peak_raw_bytes = 0
         self.kv_cache_compression = kv_cache_compression or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none")
         if self.kv_cache_compression not in KV_CACHE_COMPRESSION_MODES:
             raise ValueError("unknown KV cache compression mode %r" % self.kv_cache_compression)
@@ -647,6 +655,26 @@ class TaoMateStreaming:
         result.model_patcher.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "hr_taomate_streaming", self.forward)
         result.model_patcher.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING, "hr_taomate_preparation", self.prepare_sampling)
         return result
+
+    def _record_kv_profile(self):
+        """Add this phase's cache-only wall times to the render summary."""
+        for name, values in (self.phase_profile or {}).items():
+            if name.startswith("KV "):
+                self.kv_cache_seconds[name] = self.kv_cache_seconds.get(name, 0.0) + values[0]
+
+    def kv_cache_report(self):
+        """Return retained cache bytes and accumulated cache operation time."""
+        sizes = [cache.storage_bytes() for cache, hook in self.caches.values()]
+        stored = sum(size[0] for size in sizes)
+        raw = sum(size[1] for size in sizes)
+        return {
+            "compression": self.kv_cache_compression,
+            "seconds": dict(self.kv_cache_seconds),
+            "stored_bytes": stored,
+            "raw_bytes": raw,
+            "peak_stored_bytes": self.kv_cache_peak_stored_bytes,
+            "peak_raw_bytes": self.kv_cache_peak_raw_bytes,
+        }
 
     def prepare_sampling(self, executor, model, noise_shape, conds, model_options=None, force_full_load=False, force_offload=False):
         """Reuse resident weights between phases without repeating native loading."""
@@ -801,6 +829,8 @@ class TaoMateStreaming:
                     cache.retain_sink_and_recent_commits()
             sizes = [cache.storage_bytes() for cache, hook in self.caches.values()]
             stored, raw = sum(size[0] for size in sizes), sum(size[1] for size in sizes)
+            self.kv_cache_peak_stored_bytes = max(self.kv_cache_peak_stored_bytes, stored)
+            self.kv_cache_peak_raw_bytes = max(self.kv_cache_peak_raw_bytes, raw)
             logging.info("TaoMate retained CPU KV: %.3f GiB stored / %.3f GiB raw, %.1f%% saved across %d branches. Staging and model weights are additional.", stored / 1024 ** 3, raw / 1024 ** 3, 100 * (1 - stored / raw) if raw else 0, len(self.caches))
             self.report_status("KV cache ready: %.2f GiB stored / %.2f GiB raw" % (stored / 1024 ** 3, raw / 1024 ** 3))
         finally:
@@ -859,7 +889,9 @@ class TaoMateStreaming:
             for phase_number, phase in enumerate(phases, 1):
                 logging.info("TaoMate group %d: video sub-chunk %d/%d", self.request_count + 1, phase_number, len(phases))
                 phase_started = (time.perf_counter(), time.process_time())
-                self.phase_profile = {} if debug_timing else None
+                # Always retain cache timings for the final render report; debug
+                # only controls the per-phase console detail.
+                self.phase_profile = {}
                 self.begin_chunk(phase)
                 if on_subchunk_start is not None:
                     on_subchunk_start(phase)
@@ -893,6 +925,7 @@ class TaoMateStreaming:
                     callback_started = (time.perf_counter(), time.process_time())
                     on_subchunk(phase["frame_end"] - self.frames(chunk["video_start"]))
                     _profile_add(self.phase_profile, "preview publication", callback_started)
+                self._record_kv_profile()
                 if debug_timing:
                     total_wall = time.perf_counter() - phase_started[0]
                     total_cpu = time.process_time() - phase_started[1]

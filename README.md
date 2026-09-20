@@ -512,9 +512,11 @@ can still be incompatible with streaming.
 
 This mode reuses the upstream TaoMate geometry, attention routing, clean-KV
 cache policy. It uses the supplied sigma schedule unchanged, including its step
-count. It generates phases of 39/34/34/17
-frames initially and 34/34/34/17 thereafter, truncating the final phase to the
-requested latent duration. The supplied sampler and its options are preserved.
+count. `video_continuation` controls the first phase: 39 preserves the prior
+39/34/34/17 initial cadence followed by 34/34/34/17. Other valid values use
+that selected first phase, then phases that are five frames shorter, with every
+fourth tail held at 17 frames. The final phase is truncated to the requested
+latent duration. The supplied sampler and its options are preserved.
 `chunk_frames` controls each prompt/audio-teacher group on the 17k+5 frame grid.
 124 retains the original four-phase grouping; 243 gives roughly ten-second
 groups with eight phases. Group boundaries can shorten phases but never enlarge
@@ -530,6 +532,22 @@ video phase anchors both retained visual memory and generated latent statistics.
 Persistent KV is held in CPU RAM and transferred per layer; RAM use and transfer
 cost grow with resolution, but retained history is bounded. No extra pip
 packages or changes to ComfyUI source files are required.
+
+`kv_cache_compression` selects its retained CPU representation. Relative sizes
+are per retained K/V vector compared with raw BF16 cache storage; Zstd depends
+on the actual cache values.
+
+| Mode | Relative retained KV size | Cache fidelity | Notes |
+| --- | ---: | --- | --- |
+| `none` | 100% | Exact | Raw BF16 K/V in CPU RAM. |
+| `zstd lossless` | about 69% | Exact | Prior local cache measurement saved about 31%; content-dependent. |
+| `int8` | 50.8% | Lossy | One signed 8-bit value plus a FP16 scale per 128-value vector. |
+| `turboquant` | 26.6% | Lossy | Packed 4-bit rotated values plus one FP32 norm per vector; quantized on GPU before CPU transfer. |
+
+TurboQuant reconstructs the active K/V layer on GPU for the existing SDPA
+attention path. In the latest local comparison, its render matched the
+uncompressed render with no observed consistency or degradation; this is one
+render result, so retain `none` or `zstd lossless` for exact comparisons.
 
 Each request first runs an audio-only teacher pass. Its schedule combines the
 upstream nine-interval base grid with the supplied video sigma endpoints, using

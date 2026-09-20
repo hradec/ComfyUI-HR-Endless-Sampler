@@ -1447,28 +1447,37 @@ app.registerExtension({
                 const statePrefix = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}`;
                 const phaseLine = `${statePrefix}${phase || "Preparing sampler"}`;
                 const h3Active = !complete && /h3\s+(?:sampling|inference)/i.test(phase || "");
+                // ETA is deliberately unit based. A TaoMate phase is one unit;
+                // otherwise a sampler chunk is one unit. The current unit counts
+                // in the elapsed average even before it has completed.
+                const phaseCountFor = range => Math.max(
+                    1,
+                    Number(range?.taomate_phase_count) || 0,
+                    Array.isArray(range?.taomate_phase_work) ? range.taomate_phase_work.length : 0,
+                );
+                const hasSubchunks = chunkRanges.some(range => phaseCountFor(range) > 1);
                 let workTotal = 0;
-                let workDone = 0;
+                let completedUnits = 0;
                 for (let index = 0; index < chunkCount; index++) {
                     const range = chunkRanges[index] || {};
-                    const phaseCount = Math.max(1, Number(range.taomate_phase_count) || 1);
-                    const phaseWork = Array.isArray(range.taomate_phase_work)
-                        && range.taomate_phase_work.length === phaseCount
-                        ? range.taomate_phase_work.map(value => Math.max(1, Number(value) || 1))
-                        : Array(phaseCount).fill(1);
-                    const chunkWork = phaseWork.reduce((sum, value) => sum + value, 0);
-                    workTotal += chunkWork;
-                    if (index < activeChunk || cachedChunkIndices.has(index)) {
-                        workDone += chunkWork;
-                    } else if (index === activeChunk) {
-                        const completedPhases = Math.max(0, Math.min(phaseCount, Number(range.taomate_completed_phases) || 0));
-                        workDone += phaseWork.slice(0, completedPhases).reduce((sum, value) => sum + value, 0);
-                        if (h3Active && totalSteps > 0 && completedPhases < phaseCount) workDone += phaseWork[completedPhases] * Math.max(0, Math.min(1, currentStep / totalSteps));
+                    const phaseCount = phaseCountFor(range);
+                    const chunkUnits = hasSubchunks ? phaseCount : 1;
+                    workTotal += chunkUnits;
+                    if (index === activeChunk) {
+                        const reportedPhases = Number(range.taomate_completed_phases) || 0;
+                        const activePhases = activeSubchunk == null ? 0 : Number(activeSubchunk) - 1;
+                        const completedPhases = Math.max(0, Math.min(phaseCount, reportedPhases));
+                        completedUnits += hasSubchunks ? Math.min(phaseCount, Math.max(completedPhases, activePhases)) : 0;
+                    } else if (index < activeChunk || cachedChunkIndices.has(index)) {
+                        // A cached range may include the active index after a
+                        // reconnect; that live range must remain estimable.
+                        completedUnits += chunkUnits;
                     }
                 }
+                const observedUnits = complete ? workTotal : Math.min(workTotal, completedUnits + 1);
                 const fallbackRemainingSteps = Math.max(0, totalSteps - currentStep) + Math.max(0, chunkCount - activeChunk - 1) * totalSteps;
                 const fallbackEtaSeconds = Number.isFinite(averageStepMs) ? fallbackRemainingSteps * averageStepMs / 1000 : NaN;
-                const timingEstimate = projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaSeconds);
+                const timingEstimate = projectedRenderTiming(elapsedSeconds, observedUnits, workTotal, fallbackEtaSeconds);
                 const eta = formatEta(timingEstimate.etaSeconds);
                 const projected = formatEta(timingEstimate.totalSeconds);
                 const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ETA ${eta} · Est. total ${projected}`;
@@ -1550,7 +1559,13 @@ app.registerExtension({
                 cachedChunkIndices = new Set(reusedChunkNumbers.map(number => number - 1));
                 cachedChunkCount = cachedChunkIndices.size;
                 const elapsedMs = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms : 0;
-                startedAt = performance.now() - elapsedMs;
+                // A reset cached by the server retains its wall-clock start, so
+                // elapsed time continues correctly after a browser refresh.
+                const startedAtMs = Number(data.started_at_ms);
+                const elapsedFromStart = Number.isFinite(startedAtMs) && startedAtMs > 0
+                    ? Math.max(0, Date.now() - startedAtMs)
+                    : 0;
+                startedAt = performance.now() - Math.max(elapsedMs, elapsedFromStart);
                 completedElapsed = null;
                 complete = false;
                 audioPlayer.pause();
@@ -1575,6 +1590,15 @@ app.registerExtension({
                 redrawGraphs();
             }
 
+            function adoptElapsed(data) {
+                // Old running renders have no wall-clock reset field, but their
+                // cached phase/progress payload still carries server elapsed time.
+                const elapsedMs = Number(data?.elapsed_ms);
+                if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return;
+                const localElapsedMs = startedAt == null ? 0 : performance.now() - startedAt;
+                if (elapsedMs > localElapsedMs) startedAt = performance.now() - elapsedMs;
+            }
+
             node._hrEndlessSamplerPreview = data => {
                 if (data.action === "reset") {
                     if (execution !== null && Number(data.execution) < Number(execution)) return;
@@ -1590,6 +1614,7 @@ app.registerExtension({
                     if (execution !== null || data.action === "chunk_metadata") return;
                     resetExecution(data);
                 }
+                adoptElapsed(data);
                 if (data.action === "chunk_metadata") {
                     const index = Number(data.chunk);
                     const range = chunkRanges[index];
