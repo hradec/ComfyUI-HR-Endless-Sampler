@@ -221,6 +221,10 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
             if key in item:
                 chunk[key] = int(item[key])
         description = item.get("gemma_detailed_description")
+        # Preserve the complete conditioning prompt for Shift-hover and reload.
+        h3_prompt = item.get("h3_prompt")
+        if isinstance(h3_prompt, str) and h3_prompt.strip():
+            chunk["h3_prompt"] = h3_prompt.strip()
         if isinstance(description, str) and description.strip():
             chunk["gemma_detailed_description"] = description.strip()
         retention_analysis = item.get("gemma_retention_analysis")
@@ -1270,6 +1274,62 @@ class HREndlessSamplerSaveVideo(io.ComfyNode):
             float(normalized_timeline["fps"]),
             ui={PLAYER_EVENT: [player_state]},
         )
+
+
+class HREndlessSamplerVideoCompare(io.ComfyNode):
+    """Encode two IMAGE batches into temporary videos for the interactive wipe player."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="HREndlessSamplerVideoCompare",
+            display_name="HR Endless Sampler Video Compare",
+            category="image/video",
+            description="Previews two IMAGE videos with an interactive comparison wipe. The browser proxies are written only to ComfyUI's temporary directory.",
+            inputs=[
+                io.Image.Input("images1", tooltip="Left-side video frames."),
+                io.Image.Input("images2", tooltip="Right-side video frames."),
+                io.Float.Input("fps", default=24.0, min=0.001, max=1000.0, step=0.001,
+                               tooltip="Playback and temporary proxy frame rate."),
+            ],
+            outputs=[],
+            hidden=[io.Hidden.unique_id],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, images1, images2, fps=24.0):
+        """Create viewable temporary proxies and publish their paired player state."""
+        left = _normalize_frames(images1)
+        right = _normalize_frames(images2)
+        if tuple(left.shape[1:3]) != tuple(right.shape[1:3]):
+            raise ValueError("images1 and images2 must have the same width and height for an aligned comparison wipe")
+        resolved_fps = _number(fps, 24.0)
+        if resolved_fps <= 0:
+            raise ValueError("fps must be greater than zero")
+        left_timeline = normalize_timeline(None, fps=resolved_fps, total_frames=int(left.shape[0]))
+        right_timeline = normalize_timeline(None, fps=resolved_fps, total_frames=int(right.shape[0]))
+        left_path = _save_native_h264(left, "hr_endless_sampler_preview/video_compare_left", resolved_fps, "yuv420p", 19, left_timeline, save_output=False)
+        right_path = _save_native_h264(right, "hr_endless_sampler_preview/video_compare_right", resolved_fps, "yuv420p", 19, right_timeline, save_output=False)
+        left_url = _view_url(left_path)
+        right_url = _view_url(right_path)
+        if left_url is None or right_url is None:
+            raise RuntimeError("could not expose temporary comparison videos to ComfyUI's browser")
+        player_state = {
+            "action": "media",
+            "origin": "compare",
+            "state_id": uuid.uuid4().hex,
+            "title": "Images 1 vs Images 2",
+            "media_url": left_url,
+            "compare_media_url": right_url,
+            "media_kind": "video",
+            "source_fps": resolved_fps,
+            "compare_source_fps": resolved_fps,
+            "timeline": left_timeline,
+            "compare_timeline": right_timeline,
+        }
+        _publish_player_state(_node_unique_id(cls), player_state)
+        return io.NodeOutput(ui={PLAYER_EVENT: [player_state]})
 
 
 def _load_video_payload(video: str, fps: float = 0.0, *, decoded: dict | None = None) -> tuple[dict, str, float, dict]:

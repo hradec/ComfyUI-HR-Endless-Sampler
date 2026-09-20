@@ -732,6 +732,16 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_start"], "<|think|>")
         self.assertEqual(kwargs["reasoning_end"], "<channel|>")
         self.assertTrue(kwargs["reasoning_start_in_prompt"])
+        # Each worker's handler owns its budget, including append-only repairs.
+        class Handler:
+            """Minimal handler carrying the selected stage budget."""
+            _endless_think_budget = 0
+        handler = Handler()
+        self.assertEqual(gemma4._gemma_reasoning_budget_kwargs(handler)["reasoning_budget"], 0)
+        self.assertFalse(gemma4._gemma_reasoning_budget_kwargs(handler)["reasoning_start_in_prompt"])
+        handler._endless_think_budget = 4096
+        self.assertEqual(gemma4._gemma_reasoning_budget_kwargs(handler)["reasoning_budget"], 4096)
+        self.assertTrue(gemma4._gemma_reasoning_budget_kwargs(handler)["reasoning_start_in_prompt"])
 
     def test_json_completion_accepts_valid_json_returned_as_gemma_reasoning_content(self):
         class FakeLlama:
@@ -1120,6 +1130,16 @@ class GemmaCaptureTest(unittest.TestCase):
         _system, planning_prompt = gemma4._render_timing_plan_messages(request)
         self.assertIn("Source Shot 2: global frames 68-147", planning_prompt)
         self.assertNotIn("Chunk 3: sampled global frames", planning_prompt)
+        self.assertIn("Fill the JSON form below in place", planning_prompt)
+        global_form = gemma4._production_bible_fill_form(request)
+        self.assertIn(global_form, planning_prompt)
+        parsed_global_form = json.loads(global_form)
+        self.assertEqual(parsed_global_form["character_name_table"], [
+            {"character_name": "Heman", "subject": "<Subject 1>"},
+            {"character_name": "Tila", "subject": "<Subject 2>"},
+        ])
+        self.assertEqual([item["source_shot"] for item in parsed_global_form["shots"]], [1, 2])
+        self.assertIsNone(parsed_global_form["shots"][1]["shot_intent"])
         _shot_system, shot_prompt = gemma4._render_single_shot_plan_messages(
             request,
             json.dumps(self.production_bible_response()),
@@ -1127,6 +1147,17 @@ class GemmaCaptureTest(unittest.TestCase):
         )
         self.assertIn("source-relative half-open [5,39)", shot_prompt)
         self.assertIn("Independently plan Source Shot 2", shot_prompt)
+        shot_form = json.loads(gemma4._single_shot_fill_form(
+            request,
+            json.dumps(self.production_bible_response()),
+            request["source_shots"][1],
+        ))
+        self.assertEqual(shot_form["source_shot"], 2)
+        self.assertEqual(
+            [(item["start_frame"], item["end_frame"]) for item in shot_form["continuity_slices"]],
+            [(0, 5), (5, 39), (39, 80)],
+        )
+        self.assertTrue(all(item["characters"][0]["subject"] == "<Subject 1>" for item in shot_form["continuity_slices"]))
 
         plan = gemma4._validate_timing_plan(
             self.timing_response(), request, json.dumps(self.timing_response())
@@ -1200,7 +1231,27 @@ class GemmaCaptureTest(unittest.TestCase):
         self.assertIn("Source Shot 2: immutable preproduction timing schedule", observation)
         self.assertIn("Heman -> <Subject 1>", observation)
         self.assertIn("literal contiguous substring copied from your final detailed_description", observation)
-        self.assertIn("exactly these eight fields", observation)
+        self.assertIn("exactly these nine fields", observation)
+        self.assertIn("Fill this Python-built JSON form in place", observation)
+
+    def test_chunk_fill_form_fixes_coverage_ids_and_character_bindings(self):
+        request = self.request()
+        request["character_name_table"] = "- Heman -> <Subject 1>\n- Tila -> <Subject 2>"
+        request["current_character_subjects"] = [
+            {"character_name": "Heman", "subject": "<Subject 1>"},
+        ]
+        request["mandatory_coverage"] = [
+            {"id": "S4.V2", "action": "walk right"},
+            {"id": "S5.O1.D1", "action": "<d>[English] Stay back!</d>"},
+        ]
+        form = json.loads(gemma4._chunk_fill_form(request))
+        self.assertEqual([item["id"] for item in form["coverage"]], ["S4.V2", "S5.O1.D1"])
+        self.assertTrue(all(item["status"] is None and item["evidence"] is None for item in form["coverage"]))
+        self.assertEqual(
+            [(item["character_name"], item["subject"]) for item in form["last_seen_character_state"]],
+            [("Heman", "<Subject 1>"), ("Tila", "<Subject 2>")],
+        )
+        self.assertTrue(all(item["environment"] is None for item in form["last_seen_character_state"]))
 
     def test_preproduction_requires_explicit_light_change_decision_per_shot(self):
         invalid = self.timing_response()
@@ -1893,6 +1944,19 @@ class GemmaCaptureTest(unittest.TestCase):
             ),
         }
         result = gemma4._validate_chunk_prompt(payload, request, json.dumps(payload))
+        summary_request = dict(request, require_summary=True, summary_required_tasks=["audio reference"], summary_forbidden_tasks=["video continuation"])
+        missing = gemma4._validate_chunk_prompt(payload, summary_request, json.dumps(payload))
+        self.assertTrue(any("summary" in warning for warning in gemma4._contract_validation_warnings(missing.validation_warnings)))
+        summarized = dict(payload, summary="[reference generation + audio reference] The riders continue, using <Audio 1> for voice continuity.")
+        valid = gemma4._validate_chunk_prompt(summarized, summary_request, json.dumps(summarized))
+        self.assertFalse(any("summary" in warning for warning in valid.validation_warnings))
+        self.assertEqual(gemma4._chunk_prompt_from_payload(gemma4._chunk_prompt_payload(valid)).summary, summarized["summary"])
+        split_summary = dict(payload, summary="[audio reference] + [reference generation] The riders continue.")
+        invalid = gemma4._validate_chunk_prompt(split_summary, summary_request, json.dumps(split_summary))
+        self.assertTrue(any("ONE bracket pair" in warning for warning in gemma4._contract_validation_warnings(invalid.validation_warnings)))
+        bare_summary = dict(payload, summary="[audio reference] Subject 1 uses Audio 1 for continuity.")
+        invalid = gemma4._validate_chunk_prompt(bare_summary, summary_request, json.dumps(bare_summary))
+        self.assertTrue(any("angle-bracket" in warning for warning in gemma4._contract_validation_warnings(invalid.validation_warnings)))
         contract = gemma4._contract_validation_warnings(result.validation_warnings)
         self.assertTrue(any("omits planned character Heman" in warning for warning in contract))
         self.assertTrue(any("bookkeeping language" in warning for warning in contract))

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -42,12 +42,509 @@ class _FakeAudioVAE:
 
 
 class ChunkDirectorHelperTest(unittest.TestCase):
+    def test_manual_prompt_edits_preserve_old_and_new_cache_compatibility(self):
+        """Ignore editor text but still reject changed render geometry."""
+        module = importlib.import_module(PLUGIN_ROOT.name + ".python.preproduction")
+        before = module.LegacyChunkPrompts("old text").fingerprint()
+        after = module.LegacyChunkPrompts("new text").fingerprint()
+        self.assertEqual(before, after)
+        wanted = {"chunk_frames": 124, "pre_production": after}
+        for provider in (before, dict(before, text="old cached text")):
+            manifest = {"format": nodes.REPLAY_CACHE_FORMAT, "fingerprint": {"chunk_frames": 124, "pre_production": provider}}
+            root = Mock()
+            root.__truediv__ = Mock(return_value=Mock(read_text=Mock(return_value=json.dumps(manifest))))
+            with patch.object(nodes, "_replay_cache_root", return_value=root), patch.object(nodes, "_replay_load_tensor_file", return_value={"video": "saved"}):
+                cache = nodes._LastRunReplayCache()
+                loaded, reason = cache.load_if_compatible(wanted)
+                self.assertIsNone(reason)
+                self.assertEqual(loaded["initial"]["video"], "saved")
+                self.assertIsNone(cache.load_if_compatible(dict(wanted, chunk_frames=192))[0])
+
+    def test_manual_chunk_prompts_round_trip_and_validation(self):
+        """Separators are removed without rewriting authored H3 text."""
+        module = importlib.import_module(PLUGIN_ROOT.name + ".python.preproduction")
+        prompts = ["summary: My opening.\n\ndetailed_description: [Shot 1] Wide camera.", "summary: My continuation.\n\ndetailed_description: [Shot 1] Keep my exact wording."]
+        provider = module.LegacyChunkPrompts(module.LegacyChunkPrompts.format(prompts))
+        self.assertEqual(provider.prompts(), prompts)
+        self.assertEqual(provider.get_chunk_prompt(2), prompts[1])
+        with self.assertRaises(ValueError):
+            provider.get_chunk_prompt(3)
+        for invalid in ("", "No delimiter", module.LegacyChunkPrompts.format([""]), module.LegacyChunkPrompts.format(prompts).replace("Chunk 2", "Chunk 3")):
+            with self.assertRaises(ValueError):
+                module.LegacyChunkPrompts(invalid).prompts()
+
+    def test_manual_prompt_bake_uses_native_layout_and_summary(self):
+        """The button's backend emits a usable provider without diffusion."""
+        module = importlib.import_module(PLUGIN_ROOT.name + ".python.preproduction")
+        import server
+        prompt = "summary: My opening.\n\ndetailed_description: [Shot 1] The camera is a closeup. She smiles."
+        with patch.object(server.PromptServer, "instance", Mock(), create=True) as instance:
+            module.HREndlessLegacyPromptBake.execute(73, "[]", prompt, 24, 39, 5, nodes.VIDEO_CONTINUATION_METHOD_MASKED_AV, "42", "request")
+        event, payload = instance.send_sync.call_args.args
+        self.assertEqual(event, "hr_endless_legacy_prompts")
+        self.assertEqual(payload["request_id"], "request")
+        provider = module.LegacyChunkPrompts(payload["text"])
+        plan = nodes._chunk_plan_without_overlap(nodes._video_steps(73), nodes._audio_steps(73), 39, 5)
+        self.assertEqual(len(provider.prompts()), len(plan))
+        self.assertIn("summary: My opening.", provider.get_chunk_prompt(1))
+        self.assertIn("keyframe completion", provider.get_chunk_prompt(2))
+        self.assertNotIn("--8<--", provider.get_chunk_prompt(2))
+        self.assertEqual(module.HREndlessLegacyChunkPrompts.define_schema().node_id, "HREndlessLegacyChunkPrompts")
+        self.assertTrue(module.HREndlessLegacyPromptBake.define_schema().is_output_node)
+
+    def test_visual_condition_noise_setting_on_both_branches_without_mutating_source(self):
+        """Every chunk propagates the configured visual noise, including CFG negative."""
+        original = {"positive": [{"minimax_visual_cond_noise_aug": 0.999}], "negative": [{}]}
+        updated = nodes._conditioning_for_chunk(original, 0, 39, (torch.zeros(1, 1, 1), {}))
+        for branch in ("positive", "negative"):
+            self.assertEqual(updated[branch][0]["minimax_visual_cond_noise_aug"], nodes.minimax_visual_cond_noise_aug)
+        self.assertEqual(original["positive"][0]["minimax_visual_cond_noise_aug"], 0.999)
+        self.assertNotIn("minimax_visual_cond_noise_aug", original["negative"][0])
+
+    def test_dialogue_language_codes_cover_h3_stable_languages(self):
+        """Use espeak variants for MiniMax H3's stable dialogue languages."""
+        expected = {"Arabic": "ar", "Chinese": "cmn", "English": "en-us", "French": "fr-fr", "German": "de", "Italian": "it", "Japanese": "ja", "Korean": "ko", "Portuguese": "pt-br", "Russian": "ru", "Spanish": "es"}
+        self.assertEqual({language: nodes._dialogue_language_code(language) for language in expected}, expected)
+
+    def test_audiosr_preview_copies_leave_original_audio_for_the_final_pass(self):
+        """Preview processing must not feed enhanced samples into the final pass."""
+        originals = [torch.full((1, 2, 320), 0.1), torch.full((1, 2, 320), 0.2)]
+        seen = []
+
+        def enhance(audio, **options):
+            """Record the source and return visibly different 48 kHz preview data."""
+            seen.append(audio["waveform"].clone())
+            count = round(audio["waveform"].shape[-1] * 48000 / audio["sample_rate"])
+            return {"waveform": torch.full((1, 2, count), 0.9), "sample_rate": 48000}
+
+        with patch.object(nodes, "fix_audio", side_effect=enhance), patch.object(nodes.comfy.model_management, "unload_all_models"), patch.object(nodes.comfy.model_management, "soft_empty_cache"):
+            for original in originals:
+                waveform, rate, overlap = nodes._enhance_decoded_audio(original, 32000, enabled=True)
+                self.assertEqual(rate, 48000)
+                self.assertEqual(waveform.shape[-1], 480)
+                self.assertIsNone(overlap)
+            complete_original = torch.cat(originals, dim=-1)
+            waveform, rate, _overlap = nodes._enhance_decoded_audio(complete_original, 32000, enabled=True)
+            self.assertTrue(torch.equal(seen[-1], complete_original))
+            self.assertEqual(waveform.shape[-1], 960)
+            self.assertTrue(torch.equal(originals[0], torch.full((1, 2, 320), 0.1)))
+            self.assertTrue(torch.equal(originals[1], torch.full((1, 2, 320), 0.2)))
+
+    def test_chunk_summary_keeps_opening_verbatim_and_replaces_later_reference_roles(self):
+        """Old first-frame/video/audio tasks must not leak into later summaries."""
+        original = "subject_definitions:\nAlice.\nsummary: [keyframe completion + audio reference]\n<Picture 1> is first frame. Use <Video 1> and <Audio 1>.\n\ndetailed_description: [Shot 1] Alice speaks."
+        rewritten = "subject_definitions:\nAlice.\nsummary: A director replacement.\n\ndetailed_description: Alice continues."
+        first = nodes._chunk_summary_prompt(rewritten, original, False)
+        self.assertIn(original[original.index("summary:"):original.index("detailed_description:")], first)
+        self.assertIn("detailed_description: Alice continues.", first)
+        for current in (original, rewritten):
+            later = nodes._chunk_summary_prompt(current, original, True, picture_label="<Picture 2>", video_label="<Video 2>", audio_label="<Audio 2>")
+            summary = later[later.index("summary:"):later.index("detailed_description:")]
+            self.assertIn("[video continuation + audio reference + keyframe completion]", summary)
+            self.assertIn("<Picture 2> serves as first frame of target video.", summary)
+            self.assertIn("the previous video's audio", summary)
+            self.assertNotIn("chunk", summary.lower())
+            for old in ("<Picture 1>", "<Video 1>", "<Audio 1>", "A director replacement"):
+                self.assertNotIn(old, summary)
+            masked = nodes._chunk_summary_prompt(current, original, True, audio_label="<Audio 2>", boundary_keyframe=True)
+            summary = masked[masked.index("summary:"):masked.index("detailed_description:")]
+            self.assertNotIn("<Picture", summary)
+            self.assertNotIn("video continuation", summary)
+        self.assertEqual(nodes._chunk_summary_prompt("detailed_description: Plain.", "detailed_description: Plain.", False), "detailed_description: Plain.")
+
+    def test_local_planner_keeps_the_complete_source_description_for_first_video(self):
+        """The first video keeps visual prose while later videos slice action."""
+        prompt = (
+            "summary: original task\n\n"
+            "detailed_description: [Shot 1] Initial source prose remains complete. "
+            "A second source action remains present.\n\n"
+            "overall_soundscape: quiet room"
+        )
+        plan = [
+            {"frame_start": 0, "frame_end": 48, "output_trim_frames": 0},
+            {"frame_start": 48, "frame_end": 96, "output_trim_frames": 0},
+        ]
+        with patch.object(nodes, "_legacy_shot_body_for_range", return_value="SLICED CONTINUATION") as slicer:
+            planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24.0, 0, False, False, True, 1, 1, legacy=True)
+
+        self.assertIn("Initial source prose remains complete.", planned[0][0])
+        self.assertIn("A second source action remains present.", planned[0][0])
+        self.assertNotIn("SLICED CONTINUATION", planned[0][0])
+        self.assertIn("SLICED CONTINUATION", planned[1][0])
+        self.assertEqual(slicer.call_count, 1)
+
+    def test_local_opening_body_keeps_visual_prose_but_times_dialogue(self):
+        """Chunk 1 cannot repeat dialogue that belongs to a later video."""
+        body = "Complete opening visual prose. <Subject 1> (S1) says: <d>[English] one two three four.</d>"
+        words = list(nodes.re.finditer(r"\S+", "one two three four."))
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple(zip(words, (1.0, 1.0, 1.0, 1.0)))):
+            opening = nodes._legacy_opening_body_with_timed_dialogue(body, 0, 4, 0, 2, 1)
+
+        self.assertIn("Complete opening visual prose.", opening)
+        self.assertIn("one two", opening)
+        self.assertNotIn("three four.", opening)
+
+    def test_first_legacy_chunk_keeps_the_source_static_camera_sentence(self):
+        prompt = (
+            "summary: Opening.\n\n"
+            "detailed_description: [Shot 1] The camera stays static at the same position from start to end of the shot. "
+            "<Subject 1> (S1) says: <d>[English] One two three four.</d>"
+        )
+        plan = [
+            {"frame_start": 0, "frame_end": 24, "output_trim_frames": 0},
+            {"frame_start": 24, "frame_end": 48, "output_trim_frames": 0},
+        ]
+        planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24, 0, False, False, False, 1, 1, legacy=True)
+
+        self.assertIn("The camera stays static at the same position from start to end of the shot.", planned[0][0])
+        self.assertIn("The camera stays static in the stablished frame.", planned[1][0])
+
+    def test_continuation_drops_complete_opening_picture_instruction_before_slicing(self):
+        """An opening setup cannot be cut into a dangling dialogue prefix."""
+        setup = "Starts with <Picture 1> as the exact first frame for the target video, and the camera stays static at <Picture 1> stablished position for the entire duration of the shot."
+        body = setup + " She smiles warmly."
+        first = nodes._legacy_opening_body_with_timed_dialogue(body, 0, 240, 0, 120)
+        later = nodes._legacy_shot_body_for_range(body, 0, 240, 120, 240)
+        self.assertIn(setup, first)
+        self.assertNotIn("<Picture 1>", later)
+        self.assertIn("She smiles warmly.", later)
+        long_sentence = "The subject " + "very " * 40 + "slowly turns around."
+        sliced = nodes._legacy_shot_body_for_range(long_sentence, 0, 240, 120, 240)
+        self.assertEqual(sliced.strip(), long_sentence)
+
+    def test_camera_establishment_is_exclusive_per_source_shot(self):
+        """A new shot establishes its camera even when it starts mid-chunk."""
+        prompt = "detailed_description: [Shot 1] The camera is a frontal closeup. She smiles. [Shot 2] At 00:03.000, The camera is a side view. He waves."
+        plan = [{"frame_start": start, "frame_end": start + 48, "output_trim_frames": 0} for start in (0, 48, 96)]
+        planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24, 0, False, False, False, 1, 1, legacy=True)
+        automatic = "The camera stays static in the stablished frame."
+        self.assertIn("frontal closeup", planned[0][0])
+        self.assertNotIn(automatic, planned[0][0])
+        self.assertNotIn("frontal closeup", planned[1][0])
+        self.assertIn("side view", planned[1][0])
+        self.assertEqual(planned[1][0].count(automatic), 1)
+        self.assertNotIn("side view", planned[2][0])
+        self.assertEqual(planned[2][0].count(automatic), 1)
+
+    def test_video1_last_frame_is_an_ordinary_picture_reference(self):
+        """Qwen and H3 receive the same final frame without a target keyframe."""
+        frames = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1).expand(3, 32, 64, 3) / 4.0
+        vae = Mock()
+        vae.encode.return_value = torch.ones((1, 24, 1, 2, 4))
+        item, ref = nodes._last_frame_picture_reference(vae, frames, 64, 32)
+        self.assertTrue(torch.equal(item["data"], frames[-1:]))
+        self.assertIs(vae.encode.call_args.args[0], item["data"])
+        self.assertEqual((ref["kind"], ref["latent_h"], ref["latent_w"]), ("image", 2, 4))
+        original = {"positive": [{"cross_attn": None, "minimax_refs": [{"kind": "image"}]}]}
+        clip = Mock()
+        nodes._prompt_tokens(clip, "summary: test", frames[:1], original["positive"], 64, 32, True, [item])
+        refs = clip.tokenize.call_args.kwargs["minimax_ref_items"]
+        self.assertEqual([entry["type"] for entry in refs], ["image", "image"])
+        self.assertIs(refs[-1], item)
+        linear_ref = {"kind": "image", "latent": torch.full((1,), 0.25)}
+        conds = nodes._conditioning_for_chunk(original, 39, 78, (torch.ones((1, 2, 3)), {}), video_refs=[ref], replacement_refs=[linear_ref])
+        self.assertIs(conds["positive"][0]["minimax_refs"][0], linear_ref)
+        self.assertIs(conds["positive"][0]["minimax_refs"][-1], ref)
+        self.assertNotIn("minimax_keyframes", conds["positive"][0])
+        self.assertEqual(len(original["positive"][0]["minimax_refs"]), 1)
+
+    def test_video1_first_frame_summary_preserves_tasks_and_is_idempotent(self):
+        """The exact picture role survives authored summaries and absent summaries."""
+        for summary in ("summary: [video continuation + audio reference] Continue the scene.\n\n", "summary: Continue the scene.\n\n", ""):
+            prompt = "subject_definitions:\n<Subject 1> is Alice.\n\n" + summary + "detailed_description: Alice talks.\noverall_soundscape: Wind."
+            result = nodes._first_frame_picture_prompt(prompt, "<Picture 3>")
+            self.assertIn("keyframe completion", result)
+            self.assertEqual(result.count("<Picture 3> serves as first frame of target video."), 1)
+            self.assertIn("detailed_description: Alice talks.\noverall_soundscape: Wind.", result)
+            self.assertEqual(nodes._first_frame_picture_prompt(result, "<Picture 3>"), result)
+            if "video continuation" in summary:
+                self.assertIn("[video continuation + audio reference + keyframe completion]", result)
+
+    def test_legacy_static_camera_checks_both_slices(self):
+        """Motion in either description prevents the static-camera prefix."""
+        still = "summary: Camera zooms in the source.\ndetailed_description: [Shot 1] She speaks."
+        sentence = "The camera stays static in the stablished frame."
+        result = nodes._legacy_static_camera_prompt(still)
+        self.assertIn("[Shot 1] " + sentence + " She speaks.", result)
+        self.assertEqual(nodes._legacy_static_camera_prompt(result), result)
+        moving = "detailed_description: The camera slowly zooms out."
+        self.assertEqual(nodes._legacy_static_camera_prompt(still, moving), still)
+        self.assertEqual(nodes._legacy_static_camera_prompt(moving, still), moving)
+        self.assertIn(sentence, nodes._legacy_static_camera_prompt("detailed_description: No camera movement. She runs."))
+
+    def test_legacy_static_camera_replaces_the_repeated_full_shot_instruction(self):
+        """A sliced static shot has one local camera instruction."""
+        prompt = "detailed_description: The camera stays static at the same position from start to end of the shot. She speaks."
+        result = nodes._legacy_static_camera_prompt(prompt)
+        self.assertNotIn("at the same position from start to end", result)
+        self.assertEqual(result.count("The camera stays static in the stablished frame."), 1)
+
+    def test_legacy_dialogue_keeps_tags_and_continues_without_repeated_words(self):
+        """Whole words have one owner; every emitted utterance closes its tags."""
+        body = "Camera stays static. <Subject 1> (S1) says: <d>[English] One two three, four five six seven eight.</d>"
+        fragments = [nodes._legacy_shot_body_for_range(body, 0, 240, start, start + 24, 24) for start in range(0, 240, 24)]
+        words = []
+        for fragment in fragments:
+            self.assertEqual(fragment.count("<d>"), fragment.count("</d>"))
+            if "<d>" in fragment:
+                self.assertIn("<Subject 1> (S1) says: <d>[English]", fragment)
+                words.extend(fragment.split("[English] ", 1)[1].split("</d>", 1)[0].split())
+        self.assertEqual(words, "One two three, four five six seven eight.".split())
+        self.assertNotEqual(fragments[0], fragments[1])
+
+    def test_legacy_dialogue_normalizes_internal_line_breaks(self):
+        """H3 receives one continuous spoken line per dialogue fragment."""
+        body = "<Subject 1> (S1) says: <d>[English] one two.\n\nthree four.</d>"
+        fragment = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 240, 24)
+        spoken = fragment.split("[English] ", 1)[1].split("</d>", 1)[0]
+        self.assertEqual(spoken, "one two. three four.")
+
+    def test_legacy_dialogue_uses_the_global_clock_without_restarting_later_chunks(self):
+        """Later physical slices retain only their source-clock words and no opening silence."""
+        body = "<Subject 1> starts the video in silence for 00:01.00, then (S1) says: <d>[English] One two three four five six seven eight nine ten.</d>"
+        first = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 48, 24)
+        later = nodes._legacy_shot_body_for_range(body, 0, 240, 48, 96, 24)
+        self.assertNotIn("already in progress", first)
+        self.assertNotIn("already in progress", later)
+        self.assertNotIn("start the video in silence", later.lower())
+        self.assertNotIn("One two", later)
+
+    def test_legacy_dialogue_honors_explicit_opening_silence_on_the_global_clock(self):
+        """A source timing instruction delays speech once, instead of every chunk."""
+        body = "<Subject 1> starts the video in silence for 00:01.00, then (S1) says: <d>[English] One two three four.</d>"
+        silent = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 24, 24)
+        speaking = nodes._legacy_shot_body_for_range(body, 0, 240, 24, 72, 24)
+        self.assertNotIn("<d>", silent)
+        self.assertIn("<d>[English] One", speaking)
+        self.assertNotIn("start the video in silence", speaking.lower())
+
+    def test_phoneme_timed_dialogue_contract_is_word_exact_and_chunk_owned(self):
+        """The preproduction verifier receives the same deterministic split as legacy sampling."""
+        body = "<Subject 1> (S1) says: <d>[English] One two three four five six seven eight nine ten.</d>"
+        chunks = [{"output_start": 0, "output_end": 120}, {"output_start": 120, "output_end": 240}]
+        segments = nodes._deterministic_dialogue_segments(body, 0, 240, chunks, 24)
+        words = [match.group(1).split("]", 1)[1].strip() for segment in segments for match in nodes.DIALOGUE_BLOCK.finditer(segment["content"])]
+        self.assertEqual(" ".join(words).split(), "One two three four five six seven eight nine ten.".split())
+        self.assertEqual([segment["chunk"] for segment in segments], [1, 2])
+        source_shots, request = nodes._gemma_preproduction_request("detailed_description: " + body, [(0, 0, 240, body)], [{"frame_start": 0, "frame_end": 120, "output_trim_frames": 0}, {"frame_start": 120, "frame_end": 240, "output_trim_frames": 0}], 24, False)
+        self.assertEqual(source_shots[0]["deterministic_dialogue_segments"], segments)
+        self.assertEqual([(item["output_start"], item["output_end"]) for item in request["chunks"]], [(0, 120), (120, 240)])
+
+    def test_dialogue_word_crossing_a_boundary_belongs_to_its_end_chunk(self):
+        """A word may start in a prefix, but its complete sound belongs later."""
+        body = "<Subject 1> (S1) says: <d>[English] one two.</d>"
+        words = list(nodes.re.finditer(r"\S+", "one two."))
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple(zip(words, (13.0, 11.0)))):
+            _visual, first = nodes._legacy_dialogue_for_range(body, 0, 240, 0, 120, 1)
+            _visual, second = nodes._legacy_dialogue_for_range(body, 0, 240, 120, 240, 1)
+        self.assertEqual(first, [])
+        self.assertIn("one two.", second[-1])
+
+    def test_dialogue_prompt_includes_words_spoken_during_the_carried_prefix(self):
+        """The resampled boundary receives its prior chunk's tail dialogue."""
+        body = "<Subject 1> (S1) says: <d>[English] one two three four.</d>"
+        words = list(nodes.re.finditer(r"\S+", "one two three four."))
+        ranges = ((0, 20), (20, 40))
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple(zip(words, (10.0, 10.0, 10.0, 10.0)))):
+            _visual, first = nodes._legacy_dialogue_for_range(body, 0, 40, 0, 20, 1, ranges)
+            _visual, second = nodes._legacy_dialogue_for_range(body, 0, 40, 20, 40, 1, ranges, 10)
+        self.assertIn("one two", first[-1])
+        self.assertEqual(second[0], "The dialogue is already in progress at this video opening.")
+        self.assertIn("two three four.", second[-1])
+
+    def test_taomate_sentence_allocation_and_no_prefix_repetition(self):
+        """Whole sentences survive unequal ranges and physical decoding halos."""
+        speech = "one two three. four five. six seven eight."
+        body = "<Subject 1> (S1) says: <d>[English] " + speech + "</d>"
+        words = list(nodes.re.finditer(r"\S+", speech))
+        ranges = ((0, 5), (5, 10), (10, 15))
+        parts = []
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
+            for start, end in ranges:
+                _visual, lines = nodes._legacy_dialogue_for_range(body, 0, 15, start, end, 1, ranges, max(0, start - 2), sentence_chunks=True)
+                parts.append(" ".join(nodes.re.findall(r"<d>\[English\] (.*?)</d>", " ".join(lines))))
+        self.assertEqual(parts, ["one two three.", "four five.", "six seven eight."])
+        self.assertEqual(" ".join(parts), speech)
+
+    def test_taomate_sentence_split_threshold_and_short_final_chunk(self):
+        """Only sentences strictly above 1.5 nominal chunks allow internal cuts."""
+        import importlib
+        allocate = importlib.import_module(nodes.__package__ + ".python.dialogue_timing").sentence_word_owners
+        self.assertEqual(allocate([[1] * 15, [1] * 5], [10, 10]), [0] * 15 + [1] * 5)
+        owners = allocate([[1] * 16, [1] * 4], [10, 10])
+        self.assertEqual(set(owners[:16]), {0, 1})
+        self.assertEqual(owners, sorted(owners))
+        self.assertEqual(len(owners), 20)
+        # The short final group cannot force a short sentence to split.
+        owners = allocate([[1] * 4, [1] * 4], [5, 5, 0.5])
+        self.assertEqual(len(set(owners[:4])), 1)
+        self.assertEqual(len(set(owners[4:])), 1)
+
+    def test_dialogue_uses_every_output_chunk_in_its_source_shot(self):
+        """Shot duration controls speaking speed without silent dialogue chunks."""
+        body = "<Subject 1> (S1) says: <d>[English] one two three four five six.</d>"
+        chunks = [{"output_start": 0, "output_end": 80}, {"output_start": 80, "output_end": 160}, {"output_start": 160, "output_end": 240}]
+        segments = nodes._deterministic_dialogue_segments(body, 0, 240, chunks, 24)
+        self.assertEqual([segment["chunk"] for segment in segments], [1, 2, 3])
+        with self.assertRaisesRegex(ValueError, "every dialogue chunk"):
+            nodes._deterministic_dialogue_segments("<Subject 1> (S1) says: <d>[English] one two.</d>", 0, 240, chunks, 24)
+
+    def test_legacy_dialogue_rejects_malformed_or_impossible_speech(self):
+        """Do not silently drop unparseable speech or overflow its shot."""
+        with self.assertRaisesRegex(ValueError, "complete"):
+            nodes._legacy_shot_body_for_range("<Subject 1> (S1) says: <d>[English] Hello", 0, 240, 0, 24)
+        with self.assertRaisesRegex(ValueError, "estimates"):
+            nodes._legacy_shot_body_for_range("<Subject 1> (S1) says: <d>[English] This sentence cannot fit.</d>", 0, 5, 0, 5)
+
+    def test_preproduction_node_is_lazy_and_creates_fresh_director_sessions(self):
+        """Graph execution configures Gemma; only sampler calls create sessions."""
+        module = importlib.import_module(PLUGIN_ROOT.name + ".python.preproduction")
+        with patch.object(module, "Gemma4ContinuityDirector", side_effect=lambda **kwargs: SimpleNamespace(settings=kwargs)) as factory:
+            provider = module.HREndlessGemmaPreProduction.execute(production_think_budget=0, chunk_think_budget=1024).result[0]
+            factory.assert_not_called()
+            context = {"prompt": "source", "fps": 24, "latent": object()}
+            first = provider.create_session(render_context=context, seed=42)
+            second = provider.create_session(render_context=context, seed=42)
+        self.assertIsNot(first, second)
+        self.assertIs(first.render_context, context)
+        self.assertEqual(first.settings["production_think_budget"], 0)
+        self.assertEqual(first.settings["chunk_think_budget"], 1024)
+        self.assertEqual(first.settings["seed"], 42)
+        self.assertNotEqual(provider.fingerprint(), module.GemmaPreProduction().fingerprint())
+        self.assertEqual([item.id for item in module.HREndlessGemmaPreProduction.define_schema().inputs], ["cache_gemma_preproduction", "gemma4_mtp", "production_think_budget", "chunk_think_budget"])
+
+    def test_legacy_prompt_slicing_selects_the_proportional_action(self):
+        """Without a director, restore the old deterministic word-count method."""
+        body = "Tiger runs. Tiger stops."
+        self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 0, 50).strip(), "Tiger runs.")
+        self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 50, 100).strip(), "Tiger stops.")
+        self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 0, 100), body)
+
+    def test_sampler_compute_precision_is_local_and_default_is_unchanged(self):
+        """FP32 reaches sampling through a clone without changing the upstream guider."""
+        model = Mock(load_device=torch.device("cpu"), model_options={"original": True})
+        model.clone.return_value = Mock(model_options={"cloned": True})
+        guider = SimpleNamespace(model_patcher=model, model_options=model.model_options, cfg=4.0, original_conds={})
+        latent = {"samples": torch.zeros((1, 4, 1, 1))}
+        # Exercise the real execute entry point while skipping GPU sampling and cache notifications.
+        with patch.object(nodes, "_set_pytorch_memory_fraction"), patch.object(nodes, "_replay_cache_activity"), patch.object(nodes.SamplerCustomAdvanced, "execute", return_value=(latent, latent)) as sample:
+            nodes.HREndlessSampler.execute(None, guider, None, None, latent, None, "", compute_precision="fp32 (full precision but more VRAM needed)")
+            local_guider = sample.call_args.args[1]
+            self.assertIsNot(local_guider, guider)
+            self.assertIs(local_guider.model_patcher, model.clone.return_value)
+            self.assertIs(local_guider.model_options, local_guider.model_patcher.model_options)
+            self.assertEqual(local_guider.cfg, 4.0)
+            local_guider.model_patcher.set_model_compute_dtype.assert_called_once_with(torch.float32)
+            self.assertIs(guider.model_patcher, model)
+            self.assertIs(guider.model_options, model.model_options)
+            model.set_model_compute_dtype.assert_not_called()
+            nodes.HREndlessSampler.execute(None, guider, None, None, latent, None, "")
+            self.assertIs(sample.call_args.args[1], guider)
+            model.clone.assert_called_once()
+            with self.assertRaises(ValueError):
+                nodes.HREndlessSampler.execute(None, guider, None, None, latent, None, "", compute_dtype="invalid")
+
+    def test_cached_preview_reports_encoding_progress(self):
+        """A dormant restore reports start and completion for its frame group."""
+        updates = []
+        chunk = {"index": 0, "frames": torch.zeros((1, 2, 2, 3)), "output_start": 0}
+        snapshot = preview.build_cached_final_preview_snapshot("restore-progress-test", [{"chunk": 1, "start": 0, "end": 0}], [], [chunk], fps=24, progress_callback=lambda done, total: updates.append((done, total)))
+        self.assertEqual(updates, [(0, 1), (1, 1)])
+        self.assertEqual(len(snapshot["chunks"]), 1)
+
+    def test_allocator_setting_is_not_a_workflow_input(self):
+        """Old hidden allocator values must not participate in validation."""
+        schema = nodes.HREndlessSampler.define_schema()
+        self.assertNotIn("pytorch_memory_fraction", [item.id for item in schema.inputs])
+
+    def test_gemma_summary_replaces_global_summary_after_reference_injection(self):
+        """The final summary is the authored chunk paragraph, exactly once."""
+        prompt = "subject_definitions:\n<Subject 1> is Alice.\n\nsummary: Old summary.\nOld second line.\n\nretention_analysis:\nKeep identity.\n\ndetailed_description: Old action.\noverall_soundscape: Wind."
+        summary = "[video continuation + audio reference] Continue <Video 2>, using <Audio 3> for voice continuity."
+        result = nodes._prompt_with_gemma_description(prompt, "Alice talks.", continuation_video_label="<Video 2>", continuation_audio_label="<Audio 3>", summary=summary)
+        self.assertEqual(result.count("summary:"), 1)
+        self.assertIn("summary: " + summary, result)
+        self.assertNotIn("Old second line", result)
+        self.assertIn("<Audio 3> is", result)
+        self.assertIn("retention_analysis:", result)
+
+    def test_static_grade_deduplication_ignores_case_punctuation_and_spacing(self):
+        """Equivalent wording is kept once, without confusing picture IDs."""
+        shots = [(0, 0, 100, "Using <Picture 1> as the exact first frame, the camera stays static.")]
+        camera = "The camera remains static in the established framing. "
+        for instruction in (
+            "Use the lighting and color grading from <Picture 1>.",
+            "USE THE LIGHTING, AND COLOR-GRADING FROM <PICTURE   1>!",
+            "use\n the lighting and\tcolor grading from <Picture1>",
+        ):
+            description = camera + instruction
+            self.assertEqual(nodes._reinforce_static_shot_grade(description, shots, 39), description)
+        description = camera + "Use the lighting and color grading from <Picture 10>."
+        self.assertIn("Use the lighting and color grading from <Picture 1>.", nodes._reinforce_static_shot_grade(description, shots, 39))
+
+    def test_prefix_noise_reuses_the_previous_full_sequence_tail(self):
+        """Prefix and retained noise form one contiguous full-sequence slice."""
+        video = torch.arange(20).reshape(1, 1, 20, 1, 1)
+        audio = torch.arange(40).reshape(1, 1, 1, 40)
+        prefix_video, prefix_audio = nodes._full_noise_prefix(video, audio, 7, 16, 2, 4)
+        self.assertTrue(torch.equal(torch.cat((prefix_video, video[:, :, 7:12]), dim=2), video[:, :, 5:12]))
+        self.assertTrue(torch.equal(torch.cat((prefix_audio, audio[..., 16:24]), dim=-1), audio[..., 12:24]))
+        next_video, _ = nodes._full_noise_prefix(video, audio, 12, 24, 2, 4)
+        self.assertFalse(torch.equal(prefix_video, next_video))
+        with self.assertRaises(ValueError):
+            nodes._full_noise_prefix(video, audio, 1, 16, 2, 4)
+
+    def test_independent_chunk_noise_uses_one_based_seed_multiples(self):
+        self.assertFalse(nodes.TOGGLE_SINGLE_NOISE)
+        self.assertEqual([nodes._per_chunk_noise_seed(17, index) for index in range(3)], [17, 34, 51])
+        self.assertEqual([nodes._per_chunk_noise_seed(0, index) for index in range(3)], [0, 0, 0])
+
+    def test_color_mode_disabled_preserves_pixels_and_visible_prefix_is_corrected(self):
+        """Disabled grading is identity; zero trim grades the first visible frame."""
+        frames = torch.full((8, 2, 2, 3), 0.2)
+        reference = torch.full((1, 2, 2, 3), 0.3)
+        unchanged, transform, count = nodes._correct_decoded_chunk_color(reference, frames, 0, enabled=False)
+        self.assertIs(unchanged, frames)
+        self.assertIsNone(transform)
+        self.assertEqual(count, 0)
+        corrected, transform, count = nodes._correct_decoded_chunk_color(reference, frames, 0)
+        self.assertEqual(count, 8)
+        self.assertFalse(torch.equal(corrected[0], frames[0]))
+        self.assertTrue(torch.equal(corrected[0], corrected[5]))
+
+    def test_static_continuation_uses_its_source_first_picture_grade(self):
+        """Use the actual shot anchor only after that shot has started."""
+        shots = [(0, 0, 100, "Using <Picture 4> as the exact first frame, the camera stays static.")]
+        description = "The camera remains static in the established framing. She walks."
+        result = nodes._reinforce_static_shot_grade(description, shots, 39)
+        self.assertIn("Use the lighting and color grading from <Picture 4>.", result)
+        self.assertNotIn("first frame", result)
+        self.assertEqual(nodes._reinforce_static_shot_grade(description, shots, 0), description)
+        self.assertEqual(nodes._reinforce_static_shot_grade("The camera pans.", shots, 39), "The camera pans.")
+
+    def test_no_trim_preview_retains_packed_prefixes_sequentially(self):
+        plan = [
+            {"frame_start": 0, "frame_end": 243, "output_trim_frames": 0},
+            {"frame_start": 238, "frame_end": 481, "output_trim_frames": 5},
+            {"frame_start": 476, "frame_end": 719, "output_trim_frames": 5},
+        ]
+        self.assertEqual(nodes._preview_ranges_for_plan(plan, keep_physical_prefix=True), [
+            {"chunk": 1, "start": 0, "end": 242},
+            {"chunk": 2, "start": 243, "end": 485},
+            {"chunk": 3, "start": 486, "end": 728},
+        ])
+        marked = nodes._preview_ranges_for_plan(plan, show_replaced_tail=True)
+        self.assertEqual(marked[0]["replacement_overlap_frames"], 5)
+        self.assertEqual(marked[1]["replacement_overlap_frames"], 5)
+        self.assertNotIn("replacement_overlap_frames", marked[2])
+
     def test_dormant_preview_restores_finalized_cpu_media_from_replay_cache(self):
         """A browser refresh must not require a model execution to show cache."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "last_run_replay"
             fingerprint = {
                 "fps": 24.0,
+                "linear_color_compute": True,
                 "plan": [{"frame_start": 0, "frame_end": 2, "output_trim_frames": 0}],
             }
             state = {
@@ -66,6 +563,11 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 cache = nodes._LastRunReplayCache()
                 cache.create(fingerprint, "source", {"video": torch.zeros(1)})
                 cache.save_chunk(1, state)
+                # A cache written before the sRGB marker held compute RGB in
+                # the browser proxy. Verify refresh repairs that legacy data.
+                legacy = cache.load_chunk(1)
+                legacy.pop("preview_proxy_color_space")
+                nodes._replay_write_tensor_file(cache.chunk_path(1), legacy)
                 with patch.object(nodes, "build_cached_final_preview_snapshot", return_value={"reset": {}}) as build:
                     snapshot = nodes._cached_replay_preview_snapshot(
                         "141",
@@ -77,7 +579,10 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(snapshot, {"reset": {}})
         self.assertEqual(build.call_args.kwargs["fps"], 24.0)
         self.assertEqual(build.call_args.args[1][0]["gemma_detailed_description"], "cached prompt")
-        self.assertTrue(torch.equal(build.call_args.args[3][0]["frames"], state["corrected_video_frames"]))
+        self.assertTrue(torch.allclose(
+            build.call_args.args[3][0]["frames"],
+            nodes._convert_image_transfer(state["corrected_video_frames"], nodes._inverse_gamma_compute_to_srgb),
+        ))
 
     def test_preview_reuses_live_cache_status_for_timeline_underlines(self):
         """The cache button's manifest count must also drive its timeline marks."""
@@ -85,14 +590,48 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("if (cacheStatus?.has_cache)", source)
         self.assertIn("cachedChunkIndices = new Set(cachedChunks", source)
         self.assertIn("cachedChunkCount = cachedChunkIndices.size;", source)
+        self.assertIn("offset += spans[index];\n                    const end", source)
+        self.assertIn("if (!cachedChunkIndices.has(index)) continue;", source)
         self.assertIn("renderTransport();\n                } catch (error)", source)
 
-    def test_preview_cache_context_menu_targets_the_clicked_chunk(self):
-        """The browser must ask the backend to invalidate its selected chunk."""
+    def test_preview_marks_replaced_tail_and_preloads_the_next_chunk_audio(self):
+        """The timeline and audio transport expose native continuation ownership."""
         source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
-        self.assertIn('timelineShell.addEventListener("contextmenu"', source)
+        self.assertIn("replacement_overlap_frames", source)
+        self.assertIn("renderOverlapReplacementLines", source)
+        self.assertIn("const color = chunkColors[(index + 1) % chunkColors.length];", source)
+        self.assertIn('const alpha = available(index + 1) ? "" : "35";', source)
+        self.assertIn("function preloadAudio(group)", source)
+        self.assertIn("audioStandbyPlayer", source)
+        self.assertIn("const shotNumber = Number(shot?.shot) || 1;", source)
+
+    def test_preview_inverse_gamma_toggle_applies_only_finalized_decodes(self):
+        """The browser-only display curve must never alter latent step previews."""
+        source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
+        self.assertIn('linearDisplayButton.textContent = "L";', source)
+        self.assertIn('filter.setAttribute("color-interpolation-filters", "sRGB");', source)
+        self.assertIn('const enabled = inverseGammaDisplay && finalized;', source)
+        self.assertIn('Boolean(group.finalized),', source)
+        self.assertIn('\n                        false,\n                    );', source)
+
+    def test_preview_cache_context_menu_targets_the_clicked_chunk(self):
+        """Global reconnect remains available beside a local cache action."""
+        source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
+        self.assertIn('root.addEventListener("contextmenu"', source)
+        self.assertIn("chunkTooltip.hide();", source)
+        self.assertIn('reconnectButton.textContent = "Reconnect"', source)
+        self.assertIn("await restoreServerState(0, true);", source)
+        self.assertIn('divider.style.cssText = "height:1px', source)
+        self.assertIn("showPreviewContextMenu(chunkIndex, event);", source)
         self.assertIn("replay_cache_chunk?chunk=${chunkNumber}", source)
         self.assertIn("Delete cached chunk", source)
+
+    def test_preview_names_the_exact_reused_chunks_in_cache_green(self):
+        """The on-image cache notice must report the actual reused chunk list."""
+        source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
+        self.assertIn("color:#69b76f", source)
+        self.assertIn("reusing cached chunks ${chunks}", source)
+        self.assertIn("data.reused_chunk_numbers", source)
 
     def test_connected_save_video_prefix_comes_from_this_sampler_timeline(self):
         class DynamicPrompt:
@@ -204,8 +743,23 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(overlap.shape[-1], round(5 * 8000 / 24.0))
         self.assertEqual(waveform.shape[-1], round(22 * 8000 / 24.0))
 
+    def test_replay_native_audio_tail_uses_exact_audio_latent_ticks(self):
+        _, _, waveform, sample_rate, overlap = nodes._decode_replay_preview_media(
+            _IndexedFakeVAE(),
+            _FakeAudioVAE(),
+            torch.zeros((1, 24, 11, 1, 1), dtype=torch.float32),
+            torch.zeros((1, 1, 1, 16), dtype=torch.float32),
+            output_trim_frames=5,
+            context_audio_t=8,
+            output_frames=22,
+            fps=24.0,
+            replace_audio_tail_ticks=True,
+        )
+        self.assertEqual(sample_rate, 8000)
+        self.assertEqual(overlap.shape[-1], round(8 * 8000 / nodes.AUDIO_LATENT_FPS))
+        self.assertEqual(waveform.shape[-1], round(22 * 8000 / 24.0))
+
     def test_masked_av_prefix_inspection_keeps_the_locked_prefix(self):
-        self.assertFalse(nodes.TRIM_MASKED_AV_PREFIX)
         decoded, retained, waveform, sample_rate, overlap = nodes._decode_replay_preview_media(
             _IndexedFakeVAE(),
             _FakeAudioVAE(),
@@ -225,6 +779,23 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(retained.shape[0], 32)
         self.assertEqual(waveform.shape[-1], round(32 * 8000 / 24.0))
 
+    def test_preview_execution_ids_survive_wrapper_and_server_recreation(self):
+        """Fresh wrappers and restarted counters cannot reuse an older render ID."""
+        first = preview._AccumulatedPreviewWrapper("restart", 0, 80, 24, 1, "none")
+        second = preview._AccumulatedPreviewWrapper("restart", 0, 80, 24, 1, "none")
+        with patch.object(preview, "_send"), patch.object(preview, "_PREVIEW_EXECUTION_ID", 0), patch.object(preview.time, "time_ns", return_value=1800000000000000000):
+            a = first.begin(1)
+            b = first.begin(1)
+            c = second.begin(1)
+            self.assertLess(a, b)
+            self.assertLess(b, c)
+            # Simulate a new process with its counter reset and a later clock.
+            preview._PREVIEW_EXECUTION_ID = 0
+            with patch.object(preview.time, "time_ns", return_value=1800000001000000000):
+                d = second.begin(1)
+            self.assertLess(c, d)
+            self.assertLess(d, 2 ** 53)
+
     def test_preview_audio_overlap_replaces_prior_groups_and_updates_cached_final_audio(self):
         wrapper = preview._AccumulatedPreviewWrapper(
             node_id="preview-audio-overlap-test",
@@ -241,7 +812,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 {"chunk": 2, "start": 4, "end": 5},
                 {"chunk": 3, "start": 6, "end": 8},
             ]
-            execution_id = wrapper.begin(ranges, reusing_cached_chunks=True, cached_chunk_count=2)
+            execution_id = wrapper.begin(ranges, reusing_cached_chunks=True, cached_chunk_count=2, reused_chunk_numbers=(1, 3))
             wrapper.final_audio = {
                 0: torch.zeros((1, 1, 4), dtype=torch.float32),
                 1: torch.ones((1, 1, 2), dtype=torch.float32),
@@ -257,6 +828,27 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         reset = next(payload for payload in payloads if payload.get("action") == "reset")
         self.assertTrue(reset["reusing_cached_chunks"])
         self.assertEqual(reset["cached_chunk_count"], 2)
+        self.assertEqual(reset["reused_chunk_numbers"], [1, 3])
+
+    def test_preview_shift_tooltip_receives_exact_h3_prompt(self):
+        wrapper = preview._AccumulatedPreviewWrapper(
+            node_id="preview-h3-prompt-test",
+            max_resolution=0,
+            quality=80,
+            fps=24.0,
+            frame_stride=1,
+            tiny_vae="none",
+        )
+        payloads = []
+        with patch.object(preview, "_send", side_effect=lambda payload: payloads.append(payload)):
+            execution_id = wrapper.begin([{"chunk": 1, "start": 0, "end": 4}])
+            wrapper.set_chunk(execution_id, 0, 0, 4, 0, 4, 0, "short description", None, "complete H3 prompt")
+
+        metadata = next(payload for payload in payloads if payload.get("action") == "chunk_metadata")
+        self.assertEqual(metadata["h3_prompt"], "complete H3 prompt")
+        source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
+        self.assertIn('const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);', source)
+        self.assertIn('showFullPrompt ? "Full prompt sent to H3:"', source)
 
         node_id = "preview-audio-update-cache-test"
         with preview._PREVIEW_CACHE_LOCK:
@@ -344,12 +936,15 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         continuation_method_input = next(item for item in schema.inputs if item.id == "video_continuation_method")
         self.assertEqual(continuation_method_input.default, nodes.VIDEO_CONTINUATION_METHOD_VIDEO1)
         self.assertEqual(tuple(continuation_method_input.options), nodes.VIDEO_CONTINUATION_METHODS)
-        self.assertIn("cache_gemma_preproduction", input_ids)
-        self.assertIn("gemma4_mtp", input_ids)
-        gemma4_mtp_input = next(item for item in schema.inputs if item.id == "gemma4_mtp")
-        self.assertFalse(gemma4_mtp_input.default)
+        self.assertIn("pre_production", input_ids)
+        linear_color_input = next(item for item in schema.inputs if item.id == "linear_color_compute")
+        self.assertFalse(linear_color_input.default)
+        audio_feather_input = next(item for item in schema.inputs if item.id == "audio_feathered_overlap")
+        self.assertFalse(audio_feather_input.default)
+        self.assertNotIn("cache_gemma_preproduction", input_ids)
+        self.assertNotIn("gemma4_mtp", input_ids)
         self.assertFalse(nodes.ENABLE_GEMMA4_MTP)
-        self.assertIn("pytorch_memory_fraction", input_ids)
+        self.assertNotIn("pytorch_memory_fraction", input_ids)
         self.assertNotIn("video_continuation_enable", input_ids)
         self.assertFalse({
             "context_keyframes_enable",
@@ -360,11 +955,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             "prompt_preview_only",
         } & set(input_ids))
         self.assertEqual(
-            input_ids[-6:],
+            input_ids[-4:],
             [
-                "cache_gemma_preproduction",
-                "gemma4_mtp",
-                "pytorch_memory_fraction",
+                "pre_production",
                 "debug",
                 "debug_stop_chunk",
                 "debug_start_chunk",
@@ -378,10 +971,11 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertNotIn("qwen_full_history", execute_params)
         self.assertNotIn("prompt_preview_only", execute_params)
         self.assertIn("debug_start_chunk", execute_params)
-        self.assertIn("cache_gemma_preproduction", execute_params)
-        self.assertIn("gemma4_mtp", execute_params)
-        self.assertFalse(execute_params["gemma4_mtp"].default)
-        self.assertIn("pytorch_memory_fraction", execute_params)
+        self.assertNotIn("cache_gemma_preproduction", execute_params)
+        self.assertNotIn("gemma4_mtp", execute_params)
+        self.assertIsNone(execute_params["pre_production"].default)
+        self.assertFalse(execute_params["audio_feathered_overlap"].default)
+        self.assertNotIn("pytorch_memory_fraction", execute_params)
         self.assertEqual(execute_params["video_continuation"].default, 22)
         self.assertEqual(
             execute_params["video_continuation_method"].default,
@@ -541,6 +1135,16 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertEqual(
                 cache.automatic_resume_chunk(loaded["manifest"], 3),
                 2,
+            )
+
+            # Sampling can finish before final decoding, grading, or output
+            # assembly crashes. One-past-end restores every cached chunk and
+            # enters finalization without running H3 again.
+            cache.mark_interrupted(3)
+            loaded, _reason = cache.load_if_compatible({"geometry": "stable"})
+            self.assertEqual(
+                cache.automatic_resume_chunk(loaded["manifest"], 3),
+                4,
             )
 
             cache.mark_complete(3)
@@ -1237,7 +1841,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(rewritten.count("retention_analysis:"), 1)
         self.assertIn("retention_analysis:\nKeep identities consistent.", rewritten)
         self.assertIn(
-            "<Audio 1>: reference - audio from the previous video that needs to be continued seamlessly.",
+            "<Audio 1>: reference - its audible continuity guides the new audio without copying the original signal.",
             rewritten,
         )
         self.assertNotIn(retention_value, rewritten)
@@ -1249,24 +1853,63 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("<Video 1>", rewritten)
         self.assertIn("<Audio 1>", rewritten)
         self.assertIn(
-            "<Audio 1> is the audio from previous video that needs to be continued seamlessly.",
+            "<Audio 1> is the previous video's full audio reference for seamless continuation in this video.",
             rewritten,
         )
         self.assertEqual(nodes._chunk_retention_analysis(retention_value), retention_value)
 
-    def test_masked_av_overlap_is_disabled_for_the_video1_audio_reference_ab_test(self):
-        """The physical 39-frame AV prefix stays off without disabling keyframes."""
+    def test_audio_only_reference_names_previous_speakers_and_languages(self):
+        prompt = (
+            "subject_definitions:\nTila is <Subject 2>.\n\n"
+            "retention_analysis:\nKeep Tila consistent.\n\n"
+            "detailed_description: [Shot 1] Tila continues.\n\n"
+            "overall_soundscape: temple ambience"
+        )
+        previous = (
+            "<Subject 2> (S1) says: <d>[English] Stay close!</d> "
+            "<Subject 1> (S2) replies: <d>[Spanish] Vamos.</d>"
+        )
+        speakers = nodes._audio_reference_speakers(previous)
+        rewritten = nodes._prompt_with_gemma_description(
+            prompt,
+            "Tila continues walking.",
+            continuation_audio_label="<Audio 1>",
+            audio_speakers=speakers,
+        )
+
+        self.assertEqual(speakers, (
+            ("<Subject 2>", "S1", ("English",)),
+            ("<Subject 1>", "S2", ("Spanish",)),
+        ))
+        self.assertIn("voice-timbre reference for <Subject 2> (S1) and <Subject 1> (S2)", rewritten)
+        self.assertIn("containing spoken English and Spanish vocal layers", rewritten)
+        self.assertIn("vocal timbres guide the dialogue delivery of <Subject 2> and <Subject 1>", rewritten)
+        self.assertNotIn("<Video 1>", rewritten)
+
+    def test_masked_av_native_boundary_uses_selected_continuation_duration(self):
+        """The synthetic native boundary follows the selected overlap duration."""
         self.assertFalse(nodes.ENABLE_MASKED_AV_OVERLAP)
         plan = nodes._chunk_plan_without_overlap(
             nodes._video_steps(73),
             nodes._audio_steps(73),
             39,
+            22,
         )
         boundary, start = nodes._video_continuation_boundary_guide(
             torch.zeros((1, 24, 12, 1, 1)), plan[1], 0, True,
         )
         self.assertEqual(start, 0)
-        self.assertEqual(boundary.shape[2], nodes._video_steps(5))
+        self.assertEqual(plan[1]["output_trim_frames"], 22)
+        self.assertEqual(plan[1]["context_video_t"], nodes._video_steps(22))
+        self.assertEqual(plan[1]["context_audio_t"], nodes._audio_steps(22))
+        self.assertEqual(boundary.shape[2], nodes._video_steps(22))
+        context = nodes._gemma_conditioning_context(
+            True, 0, 0, 22, None, "<Audio 1>", False,
+            nodes.VIDEO_CONTINUATION_METHOD_MASKED_AV, False,
+        )
+        self.assertIn("22-frame video/audio boundary", context)
+        self.assertIn("discarded temporal packing prefix", context)
+        self.assertIn("without a separate Audio reference", context)
 
     def test_whole_previous_chunk_audio_uses_a_standalone_h3_audio_reference(self):
         audio = torch.zeros((1, 32, 2, 207), dtype=torch.float32)
@@ -1360,6 +2003,62 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(audio_mask[..., :10]).item(), 0)
         self.assertEqual(audio_mask[..., 10:].min().item(), 1.0)
 
+    def test_native_audio_boundary_seeds_only_audio_and_linearly_releases_it(self):
+        chunk_video = torch.zeros((1, 2, 7, 2, 2), dtype=torch.float32)
+        chunk_audio = torch.full((1, 3, 2, 20), -1.0)
+        previous_audio = torch.arange(30, dtype=torch.float32).reshape(1, 1, 1, 30).expand(1, 3, 2, 30)
+        target_audio, nested_mask = nodes._native_audio_boundary_target(
+            chunk_video, chunk_audio, previous_audio, 10,
+        )
+        video_mask, audio_mask = nested_mask.unbind()
+        positions = torch.linspace(0.0, 1.0, 10)
+        expected = positions
+        self.assertTrue(torch.equal(target_audio[..., :10], previous_audio[..., -10:]))
+        self.assertTrue(torch.equal(target_audio[..., 10:], chunk_audio[..., 10:]))
+        self.assertEqual(video_mask.min().item(), 1.0)
+        self.assertTrue(torch.allclose(audio_mask[0, 0, 0, :10], expected))
+        self.assertEqual(audio_mask[..., 10:].min().item(), 1.0)
+
+    def test_native_audio_boundary_releases_only_final_word_ticks(self):
+        chunk_video = torch.zeros((1, 2, 7, 2, 2), dtype=torch.float32)
+        chunk_audio = torch.full((1, 3, 2, 20), -1.0)
+        previous_audio = torch.arange(30, dtype=torch.float32).reshape(1, 1, 1, 30).expand(1, 3, 2, 30)
+
+        target_audio, nested_mask = nodes._native_audio_boundary_target(chunk_video, chunk_audio, previous_audio, 10, 3)
+        _video_mask, audio_mask = nested_mask.unbind()
+
+        self.assertTrue(torch.equal(target_audio[..., :10], previous_audio[..., -10:]))
+        self.assertEqual(torch.count_nonzero(audio_mask[..., :7]).item(), 0)
+        self.assertTrue(torch.allclose(audio_mask[0, 0, 0, 7:10], torch.tensor([0.0, 0.5, 1.0])))
+        self.assertEqual(audio_mask[..., 10:].min().item(), 1.0)
+
+    def test_native_av_boundary_copies_tail_and_releases_both_streams(self):
+        """The 39-frame prefix uses temporal weights and leaves the suffix free."""
+        video = torch.zeros((1, 2, 17, 2, 2))
+        audio = torch.zeros((1, 3, 2, 100))
+        tail = torch.ones((1, 2, 12, 2, 2))
+        audio_tail = torch.ones((1, 3, 2, 65))
+        out_video, out_audio, masks = nodes._native_audio_boundary_target(video, audio, audio_tail, 65, 20, previous_video=tail)
+        vm, am = masks.unbind()
+        self.assertTrue(torch.equal(out_video[:, :, :12], tail))
+        self.assertTrue(torch.equal(out_audio[..., :65], audio_tail))
+        self.assertEqual(out_video[:, :, 12:].count_nonzero().item(), 0)
+        self.assertEqual(video.count_nonzero().item(), 0)
+        self.assertEqual(vm[0, 0, 0, 0, 0].item(), 0)
+        self.assertEqual(vm[0, 0, 11, 0, 0].item(), 1)
+        self.assertEqual(am[0, 0, 0, 64].item(), 1)
+        self.assertEqual(vm[:, :, 12:].min().item(), 1)
+        self.assertEqual(am[..., 65:].min().item(), 1)
+        position = ((34.0 / 38.0 * 64.0) - 45.0) / 19.0
+        self.assertAlmostEqual(vm[0, 0, 10, 0, 0].item(), position, places=5)
+
+    def test_last_dialogue_word_feather_ticks_uses_only_terminal_word(self):
+        with patch.object(nodes, "_dialogue_word_weights", return_value=((None, 0.165),)):
+            ticks = nodes._last_dialogue_word_feather_ticks("<d>[English] Earlier words. The</d>", 66)
+
+        self.assertEqual(ticks, 7)
+        self.assertEqual(nodes._last_dialogue_word_feather_ticks("plain narrative", 66), 0)
+
     def test_masked_av_replaces_frozen_video_prefix_with_corrected_reencode(self):
         chunk_video = torch.zeros((1, 24, 12, 2, 3), dtype=torch.float32)
         corrected_reencode = torch.full((1, 24, 12, 2, 3), 0.75, dtype=torch.float32)
@@ -1371,7 +2070,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shape"):
             nodes._replace_masked_av_video_prefix(chunk_video, corrected_reencode[:, :, :-1], 12)
 
-    def test_masked_av_boundary_guides_encode_first_middle_and_last_overlap_images(self):
+    def test_masked_av_boundary_guides_encode_every_overlap_image_separately(self):
         class DummyVAE:
             def __init__(self):
                 self.encoded = []
@@ -1382,14 +2081,16 @@ class ChunkDirectorHelperTest(unittest.TestCase):
 
         vae = DummyVAE()
         decoded = torch.linspace(0.0, 0.9, 30 * 3 * 2 * 3, dtype=torch.float32).reshape(30, 3, 2, 3)
-        guides = nodes._masked_av_boundary_guides(vae, decoded, 22)
+        guides = nodes._masked_av_boundary_guides(vae, decoded, 5)
 
-        self.assertEqual([item["resolved_frame_index"] for item in guides], [0, 10, 21])
-        self.assertEqual(len(vae.encoded), 3)
+        self.assertEqual([item["resolved_frame_index"] for item in guides], [0, 1, 2, 3, 4])
+        self.assertEqual(len(vae.encoded), 5)
         # This helper faithfully encodes the caller-selected decoded frames.
-        self.assertTrue(torch.equal(vae.encoded[0], decoded[8:9]))
-        self.assertTrue(torch.equal(vae.encoded[1], decoded[18:19]))
-        self.assertTrue(torch.equal(vae.encoded[2], decoded[29:30]))
+        self.assertTrue(torch.equal(vae.encoded[0], decoded[25:26]))
+        self.assertTrue(torch.equal(vae.encoded[1], decoded[26:27]))
+        self.assertTrue(torch.equal(vae.encoded[2], decoded[27:28]))
+        self.assertTrue(torch.equal(vae.encoded[3], decoded[28:29]))
+        self.assertTrue(torch.equal(vae.encoded[4], decoded[29:30]))
         self.assertTrue(all(tuple(item["latent"].shape) == (1, 24, 1, 2, 2) for item in guides))
 
     def test_h3_context_frames_uses_corrected_tail_when_experiment_enabled(self):
@@ -1435,6 +2136,24 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(torch.cat(parts, dim=-1), torch.tensor([[[[0.0, 20.0, 30.0, 40.0, 50.0]]]]))
         )
+
+    def test_decoded_frame_before_tail_uses_the_last_frame_that_will_remain(self):
+        parts = [
+            torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1),
+            torch.arange(3, 7, dtype=torch.float32).reshape(4, 1, 1, 1),
+        ]
+        reference = nodes._decoded_frame_before_tail(parts, 3)
+        self.assertEqual(reference[:, 0, 0, 0].tolist(), [3.0])
+        self.assertIsNone(nodes._decoded_frame_before_tail(parts, 7))
+
+    def test_decoded_tail_replacement_keeps_duration_and_uses_new_chunk_prefix(self):
+        parts = [
+            torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1),
+            torch.arange(3, 7, dtype=torch.float32).reshape(4, 1, 1, 1),
+        ]
+        replacement = torch.tensor([20.0, 30.0, 40.0], dtype=torch.float32).reshape(3, 1, 1, 1)
+        nodes._replace_decoded_frame_tail(parts, replacement)
+        self.assertEqual(torch.cat(parts, dim=0)[:, 0, 0, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 20.0, 30.0, 40.0])
 
     def test_masked_av_gemma_context_never_claims_video1_reference(self):
         context = nodes._gemma_conditioning_context(
@@ -1518,6 +2237,20 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         keyframe = conds["positive"][0]["minimax_keyframes"][0]
         self.assertEqual(keyframe["resolved_frame_index"], 0)
         self.assertIs(keyframe["latent"], boundary_latent)
+
+        audio_boundary = torch.zeros((1, 32, 2, nodes._audio_steps(5)), dtype=torch.float32)
+        conds = nodes._conditioning_for_chunk(
+            {"positive": [{"minimax_keyframes": []}]},
+            34,
+            73,
+            (torch.zeros((1, 1, 1)), {}),
+            audio_context=audio_boundary,
+            audio_end_frame=audio_boundary.shape[-1] / nodes.FRAME_RESCALE,
+        )
+        audio_keyframe = conds["positive"][0]["minimax_keyframes"][0]
+        self.assertEqual(nodes._audio_steps(5), 8)
+        self.assertEqual(audio_keyframe["resolved_frame_index"], 0)
+        self.assertIs(audio_keyframe["audio_latent"], audio_boundary)
 
     def test_debug_memory_preflight_uses_at_most_three_real_sigma_steps(self):
         sigmas = torch.arange(21, dtype=torch.float32)
@@ -1640,6 +2373,29 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(corrected, frames, atol=1e-5, rtol=1e-5))
 
+    def test_inverse_gamma_compute_transfer_round_trips_rgb_and_preserves_alpha(self):
+        frames = torch.tensor([[[[0.25, 0.50, 0.75, 0.30]]]], dtype=torch.float32)
+        linear = nodes._convert_image_transfer(frames, nodes._srgb_to_inverse_gamma_compute_rgb)
+        restored = nodes._convert_image_transfer(linear, nodes._inverse_gamma_compute_to_srgb)
+
+        self.assertTrue(torch.allclose(restored, frames, atol=1e-5, rtol=1e-5))
+        self.assertAlmostEqual(float(linear[..., 3].item()), 0.30, places=6)
+
+    def test_linear_ref2va_images_are_reencoded_from_original_pixels(self):
+        images = torch.full((1, 32, 48, 3), 0.5, dtype=torch.float32)
+        original_latent = torch.zeros((1, 24, 1, 2, 3), dtype=torch.float32)
+        vae = Mock()
+        vae.encode.return_value = torch.ones_like(original_latent)
+
+        original_ref = {"kind": "image", "latent_h": 2, "latent_w": 3, "latent": original_latent}
+        refs = nodes._linear_ref2va_image_refs([original_ref], images, vae)
+
+        self.assertTrue(torch.equal(refs[0]["latent"], torch.ones_like(original_latent)))
+        self.assertIsNot(refs[0], original_ref)
+        encoded_image = vae.encode.call_args.args[0]
+        self.assertEqual(tuple(encoded_image.shape[1:3]), (32, 48))
+        self.assertAlmostEqual(float(encoded_image[..., :3].mean()), float(nodes._srgb_to_inverse_gamma_compute_rgb(images).mean()), places=2)
+
     def test_sampler_h3_decode_restores_finalizer_without_clipping_float_pixels(self):
         class FakeStage:
             pixel_mean = torch.zeros((1, 3, 1, 1, 1))
@@ -1679,6 +2435,29 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertGreater(float(corrected[2:].mean()), float(images[2:].mean()))
         self.assertIn("applied", reports[0][1])
 
+    def test_final_all_chunks_grade_uses_mkl_without_gemma_preproduction(self):
+        images = torch.full((4, 4, 4, 3), 0.6, dtype=torch.float32)
+        images[2:] = 0.4
+        corrected, reports = nodes._final_shot_color_correction(
+            images,
+            [(0, 0, 4, "stable lighting")],
+            None,
+            [{"start": 0, "end": 1}, {"start": 2, "end": 3}],
+        )
+        self.assertTrue(torch.equal(corrected[:2], images[:2]))
+        self.assertGreater(float(corrected[2:].mean()), float(images[2:].mean()))
+        self.assertIn("applied", reports[0][1])
+
+    def test_ready_entire_shot_grade_uses_the_first_frame_and_grades_chunk_one(self):
+        frames = torch.full((3, 4, 4, 3), 0.6, dtype=torch.float32)
+        frames[1:] = 0.4
+        corrected = nodes._correct_ready_entire_shot_frames(
+            frames, 0, [(0, 0, 3, "stable lighting")], None, {},
+        )
+
+        self.assertTrue(torch.equal(corrected[:1], frames[:1]))
+        self.assertGreater(float(corrected[1:].mean()), float(frames[1:].mean()))
+
     def test_final_shot_grade_skips_prompted_lighting_change(self):
         images = torch.full((4, 2, 2, 3), 0.4, dtype=torch.float32)
         images[2:] = 0.7
@@ -1712,10 +2491,12 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(corrected_frames, 5)
         self.assertIsNotNone(transform)
         self.assertTrue(torch.equal(corrected[:5], previous))
-        expected = nodes._apply_fixed_output_color_transform(
-            retained,
-            transform,
-        )
+        from color_matcher import ColorMatcher
+        expected = torch.stack([
+            torch.from_numpy(ColorMatcher().transfer(src=frame.numpy(), ref=previous[-1].numpy(), method="mkl"))
+            for frame in retained
+        ]).to(torch.float32).clamp_(0, 1)
+        self.assertEqual(transform["method"], "mkl")
         self.assertTrue(torch.allclose(corrected[5:], expected, atol=2e-5, rtol=2e-5))
 
     def test_adaptive_overlap_color_correction_is_identity_without_overlap(self):
@@ -1782,6 +2563,13 @@ class ChunkDirectorHelperTest(unittest.TestCase):
 
         self.assertEqual(physical["threshold"], 11 * gib)
         self.assertAlmostEqual(physical["peak_time"], 20.0)
+
+    def test_sampler_timing_has_final_output_shot_color_bucket(self):
+        with patch.object(nodes, "_memory_backend", return_value=None):
+            timing = nodes._SamplerTiming(torch.device("cpu"))
+
+        self.assertEqual(timing.seconds["output_shot_color"], 0.0)
+        self.assertEqual(timing.calls["output_shot_color"], 0)
 
     def test_non_debug_monitor_still_collects_report_samples(self):
         class FakeTiming:

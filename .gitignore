@@ -1,5 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+# Legacy local target from early AudioSR testing; current installs use ComfyUI's Python.
+.audiosr-runtime/
 *.py[codz]
 *$py.class
 

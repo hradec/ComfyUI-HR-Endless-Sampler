@@ -1,6 +1,67 @@
 # ComfyUI-HR-Endless-Sampler 
 ## (the older ComfyUI MiniMax H3 Sampler Unlimited)
 
+### AudioSR audio enhancement
+
+The sampler's `audio_sr` switch defaults to enabled when `audio_vae` is connected.
+Each decoded chunk receives an AudioSR pass for its preview and temporary chunk
+video. The final `AUDIO` output receives a separate pass over the assembled
+**original decoded audio**, never over the enhanced preview chunks. H3's audio
+reference latents are unchanged. Disabling `audio_sr` returns the original decode.
+
+Install the private optional runtime once, from this repository, using your
+ComfyUI Python wrapper:
+
+```bash
+/NVME/comfyui/tools/python.sh python/audio_sr.py --install
+```
+
+The main `requirements.txt` declares the NumPy, Transformers, and librosa
+libraries supplied by ComfyUI and installs AudioSR's missing `torchlibrosa` and
+`progressbar` dependencies. The root `install.py`, which ComfyUI Manager runs
+after requirements, installs `audiosr==0.0.7` into that same Python environment
+with `--no-deps`. This avoids applying AudioSR's obsolete NumPy, Transformers,
+and librosa pins over the modern versions tested with ComfyUI. A worker import
+check runs after installation. The first real pass downloads the official basic
+model through Hugging Face's normal cache. Each inference operation still uses
+a disposable subprocess of the same Python executable, so model memory and
+random-state changes do not persist in the ComfyUI process.
+
+The standalone module accepts and returns ordinary ComfyUI `AUDIO` dictionaries:
+
+```python
+from python.audio_sr import fix_audio
+
+enhanced = fix_audio(original_audio)  # waveform [B, C, samples], sample_rate 48000
+```
+
+It also works as a WAV command-line tool; existing output files are never replaced:
+
+```bash
+/NVME/comfyui/tools/python.sh python/audio_sr.py input.wav enhanced.wav
+```
+
+Defaults are AudioSR `basic`, 50 DDIM steps, guidance 3.5, and CUDA device 0.
+The function accepts `model_name`, `device`, `seed`, `steps`, and `guidance`;
+the CLI exposes matching `--model`, `--device`, `--seed`, `--steps`, and
+`--guidance` arguments. Set `HR_ENDLESS_AUDIOSR_PYTHON` to use another compatible
+interpreter for inference.
+
+Long recordings use 5.12-second windows with 0.64-second overlap, independently
+of video-chunk boundaries. Output duration and channel count are preserved,
+source peak level is restored after AudioSR's normalization, and stereo channels
+are processed separately because AudioSR is mono. This preserves channel
+separation but cannot guarantee stereo phase coherence. AudioSR reconstructs
+high-frequency detail; removal of metallic voice artifacts is not guaranteed.
+Enabled failures report the worker log rather than silently returning untreated
+audio. Cancellation terminates the worker. Timing reports separate preview and
+full-original AudioSR passes.
+
+Checks: `python/test_audio_sr.py` covers validation, windows, duration, levels,
+stereo, silence, worker output, and cancellation. A two-step real CPU smoke test
+produced finite 48 kHz output with the original duration; full H3/GPU rendering
+and subjective voice-quality improvement still require evaluation.
+
 
 
 https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
@@ -81,10 +142,17 @@ minimum.
 
 `video_continuation_method` chooses how those frames are used:
 
-- `Video1 reference (current)` is the established method. H3 sees the tail as
-  a separate synchronized `<Video N>` and `<Audio N>` reference, plus an
-  automatic five-frame visual boundary prefix. Larger references use more
-  VRAM. Values larger than the current chunk are capped to its effective size.
+- `Video1 reference (current)` supplies the selected video tail as `<Video N>`
+  and the whole previous chunk's audio as `<Audio N>`. It also supplies the
+  final full decoded frame as a new ordinary `<Picture N>` reference, using
+  the existing raw/corrected continuation-frame policy. The summary includes
+  `keyframe completion` and `<Picture N> serves as first frame of target video.`
+  This is not a `minimax_keyframes` guide and does not freeze the five-frame
+  packing prefix or change its noise. Larger references use more VRAM.
+  Values larger than the current chunk are capped to its effective size.
+  The five-frame packing prefix and matching audio are retained in the output,
+  as in the current Masked AV inspection mode. Each continuation therefore
+  adds five extra video frames; preview and saved timeline ranges include them.
 - `Masked AV overlap (experimental)` copies the completed latent tail directly
   into the beginning of the next sampled chunk. The video overlap is preserved;
   most audio is preserved and its final eight 40 Hz latent ticks are released
@@ -388,9 +456,102 @@ plus peak RAM and VRAM use.
  - If you don't want to use the amazing `KJNodes MiniMax H3 Low VRAM Attention`, you still can render 1080p by reducing `chunk_frames` to 39.
  - off course this all changes depending on how many (and resolution) reference images/videos/audio you are using. 
 
+## Optional pre-production director
+
+Connect **HR Endless Pre-production — Gemma 4** to the sampler's
+`pre_production` input to use Gemma. The node holds the Gemma settings;
+it does not load a model when its output is created. The sampler calls its
+director to plan the render and to write each chunk prompt after observing
+the previous chunk. Each sampler run gets a fresh director session.
+
+`cache_gemma_preproduction`, `gemma4_mtp`, `production_think_budget`, and
+`chunk_think_budget` now belong to this node. Both thinking budgets default
+to 2048; 0 disables thinking for that stage. MTP remains temporarily disabled.
+
+**Existing workflows must connect this new node to keep using Gemma.** Without
+it, the sampler uses the pre-Gemma proportional word-slicing method, with no
+LLM inference. This fallback estimates action timing by word count and cannot
+observe whether an action has already happened. Changing director settings or
+switching to the fallback invalidates the previous render cache.
+
 ## References
 
 - [MiniMax H3 prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md)
 - [MiniMax H3 base prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md)
 - [MiniMax H3 full-reference prompt guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md)
 - [Google Gemma 4 12B QAT Q4 GGUF](https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf)
+
+### Editable legacy chunk prompts
+
+Connect **HR Endless Pre-production — Legacy Chunk Prompts** to the sampler's
+`pre_production` input. Click **Generate chunk prompts** to queue a prompt-only
+preparation pass using that sampler's inputs, duration, and overlap settings.
+Native H3 frame counts and reference counts are read from the graph without running
+the guider, model, CLIP, VAE, or media loaders. Only linked prompt/numeric inputs
+need evaluation. Unsupported latent/conditioning paths report an error.
+The provider must connect to exactly one sampler for this button.
+
+Edit the complete H3 prompt under each numbered separator:
+
+```text
+--8<--[ Chunk 1 ]--8<--------8<---------8<--------
+```
+
+The sampler uses each section verbatim, excluding the delimiter. Keep sections
+nonempty and numbered consecutively. Regenerate when the chunk layout changes;
+a mismatched chunk count stops rendering with an error. Generating again asks
+before replacing existing edits. The editor text is saved with the workflow.
+
+### TaoMate-H3 streaming backend (experimental)
+
+Select **TaoMate-H3 streaming (experimental)** in `video_continuation_method`.
+Load the TaoMate-H3 three-step LoRA upstream; CFG 1.0 is recommended.
+Native image/video/audio references and keyframes are passed through.
+Other model wrappers are not rejected preemptively; attention replacements
+can still be incompatible with streaming.
+
+This mode reuses the upstream TaoMate geometry, attention routing, clean-KV
+cache policy. It uses the supplied sigma schedule unchanged, including its step
+count. It generates phases of 39/34/34/17
+frames initially and 34/34/34/17 thereafter, truncating the final phase to the
+requested latent duration. The supplied sampler and its options are preserved.
+`chunk_frames` controls each prompt/audio-teacher group on the 17k+5 frame grid.
+124 retains the original four-phase grouping; 243 gives roughly ten-second
+groups with eight phases. Group boundaries can shorten phases but never enlarge
+them. Later groups include a five-frame decoding halo in their frame budget.
+Overlap length and overlap feathering do not control this backend. Dialogue
+is timed for the request, and its prompt is encoded once and reused across
+all phases. Regenerate manual prompts after changing the group duration.
+
+Each phase runs the supplied sampler over the selected sigma intervals, followed
+by one clean KV update. The solver runs once over the complete phase schedule,
+preserving multistep history and any extra model evaluations. The first
+video phase anchors both retained visual memory and generated latent statistics.
+Persistent KV is held in CPU RAM and transferred per layer; RAM use and transfer
+cost grow with resolution, but retained history is bounded. No extra pip
+packages or changes to ComfyUI source files are required.
+
+Each request first runs an audio-only teacher pass. Its schedule combines the
+upstream nine-interval base grid with the supplied video sigma endpoints, using
+the incoming model's video/audio shifts. It saves one actual audio state for
+each video step, without interpolation; the console reports its forward count.
+Schedules must descend from 1 to 0 for noise initialization and clean KV capture.
+The teacher uses the **same loaded model
+and LoRA**, as requested; upstream instead uses a separate BF16 base model.
+The last 40 clean audio ticks guide the next teacher request. Milestones are
+supplied at model evaluations. Internal solver sigma points use linear
+interpolation between saved teacher states (extrapolation for churn above the
+first sigma); final audio is replaced by the exact clean teacher state before
+KV capture. Custom samplers must expose ComfyUI's `sampler_function` interface;
+unsupported custom objects produce an explicit error rather than falling back.
+Returned
+audio latents are checked against the teacher clean latent exactly; known
+audio carry/un-carry rounding is removed before assembly. This check is before
+VAE decoding and optional AudioSR. Audio KV is reset every 12 requests.
+The teacher has no video tokens or video heads. Prompts are scoped to each user-sized group,
+using the existing prompt-provider nodes. VAE output is decoded per request with
+a transport halo for live preview; final video and audio are decoded from joined latents and
+replace provisional preview media. It is not equivalent to the published multi-GPU pipeline or
+its performance numbers. Live preview and decoded outputs are supported;
+last-run disk replay is not supported for this mode, so runs start at Chunk 1.
+CPU integration tests pass; full-model GPU quality/performance remain unverified.

@@ -252,14 +252,14 @@ def _append_live_gemma_text(text: str) -> None:
         )
 
 
-def _gemma_reasoning_budget_kwargs() -> dict[str, Any]:
+def _gemma_reasoning_budget_kwargs(handler=None) -> dict[str, Any]:
     """Return the native first-thought-block budget shared by every Gemma turn."""
     return {
-        "reasoning_budget": GEMMA4_REASONING_BUDGET,
+        "reasoning_budget": getattr(handler, "_endless_think_budget", GEMMA4_REASONING_BUDGET),
         "reasoning_start": GEMMA4_REASONING_START,
         "reasoning_end": GEMMA4_REASONING_END,
         "reasoning_budget_message": GEMMA4_REASONING_BUDGET_MESSAGE,
-        "reasoning_start_in_prompt": True,
+        "reasoning_start_in_prompt": getattr(handler, "_endless_think_budget", GEMMA4_REASONING_BUDGET) > 0,
     }
 
 
@@ -399,6 +399,7 @@ class GemmaChunkPrompt:
     timing_plan: str = ""
     end_state: str = ""
     retention_analysis: str = ""
+    summary: str = ""
     last_seen_character_state: tuple[dict[str, Any], ...] = ()
     system_prompt: str = ""
     observation_prompt: str = ""
@@ -1595,6 +1596,7 @@ def _contract_validation_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
             or "dialogue speaker form" in warning.lower()
             or "last-seen character state" in warning.lower()
             or "retention_analysis" in warning.lower()
+            or "summary" in warning.lower()
             or "character continuity" in warning.lower()
             or "first-frame establishment" in warning.lower()
         )
@@ -1865,7 +1867,7 @@ def _chunk_contract_correction_request(request: dict[str, Any], warnings: Sequen
         "Your immediately preceding JSON was missing a required field or violated the H3 shot-marker, persistent-state, "
         "dialogue, or mandatory current-slice coverage contract. "
         "Return one complete replacement JSON object "
-        "with all eight required fields, not an explanation and not a textual patch. Keep the same current-frame-slice "
+        "with all nine required fields including summary, not an explanation and not a textual patch. Keep the same current-frame-slice "
         "creative intent and continuity reasoning, but rewrite detailed_description and coverage so every current beat "
         "is explicitly started or continued now. A current beat may never be marked deferred. For dialogue coverage, "
         "include only the exact assigned dialogue-segment <d>...</d> line in detailed_description now. Never expand it "
@@ -1902,7 +1904,7 @@ def _chunk_contract_followup_request(warnings: Sequence[str]) -> str:
         "CHUNK JSON REPAIR STILL REQUIRED\n"
         "The complete chunk contract is in the immediately preceding user turn. Do not repeat or explain it. "
         "Return one complete JSON object now with exactly these eight fields: confidence, analysis, timing_plan, "
-        "end_state, retention_analysis, last_seen_character_state, coverage, and detailed_description. "
+        "end_state, summary, retention_analysis, last_seen_character_state, coverage, and detailed_description. "
         "retention_analysis must be a short H3-facing string covering every participating character. "
         "detailed_description must be "
         "a non-empty JSON string containing the complete H3-facing prompt; coverage and "
@@ -2179,6 +2181,29 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
     warnings.extend(_dialogue_speaker_form_warnings(request, description))
     warnings.extend(_mandatory_coverage_warnings(value, request, description))
 
+    summary = value.get("summary", "")
+    if not isinstance(summary, str):
+        summary = ""
+    summary = summary.strip()
+    if request.get("require_summary"):
+        # Strip correctly delimited labels before checking for bare ones.
+        unlabeled = re.sub(r"<\s*(?:Subject|Picture|Video|Audio)\s+\d+\s*>", "", summary, flags=re.IGNORECASE)
+        if re.search(r"\b(?:Subject|Picture|Video|Audio)\s+\d+\b", unlabeled, re.IGNORECASE):
+            warnings.append("Gemma 4 summary must use angle-bracket reference labels: <Subject 1>, <Picture 1>, <Video 1>, <Audio 1>; never bare Subject 1 or other unbracketed numbered references.")
+        task_match = re.match(r"^\[([^]]+)\]\s*\S", summary)
+        allowed = {"keyframe completion", "reference generation", "video continuation", "audio reference", "audio reuse", "video editing"}
+        task_types = [] if task_match is None else [item.strip().lower() for item in task_match.group(1).split("+")]
+        if not task_types or any(item not in allowed for item in task_types):
+            warnings.append("Gemma 4 summary requires a non-empty paragraph prefixed by official task types in brackets")
+        if any(re.search(r"\[\s*" + re.escape(task) + r"\s*(?:\+|\])", summary[summary.find("]") + 1:], re.IGNORECASE) for task in allowed):
+            warnings.append("Gemma 4 summary must combine ALL task types inside ONE bracket pair: [video continuation + audio reference] followed by the paragraph. Never write [video continuation] + [audio reference].")
+        for task in request.get("summary_required_tasks", ()):
+            if task not in task_types:
+                warnings.append(f"Gemma 4 summary must include task type {task!r} for the supplied conditioning")
+        for task in request.get("summary_forbidden_tasks", ()):
+            if task in task_types:
+                warnings.append(f"Gemma 4 summary must not include task type {task!r}: that conditioning role is absent")
+
     return GemmaChunkPrompt(
         confidence=confidence,
         analysis=analysis.strip(),
@@ -2187,6 +2212,7 @@ def _validate_chunk_prompt(value: dict[str, Any], request: dict[str, Any], raw_j
         timing_plan=timing_plan,
         end_state=end_state,
         retention_analysis=retention_analysis,
+        summary=summary,
         last_seen_character_state=last_seen_character_state,
         system_prompt=system_prompt,
         observation_prompt=observation_prompt,
@@ -2203,6 +2229,7 @@ def _chunk_prompt_payload(result: GemmaChunkPrompt) -> dict[str, Any]:
         "timing_plan": result.timing_plan,
         "end_state": result.end_state,
         "retention_analysis": result.retention_analysis,
+        "summary": result.summary,
         "last_seen_character_state": list(result.last_seen_character_state),
         "system_prompt": result.system_prompt,
         "observation_prompt": result.observation_prompt,
@@ -2228,6 +2255,7 @@ def _chunk_prompt_from_payload(value: dict[str, Any]) -> GemmaChunkPrompt:
         timing_plan=str(value.get("timing_plan", "")),
         end_state=str(value.get("end_state", "")),
         retention_analysis=str(value.get("retention_analysis", "")),
+        summary=str(value.get("summary", "")),
         last_seen_character_state=tuple(
             dict(item) for item in value.get("last_seen_character_state", ()) if isinstance(item, dict)
         ),
@@ -3402,7 +3430,7 @@ def _render_observation_messages(
             "output_end": str(int(current["output_end"]) - 1),
             "output_frames": str(int(current["output_end"]) - int(current["output_start"])),
             "output_seconds": f"{(int(current['output_end']) - int(current['output_start'])) / fps:.3f}",
-            "conditioning_context": str(request["conditioning_context"]),
+            "conditioning_context": str(request["conditioning_context"]) + "\nSummary task requirements: " + json.dumps({"required": request.get("summary_required_tasks", []), "forbidden": request.get("summary_forbidden_tasks", [])}),
             "current_shot_timeline": _current_chunk_shot_timeline(target_shots, current),
             "current_shot_timing_contract": _current_shot_timing_contract(target_shots, fps),
             "production_bible": str(request.get("production_bible") or (
@@ -3433,6 +3461,7 @@ def _render_observation_messages(
             "last_seen_character_state_contract": _last_seen_character_state_contract(request),
             "target_shots": _shot_context(target_shots, fps, include_target=True),
             "chunk_generation_request": _chunk_generation_request(target_shots, current),
+            "json_fill_form": _chunk_fill_form(request),
             "original_prompt": str(request["original_prompt"]),
         },
     )
@@ -3447,14 +3476,21 @@ def _preproduction_source_shots(shots: Sequence[dict[str, Any]], fps: float) -> 
         start = int(shot["shot_start"])
         end = int(shot["shot_end"])
         duration = end - start
-        blocks.append(
-            "\n".join((
+        lines = [
                 f"Source Shot {int(shot['shot_number'])}: global frames {start}-{end - 1} inclusive "
                 f"({_frame_timestamp(start, fps)}-{_frame_timestamp(end, fps)}; {duration} frames, {duration / fps:.3f} s).",
                 "Complete original source-shot description (authoritative intent):",
                 str(shot["source_body"]).strip(),
-            ))
-        )
+        ]
+        schedule = shot.get("deterministic_dialogue_segments", ())
+        if schedule:
+            lines.append("Deterministic phoneme-timed dialogue contract — verify it; do not redistribute its words or timing:")
+            for item in schedule:
+                lines.append(
+                    f"- Chunk {int(item['chunk'])}, global frames {int(item['start_frame'])}-{int(item['end_frame']) - 1}: "
+                    f"{str(item['content']).strip()}"
+                )
+        blocks.append("\n".join(lines))
     return "\n\n".join(blocks) if blocks else "none"
 
 
@@ -3486,6 +3522,124 @@ def _preproduction_chunk_map(chunks: Sequence[dict[str, Any]], shots: Sequence[d
     return "\n".join(lines) if lines else "none"
 
 
+def _production_bible_fill_form(request: dict[str, Any]) -> str:
+    """Build the global form so Gemma fills prose instead of reconstructing schema."""
+    prompt = str(request.get("original_prompt") or "")
+    mappings = _declared_character_subject_mappings(prompt)
+    speakers = _declared_speaker_ids(prompt)
+    shots = []
+    for shot in request.get("source_shots", ()):
+        source_body = str(shot.get("source_body") or "")
+        characters = [
+            {
+                "character_name": item.character_name,
+                "subject": item.subject,
+                "opening_state": None,
+                "closing_state": None,
+            }
+            for item in mappings
+            if re.search(rf"(?i)(?<!\w){re.escape(item.character_name)}(?!\w)", source_body)
+        ]
+        shots.append({
+            "source_shot": int(shot["shot_number"]),
+            "shot_intent": None,
+            "environment": None,
+            "camera_and_cut": None,
+            "characters": characters,
+        })
+    form = {
+        "confidence": None,
+        "analysis": None,
+        "character_name_table": [
+            {"character_name": item.character_name, "subject": item.subject}
+            for item in mappings
+        ],
+        "speaker_voice_profiles": [
+            {"speaker_id": speaker, "source": None, "voice_profile": None}
+            for speaker in speakers
+        ],
+        "shots": shots,
+    }
+    return json.dumps(form, ensure_ascii=False, indent=2)
+
+
+def _single_shot_fill_form(
+    request: dict[str, Any], production_bible_json: str, shot: dict[str, Any],
+) -> str:
+    """Build one shot form with sampler-owned identity and ownership fields fixed."""
+    try:
+        bible = json.loads(production_bible_json)
+    except json.JSONDecodeError:
+        bible = {}
+    shot_number = int(shot["shot_number"])
+    bible_shot = next((item for item in bible.get("shots", ()) if isinstance(item, dict) and item.get("source_shot") == shot_number), {})
+    known_characters = [
+        {
+            "character_name": item.get("character_name"),
+            "subject": item.get("subject"),
+            "entry_state": None,
+            "expected_exit_state": None,
+        }
+        for item in bible_shot.get("characters", ())
+        if isinstance(item, dict) and item.get("character_name") and item.get("subject")
+    ]
+    continuity_slices = []
+    for start, end in _expected_continuity_intervals(shot, request):
+        continuity_slices.append({
+            "start_frame": start,
+            "end_frame": end,
+            # Gemma may remove a character that is not physically present in
+            # this slice, but it cannot silently lose the immutable binding.
+            "characters": [dict(item) for item in known_characters],
+        })
+    form = {
+        "confidence": None,
+        "analysis": None,
+        "source_shot": shot_number,
+        "light_change": None,
+        "visual_beats": [],
+        "overlays": [],
+        "continuity_slices": continuity_slices,
+    }
+    return json.dumps(form, ensure_ascii=False, indent=2)
+
+
+def _chunk_fill_form(request: dict[str, Any]) -> str:
+    """Build a chunk form with coverage and character identities already fixed."""
+    last_seen = []
+    # Every chunk returns the complete persistent table, including characters
+    # currently off-screen.  Their values stay open because only Gemma can
+    # decide from the attached stills whether to update or carry them forward.
+    for character_name, subject in _character_subject_mappings(request):
+        last_seen.append({
+            "character_name": character_name,
+            "subject": subject,
+            "last_seen_global_frame": None,
+            "last_seen_source_shot": None,
+            "environment": None,
+            "pose_and_position": None,
+            "state_and_action": None,
+            "spatial_relationships": None,
+        })
+    coverage = [
+        {"id": str(item["id"]), "status": None, "evidence": None}
+        for item in request.get("mandatory_coverage", ())
+        if isinstance(item, dict) and item.get("id")
+    ]
+    form = {
+        "confidence": None,
+        "analysis": None,
+        "timing_plan": None,
+        "end_state": None,
+        "retention_analysis": None,
+        "summary": None,
+        "last_seen_character_state": last_seen,
+        "coverage": coverage,
+        "detailed_description": None,
+    }
+    return json.dumps(form, ensure_ascii=False, indent=2)
+
+
 def _render_timing_plan_messages(request: dict[str, Any]) -> tuple[str, str]:
     """Render the immutable global-production request sent before shot planning."""
     templates = _gemma_prompt_templates()
@@ -3505,6 +3659,7 @@ def _render_timing_plan_messages(request: dict[str, Any]) -> tuple[str, str]:
             "chunk_count": str(int(request["chunk_count"])),
             "source_shots": _preproduction_source_shots(source_shots, fps),
             "physical_chunk_map": _preproduction_chunk_map(request.get("chunks", ()), source_shots),
+            "json_fill_form": _production_bible_fill_form(request),
             "original_prompt": str(request["original_prompt"]),
         },
     )
@@ -3539,6 +3694,7 @@ def _render_single_shot_plan_messages(
             "production_bible": production_bible_json,
             "source_shot": _preproduction_source_shots([shot], fps),
             "shot_ownership": ownership,
+            "json_fill_form": _single_shot_fill_form(request, production_bible_json, shot),
             "original_prompt": str(request["original_prompt"]),
         },
     )
@@ -3726,7 +3882,7 @@ def _gemma_chat_json(
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
-        kwargs.update(_gemma_reasoning_budget_kwargs())
+        kwargs.update(_gemma_reasoning_budget_kwargs(handler))
         response = llm.create_chat_completion(**kwargs)
         _append_raw_gemma_response(stage, response)
         choice = response["choices"][0]["message"]
@@ -3759,7 +3915,7 @@ def _gemma_chat_json(
                     top_p=GEMMA4_TOP_P,
                 top_k=GEMMA4_TOP_K,
                 max_tokens=max_tokens,
-                **_gemma_reasoning_budget_kwargs(),
+                **_gemma_reasoning_budget_kwargs(handler),
             )
                 _append_raw_gemma_response(
                     f"append-only JSON format repair {repair_index}/{GEMMA4_JSON_FORMAT_REPAIR_LIMIT}",
@@ -3783,7 +3939,7 @@ def _gemma_chat_json(
                 top_k=GEMMA4_TOP_K,
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
-                **_gemma_reasoning_budget_kwargs(),
+                **_gemma_reasoning_budget_kwargs(handler),
             )
             _append_raw_gemma_response("final grammar-constrained JSON fallback", response)
             candidate = _gemma_response_text(response["choices"][0]["message"])
@@ -3828,7 +3984,7 @@ def _gemma_append_chat_json(handler: Any, llm: Any, content: str | Sequence[dict
             top_k=GEMMA4_TOP_K,
             max_tokens=max_tokens,
             response_format=response_format,
-            **_gemma_reasoning_budget_kwargs(),
+            **_gemma_reasoning_budget_kwargs(handler),
         )
         _append_raw_gemma_response(f"{stage} (append call {completion_sequence})", response)
         choice = response["choices"][0]["message"]
@@ -4031,7 +4187,11 @@ def _observe_in_process(
     try:
         # Keep llama.cpp/MTMD native timing traces separate from the sampler's
         # useful debug mode.  The latter is preserved by our own diagnostics.
-        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        think_budget = int(request.get("think_budget", GEMMA4_REASONING_BUDGET))
+        if think_budget < 0:
+            raise ValueError("Gemma thinking budget cannot be negative")
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=think_budget > 0, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        handler._endless_think_budget = think_budget
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
@@ -4260,7 +4420,11 @@ def _materialize_preproduction_cache_in_process(
     handler = None
     llm = None
     try:
-        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        think_budget = int(request.get("think_budget", GEMMA4_REASONING_BUDGET))
+        if think_budget < 0:
+            raise ValueError("Gemma thinking budget cannot be negative")
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=think_budget > 0, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        handler._endless_think_budget = think_budget
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
@@ -4298,7 +4462,11 @@ def _plan_timing_in_process(request: dict[str, Any], debug: bool) -> GemmaShotTi
         # Keep the official Gemma multimodal chat handler even though this pass
         # has no images.  It supplies the same model-specific conversation
         # formatting as the later image-and-text requests.
-        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=True, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        think_budget = int(request.get("think_budget", GEMMA4_REASONING_BUDGET))
+        if think_budget < 0:
+            raise ValueError("Gemma thinking budget cannot be negative")
+        handler = Gemma4ChatHandler(mmproj_path=str(mmproj_path), verbose=False, use_gpu=True, enable_thinking=think_budget > 0, image_min_tokens=GEMMA4_IMAGE_MIN_TOKENS, image_max_tokens=GEMMA4_IMAGE_MAX_TOKENS, batch_max_tokens=GEMMA4_BATCH_SIZE)
+        handler._endless_think_budget = think_budget
         llm = _create_runtime_llm(
             Llama,
             model_path=model_path,
@@ -4831,7 +4999,11 @@ class Gemma4ContinuityDirector:
 
     def __init__(self, debug: bool = False, gemma4_mtp: bool = False, seed: int = 0,
                  capture_directory: str | Path | None = None,
-                 observation_image_directory: str | Path | None = None):
+                 observation_image_directory: str | Path | None = None, production_think_budget=2048, chunk_think_budget=2048):
+        self.production_think_budget = int(production_think_budget)
+        self.chunk_think_budget = int(chunk_think_budget)
+        if min(self.production_think_budget, self.chunk_think_budget) < 0:
+            raise ValueError("Gemma thinking budgets cannot be negative")
         self.debug = debug
         self.gemma4_mtp = bool(gemma4_mtp)
         self.seed = int(seed) & 0x7fffffff
@@ -4953,6 +5125,7 @@ class Gemma4ContinuityDirector:
     def plan_timing(self, request: dict[str, Any], progress_callback: Any = None) -> GemmaShotTimingPlan:
         """Create the immutable Gemma action schedule before any H3 chunk runs."""
         request = json.loads(json.dumps(request, ensure_ascii=False))
+        request["think_budget"] = self.production_think_budget
         if not request.get("source_shots"):
             raise Gemma4ObservationError("Gemma 4 needs source shots for timing preproduction")
         self.last_timing_system_prompt, self.last_timing_planning_prompt = _render_timing_plan_messages(request)
@@ -5011,6 +5184,7 @@ class Gemma4ContinuityDirector:
         progress_callback: Any = None,
     ) -> GemmaChunkPrompt:
         request = json.loads(json.dumps(request, ensure_ascii=False))
+        request["think_budget"] = self.chunk_think_budget
         chunk_number = int(request["chunk_number"])
         # Retain the parent-side rendering too, so a worker/dependency failure
         # can still leave the exact intended request in the last-run transcript.

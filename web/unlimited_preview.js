@@ -2,6 +2,14 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 
+function chunkPromptDescription(chunk) {
+    // The actual H3 prompt is authoritative, including runs without a director.
+    const prompt = String(chunk.h3_prompt || "");
+    const field = prompt.match(/(?:^|\n)[ \t]*(?:detailed_description|integrated_multimodal_description)[ \t]*:[ \t]*([\s\S]*?)(?=\n[ \t]*(?:overall_soundscape|non_diegetic_music|retention_analysis|summary)[ \t]*:|$)/i);
+    return field ? field[1].trim() : String(chunk.gemma_detailed_description || "").trim();
+}
+
+
 function findNode(rootGraph, qualifiedId) {
     const parts = String(qualifiedId).split(":");
     let graph = rootGraph;
@@ -58,6 +66,14 @@ function shotsOverlappingChunk(chunk, shotRanges) {
 function coloredShotPromptSegments(description, chunk, shotRanges, colors) {
     const text = String(description || "");
     if (!text) return [];
+    // Full-prompt headers must not shift the description's shot-color mapping.
+    const body = chunkPromptDescription({ h3_prompt: text });
+    if (body && body !== text) {
+        const start = text.indexOf(body);
+        return [{ text: text.slice(0, start), color: "#b8b8d0" },
+            ...coloredShotPromptSegments(body, chunk, shotRanges, colors),
+            { text: text.slice(start + body.length), color: "#b8b8d0" }];
+    }
     const overlapping = shotsOverlappingChunk(chunk, shotRanges);
     const colorFor = shot => shot
         ? colors[(Math.max(1, Number(shot.shot) || 1) - 1) % colors.length]
@@ -121,7 +137,7 @@ function createColoredChunkTooltip() {
     }
 
     return {
-        show(event, { help, chunk, timing, description, retentionAnalysis, shotRanges, colors, waitingText }) {
+        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, showFullPrompt, shotRanges, colors, waitingText }) {
             tooltip.replaceChildren();
             line(help, "color:#999;margin-bottom:6px;");
             const chunkNumber = Number(chunk.chunk) || 1;
@@ -132,18 +148,26 @@ function createColoredChunkTooltip() {
             } else {
                 line("Timing: waiting for this chunk to finish.", "color:#888;");
             }
-            if (retentionAnalysis) {
+            if (!showFullPrompt && retentionAnalysis) {
                 line("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
                 line(retentionAnalysis, "color:#d8c7a0;");
             }
-            line("Gemma detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
-            if (description) {
+            line(showFullPrompt ? "Full prompt sent to H3:" : "chunk detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+            const text = showFullPrompt ? fullPrompt : description;
+            if (text) {
                 const prompt = document.createElement("div");
-                for (const segment of coloredShotPromptSegments(description, chunk, shotRanges, colors)) {
-                    const span = document.createElement("span");
-                    span.textContent = segment.text;
-                    span.style.color = segment.color;
-                    prompt.appendChild(span);
+                for (const segment of coloredShotPromptSegments(text, chunk, shotRanges, colors)) {
+                    // H3 dialogue tags remain literal text; only their presentation changes.
+                    for (const [index, part] of segment.text.split(/(<d>[\s\S]*?<\/d>)/gi).entries()) {
+                        const span = document.createElement("span");
+                        span.textContent = part;
+                        span.style.color = segment.color;
+                        if (index % 2) {
+                            span.style.color = `color-mix(in srgb, ${segment.color} 65%, white)`;
+                            span.style.fontWeight = "700";
+                        }
+                        prompt.appendChild(span);
+                    }
                 }
                 tooltip.appendChild(prompt);
             } else {
@@ -273,49 +297,34 @@ function formatEta(seconds) {
 }
 
 
+function projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaSeconds=NaN) {
+    // Estimate remaining and total wall time from completed planned work units.
+    const fraction = workTotal > 0 ? Math.max(0, Math.min(1, workDone / workTotal)) : NaN;
+    const etaSeconds = Number.isFinite(elapsedSeconds) && fraction > 0
+        ? elapsedSeconds * (1 - fraction) / fraction
+        : fallbackEtaSeconds;
+    return {
+        etaSeconds,
+        totalSeconds: Number.isFinite(elapsedSeconds) && Number.isFinite(etaSeconds)
+            ? elapsedSeconds + etaSeconds
+            : NaN,
+    };
+}
+
+
 api.addEventListener("hr_endless_sampler_preview", event => {
     const data = event.detail;
     const node = data?.node_id == null ? null : findNode(app.graph, data.node_id);
     node?._hrEndlessSamplerPreview?.(data);
 });
 
-
-function hideSamplerWidget(node, name) {
-    const widget = node?.widgets?.find(candidate => candidate?.name === name);
-    if (!widget) return;
-
-    // Keep the native widget and its serialized value intact, but remove its
-    // visual/layout footprint in both legacy LiteGraph and Nodes 2.0. Do not
-    // change widget.type: converted widgets can acquire an unwanted socket.
-    widget.hidden = true;
-    widget.options = { ...(widget.options || {}), hidden: true };
-    widget.computeSize = () => [0, -4];
-    widget.computeLayoutSize = () => ({
-        minWidth: 0,
-        minHeight: 0,
-        maxWidth: 0,
-        maxHeight: 0,
-    });
-    if (widget.element?.style) widget.element.style.display = "none";
-}
-
-
-app.registerExtension({
-    name: "HREndlessSampler.HiddenSettings",
-    async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData?.name !== "HREndlessSampler") return;
-
-        const previousCreated = nodeType.prototype.onNodeCreated;
-        nodeType.prototype.onNodeCreated = function () {
-            const result = previousCreated?.apply(this, arguments);
-            hideSamplerWidget(this, "pytorch_memory_fraction");
-            // Nodes 2.0 can attach the DOM element after onNodeCreated. Reapply
-            // once on the next frame without changing the stored widget value.
-            requestAnimationFrame(() => hideSamplerWidget(this, "pytorch_memory_fraction"));
-            return result;
-        };
-    },
+api.addEventListener("hr_endless_sampler_cache_restore", event => {
+    const data = event.detail;
+    const node = data?.node_id == null ? null : findNode(app.graph, data.node_id);
+    node?._hrEndlessCacheRestoreProgress?.(data);
 });
+
+
 
 
 app.registerExtension({
@@ -327,6 +336,8 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             previousCreated?.apply(this, arguments);
             const node = this;
+            // LiteGraph serializes node properties with the workflow, including this local player state.
+            const savedPlayerState = node.properties?.hr_endless_sampler_preview_player || {};
             const root = document.createElement("div");
             root.style.cssText = "display:flex;flex-direction:column;width:100%;height:100%;min-height:410px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
             root.tabIndex = 0;
@@ -340,23 +351,60 @@ app.registerExtension({
             image.draggable = false;
             viewport.appendChild(image);
 
+            // Browser compositing applies this transfer to the already decoded
+            // preview image; it never requests a VAE decode or new frame data.
+            const inverseGammaFilterId = `hr-endless-inverse-gamma-${node.id}`;
+            const filterSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            filterSvg.setAttribute("width", "0");
+            filterSvg.setAttribute("height", "0");
+            filterSvg.style.cssText = "position:absolute;pointer-events:none;";
+            const filter = document.createElementNS("http://www.w3.org/2000/svg", "filter");
+            filter.setAttribute("id", inverseGammaFilterId);
+            // SVG filters default to linearRGB. This preview deliberately applies
+            // pow() to the decoded sRGB samples themselves, matching the sampler
+            // display experiment rather than doing a color-managed conversion.
+            filter.setAttribute("color-interpolation-filters", "sRGB");
+            const transfer = document.createElementNS("http://www.w3.org/2000/svg", "feComponentTransfer");
+            for (const channel of ["R", "G", "B"]) {
+                const curve = document.createElementNS("http://www.w3.org/2000/svg", `feFunc${channel}`);
+                curve.setAttribute("type", "gamma");
+                curve.setAttribute("amplitude", "1");
+                curve.setAttribute("exponent", "0.45");
+                curve.setAttribute("offset", "0");
+                transfer.appendChild(curve);
+            }
+            filter.appendChild(transfer);
+            filterSvg.appendChild(filter);
+            viewport.appendChild(filterSvg);
+
             // Finalized chunks carry their decoded H3 soundtrack as an
             // in-memory WAV. Keep the media element invisible: the custom
             // image timeline remains the authoritative visual transport.
-            const audioPlayer = document.createElement("audio");
+            let audioPlayer = document.createElement("audio");
             audioPlayer.preload = "auto";
             audioPlayer.style.display = "none";
             audioPlayer.preservesPitch = true;
             viewport.appendChild(audioPlayer);
+            let audioStandbyPlayer = document.createElement("audio");
+            audioStandbyPlayer.preload = "auto";
+            audioStandbyPlayer.style.display = "none";
+            audioStandbyPlayer.preservesPitch = true;
+            viewport.appendChild(audioStandbyPlayer);
 
             const frameLabel = document.createElement("div");
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
             viewport.appendChild(frameLabel);
 
             const cacheReuseLabel = document.createElement("div");
-            cacheReuseLabel.style.cssText = "position:absolute;left:8px;bottom:6px;color:#ff3b30;font:bold 11px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.1px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;white-space:nowrap;";
-            cacheReuseLabel.textContent = "reusing chunk cache (\"clear\" button to delete)";
+            cacheReuseLabel.style.cssText = "position:absolute;left:8px;bottom:6px;color:#69b76f;font:bold 11px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.1px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;white-space:nowrap;";
             viewport.appendChild(cacheReuseLabel);
+
+            const linearDisplayButton = document.createElement("button");
+            linearDisplayButton.type = "button";
+            linearDisplayButton.textContent = "L";
+            linearDisplayButton.title = "Preview RGB: sRGB^0.45, browser-only";
+            linearDisplayButton.style.cssText = "position:absolute;right:8px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#aaa;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:2;";
+            viewport.appendChild(linearDisplayButton);
 
             const transport = document.createElement("div");
             transport.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;height:43px;padding:4px 8px;background:#181818;border-top:1px solid #242424;";
@@ -369,7 +417,7 @@ app.registerExtension({
             playButton.title = "Play/pause (Space). Use Left/Right arrows for one preview frame.";
             transport.appendChild(playButton);
 
-            const timelineHelp = "Click or drag to seek; colors identify chunks";
+            const timelineHelp = "Click or drag to seek; colors identify chunks. Hold Shift to show the full prompt sent to H3.";
             const timelineShell = document.createElement("div");
             timelineShell.style.cssText = "position:relative;flex:1;height:33px;cursor:pointer;touch-action:none;";
             transport.appendChild(timelineShell);
@@ -383,8 +431,12 @@ app.registerExtension({
             cachedChunkUnderlines.style.cssText = "position:absolute;left:0;right:0;top:10px;height:2px;z-index:2;pointer-events:none;";
             timelineShell.appendChild(cachedChunkUnderlines);
 
+            const overlapReplacementLines = document.createElement("div");
+            overlapReplacementLines.style.cssText = "position:absolute;left:0;right:0;top:6px;height:2px;z-index:2;pointer-events:none;";
+            timelineShell.appendChild(overlapReplacementLines);
+
             const timelinePlayhead = document.createElement("div");
-            timelinePlayhead.style.cssText = "position:absolute;top:0;height:11px;width:2px;margin-left:-1px;border-radius:1px;background:#fff;box-shadow:0 0 2px #000,0 0 4px rgba(255,255,255,.75);pointer-events:none;display:none;";
+            timelinePlayhead.style.cssText = "position:absolute;z-index:3;top:0;height:11px;width:2px;margin-left:-1px;border-radius:1px;background:#fff;box-shadow:0 0 2px #000,0 0 4px rgba(255,255,255,.75);pointer-events:none;display:none;";
             timelineShell.appendChild(timelinePlayhead);
 
             const shotBrackets = document.createElement("div");
@@ -413,10 +465,21 @@ app.registerExtension({
             const cacheHelp = "Enable or disable replay-cache reuse for the next HR Endless Sampler run. Disabled ignores the existing cache, but the sampler still saves a fresh cache and overwrites the previous one.";
             let replayCacheEnabled = true;
             let reusingCachedChunks = false;
+            let reusedChunkNumbers = [];
             // This is cache availability between runs, not merely the chunks
             // restored by the current sampler execution.
             let cachedChunkCount = 0;
             let cachedChunkIndices = new Set();
+            function renderCacheReuseLabel() {
+                const labels = reusedChunkNumbers.map(number => `#${number}`);
+                const chunks = labels.length < 2
+                    ? labels.join("")
+                    : labels.length === 2
+                        ? `${labels[0]} and ${labels[1]}`
+                        : `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`;
+                cacheReuseLabel.textContent = `reusing cached chunks ${chunks}`;
+                cacheReuseLabel.style.display = reusingCachedChunks && labels.length ? "block" : "none";
+            }
             function applyReplayCacheStatus(cacheStatus) {
                 replayCacheEnabled = cacheStatus?.enabled !== false;
                 if (cacheStatus?.has_cache) {
@@ -437,7 +500,7 @@ app.registerExtension({
                 cacheButton.style.borderColor = replayCacheEnabled ? "#69b76f" : "#444";
                 cacheButton.style.color = replayCacheEnabled ? "#e5ffe6" : "#888";
                 cacheButton.style.cursor = cacheButton.disabled ? "not-allowed" : "pointer";
-                cacheReuseLabel.style.display = reusingCachedChunks ? "block" : "none";
+                renderCacheReuseLabel();
                 if (cacheStatus?.active) {
                     cacheButton.title = `${cacheHelp}\nThe current render already chose its cache policy.`;
                 } else {
@@ -488,23 +551,50 @@ app.registerExtension({
                     await refreshReplayCacheStatus();
                 } finally {
                     cacheButton.textContent = "cache";
-                    cacheReuseLabel.style.display = reusingCachedChunks ? "block" : "none";
+                    renderCacheReuseLabel();
                 }
             });
 
-            let cacheChunkMenu = null;
-            function closeCacheChunkMenu() {
-                cacheChunkMenu?.remove();
-                cacheChunkMenu = null;
+            let previewContextMenu = null;
+            function closePreviewContextMenu() {
+                previewContextMenu?.remove();
+                previewContextMenu = null;
             }
 
-            function showCacheChunkMenu(chunkIndex, event) {
-                closeCacheChunkMenu();
-                const chunkNumber = chunkIndex + 1;
+            function showPreviewContextMenu(chunkIndex, event) {
+                closePreviewContextMenu();
                 const menu = document.createElement("div");
                 menu.style.cssText = "position:fixed;z-index:10000;min-width:174px;padding:3px;background:#202020;border:1px solid #5b5b5b;border-radius:4px;box-shadow:0 3px 12px rgba(0,0,0,.65);";
                 menu.style.left = `${Math.max(4, Math.min(event.clientX, window.innerWidth - 182))}px`;
                 menu.style.top = `${Math.max(4, Math.min(event.clientY, window.innerHeight - 32))}px`;
+                const reconnectButton = document.createElement("button");
+                reconnectButton.type = "button";
+                reconnectButton.textContent = "Reconnect";
+                reconnectButton.title = "Restore this preview from the current sampler render.";
+                reconnectButton.style.cssText = "display:block;width:100%;padding:4px 7px;border:0;border-radius:2px;background:transparent;color:#f0f0f0;text-align:left;font:11px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;";
+                reconnectButton.addEventListener("mouseenter", () => { reconnectButton.style.background = "#3e5f85"; });
+                reconnectButton.addEventListener("mouseleave", () => { reconnectButton.style.background = "transparent"; });
+                reconnectButton.addEventListener("click", async clickEvent => {
+                    clickEvent.preventDefault();
+                    clickEvent.stopPropagation();
+                    reconnectButton.disabled = true;
+                    reconnectButton.textContent = "Reconnecting…";
+                    await restoreServerState(0, true);
+                    await refreshReplayCacheStatus();
+                    closePreviewContextMenu();
+                });
+                menu.appendChild(reconnectButton);
+                const canDeleteChunk = replayCacheEnabled && !cacheButton.disabled && Number.isInteger(chunkIndex)
+                    && chunkIndex >= 0 && cachedChunkIndices.has(chunkIndex);
+                if (!canDeleteChunk) {
+                    document.body.appendChild(menu);
+                    previewContextMenu = menu;
+                    return;
+                }
+                const chunkNumber = chunkIndex + 1;
+                const divider = document.createElement("div");
+                divider.style.cssText = "height:1px;margin:3px 2px;background:#505050;";
+                menu.appendChild(divider);
                 const removeButton = document.createElement("button");
                 removeButton.type = "button";
                 removeButton.textContent = "Delete cached chunk";
@@ -515,6 +605,9 @@ app.registerExtension({
                 removeButton.addEventListener("click", async clickEvent => {
                     clickEvent.preventDefault();
                     clickEvent.stopPropagation();
+                    chunkTooltip.hide();
+                    tooltipChunkIndex = null;
+                    tooltipSignature = null;
                     removeButton.disabled = true;
                     removeButton.textContent = "Deleting…";
                     try {
@@ -530,18 +623,18 @@ app.registerExtension({
                         console.warn("HR Endless Sampler could not delete the cached chunk", error);
                         await refreshReplayCacheStatus();
                     } finally {
-                        closeCacheChunkMenu();
+                        closePreviewContextMenu();
                     }
                 });
                 menu.appendChild(removeButton);
                 document.body.appendChild(menu);
-                cacheChunkMenu = menu;
+                previewContextMenu = menu;
             }
 
-            const dismissCacheChunkMenu = event => {
-                if (cacheChunkMenu && !cacheChunkMenu.contains(event.target)) closeCacheChunkMenu();
+            const dismissPreviewContextMenu = event => {
+                if (previewContextMenu && !previewContextMenu.contains(event.target)) closePreviewContextMenu();
             };
-            document.addEventListener("pointerdown", dismissCacheChunkMenu, true);
+            document.addEventListener("pointerdown", dismissPreviewContextMenu, true);
 
             const status = document.createElement("div");
             status.style.cssText = "box-sizing:border-box;display:flex;flex-direction:column;gap:1px;min-height:36px;padding:3px 9px;background:#1b1b1b;overflow:hidden;font:10px/11px ui-monospace,SFMono-Regular,Consolas,monospace;";
@@ -588,6 +681,7 @@ app.registerExtension({
             let execution = null;
             let chunkCount = 0;
             let activeChunk = 0;
+            let activeSubchunk = null;
             let chunks = [];
             let chunkRanges = [];
             let shotRanges = [];
@@ -622,10 +716,22 @@ app.registerExtension({
             let elapsedTimer = null;
             let complete = false;
             let statusProgressAnimation = null;
+            let restoringCache = false;
+            node._hrEndlessCacheRestoreProgress = data => {
+                if (!restoringCache) return;
+                statusPhase.textContent = data.message;
+                statusProgressFill.style.width = `${Math.min(100, 100 * (Number(data.completed) || 0) / Math.max(1, Number(data.total) || 1))}%`;
+            };
             let tooltipChunkIndex = null;
             let tooltipSignature = null;
+            let tooltipPointer = null;
+            let shiftPromptVisible = false;
             let audioGroup = null;
-            let audioMuted = false;
+            let standbyAudioGroup = null;
+            let audioMuted = Boolean(savedPlayerState.muted);
+            let inverseGammaDisplay = Boolean(savedPlayerState.inverseGammaDisplay);
+            let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame)
+                ? savedPlayerState.frame : null;
             let pendingAudioSources = new Map();
 
             function stop() {
@@ -685,9 +791,19 @@ app.registerExtension({
                 let sourceChanged = false;
                 if (audioGroup !== group) {
                     audioPlayer.pause();
-                    audioPlayer.src = source;
-                    audioPlayer.load();
+                    if (standbyAudioGroup === group && audioStandbyPlayer.readyState >= 1) {
+                        const previousPlayer = audioPlayer;
+                        audioPlayer = audioStandbyPlayer;
+                        audioStandbyPlayer = previousPlayer;
+                        audioStandbyPlayer.pause();
+                        audioStandbyPlayer.removeAttribute("src");
+                        audioStandbyPlayer.load();
+                    } else {
+                        audioPlayer.src = source;
+                        audioPlayer.load();
+                    }
                     audioGroup = group;
+                    standbyAudioGroup = null;
                     sourceChanged = true;
                 }
                 const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
@@ -726,8 +842,42 @@ app.registerExtension({
                 else audioPlayer.addEventListener("loadedmetadata", positionAndPlay, { once: true });
             }
 
+            function preloadAudio(group) {
+                if (!group?.audioSource || group === audioGroup || group === standbyAudioGroup) return;
+                audioStandbyPlayer.pause();
+                audioStandbyPlayer.src = group.audioSource;
+                audioStandbyPlayer.load();
+                standbyAudioGroup = group;
+            }
+
+            function persistPlayerState() {
+                const frame = displayedFrameNumber();
+                // Retain a restored target until its chunk arrives from the server.
+                if (Number.isFinite(pendingFrame) && frame !== pendingFrame) return;
+                node.properties = node.properties || {};
+                node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay };
+            }
+
+            function restorePersistedFrame() {
+                if (!Number.isFinite(pendingFrame)) return false;
+                for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+                    const group = chunks[chunkIndex];
+                    const frameIndex = group?.frameNumbers?.findIndex(value => Number(value) === pendingFrame);
+                    if (frameIndex >= 0) {
+                        paused = true;
+                        const frame = pendingFrame;
+                        pendingFrame = null;
+                        show(chunkIndex, frameIndex);
+                        node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay };
+                        return true;
+                    }
+                }
+                return false;
+            }
+
             function renderMuteButton() {
                 audioPlayer.muted = audioMuted;
+                audioStandbyPlayer.muted = audioMuted;
                 muteButton.textContent = audioMuted ? "🔇" : "🔊";
                 muteButton.setAttribute("aria-label", audioMuted ? "Unmute preview audio" : "Mute preview audio");
                 muteButton.style.color = audioMuted ? "#999" : "#f4f4f4";
@@ -737,7 +887,28 @@ app.registerExtension({
             function setAudioMuted(value) {
                 audioMuted = Boolean(value);
                 renderMuteButton();
+                persistPlayerState();
             }
+
+            function renderInverseGammaDisplay(finalized=false) {
+                const enabled = inverseGammaDisplay && finalized;
+                image.style.filter = enabled ? `url(#${inverseGammaFilterId})` : "none";
+                linearDisplayButton.disabled = false;
+                linearDisplayButton.style.color = inverseGammaDisplay ? "#82d7ff" : "#aaa";
+                linearDisplayButton.style.background = inverseGammaDisplay ? "rgba(20,68,88,.95)" : "rgba(28,28,28,.9)";
+                linearDisplayButton.style.cursor = "pointer";
+                linearDisplayButton.setAttribute("aria-pressed", String(inverseGammaDisplay));
+            }
+
+            linearDisplayButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                inverseGammaDisplay = !inverseGammaDisplay;
+                renderInverseGammaDisplay(Boolean(chunks[playing]?.finalized) && hoverStep == null);
+                persistPlayerState();
+                root.focus({ preventScroll: true });
+            });
+            renderInverseGammaDisplay(false);
 
             function setPlaybackFps(value, restart=true) {
                 const fps = validFps(value);
@@ -797,13 +968,33 @@ app.registerExtension({
                 if (!replayCacheEnabled || cachedChunkCount <= 0 || !total) return;
                 let offset = 0;
                 for (let index = 0; index < spans.length; index++) {
-                    if (!cachedChunkIndices.has(index)) continue;
                     const start = offset / total * 100;
                     offset += spans[index];
                     const end = offset / total * 100;
+                    if (!cachedChunkIndices.has(index)) continue;
                     const underline = document.createElement("div");
                     underline.style.cssText = `position:absolute;left:${start}%;width:${Math.max(0, end - start)}%;height:2px;border-radius:1px;background:#69b76f;box-shadow:0 0 2px rgba(105,183,111,.65);`;
                     cachedChunkUnderlines.appendChild(underline);
+                }
+            }
+
+            function renderOverlapReplacementLines(spans, total) {
+                overlapReplacementLines.replaceChildren();
+                if (!total) return;
+                let offset = 0;
+                for (let index = 0; index < spans.length - 1; index++) {
+                    const overlapFrames = Math.max(0, Number(chunkRanges[index]?.replacement_overlap_frames) || 0);
+                    const span = spans[index];
+                    if (overlapFrames > 0 && span > 0) {
+                        const start = (offset + Math.max(0, span - overlapFrames)) / total * 100;
+                        const end = (offset + span) / total * 100;
+                        const line = document.createElement("div");
+                        const color = chunkColors[(index + 1) % chunkColors.length];
+                        const alpha = available(index + 1) ? "" : "35";
+                        line.style.cssText = `position:absolute;left:${start}%;width:calc(${Math.max(0, end - start)}% + 1px);height:2px;border-radius:1px;background:${color}${alpha};box-shadow:0 0 2px ${color}${alpha};`;
+                        overlapReplacementLines.appendChild(line);
+                    }
+                    offset += span;
                 }
             }
 
@@ -821,17 +1012,26 @@ app.registerExtension({
             }
 
             function setChunkTooltip(index, event) {
+                if (previewContextMenu) {
+                    tooltipChunkIndex = null;
+                    tooltipSignature = null;
+                    chunkTooltip.hide();
+                    return;
+                }
                 if (!Number.isInteger(index) || !chunkRanges[index]) {
                     tooltipChunkIndex = null;
                     tooltipSignature = null;
                     chunkTooltip.hide();
                     return;
                 }
+                tooltipPointer = { clientX: event.clientX, clientY: event.clientY };
                 const range = chunkRanges[index];
-                const description = String(range.gemma_detailed_description || "").trim();
+                const description = chunkPromptDescription(range);
                 const retentionAnalysis = String(range.gemma_retention_analysis || "").trim();
+                const fullPrompt = String(range.h3_prompt || "").trim();
+                const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);
                 const timing = chunkTimingLines(range);
-                const signature = JSON.stringify([description, retentionAnalysis, timing, shotRanges]);
+                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, showFullPrompt, timing, shotRanges]);
                 if (tooltipChunkIndex === index && tooltipSignature === signature) {
                     chunkTooltip.move(event);
                     return;
@@ -844,9 +1044,11 @@ app.registerExtension({
                     timing,
                     description,
                     retentionAnalysis,
+                    fullPrompt,
+                    showFullPrompt,
                     shotRanges,
                     colors: chunkColors,
-                    waitingText: "Waiting for this chunk's Gemma direction.",
+                    waitingText: "Waiting for this chunk's prompt.",
                 });
             }
 
@@ -915,10 +1117,11 @@ app.registerExtension({
                     return Number.isFinite(start) && Number.isFinite(end) && frame >= start && frame <= end;
                 });
                 const chunkNumber = Number(chunk?.chunk);
-                const shotNumber = Number(shot?.shot);
-                return Number.isFinite(chunkNumber) && Number.isFinite(shotNumber)
-                    ? `S${Math.round(shotNumber)}/C${Math.round(chunkNumber)}/${frame}`
-                    : `${frame}`;
+                if (!Number.isFinite(chunkNumber)) return `${frame}`;
+                // A cache restore can lack source-shot brackets, but the
+                // frame label must still retain its chunk identity.
+                const shotNumber = Number(shot?.shot) || 1;
+                return `S${Math.round(shotNumber)}/C${Math.round(chunkNumber)}/${frame}`;
             }
 
             function renderTransport() {
@@ -940,6 +1143,19 @@ app.registerExtension({
                     offset += spans[index];
                     const end = offset / total * 100;
                     const color = chunkColors[index % chunkColors.length];
+                    const completedFrames = chunkRanges[index]?.taomate_completed_frames;
+                    if (Number.isFinite(completedFrames)) {
+                        // A live latent preview makes its current sub-chunk available before completion.
+                        const previewFrames = available(index)
+                            ? Math.max(0, (Number(chunks[index].outputEnd) + 1) - Number(chunkRanges[index]?.start)) || 0
+                            : 0;
+                        const fraction = Math.max(0, Math.min(1, Math.max(completedFrames, previewFrames) / spans[index]));
+                        const boundary = start + (end - start) * fraction;
+                        const pendingColor = `color-mix(in srgb, ${color} 50%, black)`;
+                        if (fraction > 0) stops.push(`${color}e8 ${start}%`, `${color}e8 ${boundary}%`);
+                        if (fraction < 1) stops.push(`${pendingColor} ${boundary}%`, `${pendingColor} ${end}%`);
+                        continue;
+                    }
                     const alpha = available(index) ? "e8" : "35";
                     stops.push(`${color}${alpha} ${start}%`, `${color}${alpha} ${end}%`);
                 }
@@ -947,6 +1163,7 @@ app.registerExtension({
                     ? `linear-gradient(to right, ${stops.join(",")})`
                     : "#333";
                 renderCachedChunkUnderlines(spans, total);
+                renderOverlapReplacementLines(spans, total);
                 renderShotBrackets();
 
                 if (!available(playing)) {
@@ -954,15 +1171,22 @@ app.registerExtension({
                     return;
                 }
                 const before = spans.slice(0, playing).reduce((sum, value) => sum + value, 0);
-                const fraction = chunks[playing].frames.length < 2
+                const group = chunks[playing];
+                const exactFrame = Number(group.frameNumbers?.[playingFrame]);
+                const rangeStart = Number(chunkRanges[playing]?.start ?? group.outputStart ?? before);
+                const fraction = group.frames.length < 2
                     ? 0
-                    : playingFrame / (chunks[playing].frames.length - 1);
-                const position = (before + fraction * spans[playing]) / total * 100;
+                    : playingFrame / (group.frames.length - 1);
+                // Use source frames, not the number of preview images stretched over the planned group.
+                const previewSpan = Math.max(0, Number(group.outputEnd) - Number(group.outputStart)) || 0;
+                const localFrame = Number.isFinite(exactFrame) ? exactFrame - rangeStart : fraction * previewSpan;
+                const position = (before + Math.max(0, Math.min(spans[playing], localFrame))) / total * 100;
                 timelinePlayhead.style.left = `${Math.max(0, Math.min(100, position))}%`;
                 timelinePlayhead.style.display = "block";
             }
 
-            function displaySource(source, valid, displayed) {
+            function displaySource(source, valid, displayed, finalized=false) {
+                renderInverseGammaDisplay(finalized);
                 if (!source) {
                     displayed?.(false);
                     return;
@@ -997,6 +1221,8 @@ app.registerExtension({
                 renderTransport();
                 let duration = frameDuration(group, boundedFrame);
                 syncAudio(group, boundedFrame, true, serial, seekAudio);
+                const next = nextAvailable(index);
+                if (next >= 0 && next !== index) preloadAudio(chunks[next]);
                 if (group.audioSource && audioGroup === group && !audioPlayer.paused && audioPlayer.readyState >= 1) {
                     const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
                     const nextMediaTime = (boundedFrame + 1) / sourceRate;
@@ -1037,6 +1263,7 @@ app.registerExtension({
                             }
                         }, duration);
                     },
+                    Boolean(group.finalized),
                 );
             }
 
@@ -1045,6 +1272,7 @@ app.registerExtension({
                 stop();
                 playing = index;
                 playingFrame = Math.max(0, Math.min(frameIndex, chunks[index].frames.length - 1));
+                persistPlayerState();
                 renderTransport();
                 const group = chunks[index];
                 const serial = playbackSerial;
@@ -1055,6 +1283,7 @@ app.registerExtension({
                         group.frames[playingFrame],
                         () => serial === playbackSerial && paused && hoverStep == null,
                         () => { framePending = false; },
+                        Boolean(group.finalized),
                     );
                 } else {
                     playFrameGroup(index, group, playingFrame, serial, true);
@@ -1156,6 +1385,7 @@ app.registerExtension({
                 }
             });
             timelineShell.addEventListener("pointerdown", event => {
+                if (event.button !== 0) return;
                 event.preventDefault();
                 event.stopPropagation();
                 timelineDragging = true;
@@ -1175,13 +1405,16 @@ app.registerExtension({
             };
             timelineShell.addEventListener("pointerup", finishTimelineDrag);
             timelineShell.addEventListener("pointercancel", finishTimelineDrag);
-            timelineShell.addEventListener("contextmenu", event => {
-                const chunkIndex = chunkIndexAtTimelinePointer(event);
-                if (!replayCacheEnabled || cacheButton.disabled || !Number.isInteger(chunkIndex)
-                    || chunkIndex < 0 || !cachedChunkIndices.has(chunkIndex)) return;
+            root.addEventListener("contextmenu", event => {
                 event.preventDefault();
                 event.stopPropagation();
-                showCacheChunkMenu(chunkIndex, event);
+                chunkTooltip.hide();
+                tooltipChunkIndex = null;
+                tooltipSignature = null;
+                tooltipPointer = null;
+                closePreviewContextMenu();
+                const chunkIndex = timelineShell.contains(event.target) ? chunkIndexAtTimelinePointer(event) : null;
+                showPreviewContextMenu(chunkIndex, event);
             });
             transport.addEventListener("mousedown", event => event.stopPropagation());
             root.addEventListener("keydown", event => {
@@ -1202,23 +1435,46 @@ app.registerExtension({
             renderMuteButton();
 
             function renderStatus() {
+                if (restoringCache) return;
                 const resolution = previewWidth && previewHeight ? `${previewWidth}×${previewHeight}` : "resolution —";
                 const fps = Number.isFinite(currentPlaybackFps()) ? `${Number(currentPlaybackFps().toFixed(3))} fps` : "fps —";
                 const secondsPerStep = Number.isFinite(averageStepMs) ? `${(averageStepMs / 1000).toFixed(2)}s/step` : "—s/step";
-                const remainingSteps = Math.max(0, totalSteps - currentStep) + Math.max(0, chunkCount - activeChunk - 1) * totalSteps;
-                const eta = Number.isFinite(averageStepMs) ? formatEta(remainingSteps * averageStepMs / 1000) : "—";
                 const elapsedSeconds = completedElapsed ?? (startedAt == null ? NaN : (performance.now() - startedAt) / 1000);
                 const elapsed = formatEta(elapsedSeconds);
-                const chunk = chunkCount ? `C ${activeChunk + 1}/${chunkCount}` : "C —/—";
+                const chunk = chunkCount ? `C ${activeChunk + 1}${activeSubchunk ? `.${activeSubchunk}` : ""}/${chunkCount}` : "C —/—";
                 const displayStep = hoverStep ?? currentStep;
                 const inspecting = hoverStep == null ? "" : "Inspect · ";
                 const statePrefix = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}`;
                 const phaseLine = `${statePrefix}${phase || "Preparing sampler"}`;
-                const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ETA ${eta}`;
+                const h3Active = !complete && /h3\s+(?:sampling|inference)/i.test(phase || "");
+                let workTotal = 0;
+                let workDone = 0;
+                for (let index = 0; index < chunkCount; index++) {
+                    const range = chunkRanges[index] || {};
+                    const phaseCount = Math.max(1, Number(range.taomate_phase_count) || 1);
+                    const phaseWork = Array.isArray(range.taomate_phase_work)
+                        && range.taomate_phase_work.length === phaseCount
+                        ? range.taomate_phase_work.map(value => Math.max(1, Number(value) || 1))
+                        : Array(phaseCount).fill(1);
+                    const chunkWork = phaseWork.reduce((sum, value) => sum + value, 0);
+                    workTotal += chunkWork;
+                    if (index < activeChunk || cachedChunkIndices.has(index)) {
+                        workDone += chunkWork;
+                    } else if (index === activeChunk) {
+                        const completedPhases = Math.max(0, Math.min(phaseCount, Number(range.taomate_completed_phases) || 0));
+                        workDone += phaseWork.slice(0, completedPhases).reduce((sum, value) => sum + value, 0);
+                        if (h3Active && totalSteps > 0 && completedPhases < phaseCount) workDone += phaseWork[completedPhases] * Math.max(0, Math.min(1, currentStep / totalSteps));
+                    }
+                }
+                const fallbackRemainingSteps = Math.max(0, totalSteps - currentStep) + Math.max(0, chunkCount - activeChunk - 1) * totalSteps;
+                const fallbackEtaSeconds = Number.isFinite(averageStepMs) ? fallbackRemainingSteps * averageStepMs / 1000 : NaN;
+                const timingEstimate = projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaSeconds);
+                const eta = formatEta(timingEstimate.etaSeconds);
+                const projected = formatEta(timingEstimate.totalSeconds);
+                const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ETA ${eta} · Est. total ${projected}`;
                 statusPhase.textContent = phaseLine;
                 statusMetrics.textContent = metricsLine;
                 const gemmaActive = !complete && /gemma\s*4/i.test(phase || "");
-                const h3Active = !complete && /h3\s+(?:sampling|inference)/i.test(phase || "");
                 let progressHelp = "";
                 if (gemmaActive) {
                     statusProgressFill.style.width = "32%";
@@ -1262,6 +1518,7 @@ app.registerExtension({
                 cachedChunkCount = Math.max(0, Math.min(Number(data.cached_chunk_count) || 0, chunkCount));
                 cachedChunkIndices = new Set(Array.from({ length: cachedChunkCount }, (_, index) => index));
                 activeChunk = data.chunk ?? 0;
+                activeSubchunk = null;
                 chunks = new Array(chunkCount);
                 chunkRanges = Array.isArray(data.chunk_ranges) ? data.chunk_ranges.map(range => ({ ...range })) : [];
                 shotRanges = Array.isArray(data.shot_ranges) ? data.shot_ranges.slice() : [];
@@ -1284,6 +1541,14 @@ app.registerExtension({
                 phase = typeof data.phase === "string" ? data.phase : "Preparing sampler";
                 setSourceFps(data.fps);
                 reusingCachedChunks = Boolean(data.reusing_cached_chunks);
+                const suppliedReusedChunks = Array.isArray(data.reused_chunk_numbers)
+                    ? data.reused_chunk_numbers
+                    : Array.from({ length: cachedChunkCount }, (_, index) => index + 1);
+                reusedChunkNumbers = Array.from(new Set(suppliedReusedChunks
+                    .map(value => Math.round(Number(value)))
+                    .filter(number => number >= 1 && number <= chunkCount))).sort((left, right) => left - right);
+                cachedChunkIndices = new Set(reusedChunkNumbers.map(number => number - 1));
+                cachedChunkCount = cachedChunkIndices.size;
                 const elapsedMs = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms : 0;
                 startedAt = performance.now() - elapsedMs;
                 completedElapsed = null;
@@ -1292,6 +1557,9 @@ app.registerExtension({
                 audioPlayer.removeAttribute("src");
                 audioPlayer.load();
                 audioGroup = null;
+                audioStandbyPlayer.removeAttribute("src");
+                audioStandbyPlayer.load();
+                standbyAudioGroup = null;
                 pendingAudioSources.clear();
                 chunkTooltip.hide();
                 tooltipChunkIndex = null;
@@ -1301,7 +1569,7 @@ app.registerExtension({
                 stop();
                 image.removeAttribute("src");
                 frameLabel.style.display = "none";
-                cacheReuseLabel.style.display = reusingCachedChunks ? "block" : "none";
+                renderCacheReuseLabel();
                 renderStatus();
                 renderTransport();
                 redrawGraphs();
@@ -1331,7 +1599,17 @@ app.registerExtension({
                     if (range && typeof data.gemma_retention_analysis === "string") {
                         range.gemma_retention_analysis = data.gemma_retention_analysis;
                     }
+                    if (range && typeof data.h3_prompt === "string") {
+                        range.h3_prompt = data.h3_prompt;
+                    }
                     if (range) {
+                        if (Number.isFinite(data.taomate_completed_frames) && data.taomate_completed_frames >= 0) {
+                            range.taomate_completed_frames = data.taomate_completed_frames;
+                            renderTransport();
+                        }
+                        if (Number.isFinite(data.taomate_completed_phases) && data.taomate_completed_phases >= 0) {
+                            range.taomate_completed_phases = data.taomate_completed_phases;
+                        }
                         for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds"]) {
                             const value = Number(data[key]);
                             if (Number.isFinite(value) && value >= 0) range[key] = value;
@@ -1341,13 +1619,17 @@ app.registerExtension({
                 }
                 if (data.action === "phase") {
                     if (typeof data.phase === "string") phase = data.phase;
-                    if (data.chunk != null) activeChunk = data.chunk;
+                    if (data.chunk != null) {
+                        if (data.chunk !== activeChunk) activeSubchunk = null;
+                        activeChunk = data.chunk;
+                    }
                     renderStatus();
                     renderTransport();
                     return;
                 }
                 if (data.action === "sample_start") {
                     activeChunk = data.chunk ?? activeChunk;
+                    activeSubchunk = data.subchunk ?? null;
                     phase = "H3 sampling";
                     sigmas = Array.isArray(data.sigmas) ? data.sigmas : [];
                     deltas = [];
@@ -1378,6 +1660,7 @@ app.registerExtension({
                 }
                 if (data.action === "progress") {
                     activeChunk = data.chunk ?? activeChunk;
+                    activeSubchunk = data.subchunk ?? null;
                     currentStep = data.step || currentStep;
                     totalSteps = data.steps || totalSteps;
                     if (Array.isArray(data.sigmas)) sigmas = data.sigmas;
@@ -1425,6 +1708,7 @@ app.registerExtension({
                 const replacingPlayingChunk = finalized && index === playing;
                 const displayedBeforeReplacement = replacingPlayingChunk ? displayedFrameNumber() : null;
                 activeChunk = index;
+                activeSubchunk = finalized ? null : (data.subchunk ?? null);
                 currentStep = data.step || currentStep;
                 totalSteps = data.steps || totalSteps;
                 if (Array.isArray(data.sigmas)) sigmas = data.sigmas;
@@ -1456,6 +1740,9 @@ app.registerExtension({
                 if (typeof data.gemma_retention_analysis === "string" && chunkRanges[index]) {
                     chunkRanges[index].gemma_retention_analysis = data.gemma_retention_analysis;
                 }
+                if (typeof data.h3_prompt === "string" && chunkRanges[index]) {
+                    chunkRanges[index].h3_prompt = data.h3_prompt;
+                }
                 if (chunkRanges[index]) {
                     for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds"]) {
                         const value = Number(data[key]);
@@ -1470,6 +1757,7 @@ app.registerExtension({
                 renderStatus();
                 renderTransport();
                 redrawGraphs();
+                if (restorePersistedFrame()) return;
                 if (replacingPlayingChunk && hoverStep == null) {
                     let replacementFrame = 0;
                     if (Number.isFinite(displayedBeforeReplacement) && group.frameNumbers.length) {
@@ -1485,12 +1773,16 @@ app.registerExtension({
                 }
             };
 
-            async function restoreServerState(attempt=0) {
+            async function restoreServerState(attempt=0, force=false) {
                 if (node.id == null || Number(node.id) < 0) {
-                    if (attempt < 20) setTimeout(() => restoreServerState(attempt + 1), 100);
+                    if (attempt < 20) setTimeout(() => restoreServerState(attempt + 1, force), 100);
                     return;
                 }
+                const executionAtRequest = execution;
                 try {
+                    restoringCache = true;
+                    statusPhase.textContent = force ? "Reconnecting preview…" : "Retrieving cached previous run…";
+                    statusProgressFill.style.width = "0%";
                     // Workflow widget restoration normally completes before
                     // the asynchronous history request. Synchronize it here
                     // so restored playback starts at the visible FPS value.
@@ -1515,12 +1807,22 @@ app.registerExtension({
                         if (cachedResponse.ok) snapshot = await cachedResponse.json();
                     }
                     if (!snapshot?.reset) return;
-                    if (execution !== null && Number(snapshot.execution) < Number(execution)) return;
-                    node._hrEndlessSamplerPreview(snapshot.reset);
+                    // A live reset arriving during fetch owns the newer render.
+                    if (execution !== executionAtRequest && snapshot.execution !== execution) return;
+                    if (!force && execution !== null && Number(snapshot.execution) < Number(execution)) return;
+                    // Explicit reconnect must bypass the stale-reset guard after a server restart.
+                    if (force) resetExecution(snapshot.reset);
+                    else node._hrEndlessSamplerPreview(snapshot.reset);
                     if (snapshot.phase) node._hrEndlessSamplerPreview(snapshot.phase);
                     if (snapshot.sample_start) node._hrEndlessSamplerPreview(snapshot.sample_start);
                     if (snapshot.progress) node._hrEndlessSamplerPreview(snapshot.progress);
-                    for (const chunk of snapshot.chunks || []) node._hrEndlessSamplerPreview(chunk);
+                    for (const chunk of snapshot.chunks || []) {
+                        if (execution !== snapshot.execution) return;
+                        node._hrEndlessSamplerPreview(chunk);
+                        // Let input, drawing and playback run between restored chunks.
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                    if (execution !== snapshot.execution) return;
                     if (Array.isArray(snapshot.deltas)) deltas = snapshot.deltas.slice();
                     if (Array.isArray(snapshot.step_times)) stepTimes = snapshot.step_times.slice();
                     renderStatus();
@@ -1529,6 +1831,9 @@ app.registerExtension({
                     if (hoverStep == null && timer == null && !framePending) restorePlayback();
                 } catch (error) {
                     console.warn("HR Endless Sampler preview history restore failed", error);
+                } finally {
+                    restoringCache = false;
+                    renderStatus();
                 }
             }
 
@@ -1556,6 +1861,7 @@ app.registerExtension({
                                 play(boundedFrame + 1);
                             }, duration);
                         },
+                        false,
                     );
                 };
                 play(0);
@@ -1594,8 +1900,21 @@ app.registerExtension({
             timelineShell.addEventListener("mouseleave", () => {
                 tooltipChunkIndex = null;
                 tooltipSignature = null;
+                tooltipPointer = null;
                 chunkTooltip.hide();
             });
+            const updateShiftPrompt = event => {
+                if (event.key !== "Shift") return;
+                shiftPromptVisible = event.type === "keydown";
+                if (tooltipChunkIndex == null || tooltipPointer == null) return;
+                setChunkTooltip(tooltipChunkIndex, {
+                    clientX: tooltipPointer.clientX,
+                    clientY: tooltipPointer.clientY,
+                    shiftKey: shiftPromptVisible,
+                });
+            };
+            document.addEventListener("keydown", updateShiftPrompt);
+            document.addEventListener("keyup", updateShiftPrompt);
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);
@@ -1621,10 +1940,14 @@ app.registerExtension({
                 stop();
                 audioPlayer.removeAttribute("src");
                 audioPlayer.load();
+                audioStandbyPlayer.removeAttribute("src");
+                audioStandbyPlayer.load();
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 clearInterval(replayCacheStatusTimer);
-                document.removeEventListener("pointerdown", dismissCacheChunkMenu, true);
-                closeCacheChunkMenu();
+                document.removeEventListener("pointerdown", dismissPreviewContextMenu, true);
+                document.removeEventListener("keydown", updateShiftPrompt);
+                document.removeEventListener("keyup", updateShiftPrompt);
+                closePreviewContextMenu();
                 resizeObserver.disconnect();
                 chunkTooltip.remove();
                 node._hrEndlessSamplerPreview = null;

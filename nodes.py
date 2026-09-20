@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import functools
 import gc
 import hashlib
@@ -17,6 +18,8 @@ import psutil
 import torch
 import torch.nn.functional as F
 from aiohttp import web
+from phonemizer import phonemize
+from phonemizer.separator import Separator
 
 import comfy.model_management
 import comfy.nested_tensor
@@ -35,7 +38,6 @@ except ImportError:  # Unit tests can import the node helpers without ComfyUI's 
     PromptServer = None
 
 from .gemma4 import (
-    Gemma4ContinuityDirector,
     Gemma4DependencyError,
     Gemma4ObservationError,
     Gemma4PreproductionCache,
@@ -46,6 +48,8 @@ from .gemma4 import (
     reset_gemma4_raw_output_log,
 )
 from .preview import begin_preview_execution, build_cached_final_preview_snapshot
+from .python.audio_sr import AudioSR, fix_audio
+from .python.preproduction import HRPreProduction, ENABLE_GEMMA4_MTP
 from .video_io import HREndlessTimeline, IntermediateChunkVideoWriter, load_replay_preview_proxy, normalize_timeline, save_replay_preview_proxy
 
 
@@ -63,6 +67,12 @@ COLOR_CORRECTION_MIN_TONE_RATIO = 0.75
 COLOR_CORRECTION_MAX_TONE_RATIO = 1.30
 COLOR_CORRECTION_MIN_RGB_BALANCE = 0.94
 COLOR_CORRECTION_MAX_RGB_BALANCE = 1.06
+PHONEME_SECONDS = 0.055
+WORD_ONSET_SECONDS = 0.055
+COMMA_PAUSE_SECONDS = 0.15
+SENTENCE_PAUSE_SECONDS = 0.30
+ELLIPSIS_PAUSE_SECONDS = 0.50
+minimax_visual_cond_noise_aug = 0.9
 VIDEO_CONTINUATION_RESOLUTIONS = (
     "full",
     "0.98mp (1344x768 native)",
@@ -78,13 +88,15 @@ VIDEO_CONTINUATION_RESOLUTIONS = (
 )
 VIDEO_CONTINUATION_METHOD_VIDEO1 = "Video1 reference (current)"
 VIDEO_CONTINUATION_METHOD_MASKED_AV = "Masked AV overlap (experimental)"
+VIDEO_CONTINUATION_METHOD_TAOMATE = "TaoMate-H3 streaming (experimental)"
 VIDEO_CONTINUATION_METHODS = (
     VIDEO_CONTINUATION_METHOD_VIDEO1,
     VIDEO_CONTINUATION_METHOD_MASKED_AV,
+    VIDEO_CONTINUATION_METHOD_TAOMATE,
 )
-# Temporary A/B switch: leave the normal five-frame Video1 boundary keyframe
-# and all other continuation conditioning active, but do not copy/protect the
-# selected 39/90/... previous AV run inside the new chunk latent.
+# Temporary A/B switch: do not copy/protect the selected 39/90/... previous AV
+# run inside the new chunk latent. Native-boundary mode instead uses the
+# selected continuation duration as a disposable packing prefix.
 ENABLE_MASKED_AV_OVERLAP = False
 # Test a fully frozen AV prefix: Video already uses an all-zero denoise mask,
 # and audio now does too. Set this back to 8 to restore the former 0.2-second
@@ -96,7 +108,8 @@ MASKED_AV_AUDIO_FEATHER_TICKS = 0
 # inspect exactly what H3 emitted during its locked temporal interval.
 # ponytail: this intentionally repeats the preceding AV tail; restore True
 # after diagnosing the prefix behavior.
-TRIM_MASKED_AV_PREFIX = False
+TRIM_MASKED_AV_PREFIX = True
+COLOR_CORRECTION_MODES = ("disable", "chunk boundaries", "entire shots", "chunk boundaries + entire shots")
 VIDEO_CONTINUATION_CANVASES = {
     label: tuple(int(value) for value in re.search(r"\((\d+)x(\d+)", label).groups())
     for label in VIDEO_CONTINUATION_RESOLUTIONS[1:]
@@ -106,19 +119,21 @@ VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
 # The current llama-cpp-python Gemma 4 MTP verifier is slower than ordinary
 # decoding and can fail hybrid-state rollback. Keep its implementation intact,
 # but reject stale workflow values until the upstream path is usable again.
-ENABLE_GEMMA4_MTP = False
 # Temporarily disable the disposable three-step continuation memory probe.  It
 # remains implemented below so the experiment can be restored by changing this
 # single flag after its startup cost is useful again.
 ENABLE_DEBUG_MEMORY_PREFLIGHT = False
+# Experimental A/B switch. False regenerates complete AV noise for every
+# chunk with seed * chunk_number; True preserves one sliced full-sequence noise.
+TOGGLE_SINGLE_NOISE = False
 # Set this to False only for the isolation experiment that retains the
-# five-frame visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
+# native visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
 # DiT references, and prompt text.
 INCLUDE_VIDEO1_REFERENCE = True
 # Experimental H3-conditioning A/B switch.  The normal source uses the raw
 # prior VAE decode, while this path feeds the finalized display-color-corrected
 # tail back through H3's pixel-space continuation inputs.  It deliberately
-# does not alter the five-frame latent boundary, which has no pixel-space
+# does not alter the native latent boundary, which has no pixel-space
 # color-correction equivalent.
 USE_COLOR_CORRECTED_H3_CONTEXT = True
 # Per-chunk retention prose proved counterproductive with H3: it can behave
@@ -147,6 +162,7 @@ SUMMARY_FIELD = re.compile(r"(?im)^(\s*summary\s*:\s*)(.*)$")
 RETENTION_FIELD = re.compile(r"(?im)^\s*retention_analysis\s*:\s*$")
 PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
 DIALOGUE_BLOCK = re.compile(r"<d>(.*?)</d>", re.IGNORECASE | re.DOTALL)
+SUBJECT_SPEAKER = re.compile(r"(<Subject\s+\d+>)\s*\((S\d+)\)", re.IGNORECASE)
 
 
 def _description_field(prompt, start=0):
@@ -386,7 +402,8 @@ _PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instan
 if _PROMPT_SERVER is not None:
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_preview/replay_cache")
     async def hr_endless_sampler_replay_cache_status(_request):
-        return web.json_response(_replay_cache_ui_status(), headers={"Cache-Control": "no-store"})
+        status = await asyncio.to_thread(_replay_cache_ui_status)
+        return web.json_response(status, headers={"Cache-Control": "no-store"})
 
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_preview/cached_preview")
     async def hr_endless_sampler_cached_preview(request):
@@ -409,10 +426,16 @@ if _PROMPT_SERVER is not None:
             quality=quality,
             fps=fps,
         )
-        return web.json_response(snapshot or {}, headers={"Cache-Control": "no-store"})
+        # The restored frame payload can be large; serialize it off-loop too.
+        return await asyncio.to_thread(web.json_response, snapshot or {}, headers={"Cache-Control": "no-store"})
 
     @_PROMPT_SERVER.routes.post("/hr_endless_sampler_preview/replay_cache_enabled")
     async def hr_endless_sampler_set_replay_cache_enabled(request):
+        """Never wait for the replay lock on aiohttp's event loop."""
+        return await asyncio.to_thread(_set_replay_cache_enabled_response, request)
+
+    def _set_replay_cache_enabled_response(request):
+        """Apply cache policy under the shared lock in a worker thread."""
         requested = request.query.get("enabled", "")
         if requested not in {"0", "1"}:
             return web.json_response(
@@ -438,6 +461,11 @@ if _PROMPT_SERVER is not None:
 
     @_PROMPT_SERVER.routes.post("/hr_endless_sampler_preview/replay_cache_chunk")
     async def hr_endless_sampler_delete_replay_cache_chunk(request):
+        """Run disk mutation and lock acquisition off the event loop."""
+        return await asyncio.to_thread(_delete_replay_cache_chunk_response, request)
+
+    def _delete_replay_cache_chunk_response(request):
+        """Delete only the requested checkpoint under the cache lock."""
         try:
             chunk_number = int(request.query.get("chunk", ""))
         except (TypeError, ValueError):
@@ -457,7 +485,10 @@ if _PROMPT_SERVER is not None:
                 )
             cache = _LastRunReplayCache()
             status = _replay_cache_ui_status_unlocked()
-            if chunk_number > status["completed_chunks"] or not cache.has_chunk(chunk_number):
+            # ``completed_chunks`` becomes the first missing chunk after a
+            # sparse deletion. Later checkpoint files remain individually
+            # deletable, so availability must be based on the file itself.
+            if not cache.has_chunk(chunk_number):
                 return web.json_response(
                     {**status, "error": f"Cached Chunk {chunk_number} is unavailable."},
                     status=404,
@@ -539,7 +570,7 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
     diagnostics in the cache manifest.
     """
     return {
-        "chunk_prompt_marker_mode": "global-shot-labels-local-time-dialogue-segments-v2",
+        "chunk_prompt_marker_mode": "global-shot-labels-local-time-dialogue-segments-v3",
         "video_shape": list(video.shape),
         "audio_shape": list(audio.shape),
         "video_dtype": str(video.dtype),
@@ -614,14 +645,14 @@ class _LastRunReplayCache:
 
     @staticmethod
     def automatic_resume_chunk(manifest, chunk_count):
-        """Return the next chunk only for an incomplete ordinary render."""
+        """Return the next chunk, or one-past-end for interrupted finalization."""
         if manifest.get("status") not in {"recording", "interrupted"}:
             return None
         try:
             completed = int(manifest.get("completed_chunks", -1))
         except (TypeError, ValueError):
             return None
-        if completed < 0 or completed >= int(chunk_count):
+        if completed < 0 or completed > int(chunk_count):
             return None
         return completed + 1
 
@@ -630,7 +661,12 @@ class _LastRunReplayCache:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             if manifest.get("format") != REPLAY_CACHE_FORMAT:
                 return None, "cache format is obsolete"
-            if manifest.get("fingerprint") != fingerprint:
+            cached_fingerprint = dict(manifest.get("fingerprint") or {})
+            provider = cached_fingerprint.get("pre_production", {})
+            # Accept older manual-prompt caches that included the editor text.
+            if isinstance(provider, dict) and provider.get("provider") == "legacy-chunk-prompts":
+                cached_fingerprint["pre_production"] = {key: value for key, value in provider.items() if key != "text"}
+            if cached_fingerprint != fingerprint:
                 return None, "latent/chunk layout or continuation settings changed"
             initial = _replay_load_tensor_file(self.initial_path)
         except FileNotFoundError:
@@ -662,6 +698,9 @@ class _LastRunReplayCache:
     def save_chunk(self, chunk_number, state, *, fps=None):
         state = dict(state)
         preview_frames = state.pop("corrected_video_frames", None)
+        # Browser proxies always store display sRGB. The checkpoint itself
+        # keeps H3's inverse-gamma compute frames for an exact replay.
+        state["preview_proxy_color_space"] = "srgb"
         state.pop("decoded_video_frames", None)
         preview_audio = state.pop("decoded_preview_audio", None)
         preview_audio_rate = state.pop("decoded_preview_audio_rate", None)
@@ -751,6 +790,10 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
     """
     if not str(node_id):
         return None
+    def progress(completed, total, message):
+        """Send lightweight restoration progress without taking a preview lock."""
+        if _PROMPT_SERVER is not None:
+            _PROMPT_SERVER.send_sync("hr_endless_sampler_cache_restore", {"node_id": str(node_id), "completed": completed, "total": total, "message": message})
     with _REPLAY_CACHE_ACTIVITY_LOCK:
         if not REPLAY_CACHE_ENABLED or _REPLAY_CACHE_ACTIVE_RUNS:
             return None
@@ -769,19 +812,23 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
         # Keep the complete physical geometry visible, including unrendered
         # suffix chunks of an interrupted cache. The encoder below publishes
         # only checkpoints that carry a browser-only preview proxy.
-        chunk_ranges = []
-        for index, item in enumerate(plan):
-            if not isinstance(item, dict):
-                return None
-            try:
-                start = int(item["frame_start"]) + int(item.get("output_trim_frames", 0))
-                end = int(item["frame_end"]) - 1
-            except (KeyError, TypeError, ValueError):
-                return None
-            chunk_ranges.append({"chunk": index + 1, "start": start, "end": end})
+        if not all(isinstance(item, dict) for item in plan):
+            return None
+        try:
+            chunk_ranges = _preview_ranges_for_plan(
+                plan,
+                show_replaced_tail=(
+                    manifest.get("fingerprint", {}).get("video_continuation_method")
+                    == VIDEO_CONTINUATION_METHOD_MASKED_AV
+                    and not bool(manifest.get("fingerprint", {}).get("keep_continuation_prefix"))
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
         cached_chunks = []
-        for number in status["cached_chunks"]:
+        for position, number in enumerate(status["cached_chunks"]):
+            progress(position, 2 * len(status["cached_chunks"]), f"Retrieving cached previous run: loading chunk {number}")
             if number < 1 or number > len(chunk_ranges):
                 continue
             try:
@@ -798,12 +845,20 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
                 continue
             if int(preview_frames.shape[0]) != preview_end - preview_start + 1:
                 continue
+            # Before this marker existed, linear_color_compute proxies were
+            # encoded directly from inverse-gamma compute RGB. Restore their
+            # intended display transfer when a browser reloads an old cache.
+            if manifest.get("fingerprint", {}).get("linear_color_compute") and state.get("preview_proxy_color_space") != "srgb":
+                preview_frames = _convert_image_transfer(preview_frames, _inverse_gamma_compute_to_srgb)
             range_item = chunk_ranges[number - 1]
             range_item["start"] = preview_start
             range_item["end"] = preview_end
             description = state.get("gemma_description")
             if isinstance(description, str) and description.strip():
                 range_item["gemma_detailed_description"] = description.strip()
+            h3_prompt = state.get("h3_prompt")
+            if isinstance(h3_prompt, str) and h3_prompt.strip():
+                range_item["h3_prompt"] = h3_prompt.strip()
             if INCLUDE_PER_CHUNK_RETENTION_ANALYSIS:
                 retention = _chunk_retention_analysis(state.get("gemma_retention_analysis"))
                 if retention:
@@ -825,6 +880,7 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
                 "audio_sample_rate": preview_audio_rate,
                 "gemma_detailed_description": range_item.get("gemma_detailed_description"),
                 "gemma_retention_analysis": range_item.get("gemma_retention_analysis"),
+                "h3_prompt": range_item.get("h3_prompt"),
                 "h3_render_seconds": range_item.get("h3_render_seconds"),
                 "gemma_seconds": range_item.get("gemma_seconds"),
                 "gemma_preproduction_seconds": range_item.get("gemma_preproduction_seconds"),
@@ -856,6 +912,7 @@ def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
             fps=source_fps,
             max_resolution=max_resolution,
             quality=quality,
+            progress_callback=lambda done, total: progress(total + done, 2 * total, f"Retrieving cached previous run: preparing preview {done}/{total}"),
         )
 
 
@@ -938,12 +995,56 @@ def _drop_picture_anchors(prompt):
     return prefix + PICTURE_LABEL.sub("the established subject and scene", prompt[field.start():])
 
 
-def _video_continuation_prompt(prompt, video_label, audio_label=None, storyboard=False):
+def _audio_reference_speakers(description):
+    """Return prior visual speakers and languages from final H3 dialogue prose."""
+    speakers = {}
+    for dialogue in DIALOGUE_BLOCK.finditer(str(description or "")):
+        prefix = str(description)[:dialogue.start()]
+        prior_dialogue = prefix.lower().rfind("</d>")
+        local_prefix = prefix[prior_dialogue + 4:] if prior_dialogue >= 0 else prefix
+        matches = list(SUBJECT_SPEAKER.finditer(local_prefix))
+        if not matches:
+            continue
+        subject, speaker = matches[-1].groups()
+        language = re.match(r"\s*\[([^]]+)\]", dialogue.group(1))
+        key = (subject, speaker.upper())
+        speakers.setdefault(key, set())
+        if language is not None:
+            speakers[key].add(language.group(1).strip())
+    return tuple((subject, speaker, tuple(sorted(languages))) for (subject, speaker), languages in speakers.items())
+
+
+def _audio_reference_definition(audio_label, audio_speakers=()):
+    """Describe previous-chunk audio using MiniMax's official reference roles."""
+    base = f"{audio_label} is the previous video's full audio reference for seamless continuation in this video"
+    if not audio_speakers:
+        return base + "."
+    subjects = [f"{subject} ({speaker})" for subject, speaker, _languages in audio_speakers]
+    languages = sorted({language for _subject, _speaker, values in audio_speakers for language in values})
+    subject_text = ", ".join(subjects[:-1]) + (" and " if len(subjects) > 1 else "") + subjects[-1]
+    language_text = ""
+    if languages:
+        layer = "layer" if len(languages) == 1 else "layers"
+        language_text = f", containing spoken {' and '.join(languages)} vocal {layer}"
+    return f"{base} and the voice-timbre reference for {subject_text}{language_text}."
+
+
+def _audio_reference_retention(audio_label, audio_speakers=()):
+    """Describe reference-only audio continuity without requesting signal copying."""
+    if not audio_speakers:
+        return f"{audio_label}: reference - its audible continuity guides the new audio without copying the original signal."
+    subjects = [subject for subject, _speaker, _languages in audio_speakers]
+    subject_text = ", ".join(subjects[:-1]) + (" and " if len(subjects) > 1 else "") + subjects[-1]
+    timbre = "timbre guides" if len(subjects) == 1 else "timbres guide"
+    return f"{audio_label}: reference - its audio continuity guides this video, and its vocal {timbre} the dialogue delivery of {subject_text} without copying the original signal."
+
+
+def _video_continuation_prompt(prompt, video_label, audio_label=None, storyboard=False, audio_speakers=()):
     source_lines = []
     if video_label is not None:
-        source_lines.append(f"{video_label} is the continuation source for this chunk.")
+        source_lines.append(f"{video_label} is the continuation source for this video.")
     if audio_label is not None:
-        source_lines.append(f"{audio_label} is the audio from previous video that needs to be continued seamlessly.")
+        source_lines.append(_audio_reference_definition(audio_label, audio_speakers))
     if not source_lines:
         return prompt
     source_line = "\n".join(source_lines)
@@ -982,7 +1083,7 @@ def _video_continuation_prompt(prompt, video_label, audio_label=None, storyboard
     # per-chunk character-state prose. Keep this one concise reference line
     # even while the experimental per-chunk retention analysis stays disabled.
     if audio_label is not None:
-        audio_retention_line = f"{audio_label}: reference - audio from the previous video that needs to be continued seamlessly."
+        audio_retention_line = _audio_reference_retention(audio_label, audio_speakers)
         retention = RETENTION_FIELD.search(prompt)
         if retention is not None:
             field = _description_field(prompt, retention.end())
@@ -1002,7 +1103,7 @@ def _video_continuation_prompt(prompt, video_label, audio_label=None, storyboard
     # detailed description with plain continuation prose.
     if video_label is not None:
         continuation_location = "the opening storyboard block" if storyboard else "the opening local continuation sequence"
-        retention_line = f"{video_label} (appears in {continuation_location}): fully_preserved - its ending is used as the continuation starting point for this chunk."
+        retention_line = f"{video_label} (appears in {continuation_location}): fully_preserved - its ending is used as the continuation starting point for this video."
         retention = RETENTION_FIELD.search(prompt)
         if retention is not None:
             field = _description_field(prompt, retention.end())
@@ -1141,16 +1242,327 @@ def _prompt_for_chunk(prompt, frame_start, frame_end, total_frames, fps, content
     return rewritten_prompt
 
 
+def _dialogue_language_code(language):
+    """Map the H3 dialogue language label to espeak's language code."""
+    return {"arabic": "ar", "chinese": "cmn", "english": "en-us", "french": "fr-fr", "german": "de", "italian": "it", "japanese": "ja", "korean": "ko", "portuguese": "pt-br", "russian": "ru", "spanish": "es"}.get(language.strip().lower(), "en-us")
+
+
+@functools.lru_cache(maxsize=4096)
+def _dialogue_phoneme_count(word, language):
+    """Count espeak phones for one spoken word, preserving deterministic timing."""
+    spoken = re.sub(r"(^[^\w']+|[^\w']+$)", "", word, flags=re.UNICODE)
+    if not spoken:
+        return 0
+    phones = phonemize(spoken, language=_dialogue_language_code(language), backend="espeak", separator=Separator(phone=" ", word="|"), strip=True, preserve_punctuation=False)
+    return max(1, len([phone for phone in phones.replace("|", " ").split() if phone]))
+
+
+def _dialogue_word_weights(speech, language):
+    """Return phoneme and punctuation weights for a word-exact utterance."""
+    words = list(re.finditer(r"\S+", speech))
+    if not words:
+        return ()
+    weights = []
+    for word in words:
+        token = word.group()
+        if re.search(r"(?:\.{3,}|…+)", token):
+            pause = ELLIPSIS_PAUSE_SECONDS
+        elif re.search(r"[.!?][\"')]*$", token):
+            pause = SENTENCE_PAUSE_SECONDS
+        elif re.search(r"[,;:][\"')]*$", token):
+            pause = COMMA_PAUSE_SECONDS
+        else:
+            pause = 0.0
+        weights.append(WORD_ONSET_SECONDS + PHONEME_SECONDS * _dialogue_phoneme_count(token, language) + pause)
+    return tuple(zip(words, weights))
+
+
+def _last_dialogue_word_feather_ticks(prompt, maximum_ticks):
+    """Return the final rendered dialogue word's estimated duration in audio ticks."""
+    maximum_ticks = max(0, int(maximum_ticks))
+    dialogues = list(DIALOGUE_BLOCK.finditer(str(prompt or "")))
+    if not dialogues or not maximum_ticks:
+        return 0
+    # Use the final exact H3 dialogue block, including its punctuation pause,
+    # rather than re-timing the source shot's complete dialogue.
+    dialogue = dialogues[-1].group(1)
+    language_match = re.match(r"\s*\[([^]]+)\]\s*(.*)", dialogue, re.DOTALL)
+    if language_match is None:
+        return 0
+    weighted_words = _dialogue_word_weights(language_match.group(2), language_match.group(1))
+    if not weighted_words:
+        return 0
+    last_word_seconds = weighted_words[-1][1]
+    return min(maximum_ticks, max(1, int(round(last_word_seconds * AUDIO_LATENT_FPS))))
+
+
+def _dialogue_word_schedule(speech, language, start_seconds, end_seconds):
+    """Assign phoneme-weighted word intervals across one source dialogue span."""
+    weighted_words = _dialogue_word_weights(speech, language)
+    if not weighted_words:
+        return ()
+    available = max(0.0, end_seconds - start_seconds)
+    total_weight = sum(weight for _word, weight in weighted_words)
+    scale = available / total_weight if total_weight else 0.0
+    cursor = start_seconds
+    schedule = []
+    for word, weight in weighted_words:
+        next_cursor = cursor + weight * scale
+        schedule.append((word, cursor, next_cursor))
+        cursor = next_cursor
+    return tuple(schedule)
+
+
+def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges=(), sampled_start=None, sentence_chunks=False):
+    """Assign whole phoneme-timed words once on the global source-shot clock."""
+    pattern = re.compile(r"(?P<header>(?:<Subject\s+\d+>|[\w'-]+)\s*\(S\d+\)\s*says\s*:\s*)<d>\s*(?P<language>\[[^]\n]+\])\s*(?P<speech>.*?)</d>", re.IGNORECASE | re.DOTALL)
+    matches = list(pattern.finditer(body))
+    if len(matches) != len(re.findall(r"<d>", body, re.IGNORECASE)) or len(matches) != len(re.findall(r"</d>", body, re.IGNORECASE)):
+        raise ValueError("Legacy dialogue needs complete '<Subject N> (SN) says: <d>[Language] words</d>' blocks (a character name may replace <Subject N>).")
+    if not matches:
+        return body, []
+    silence = re.search(
+        r"(?i)\b(?:start(?:s)?\s+(?:the\s+)?video|begin(?:s)?)\s+in\s+silence\s+for\s+"
+        r"(?P<clock>\d+(?::\d+)?(?:\.\d+)?)\s*(?:seconds?|s)?",
+        body,
+    )
+    clock_text = "" if silence is None else silence.group("clock")
+    clock_parts = clock_text.split(":")
+    opening_silence = float(clock_parts[-1] or 0)
+    if len(clock_parts) == 2:
+        opening_silence += 60.0 * float(clock_parts[0] or 0)
+    # ponytail: the utterance owns the source shot after an explicit opening
+    # silence. Forced alignment against generated audio remains the upgrade.
+    dialogue_end = (shot_end - shot_start) / fps
+    source_dialogues = [(match, _dialogue_word_weights(match.group("speech"), match.group("language").strip("[]"))) for match in matches]
+    total_weight = sum(weight for _match, weighted_words in source_dialogues for _word, weight in weighted_words)
+    if not total_weight:
+        return pattern.sub("", body), []
+    available_seconds = max(0.0, dialogue_end - opening_silence)
+    if total_weight > available_seconds:
+        raise ValueError(f"Legacy dialogue phoneme estimate estimates {total_weight:.2f}s of speech, but the shot allows only {available_seconds:.2f}s after opening silence. Increase the shot duration, shorten its dialogue, or connect a pre-production director.")
+    speech_start = shot_start + int(math.ceil(opening_silence * fps))
+    owned_ranges = tuple((max(shot_start, speech_start, start), min(shot_end, end)) for start, end in dialogue_ranges if start < shot_end and end > speech_start)
+    word_owners = {}
+    word_start_frames = {}
+    word_end_frames = {}
+    if owned_ranges:
+        all_words = [(match_index, word_index, weight) for match_index, (_match, weighted_words) in enumerate(source_dialogues) for word_index, (_word, weight) in enumerate(weighted_words)]
+        if not sentence_chunks and len(all_words) < len(owned_ranges):
+            raise ValueError(f"Legacy dialogue has {len(all_words)} words for {len(owned_ranges)} output chunks. Add dialogue, use longer chunks, or shorten the shot so every dialogue chunk can contain a complete word.")
+        # Keep words contiguous while putting each weight boundary as close as
+        # possible to the output-time boundary. Every dialogue chunk receives
+        # a whole word, and each local phoneme schedule finishes at its seam.
+        range_seconds = [(end - start) / fps for start, end in owned_ranges]
+        total_range_seconds = sum(range_seconds)
+        cumulative_weights = []
+        weight_sum = 0.0
+        for _match_index, _word_index, weight in all_words:
+            weight_sum += weight
+            cumulative_weights.append(weight_sum)
+        if sentence_chunks:
+            from .python.dialogue_timing import sentence_word_owners
+            sentences = []
+            for _match, weighted_words in source_dialogues:
+                sentence = []
+                for word, weight in weighted_words:
+                    sentence.append(weight)
+                    # ponytail: punctuation-based boundaries; abbreviations can be
+                    # ambiguous. A language-aware segmenter is the upgrade path.
+                    if re.search(r'[.!?。！？]["\')”’]*$', word.group()):
+                        sentences.append(sentence)
+                        sentence = []
+                if sentence:
+                    sentences.append(sentence)
+            owners = sentence_word_owners(sentences, range_seconds)
+            word_owners = {item[:2]: owner for item, owner in zip(all_words, owners)}
+        else:
+            first_word = 0
+            elapsed_seconds = 0.0
+            for range_index, duration in enumerate(range_seconds[:-1]):
+                elapsed_seconds += duration
+                desired_weight = total_weight * elapsed_seconds / total_range_seconds if total_range_seconds else total_weight
+                last_allowed = len(all_words) - (len(owned_ranges) - range_index - 1)
+                final_word = min(range(first_word, last_allowed), key=lambda word_index: abs(cumulative_weights[word_index] - desired_weight))
+                for word_index in range(first_word, final_word + 1):
+                    word_owners[all_words[word_index][:2]] = range_index
+                first_word = final_word + 1
+            for word_index in range(first_word, len(all_words)):
+                word_owners[all_words[word_index][:2]] = len(owned_ranges) - 1
+        for range_index, (range_start, range_end) in enumerate(owned_ranges):
+            owned_words = [item for item in all_words if word_owners[item[:2]] == range_index]
+            if not owned_words:
+                continue
+            range_scale = range_seconds[range_index] / sum(item[2] for item in owned_words)
+            range_cursor = range_start / fps
+            for match_index, word_index, weight in owned_words:
+                word_start_frames[(match_index, word_index)] = max(range_start, int(math.floor(range_cursor * fps)))
+                range_cursor += weight * range_scale
+                word_end_frames[(match_index, word_index)] = min(range_end, int(math.ceil(range_cursor * fps)))
+    # Expand natural word and pause weights across the remaining planned shot;
+    # this prevents the dialogue from finishing in early chunks and leaving a
+    # silent tail simply because a long source shot was chunked.
+    scale = available_seconds / total_weight
+    cursor = opening_silence
+    dialogue = []
+    carries_boundary_words = False
+    sampled_start = frame_start if sampled_start is None else int(sampled_start)
+    current_range = (max(shot_start, speech_start, frame_start), min(shot_end, frame_end))
+    current_range_index = owned_ranges.index(current_range) if current_range in owned_ranges else None
+    for match_index, (match, weighted_words) in enumerate(source_dialogues):
+        speech = match.group("speech")
+        selected = []
+        for word_index, (word, weight) in enumerate(weighted_words):
+            cursor += weight * scale
+            # A word is owned where its spoken sound finishes. This lets a word
+            # cross a chunk's physical prefix instead of being cut at its tail.
+            word_end_frame = shot_start + int(math.ceil(cursor * fps))
+            if owned_ranges:
+                # The physical opening prefix is sampled again and replaces
+                # the preceding chunk's decoded tail. Give H3 the words that
+                # begin there, followed by this chunk's retained words, so
+                # its phoneme timing continues through the boundary.
+                owns_output = current_range_index is not None and word_owners[(match_index, word_index)] == current_range_index and current_range[0] < word_end_frames[(match_index, word_index)] <= current_range[1]
+                owns_prefix = not sentence_chunks and current_range_index and word_owners[(match_index, word_index)] == current_range_index - 1 and sampled_start <= word_start_frames[(match_index, word_index)] < current_range[0]
+                selected_here = owns_prefix or owns_output
+                carries_boundary_words = carries_boundary_words or bool(owns_prefix)
+            else:
+                selected_here = max(frame_start, shot_start) < word_end_frame <= min(frame_end, shot_end)
+            if selected_here:
+                selected.append(word)
+        if selected:
+            words = re.sub(r"\s+", " ", speech[selected[0].start():selected[-1].end()]).strip()
+            dialogue.append(match.group("header") + "<d>" + match.group("language") + " " + words + "</d>")
+    if dialogue and carries_boundary_words:
+        # The selected words are a source-clock slice, not a fresh utterance.
+        # State this once outside <d> so H3 continues the prefix's phonemes.
+        dialogue.insert(0, "The dialogue is already in progress at this video opening.")
+    return pattern.sub("", body), dialogue
+
+
+def _legacy_shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None, sentence_chunks=False):
+    """Pre-Gemma proportional word slicing, restored from 12a771b's parent."""
+    if frame_start > shot_start:
+        # Remove explicit opening-image setup BEFORE slicing can truncate it.
+        # Protect spoken text even when it mentions a picture or first frame.
+        parts = re.split(r"(<d>.*?</d>)", body, flags=re.IGNORECASE | re.DOTALL)
+        opening = re.compile(r"(?:^\s*|(?<=[.!?])\s+)(?:starts?\s+with|begins?\s+with|use|using)\s+<Picture\s+\d+>\s+as\s+(?:the\s+)?(?:exact\s+)?(?:first|opening|initial)\s+frame\b[^.!?]*(?:[.!?]|$)\s*", re.IGNORECASE)
+        body = "".join(part if index % 2 else opening.sub("", part) for index, part in enumerate(parts))
+    visual_body, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start, sentence_chunks)
+    if visual_body != body:
+        if frame_start > shot_start:
+            # Opening-only setup belongs only to the source shot's beginning.
+            # Its former proportional visual slice could reintroduce a one-second
+            # silence in later chunks even while their dialogue words progressed.
+            visual_body = re.sub(
+                r"(?is)(?:<Subject\s+\d+>|[\w'-]+)\s+start(?:s)?\s+(?:the\s+)?video\s+in\s+silence\s+for\s+"
+                r"\d+(?::\d+)?(?:\.\d+)?\s*(?:seconds?|s)?\s*,?\s*(?:then\s*)?",
+                "",
+                visual_body,
+            )
+        visual = _legacy_shot_body_for_range(visual_body, shot_start, shot_end, frame_start, frame_end, fps) if visual_body.strip() else ""
+        return " ".join([visual.strip()] + dialogue).strip() or "Continue the established shot without additional dialogue."
+    if frame_start <= shot_start and frame_end >= shot_end:
+        return body
+    # ponytail: this estimates action timing by word count, not scene semantics;
+    # connect a pre-production provider for visual, model-authored direction.
+    units = []
+    for sentence in re.split(r"(?<=[.!?])\s+|(?<=[.!?][\"'])\s+|\n\s*\n+", body):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        # Keep complete visual sentences: fixed word blocks can leave a
+        # dangling camera instruction immediately before dialogue prose.
+        units.append(sentence)
+    weights = [max(1, len(re.findall(r"\w+", unit))) for unit in units]
+    total_weight = sum(weights)
+    start_weight = total_weight * (max(frame_start, shot_start) - shot_start) / (shot_end - shot_start)
+    end_weight = total_weight * (min(frame_end, shot_end) - shot_start) / (shot_end - shot_start)
+    selected = []
+    offset = 0
+    for unit, weight in zip(units, weights):
+        if offset < end_weight and offset + weight > start_weight:
+            selected.append(unit)
+        offset += weight
+    return " " + " ".join(selected) if selected else " Continue the established shot and its ongoing action."
+
+
+def _legacy_opening_body_with_timed_dialogue(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None, sentence_chunks=False):
+    """Keep opening visual prose whole while assigning only its dialogue to time."""
+    visual_body, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start, sentence_chunks)
+    return " ".join([visual_body.strip()] + dialogue).strip()
+
+
+def _legacy_static_camera_prompt(prompt, previous_prompt=None):
+    """Reinforce a still camera only when both neighboring descriptions allow it."""
+    def description_bounds(text):
+        """Ignore reference metadata when checking camera instructions."""
+        field = _description_field(text)
+        start = field.end() if field is not None else 0
+        end = DESCRIPTION_END.search(text, start)
+        return start, end.start() if end is not None else len(text)
+
+    # ponytail: explicit English camera-motion vocabulary, not semantic parsing.
+    # Unknown/implicit movement needs a director; never infer it from dialogue.
+    motion = re.compile(r"\b(?:pan(?:s|ning)?|tilt(?:s|ing)?|zoom(?:s|ing)?|dolly|dollies|dollying|truck(?:s|ing)?|orbit(?:s|ing)?|arc(?:s|ing)?|tracking\s+shot|handheld)\b|\bcamera\b[^.!?\n]{0,100}\b(?:move[sd]?|moving|movement|follow[s]?|track[s]?|shake[s]?|shaking|rotate[s]?|rotating|push(?:es)?|pull[s]?|crane[s]?)\b", re.IGNORECASE)
+    for text in (prompt, previous_prompt or ""):
+        start, end = description_bounds(text)
+        description = re.sub(r"<d>.*?</d>", "", text[start:end], flags=re.IGNORECASE | re.DOTALL)
+        description = re.sub(r"\b(?:no|without)\s+camera\s+movement\b", "", description, flags=re.IGNORECASE)
+        if motion.search(description):
+            return prompt
+    start, _ = description_bounds(prompt)
+    # The legacy source prompt often repeats this whole-shot instruction in
+    # every sliced chunk. The local static-frame instruction below is the
+    # single command H3 needs for a chunk without detected camera motion.
+    description_end = DESCRIPTION_END.search(prompt, start)
+    description_end = len(prompt) if description_end is None else description_end.start()
+    # ponytail: explicit English setup clauses only; keep dialogue verbatim
+    # and preserve action after a colon. Semantic camera direction needs a director.
+    parts = re.split(r"(<d>.*?</d>)", prompt[start:description_end], flags=re.IGNORECASE | re.DOTALL)
+    setup = re.compile(r"(?:^\s*|(?<=[.!?\]])\s+)(?:the\s+)?(?:camera\b|(?:first|opening|initial)\s+frame\b|(?:wide|medium|close[- ]?up|establishing)\s+shot\b)[^.!?:]*(?:[.!?:]|$)\s*", re.IGNORECASE)
+    description = "".join(part if index % 2 else setup.sub("", part) for index, part in enumerate(parts))
+    prompt = prompt[:start] + description + prompt[description_end:]
+    # Preserve the required opening shot marker before its descriptive prose.
+    marker = SHOT_MARKER.match(prompt, start + len(prompt[start:]) - len(prompt[start:].lstrip()))
+    insert_at = marker.end() if marker is not None else start
+    sentence = "The camera stays static in the stablished frame."
+    if prompt[insert_at:].lstrip().startswith(sentence):
+        return prompt
+    return prompt[:insert_at] + " " + sentence + " " + prompt[insert_at:].lstrip()
+
+
 def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_continuation,
-                           audio_continuation, ref2va, video_number, audio_number):
+                           audio_continuation, ref2va, video_number, audio_number, legacy=False, taomate=False):
     total_frames = plan[-1]["frame_end"]
     guide_enabled = guide_frames > 0
     planned = []
+    previous_bodies = {}
+    source_shots = _parse_prompt_shots(prompt, total_frames, fps)[1] if legacy else ()
+    dialogue_ranges = [(chunk["frame_start"] + chunk.get("output_trim_frames", 0), chunk["frame_end"]) for chunk in plan] if legacy else ()
     for index, chunk in enumerate(active_plan):
         continuation = index > 0
         content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
         continuation_video_label = f"<Video {video_number}>" if continuation and video_continuation else None
         continuation_audio_label = f"<Audio {audio_number}>" if continuation and audio_continuation else None
+        body_overrides = None
+        # The first H3 video establishes the shot from the user's complete
+        # source description, but dialogue still follows the output clock.
+        # Later videos also slice visual action for continuation.
+        if legacy:
+            body_overrides = {}
+            for number, start, end, body in source_shots:
+                if start >= chunk["frame_end"] or end <= content_start:
+                    continue
+                # Camera establishment belongs to the first chunk of EACH shot.
+                opening = content_start <= start
+                body_for_range = _legacy_opening_body_with_timed_dialogue if opening else _legacy_shot_body_for_range
+                local_body = body_for_range(body, start, end, content_start, chunk["frame_end"], fps, dialogue_ranges, chunk["frame_start"], sentence_chunks=taomate)
+                if not opening:
+                    prior_body = previous_bodies.get(number, "")
+                    local_body = _legacy_static_camera_prompt(local_body, prior_body)
+                body_overrides[number] = local_body
+            previous_bodies = body_overrides
         chunk_prompt = _prompt_for_chunk(
             prompt,
             chunk["frame_start"],
@@ -1163,10 +1575,35 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
             continuation_video_label=continuation_video_label,
             continuation_audio_label=continuation_audio_label,
             has_opening_frames=guide_enabled,
+            body_overrides=body_overrides,
         )
         debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt)
         planned.append((chunk_prompt, debug_prompt))
     return planned
+
+
+def _preview_ranges_for_plan(plan, keep_physical_prefix=False, show_replaced_tail=False):
+    """Return sequential display ranges, optionally retaining packed prefixes."""
+    ranges = []
+    retained_prefix_offset = 0
+    for index, chunk in enumerate(plan):
+        trim_frames = max(0, int(chunk.get("output_trim_frames", 0)))
+        normal_start = int(chunk["frame_start"]) + trim_frames
+        frame_count = int(chunk["frame_end"]) - normal_start
+        keep_prefix = bool(keep_physical_prefix and index and trim_frames)
+        start = normal_start + retained_prefix_offset
+        if keep_prefix:
+            frame_count += trim_frames
+        ranges.append({"chunk": index + 1, "start": start, "end": start + frame_count - 1})
+        if keep_prefix:
+            retained_prefix_offset += trim_frames
+    if show_replaced_tail:
+        for index in range(1, len(ranges)):
+            ranges[index - 1]["replacement_overlap_frames"] = max(
+                0,
+                int(plan[index].get("output_trim_frames", 0)),
+            )
+    return ranges
 
 
 def _debug_chunk_header(index, chunk, content_start):
@@ -1235,6 +1672,23 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
     return records
 
 
+def _deterministic_dialogue_segments(body, shot_start, shot_end, chunks, fps):
+    """Return exact phoneme-timed dialogue fragments owned by output chunks."""
+    segments = []
+    dialogue_ranges = [(item["output_start"], item["output_end"]) for item in chunks]
+    for chunk_index, chunk in enumerate(chunks, 1):
+        start = max(shot_start, int(chunk["output_start"]))
+        end = min(shot_end, int(chunk["output_end"]))
+        if start >= end:
+            continue
+        _visual, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, start, end, fps, dialogue_ranges)
+        for item in dialogue:
+            if "<d>" not in item:
+                continue
+            segments.append({"chunk": chunk_index, "start_frame": start, "end_frame": end, "content": item})
+    return segments
+
+
 def _gemma_source_shot_records(shots, range_start, range_end):
     """Return complete source-shot facts for Gemma's preproduction pass."""
     return [
@@ -1275,12 +1729,17 @@ def _gemma_preproduction_request(prompt, shots, full_plan, fps, ref2va):
         full_plan[0]["frame_start"],
         full_plan[-1]["frame_end"],
     )
+    chunks = _gemma_preproduction_chunks(full_plan)
+    for shot in source_shots:
+        shot["deterministic_dialogue_segments"] = _deterministic_dialogue_segments(
+            shot["source_body"], shot["shot_start"], shot["shot_end"], chunks, fps,
+        )
     return source_shots, {
         "chunk_count": len(full_plan),
         "fps": fps,
         "prompt_mode": "ref" if ref2va else "base",
         "source_shots": source_shots,
-        "chunks": _gemma_preproduction_chunks(full_plan),
+        "chunks": chunks,
         "original_prompt": prompt,
     }
 
@@ -1298,6 +1757,12 @@ def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, 
             "new generation. This is opening continuity, not a Video/Audio reference and must not be named "
             "or described as a new shot"
         )
+    if video_continuation_method == VIDEO_CONTINUATION_METHOD_MASKED_AV:
+        return (
+            f"a {video_continuation}-frame video/audio boundary copied from the previous completed chunk into the "
+            "discarded temporal packing prefix; this is duplicated opening continuity, not a Video reference "
+            "or a new shot; native video and audio keyframes provide the boundary without a separate Audio reference"
+        )
     sources = []
     if context_keyframes:
         sources.append(
@@ -1312,11 +1777,6 @@ def _gemma_conditioning_context(continuation, context_keyframes, guide_overlap, 
             sources.append(
                 f"the whole previous physical chunk's audio as {audio_label}"
             )
-        if include_video1_reference and not context_keyframes:
-            sources.append(
-                "one fixed five-frame video keyframe clip made from the previous chunk's exact final tail, "
-                "anchored across the discarded packing prefix; it has no separate audio keyframe"
-            )
     if guide_overlap:
         sources.append(
             f"a {guide_overlap}-frame latent warm-start that is fully denoised and retained, not a fixed keyframe"
@@ -1329,9 +1789,41 @@ def _chunk_retention_analysis(retention_analysis):
     return retention_analysis.strip() if isinstance(retention_analysis, str) else ""
 
 
+def _reinforce_static_shot_grade(description, shots, content_start):
+    """Carry a source shot's first-picture grade into its static continuation."""
+    camera = "The camera remains static in the established framing."
+    # ponytail: require an explicit picture/first-frame relationship in one
+    # clause. Ambiguous prose is left alone rather than guessing an asset.
+    source = next((body for _index, start, end, body in shots if start < content_start < end), None)
+    if source is None or not re.search(r"(?i)camera\s+(?:stays|remains|is)\s+static", source):
+        return description
+    pictures = []
+    for clause in re.split(r"[.!?;\n]", source):
+        if re.search(r"(?i)\bfirst\s+frame\b", clause):
+            pictures.extend(PICTURE_LABEL.findall(clause))
+    pictures = list(dict.fromkeys(pictures))
+    if len(pictures) != 1:
+        return description
+    # Only the opening continuing segment may inherit this shot's reference;
+    # a later real cut has its own camera and lighting instructions.
+    marker = SHOT_MARKER.search(description)
+    end = marker.start() if marker is not None else len(description)
+    opening = description[:end]
+    if camera not in opening:
+        return description
+    reinforcement = f" Use the lighting and color grading from {pictures[0]}."
+    # Compare letters and digits only: punctuation, spacing and case can
+    # vary in Gemma's response without making this a new instruction.
+    normalized_opening = "".join(character for character in opening.casefold() if character.isalnum())
+    normalized_reinforcement = "".join(character for character in reinforcement.casefold() if character.isalnum())
+    if re.search(re.escape(normalized_reinforcement) + r"(?!\d)", normalized_opening):
+        return description
+    return opening.replace(camera, camera + reinforcement, 1) + description[end:]
+
+
 def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=False,
                                    continuation_video_label=None, continuation_audio_label=None,
-                                   retention_analysis=""):
+                                   retention_analysis="", audio_speakers=(), summary=None):
     if drop_picture_anchors:
         prompt = _drop_picture_anchors(prompt)
     field = _description_field(prompt)
@@ -1364,13 +1856,85 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
                 + "\n\n"
                 + rewritten[insert_at:].lstrip()
             )
-    if continuation_video_label is not None:
+    if continuation_video_label is not None or continuation_audio_label is not None:
         rewritten = _video_continuation_prompt(
             rewritten,
             continuation_video_label,
             continuation_audio_label,
+            audio_speakers=audio_speakers,
         )
+    if summary is not None:
+        # Replace the entire prior summary after reference definitions have
+        # been inserted, keeping Gemma's current-chunk paragraph authoritative.
+        summary_field = re.search(r"(?im)^\s*summary\s*:", rewritten)
+        if summary_field is not None:
+            next_field = re.search(r"(?im)^\s*(?:retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music)\s*:", rewritten[summary_field.end():])
+            end = summary_field.end() + next_field.start() if next_field else len(rewritten)
+            rewritten = rewritten[:summary_field.start()].rstrip() + "\n\nsummary: " + summary.strip() + "\n\n" + rewritten[end:].lstrip()
+        else:
+            field = RETENTION_FIELD.search(rewritten) or _description_field(rewritten)
+            insert_at = field.start() if field else len(rewritten)
+            rewritten = rewritten[:insert_at].rstrip() + "\n\nsummary: " + summary.strip() + "\n\n" + rewritten[insert_at:].lstrip()
     return rewritten
+
+
+def _chunk_summary_prompt(prompt, original_prompt, continuation, picture_label=None, video_label=None, audio_label=None, boundary_keyframe=False):
+    """Keep the source opening summary only for chunk one; rebuild later roles."""
+    section = re.compile(r"(?im)^[ \t]*summary[ \t]*:[\s\S]*?(?=^[ \t]*(?:retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music)[ \t]*:|\Z)")
+    current = section.search(prompt)
+    if not continuation:
+        # Copy the complete original section verbatim, including multiline prose.
+        original = section.search(original_prompt)
+        replacement = original.group(0) if original else ""
+    else:
+        tasks, roles = [], []
+        if video_label is not None:
+            tasks.append("video continuation")
+            roles.append(f"Continue directly from the end of {video_label}.")
+        if audio_label is not None:
+            tasks.append("audio reference")
+            roles.append(f"Use {audio_label}, the previous video's audio, as the audio reference.")
+        if picture_label is not None or boundary_keyframe:
+            tasks.append("keyframe completion")
+            roles.append(f"{picture_label} serves as first frame of target video." if picture_label is not None else "Continue from the supplied previous-video boundary keyframe.")
+        replacement = "summary: " + ("[" + " + ".join(tasks) + "] " if tasks else "") + (" ".join(roles) or "Continue the current scene.") + "\n\n"
+    if current is not None:
+        return prompt[:current.start()] + replacement + prompt[current.end():]
+    field = RETENTION_FIELD.search(prompt) or _description_field(prompt)
+    start = field.start() if field else 0
+    return prompt[:start] + replacement + prompt[start:]
+
+
+def _first_frame_picture_prompt(prompt, picture_label):
+    """Add the ordinary picture's first-frame role to the current summary."""
+    field = re.search(r"(?im)^\s*summary\s*:", prompt)
+    end_field = re.search(r"(?im)^\s*(?:retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music)\s*:", prompt[field.end():] if field else prompt)
+    start = field.end() if field else (end_field.start() if end_field else len(prompt))
+    end = start + end_field.start() if field and end_field else (len(prompt) if field else start)
+    summary = prompt[start:end].strip()
+    # Keep the authored tasks and prose, adding only the requested reference contract.
+    tasks = re.match(r"\[([^\]]*)\]", summary)
+    if tasks and "keyframe completion" not in tasks.group(1).lower():
+        summary = "[" + tasks.group(1) + " + keyframe completion]" + summary[tasks.end():]
+    elif not tasks:
+        summary = "[keyframe completion] " + summary
+    sentence = f"{picture_label} serves as first frame of target video."
+    if sentence not in summary:
+        summary = summary.rstrip() + " " + sentence
+    prefix = prompt[:field.start()] if field else prompt[:start]
+    return prefix.rstrip() + "\n\nsummary: " + summary.strip() + "\n\n" + prompt[end:].lstrip()
+
+
+def _last_frame_picture_reference(vae, frames, width, height):
+    """Encode the final full decoded frame as a native image reference."""
+    if frames is None or frames.ndim != 4 or frames.shape[0] == 0:
+        raise ValueError("Video1 first-frame picture requires decoded previous-chunk frames")
+    # Preserve the full frame's float values when it already matches the canvas.
+    image = frames[-1:, ..., :3] if tuple(frames.shape[1:3]) == (height, width) else _reference_image(frames[-1:], width, height)
+    latent = vae.encode(image)
+    if latent.ndim != 5 or latent.shape[1] != 24:
+        raise ValueError("Video1 first-frame picture encode did not return an H3 image latent")
+    return {"type": "image", "data": image}, {"kind": "image", "latent_h": image.shape[1] // 16, "latent_w": image.shape[2] // 16, "latent": latent}
 
 
 def _gemma_report(chunk_number, result):
@@ -1513,6 +2077,29 @@ def _encode_prompt(clip, prompt, images, positive, width, height, continuation, 
     return conditioning[0]
 
 
+def _linear_ref2va_image_refs(refs, images, vae):
+    """Re-encode Ref2VA image blocks from their original sRGB image inputs."""
+    if vae is None:
+        raise ValueError("linear_color_compute needs the video VAE to rebuild Ref2VA image references")
+    image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
+    rebuilt = []
+    image_index = 0
+    for ref in refs:
+        updated = ref.copy()
+        if ref.get("kind") == "image":
+            if image_index >= len(image_list):
+                raise ValueError("linear_color_compute needs every Ref2VA reference image in the images input")
+            width = int(ref["latent_w"]) * 16
+            height = int(ref["latent_h"]) * 16
+            linear_image = _convert_image_transfer(image_list[image_index], _srgb_to_inverse_gamma_compute_rgb)
+            updated["latent"] = vae.encode(_resize(linear_image, width, height, "disabled"))
+            image_index += 1
+        rebuilt.append(updated)
+    if image_index != len(image_list):
+        raise ValueError("linear_color_compute received more images than the Ref2VA conditioning uses")
+    return rebuilt
+
+
 def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
     max_chunk_frames = chunk_frames - (chunk_frames - 5) % 17
     max_chunk_t = _video_steps(max_chunk_frames)
@@ -1567,8 +2154,9 @@ def _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames=5):
     return plan
 
 
-def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames):
-    plan = _chunk_plan(video_t, audio_t, chunk_frames, 5)
+def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames, overlap_frames=5):
+    """Plan a zero/noise synthetic prefix of the requested H3-valid duration."""
+    plan = _chunk_plan(video_t, audio_t, chunk_frames, overlap_frames)
     for index in range(1, len(plan)):
         chunk = plan[index].copy()
         chunk["video_start"] += chunk["context_video_t"]
@@ -1576,6 +2164,20 @@ def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames):
         chunk["synthetic_prefix"] = True
         plan[index] = chunk
     return plan
+
+
+def _full_noise_prefix(video_noise, audio_noise, video_start, audio_start, video_count, audio_count):
+    """Reuse the preceding full-sequence noise tokens for a packed prefix."""
+    if video_count <= 0 or audio_count <= 0 or video_start < video_count or audio_start < audio_count:
+        raise ValueError("Synthetic prefix requires enough preceding full-sequence AV noise")
+    if video_start > video_noise.shape[2] or audio_start > audio_noise.shape[-1]:
+        raise ValueError("Synthetic prefix noise starts outside the full sequence")
+    return video_noise[:, :, video_start - video_count:video_start], audio_noise[..., audio_start - audio_count:audio_start]
+
+
+def _per_chunk_noise_seed(seed, chunk_index):
+    """Return the requested one-based seed multiple for an independent chunk."""
+    return (int(seed) * (int(chunk_index) + 1)) & 0xffffffffffffffff
 
 
 def _apply_audio_context_feather(audio_mask, context_audio_t,
@@ -1603,6 +2205,57 @@ def _apply_audio_context_feather(audio_mask, context_audio_t,
         shape[-1] = feather_ticks
         audio_mask[..., hard_ticks:context_audio_t] = ramp.view(*shape)
     return audio_mask
+
+
+def _native_audio_boundary_target(chunk_video, chunk_audio, previous_audio, context_audio_t, feather_ticks=None, previous_video=None):
+    """Seed AV prefixes and release them over the same final-word interval."""
+    context_audio_t = int(context_audio_t)
+    if context_audio_t <= 0 or context_audio_t >= chunk_audio.shape[-1]:
+        raise ValueError("Native audio boundary must be smaller than the sampled audio chunk")
+    if previous_audio is None or previous_audio.shape[-1] < context_audio_t:
+        raise ValueError("Previous chunk is too short for the native audio boundary")
+
+    target_audio = chunk_audio.clone()
+    target_audio[..., :context_audio_t] = previous_audio[..., -context_audio_t:].to(
+        device=target_audio.device,
+        dtype=target_audio.dtype,
+    )
+    video_mask = torch.ones(
+        (chunk_video.shape[0], 1, chunk_video.shape[2], chunk_video.shape[3], chunk_video.shape[4]),
+        device=chunk_video.device,
+        dtype=torch.float32,
+    )
+    audio_mask = torch.ones(
+        (target_audio.shape[0], 1, target_audio.shape[2], target_audio.shape[3]),
+        device=target_audio.device,
+        dtype=torch.float32,
+    )
+    feather_ticks = context_audio_t if feather_ticks is None else max(0, min(int(feather_ticks), context_audio_t))
+    hard_ticks = context_audio_t - feather_ticks
+    # Keep the copied audio exact until the final spoken word. A linear ramp then
+    # hands that word's end to H3 while retaining a fully generated next tick.
+    if hard_ticks:
+        audio_mask[..., :hard_ticks] = 0.0
+    if feather_ticks:
+        positions = torch.linspace(0.0, 1.0, feather_ticks, device=audio_mask.device, dtype=audio_mask.dtype)
+        audio_mask[..., hard_ticks:context_audio_t] = positions.view(1, 1, 1, feather_ticks)
+    if previous_video is not None:
+        video_t = previous_video.shape[2]
+        if video_t <= 0 or video_t >= chunk_video.shape[2] or previous_video.shape[:2] + previous_video.shape[3:] != chunk_video.shape[:2] + chunk_video.shape[3:]:
+            raise ValueError("Native video boundary must match the target and leave a generated suffix")
+        chunk_video = chunk_video.clone()
+        chunk_video[:, :, :video_t] = previous_video.to(device=chunk_video.device, dtype=chunk_video.dtype)
+        # Use temporal frame positions, not evenly spaced token indices: H3
+        # tokens cover 1,4,4,4,4 frames. Align the final token with audio's end.
+        frame_ends = torch.tensor([_pixel_frames(i + 1) - 1 for i in range(video_t)], device=video_mask.device, dtype=torch.float32)
+        positions = frame_ends / max(float(frame_ends[-1]), 1.0) * (context_audio_t - 1)
+        if feather_ticks > 1:
+            weights = ((positions - hard_ticks) / (feather_ticks - 1)).clamp(0, 1)
+        else:
+            weights = torch.zeros_like(positions)
+        video_mask[:, :, :video_t] = weights.view(1, 1, video_t, 1, 1)
+        return chunk_video, target_audio, comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+    return target_audio, comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
 
 
 def _masked_av_overlap_target(chunk_video, chunk_audio, previous_video, previous_audio,
@@ -1670,6 +2323,29 @@ def _replace_masked_av_video_prefix(chunk_video, replacement_video, context_vide
     return updated
 
 
+def _replace_decoded_frame_tail(parts, replacement):
+    """Replace final decoded frames across chunk parts without changing duration."""
+    remaining = int(replacement.shape[0])
+    if remaining <= 0:
+        return
+    available = sum(int(part.shape[0]) for part in parts)
+    if available < remaining:
+        raise ValueError(
+            f"Cannot replace {remaining} decoded frames; only {available} finalized frames are available"
+        )
+    source_end = remaining
+    for index in range(len(parts) - 1, -1, -1):
+        part = parts[index]
+        take = min(int(part.shape[0]), remaining)
+        source_start = source_end - take
+        replacement_slice = replacement[source_start:source_end].to(device=part.device, dtype=part.dtype)
+        parts[index] = replacement_slice.clone() if take == int(part.shape[0]) else torch.cat((part[:-take], replacement_slice), dim=0)
+        remaining -= take
+        source_end = source_start
+        if remaining == 0:
+            break
+
+
 def _replace_stream_tail(parts, replacement):
     """Replace an accumulated stream tail without changing its total length."""
     remaining = int(replacement.shape[-1])
@@ -1702,11 +2378,11 @@ def _replace_stream_tail(parts, replacement):
 def _video_continuation_boundary_guide(previous_video, chunk, context_keyframes, use_video_continuation):
     if not use_video_continuation or context_keyframes:
         return None, 0
-    if not chunk.get("synthetic_prefix") or chunk.get("output_trim_frames") != 5:
-        raise ValueError("Video1 boundary keyframe needs the five-frame discarded packing prefix")
+    if not chunk.get("synthetic_prefix"):
+        raise ValueError("Native video boundary keyframe needs a discarded synthetic packing prefix")
     guide_t = _video_steps(chunk["output_trim_frames"])
     if previous_video.shape[2] < guide_t:
-        raise ValueError("Previous chunk is too short for the five-frame Video1 boundary keyframe")
+        raise ValueError("Previous chunk is too short for the requested native video boundary keyframe")
     return previous_video[:, :, -guide_t:].clone(), 0
 
 
@@ -1735,6 +2411,25 @@ def _linear_rgb_to_srgb(linear):
         linear * 12.92,
         1.055 * positive - 0.055,
     )
+
+
+def _srgb_to_inverse_gamma_compute_rgb(images):
+    """Apply the requested float32 sRGB^(1/2.4) compute transfer."""
+    return images.to(dtype=torch.float32).clamp_min(0.0).pow(1.0 / 2.4)
+
+
+def _inverse_gamma_compute_to_srgb(rgb):
+    """Restore display sRGB values from inverse-gamma compute RGB."""
+    return rgb.to(dtype=torch.float32).clamp_min(0.0).pow(2.4)
+
+
+def _convert_image_transfer(images, converter):
+    """Apply an RGB transfer curve while retaining any non-RGB image channels."""
+    if images is None:
+        return None
+    converted = images.to(dtype=torch.float32).clone()
+    converted[..., :3] = converter(converted[..., :3])
+    return converted
 
 
 def _bounded_overlap_color_sample(frames):
@@ -1867,64 +2562,71 @@ def _apply_fixed_output_color_transform(images, transform):
 
 
 def _correct_decoded_chunk_color(previous_finalized_frames, decoded_chunk_frames, overlap_frames,
-                                 correction_frames=None):
-    """Color-match only new same-shot decoded output, never the H3 input path."""
-    overlap = min(
-        max(0, int(overlap_frames)),
-        int(decoded_chunk_frames.shape[0]),
-    )
+                                 correction_frames=None, enabled=True):
+    """Apply ColorMatchV2's output-only MKL transfer to one decoded chunk."""
+    if not enabled:
+        return decoded_chunk_frames, None, 0
+    overlap = min(max(0, int(overlap_frames)), int(decoded_chunk_frames.shape[0]))
     generated_available = int(decoded_chunk_frames.shape[0]) - overlap
     correction_count = generated_available if correction_frames is None else min(
-        generated_available,
-        max(0, int(correction_frames)),
-    )
+        generated_available, max(0, int(correction_frames)))
     if previous_finalized_frames is None or correction_count <= 0:
         return decoded_chunk_frames, None, 0
     if not int(previous_finalized_frames.shape[0]):
         return decoded_chunk_frames, None, 0
-    transform = _fixed_output_color_transform(
-        previous_finalized_frames,
-        decoded_chunk_frames[overlap:overlap + 1],
-    )
+
+    # Match ColorMatchV2 exactly: each target frame uses its own ColorMatcher
+    # MKL transfer against the last finalized frame before this chunk.
+    from color_matcher import ColorMatcher
+    reference = previous_finalized_frames[-1].detach().to(device="cpu", dtype=torch.float32).numpy()
     corrected = decoded_chunk_frames.clone()
-    corrected[overlap:overlap + correction_count] = _apply_fixed_output_color_transform(
-        decoded_chunk_frames[overlap:overlap + correction_count],
-        transform,
-    )
-    corrected_stats = _serializable_color_statistics(
-        _display_color_statistics(corrected[overlap:overlap + 1])
-    )
-    transform.update({
+    failures = 0
+    for frame_index in range(correction_count):
+        target_index = overlap + frame_index
+        target = decoded_chunk_frames[target_index].detach().to(device="cpu", dtype=torch.float32).numpy()
+        try:
+            matched = ColorMatcher().transfer(src=target, ref=reference, method="mkl")
+        except Exception as error:
+            # ColorMatchV2 keeps the original target when a frame cannot be matched.
+            logging.warning("HR Endless Sampler MKL color match skipped frame %d: %s", target_index, error)
+            failures += 1
+            continue
+        corrected[target_index] = torch.from_numpy(matched).to(dtype=corrected.dtype).clamp_(0, 1)
+
+    raw_stats = _serializable_color_statistics(_display_color_statistics(decoded_chunk_frames[overlap:overlap + 1]))
+    corrected_stats = _serializable_color_statistics(_display_color_statistics(corrected[overlap:overlap + 1]))
+    reference_stats = _serializable_color_statistics(_display_color_statistics(previous_finalized_frames[-1:]))
+    return corrected, {
+        "method": "mkl",
+        "reference": reference_stats,
+        "raw": raw_stats,
         "corrected": corrected_stats,
+        "failures": failures,
         "residual": {
-            "rgb_mean": [
-                corrected_value - reference_value
-                for corrected_value, reference_value in zip(
-                    corrected_stats["rgb_mean"], transform["reference"]["rgb_mean"]
-                )
-            ],
-            "luma_mean": corrected_stats["luma_mean"] - transform["reference"]["luma_mean"],
-            "luma_median": corrected_stats["luma_median"] - transform["reference"]["luma_median"],
-            "black_clip": corrected_stats["black_clip"] - transform["reference"]["black_clip"],
+            "rgb_mean": [corrected_value - reference_value for corrected_value, reference_value in zip(corrected_stats["rgb_mean"], reference_stats["rgb_mean"])],
+            "luma_mean": corrected_stats["luma_mean"] - reference_stats["luma_mean"],
+            "luma_median": corrected_stats["luma_median"] - reference_stats["luma_median"],
+            "black_clip": corrected_stats["black_clip"] - reference_stats["black_clip"],
         },
-    })
-    return corrected, transform, correction_count
+    }, correction_count
 
 
 def _final_shot_color_correction(images, source_shots, timing_plan, chunk_ranges):
-    """Match stable-lighting shot chunks to that shot's first rendered chunk.
+    """Match every stable-lighting shot frame to that shot's first frame.
 
     The ordinary per-chunk seam correction remains responsible for exact
-    adjacent-boundary continuity. This second pass uses Gemma's immutable
-    source-shot lighting decision only after every chunk is complete, so it
-    never changes H3/Qwen/Gemma conditioning or the serial sampling path.
+    adjacent-boundary continuity. This second pass uses that same MKL transfer
+    over the completed shot. When Gemma supplies a lighting decision, only a
+    declared lighting change suppresses it.
     """
-    if images is None or not source_shots or timing_plan is None or not chunk_ranges:
+    if images is None or not source_shots or not chunk_ranges:
         return images, []
     if images.ndim != 4 or not int(images.shape[0]):
         return images, []
 
-    lighting = {int(shot.source_shot): bool(shot.light_change) for shot in timing_plan.shots}
+    lighting = {} if timing_plan is None else {
+        int(shot.source_shot): bool(shot.light_change) for shot in timing_plan.shots
+    }
     corrected = images.clone()
     reports = []
     frame_count = int(images.shape[0])
@@ -1934,39 +2636,66 @@ def _final_shot_color_correction(images, source_shots, timing_plan, chunk_ranges
         end = min(frame_count, int(shot_end))
         if start >= end:
             continue
-        if lighting.get(source_shot, True):
+        if lighting.get(source_shot, timing_plan is not None):
             reports.append((source_shot, "skipped: source prompt permits lighting change"))
             continue
 
-        anchor = None
+        anchor = images[start:start + 1]
         corrected_ranges = 0
         for chunk in chunk_ranges:
             chunk_start = max(start, int(chunk.get("start", start)))
             chunk_end = min(end, int(chunk.get("end", end - 1)) + 1)
             if chunk_start >= chunk_end:
                 continue
-            if anchor is None:
-                # This complete physical-chunk portion defines the grade for
-                # the source shot. _display_color_statistics samples it
-                # cheaply, so retaining the tensor needs no extra copy.
-                anchor = images[chunk_start:chunk_end]
+            # Preserve the source shot's first frame exactly; every other
+            # frame, including the remainder of its first chunk, is graded.
+            chunk_start = max(chunk_start, start + 1)
+            if chunk_start >= chunk_end:
                 continue
-            transform = _fixed_output_color_transform(
-                anchor,
-                images[chunk_start:chunk_end],
-                whole_range=True,
+            # Use the same ColorMatchV2 MKL path as the chunk decode stage.
+            matched, _transform, matched_count = _correct_decoded_chunk_color(
+                anchor, images[chunk_start:chunk_end], 0, enabled=True,
             )
-            corrected[chunk_start:chunk_end] = _apply_fixed_output_color_transform(
-                images[chunk_start:chunk_end],
-                transform,
-            )
-            corrected_ranges += 1
+            if matched_count:
+                corrected[chunk_start:chunk_end] = matched
+                corrected_ranges += 1
         reports.append((
             source_shot,
-            "applied to %d later chunk portion(s)" % corrected_ranges
+            "applied to %d chunk portion(s) after the first frame" % corrected_ranges
             if anchor is not None else "skipped: no rendered anchor",
         ))
     return corrected, reports
+
+
+def _correct_ready_entire_shot_frames(frames, frame_start, source_shots, timing_plan, anchors):
+    """Grade one ready display chunk from each source shot's fixed first frame."""
+    if frames is None or frames.ndim != 4 or not int(frames.shape[0]) or not source_shots:
+        return frames
+    lighting = {} if timing_plan is None else {
+        int(shot.source_shot): bool(shot.light_change) for shot in timing_plan.shots
+    }
+    corrected = frames.clone()
+    frame_start = int(frame_start)
+    for shot_index, shot_start, shot_end, _body in source_shots:
+        source_shot = int(shot_index) + 1
+        shot_start = int(shot_start)
+        shot_end = int(shot_end)
+        local_start = max(0, shot_start - frame_start)
+        local_end = min(int(frames.shape[0]), shot_end - frame_start)
+        if local_start >= local_end or lighting.get(source_shot, timing_plan is not None):
+            continue
+        anchor = anchors.get(source_shot)
+        if anchor is None:
+            anchor = frames[local_start:local_start + 1].clone()
+            anchors[source_shot] = anchor
+            local_start += 1
+        if local_start >= local_end:
+            continue
+        matched, _transform, _matched_count = _correct_decoded_chunk_color(
+            anchor, frames[local_start:local_end], 0, enabled=True,
+        )
+        corrected[local_start:local_end] = matched
+    return corrected
 
 
 def _log_output_color_correction(chunk_label, transform, corrected_frame_count):
@@ -1982,6 +2711,14 @@ def _log_output_color_correction(chunk_label, transform, corrected_frame_count):
     raw = transform["raw"]
     corrected = transform["corrected"]
     residual = transform["residual"]
+    if transform.get("method") == "mkl":
+        logging.info(
+            "HR Endless Sampler %s output color correction: ColorMatchV2 MKL applied to %d same-shot frames (%d skipped); "
+            "first-frame luma %.5f -> %.5f, reference %.5f.",
+            chunk_label, corrected_frame_count, transform["failures"], raw["luma_mean"],
+            corrected["luma_mean"], reference["luma_mean"],
+        )
+        return
     source_points = ", ".join("%.4f" % value for value in transform["source_points"])
     target_points = ", ".join("%.4f" % value for value in transform["target_points"])
     balance = ", ".join("%.4f" % value for value in transform["rgb_balance"])
@@ -2031,15 +2768,21 @@ def _decoded_frame_tail(parts, frame_count):
     return selected[0] if len(selected) == 1 else torch.cat(selected, dim=0)
 
 
-def _masked_av_boundary_guides(vae, previous_decoded_frames, overlap_frames):
-    """Anchor the first, middle, and final images of the protected overlap.
+def _decoded_frame_before_tail(parts, tail_frames):
+    """Return the final retained decoded frame before a tail replacement."""
+    tail_frames = max(0, int(tail_frames))
+    available = sum(int(part.shape[0]) for part in parts)
+    if available <= tail_frames:
+        return None
+    return _decoded_frame_tail(parts, tail_frames + 1)[:1]
 
-    MiniMax accepts multiple independent one-frame guides at arbitrary pixel
-    frame positions. Encoding each image separately avoids turning the three
-    sparse anchors into one contiguous guide clip. The final anchor remains
-    immediately before the first retained/generated frame; the two earlier
-    anchors give H3 more evidence for background, lighting, and motion through
-    the physical overlap.
+
+def _masked_av_boundary_guides(vae, previous_decoded_frames, overlap_frames):
+    """Anchor every image of the short keyframe-only boundary.
+
+    MiniMax accepts independent one-frame guides at arbitrary pixel positions.
+    Encoding every boundary image separately avoids the temporal VAE's clip
+    encoding, which can reinterpret motion or brightness between frames.
     """
     overlap_frames = int(overlap_frames)
     if overlap_frames <= 0:
@@ -2048,7 +2791,7 @@ def _masked_av_boundary_guides(vae, previous_decoded_frames, overlap_frames):
         raise ValueError(
             "Masked AV boundary keyframes need the complete decoded previous-chunk overlap"
         )
-    positions = tuple(sorted({0, (overlap_frames - 1) // 2, overlap_frames - 1}))
+    positions = range(overlap_frames)
     tail_start = int(previous_decoded_frames.shape[0]) - overlap_frames
     guides = []
     for position in positions:
@@ -2077,12 +2820,17 @@ def _h3_context_frames(raw_frames, corrected_frames):
 
 def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prompt, video_context=None,
                             audio_context=None, audio_end_frame=5.0, video_refs=(), video_context_start=0,
-                            video_contexts=()):
+                            video_contexts=(), replacement_refs=None):
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
     positive = conds.get("positive")
     if positive is None:
         raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
 
+    # H3's value is the clean fraction: 1.0 disables visual condition noise.
+    # Apply to both CFG branches without mutating the upstream guider.
+    for values in conds.values():
+        for cond in values:
+            cond["minimax_visual_cond_noise_aug"] = minimax_visual_cond_noise_aug
     cross_attn, prompt_metadata = encoded_prompt
     for cond in positive:
         cond["cross_attn"] = cross_attn
@@ -2091,7 +2839,9 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
             cond["minimax_token_tags"] = token_tags
         else:
             cond.pop("minimax_token_tags", None)
-        if video_refs:
+        if replacement_refs is not None:
+            cond["minimax_refs"] = [*replacement_refs, *video_refs]
+        elif video_refs:
             cond["minimax_refs"] = [*cond.get("minimax_refs", ()), *video_refs]
         keyframes = []
         for keyframe in cond.get("minimax_keyframes", ()):
@@ -2144,12 +2894,26 @@ def _decode_video_frames(vae, latent):
     return frames
 
 
-def _decode_audio_preview(audio_vae, latent, *, trim_latent_steps=0, output_frames=None, fps=VIDEO_FPS):
+def _enhance_decoded_audio(waveform, sample_rate, overlap=None, *, enabled=False, device="cuda:0", seed=42):
+    """Enhance a preview copy after original decoded audio has been accumulated."""
+    if not enabled or waveform is None or sample_rate is None:
+        return waveform, sample_rate, overlap
+    # AudioSR owns its GPU only for this pass; original H3 latents stay untouched.
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache(force=True)
+    original = torch.cat((overlap, waveform), dim=-1) if overlap is not None else waveform
+    enhanced = fix_audio({"waveform": original, "sample_rate": int(sample_rate)}, device=str(device), seed=seed, interrupt_check=comfy.model_management.throw_exception_if_processing_interrupted)
+    split = round(overlap.shape[-1] * enhanced["sample_rate"] / sample_rate) if overlap is not None else 0
+    return enhanced["waveform"][..., split:], enhanced["sample_rate"], enhanced["waveform"][..., :split] if overlap is not None else None
+
+
+def _decode_audio_preview(audio_vae, latent, *, trim_latent_steps=0, output_frames=None, fps=VIDEO_FPS, normalize=True):
     """Decode and trim one H3 chunk using ComfyUI's ordinary audio normalization."""
     waveform = audio_vae.decode(latent).movedim(-1, 1)
-    deviation = torch.std(waveform, dim=[1, 2], keepdim=True) * 5.0
-    deviation[deviation < 1.0] = 1.0
-    waveform = waveform / deviation
+    if normalize:
+        deviation = torch.std(waveform, dim=[1, 2], keepdim=True) * 5.0
+        deviation[deviation < 1.0] = 1.0
+        waveform = waveform / deviation
     sample_rate = int(getattr(
         audio_vae,
         "audio_sample_rate_output",
@@ -2227,6 +2991,7 @@ def _connected_save_video_prefix(dynprompt, sampler_node_id):
 def _decode_replay_preview_media(vae, audio_vae, sampled_video, sampled_audio, *,
                                  output_trim_frames, context_audio_t, output_frames,
                                  fps=VIDEO_FPS, masked_audio_overlap_frames=0,
+                                 replace_audio_tail_ticks=False,
                                  keep_masked_av_prefix=False):
     """Decode one cached physical chunk exactly like live finalization.
 
@@ -2257,7 +3022,15 @@ def _decode_replay_preview_media(vae, audio_vae, sampled_video, sampled_audio, *
     overlap_waveform = None
     if audio_vae is not None and sampled_audio is not None:
         overlap_frames = max(0, int(masked_audio_overlap_frames))
-        if overlap_frames:
+        if replace_audio_tail_ticks:
+            full_waveform, audio_sample_rate = _decode_audio_preview(
+                audio_vae, sampled_audio, trim_latent_steps=0, output_frames=None, fps=fps,
+            )
+            overlap_samples = max(0, round(int(context_audio_t) * audio_sample_rate / AUDIO_LATENT_FPS))
+            retained_samples = max(0, round(retained_count * audio_sample_rate / float(fps)))
+            overlap_waveform = full_waveform[..., :overlap_samples]
+            audio_waveform = full_waveform[..., overlap_samples:overlap_samples + retained_samples]
+        elif overlap_frames:
             full_waveform, audio_sample_rate = _decode_audio_preview(
                 audio_vae,
                 sampled_audio,
@@ -2678,7 +3451,7 @@ def _debug_preflight_continuation_payload(video, audio, continuation_frames,
     """Build shape-faithful black continuation data for the debug VRAM probe.
 
     The values are intentionally meaningless; only the temporal/spatial rows,
-    synchronized audio span, Qwen presentation, and five-frame boundary anchor
+    synchronized audio span, Qwen presentation, and temporal boundary anchor
     need to match a real continuation chunk for its allocation behavior.
     """
     reference_t = _video_steps(continuation_frames)
@@ -3297,8 +4070,12 @@ class _SamplerTiming:
         ("Qwen encode/tokenize", "qwen"),
         ("Gemma 4", "gemma4"),
         ("Video VAE decode: final preview/Gemma", "vae_previous_chunk"),
+        ("Video VAE decode: continuous TaoMate output", "vae_video_final"),
         ("Audio VAE decode: final preview", "vae_audio_preview"),
+        ("AudioSR: chunk previews", "audiosr_preview"),
+        ("AudioSR: full original audio", "audiosr_final"),
         ("VAE decode: final color diagnostics", "vae_color_final"),
+        ("Final output shot color grade", "output_shot_color"),
         ("VAE continuation decode/resize/encode", "vae_context"),
         ("VAE decode: Qwen full history", "vae_history"),
     )
@@ -3308,8 +4085,12 @@ class _SamplerTiming:
         "qwen": "Qwen",
         "gemma4": "Gemma 4",
         "vae_previous_chunk": "Final video preview/Gemma VAE decode",
+        "vae_video_final": "Continuous TaoMate video VAE decode",
         "vae_audio_preview": "Final audio preview VAE decode",
+        "audiosr_preview": "AudioSR chunk previews",
+        "audiosr_final": "AudioSR full original audio",
         "vae_color_final": "Final color-diagnostic VAE decode",
+        "output_shot_color": "Final output shot color grade",
         "vae_context": "Video1 VAE decode",
         "vae_history": "Qwen full-history VAE decode",
     }
@@ -3698,26 +4479,30 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Sigmas.Input("sigmas", lazy=True),
                 io.Latent.Input("latent_image"),
                 io.Clip.Input("clip", lazy=True, tooltip="The CLIP used to encode the original conditioning for the current model backend."),
-                io.String.Input("prompt", multiline=True, dynamic_prompts=True,
+                io.String.Input("prompt", force_input=True,
                                 tooltip="The original model prompt. MiniMax H3 currently uses [Shot 1] and [Shot N] At MM:SS.mmm, markers."),
                 io.Float.Input("fps", default=24.0, min=1.0, max=120.0, step=0.001,
                                tooltip="FPS used to convert source-prompt cut timestamps to exact frame positions."),
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
-                             tooltip="Maximum frames sampled at once. MiniMax H3 values are snapped down to its 17k+5 frame grid."),
+                             tooltip="Maximum chunk frames, snapped down to H3's 17k+5 grid. In TaoMate this sets the prompt/audio-teacher group size; inference still uses small sub-chunks."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
                 io.Int.Input("video_continuation", default=22, min=5, max=3600, step=17,
-                             tooltip="Completed continuation tail length. The selected continuation method interprets this as either a separate synchronized Video1/Audio1 reference or a physical masked AV overlap inside chunk_frames."),
+                               tooltip="Completed continuation tail length. Video1 reference uses it for a synchronized Video1/Audio1 reference; Masked AV uses it for native boundary keyframes and the matching decoded/latent tail replacement inside chunk_frames."),
                 io.Combo.Input(
                     "video_continuation_method",
                     options=list(VIDEO_CONTINUATION_METHODS),
                     default=VIDEO_CONTINUATION_METHOD_VIDEO1,
                     tooltip=(
                         "Video1 reference keeps the current Ref2VA <Video N>/<Audio N> path plus its five-frame "
-                        "boundary prefix. Masked AV overlap instead copies this many completed frames directly "
-                        "into the next target, preserves video, feathers the audio seam, and creates no Video1 "
-                        "reference or continuation-summary text. In masked mode the overlap is included inside "
-                        "chunk_frames, so it must be smaller than chunk_frames and reduces new frames per chunk."
+                        "packing prefix. Masked AV creates native video/audio boundary keyframes covering this "
+                        "many completed frames, then replaces the preceding decoded/latent tails with the new "
+                        "prefix. It creates no Video1 or Audio1 reference text. The boundary is included inside "
+                        "chunk_frames, so it must be smaller than chunk_frames and reduces new frames per chunk. "
+                        "TaoMate-H3 uses fixed small streaming phases and CPU KV memory, preserving the supplied sampler and sigmas. "
+                        "chunk_frames controls TaoMate prompt/audio group size; video_continuation/feathering do not control TaoMate. "
+                        "Uses native H3 references/keyframes; CFG 1 is recommended for the TaoMate LoRA. "
+                        "Audio teacher uses the same model/LoRA and captures the selected sigma points; no disk replay."
                     ),
                 ),
                 io.Combo.Input(
@@ -3731,27 +4516,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         "Qwen and Gemma keep the normal native H3 reference-video presentation resolution."
                     ),
                 ),
+                io.Boolean.Input("audio_feathered_overlap", default=False, tooltip="Copy previous video/audio latent tails into the opening latent and smoothly release both during the final spoken word. Both tails remain keyframes when disabled. This changes joint AV inference and requires a fresh cache."),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
                 io.Vae.Input("audio_vae", optional=True,
                              tooltip="MiniMax H3 audio VAE. When connected, each completed chunk's final decoded audio is synchronized with its full-VAE browser preview."),
-                io.Boolean.Input("cache_gemma_preproduction", default=False,
-                                 tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
-                io.Boolean.Input("gemma4_mtp", default=False,
-                                 tooltip="Experimental native Gemma 4 draft-MTP with four speculative tokens. Temporarily disabled in this build because the current Python runtime is slower and has hybrid-checkpoint failures."),
-                io.Float.Input(
-                    "pytorch_memory_fraction",
-                    default=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                    min=0.50,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        "Global PyTorch CUDA allocator limit applied when this sampler starts. 0.85 reserves "
-                        "15% of VRAM outside PyTorch so cached memory is pressured before a driver-level OOM. "
-                        "The setting remains active for the ComfyUI process until another run changes it; "
-                        "set 1.0 for the normal unrestricted allocator limit."
-                    ),
-                ),
+                io.Combo.Input("color_correction", options=list(COLOR_CORRECTION_MODES), default="chunk boundaries", tooltip="Disable grading, match chunk boundaries with ColorMatchV2's MKL transfer, match entire shots after generation, or apply both. This changes preview/final pixels only; H3 continuation latents remain native and unchanged. Changing this setting requires a fresh cache."),
+                io.Boolean.Input("linear_color_compute", default=False, tooltip="Use float32 inverse-gamma compute color: convert input reference RGB with sRGB^(1/2.4) before H3/VAE encoding, then restore preview and IMAGE output with value^2.4. Changes inference behavior and requires a fresh cache."),
+                io.Combo.Input("compute_precision", options=["default", "fp32 (full precision but more VRAM needed)"], default="default", tooltip="default preserves the incoming model precision. fp32 forces diffusion computation to 32-bit for video and audio, increasing memory use and runtime. VAE and text encoder precision are unchanged."),
+                io.Combo.Input("kv_cache_compression", options=["none", "zstd lossless", "int8", "turboquant"], default="none", tooltip="TaoMate only: none keeps exact BF16 KV in RAM. zstd lossless stores exact BF16 bytes with Zstd. int8 uses per-vector signed INT8 plus a scale. turboquant uses a GPU 4-bit rotated-vector codec. The last two are lossy and experimental."),
+                io.Boolean.Input("audio_sr", default=True, tooltip="Apply AudioSR to each decoded chunk for preview, then separately to the assembled original decoded audio for the final 48 kHz AUDIO output. Requires audio_vae and python/audio_sr.py --install. Adds processing time; does not change H3 reference latents."),
+                HRPreProduction.Input("pre_production", optional=True, tooltip="Connect Gemma 4 for model-directed prompts or Legacy Chunk Prompts for editable, pre-baked prompts. Unconnected uses native legacy prompts without an LLM."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt, raw Gemma response, and detailed VRAM snapshots. chunk_prompts is returned whether debug is enabled or not."),
                 io.Int.Input("debug_stop_chunk", default=0, min=0, max=10000, step=1,
@@ -3760,8 +4535,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Resume or rerun from this 1-based chunk using the automatically recorded last-run recovery cache. Leave this at 0 to automatically continue a compatible interrupted render; nonzero forces a specific chunk for debugging."),
             ],
             outputs=[
-                io.Latent.Output(display_name="output"),
-                io.Latent.Output(display_name="denoised_output"),
+                io.Latent.Output(display_name="output", tooltip="Raw assembled latent from every sampled chunk. Display color correction is applied only to decoded preview, image, and video output, never to this latent."),
+                io.Latent.Output(display_name="denoised_output", tooltip="Raw assembled denoised latent from every sampled chunk. Display color correction is applied only to decoded preview, image, and video output, never to this latent."),
                 io.String.Output(display_name="chunk_prompts", tooltip="Exact planned prompt and frame ranges for every active chunk."),
                 HREndlessTimeline.Output(display_name="timeline", tooltip="Finished chunk, shot, and Gemma prompt metadata for HR Endless Sampler Save Video."),
                 io.Image.Output(
@@ -3793,20 +4568,73 @@ class HREndlessSampler(SamplerCustomAdvanced):
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
                 video_continuation=22, video_continuation_method=VIDEO_CONTINUATION_METHOD_VIDEO1,
                 video_continuation_res="full", vae=None, audio_vae=None,
-                cache_gemma_preproduction=False,
-                gemma4_mtp=False,
-                pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
-                unique_id=None, dynprompt=None,
+                unique_id=None, dynprompt=None, color_correction="chunk boundaries",
+                pre_production=None,
+                linear_color_compute=False,
+                audio_feathered_overlap=False,
+                compute_precision="default",
+                kv_cache_compression="none",
+                audio_sr=True,
                 **_deprecated_inputs):
+        use_taomate = video_continuation_method == VIDEO_CONTINUATION_METHOD_TAOMATE
+        taomate_backend = None
+        if use_taomate:
+            from .python.taomate import TaoMateStreaming
+            TaoMateStreaming.validate(guider)
+            if debug_start_chunk:
+                raise ValueError("TaoMate-H3 currently starts from Chunk 1; persistent KV replay is not yet supported")
+            incoming = latent_image["samples"]
+            if not incoming.is_nested or len(incoming.unbind()) != 2:
+                raise ValueError("TaoMate-H3 requires a nested H3 video/audio latent")
+            incoming_video, incoming_audio = incoming.unbind()
+            if incoming_video.ndim != 5 or incoming_video.shape[1] != 24 or incoming_audio.ndim != 4 or incoming_audio.shape[1] != 32:
+                raise ValueError("TaoMate-H3 requires 24-channel video and 32-channel audio latents")
+            taomate_backend = TaoMateStreaming(kv_cache_compression=kv_cache_compression)
+            guider = taomate_backend.patch_guider(guider)
+            logging.warning("TaoMate-H3: using supplied sampler %s and %d-step sigma schedule; fixed streaming geometry, CPU clean-KV cache and SDPA. Audio teacher uses the supplied model/LoRA and model shifts; no replay.", getattr(getattr(sampler, "sampler_function", None), "__name__", type(sampler).__name__), len(sigmas) - 1)
+        if audio_sr and audio_vae is not None:
+            AudioSR.ensure_installed()
+        # Accept the former input name and value for existing API callers.
+        compute_dtype = _deprecated_inputs.get("compute_dtype", compute_precision) if compute_precision == "default" else compute_precision
+        if compute_dtype == "fp32 (full precision but more VRAM needed)":
+            compute_dtype = "fp32"
+        if compute_dtype not in ("default", "fp32"):
+            raise ValueError(f"Unknown compute_precision: {compute_dtype!r}")
+        if compute_dtype == "fp32":
+            # ponytail: reuse native casting and a shallow guider copy; no duplicate model weights.
+            guider = copy.copy(guider)
+            guider.model_patcher = guider.model_patcher.clone()
+            guider.model_patcher.set_model_compute_dtype(torch.float32)
+            if taomate_backend is not None:
+                taomate_backend.audio_teacher.patcher.set_model_compute_dtype(torch.float32)
+            guider.model_options = guider.model_patcher.model_options
+            logging.info("HR Endless Sampler diffusion compute dtype override: torch.float32 (video and audio).")
+
         # ComfyUI V3 stores hidden inputs on the per-execution class clone
         # instead of passing them as execute() arguments.  Keep the arguments
         # as a compatibility fallback for older ComfyUI releases.
+        color_correction = {
+            "chunk end-start": "chunk boundaries",
+            "all chunks at once": "entire shots",
+            "chunk end-start + all at once": "chunk boundaries + entire shots",
+        }.get(color_correction, color_correction)
+        if color_correction not in COLOR_CORRECTION_MODES:
+            raise ValueError(f"Unknown color_correction mode: {color_correction!r}")
+        correct_chunk_boundaries = color_correction in ("chunk boundaries", "chunk boundaries + entire shots")
+        correct_all_chunks = color_correction in ("entire shots", "chunk boundaries + entire shots")
+        linear_color_compute = bool(linear_color_compute)
+        audio_feathered_overlap = bool(audio_feathered_overlap)
+        # Keep sRGB images for optional director observation, while H3's
+        # rebuilt Ref2VA/Qwen conditioning receives float32 inverse-gamma RGB.
+        h3_images = _convert_image_transfer(images, _srgb_to_inverse_gamma_compute_rgb) if linear_color_compute else images
         hidden = getattr(cls, "hidden", None)
         if unique_id is None:
             unique_id = getattr(hidden, "unique_id", None)
         if dynprompt is None:
             dynprompt = getattr(hidden, "dynprompt", None)
+        # Keep experimental allocator policy out of serialized workflow widgets.
+        pytorch_memory_fraction = DEFAULT_PYTORCH_MEMORY_FRACTION
         _set_pytorch_memory_fraction(pytorch_memory_fraction, guider.model_patcher.load_device)
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
@@ -3819,11 +4647,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
         guide_overlap = 5
         video_continuation_enable = True
         qwen_full_history = False
-        if gemma4_mtp and not ENABLE_GEMMA4_MTP:
-            logging.warning(
-                "HR Endless Sampler ignored saved gemma4_mtp=true: MTP is temporarily disabled; using the original decoder."
-            )
-        gemma4_mtp = bool(gemma4_mtp and ENABLE_GEMMA4_MTP)
+        if pre_production is not None and not callable(getattr(pre_production, "create_session", None)):
+            raise ValueError("pre_production must be a callable HR Endless pre-production provider")
+        cache_gemma_preproduction = bool(getattr(pre_production, "cache_gemma_preproduction", False))
+        gemma4_mtp = bool(getattr(pre_production, "gemma4_mtp", False))
         if video_continuation_method not in VIDEO_CONTINUATION_METHODS:
             raise ValueError(
                 f"Unknown video_continuation_method {video_continuation_method!r}; choose one of "
@@ -3874,7 +4701,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             )
         warm_start_video_t = _video_steps(guide_overlap) if guide_overlap else 0
         keyframe_duration_frames = context_keyframes
-        use_video_continuation = video_continuation > 0
+        use_video_continuation = video_continuation > 0 and not use_taomate
         use_masked_av_mode = (
             use_video_continuation
             and video_continuation_method == VIDEO_CONTINUATION_METHOD_MASKED_AV
@@ -3885,15 +4712,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
         )
         if use_masked_av_mode and not ENABLE_MASKED_AV_OVERLAP:
             logging.info(
-                "HR Endless Sampler masked AV overlap is temporarily disabled; preserving masked-mode keyframes "
-                "and the whole-previous-chunk Audio reference without a protected AV prefix or Video1 reference."
+                "HR Endless Sampler long masked AV overlap is temporarily disabled; using only a protected "
+                "native AV boundary keyframes, without full Video1 or Audio1 references."
             )
-        if use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX:
+        # Both methods retain their packing prefix in outputs and previews.
+        keep_continuation_prefix = use_video_continuation and (not use_masked_av_mode or not TRIM_MASKED_AV_PREFIX)
+        if keep_continuation_prefix:
             logging.warning(
-                "HR Endless Sampler masked-AV prefix inspection is active: retaining each locked "
+                "HR Endless Sampler prefix inspection is active: retaining each "
                 "video/audio prefix in its own chunk instead of trimming the repeated AV tail."
             )
-        if use_masked_av_overlap and video_continuation >= max_chunk_frames:
+        if use_masked_av_mode and video_continuation >= max_chunk_frames:
             raise ValueError(
                 f"video_continuation ({video_continuation}) must be smaller than the effective chunk size "
                 f"({max_chunk_frames}) for {VIDEO_CONTINUATION_METHOD_MASKED_AV}"
@@ -3903,18 +4732,25 @@ class HREndlessSampler(SamplerCustomAdvanced):
             and not use_masked_av_mode
             and INCLUDE_VIDEO1_REFERENCE
         )
-        include_previous_audio_reference = use_video_continuation
+        # The native audio boundary keyframe replaces the broad <Audio N>
+        # reference in masked packing mode; it carries no prompt-visible role.
+        include_previous_audio_reference = use_video_continuation and not use_masked_av_mode
         # A multi-frame MiniMax keyframe is anchored on the target timeline; it
         # is not detached historical memory. Keep the same completed frames in
         # the opening physical target interval and trim that truthful overlap
-        # after sampling. With keyframes disabled, retain the minimum synthetic
-        # five-frame prefix needed to preserve H3's temporal packing phase.
-        if use_masked_av_overlap:
+        # after sampling. Native masked mode uses the selected continuation
+        # duration as its synthetic prefix; Video1 keeps its five-frame phase.
+        if use_taomate:
+            plan = taomate_backend.request_plan(video.shape[2], audio.shape[-1], chunk_frames)
+        elif use_masked_av_overlap:
             plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, video_continuation)
         elif context_keyframes:
             plan = _chunk_plan(video.shape[2], audio.shape[-1], chunk_frames, context_keyframes)
         else:
-            plan = _chunk_plan_without_overlap(video.shape[2], audio.shape[-1], chunk_frames)
+            plan = _chunk_plan_without_overlap(
+                video.shape[2], audio.shape[-1], chunk_frames,
+                video_continuation if use_masked_av_mode else 5,
+            )
         if debug_stop_chunk > len(plan):
             raise ValueError(f"debug_stop_chunk is {debug_stop_chunk}, but this latent has only {len(plan)} chunks")
         if debug_start_chunk > len(plan):
@@ -3923,7 +4759,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
             raise ValueError("debug_start_chunk cannot be greater than debug_stop_chunk")
         active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
         _gemma_markers, gemma_shots, _gemma_description_end = _parse_prompt_shots(prompt, plan[-1]["frame_end"], fps)
-        gemma_director_needed = bool(gemma_shots)
+        manual_prompts = pre_production if callable(getattr(pre_production, "get_chunk_prompt", None)) else None
+        if manual_prompts is not None and len(manual_prompts.prompts()) != len(plan):
+            raise ValueError(f"Manual prompts contain {len(manual_prompts.prompts())} chunks, but this render needs {len(plan)} {'TaoMate chunks' if use_taomate else 'chunks'}. Regenerate prompts for this layout.")
+        gemma_director_needed = pre_production is not None and manual_prompts is None and bool(gemma_shots)
 
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
@@ -3933,8 +4772,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if len(active_plan) > 1 and (include_video1_reference or include_previous_audio_reference or qwen_full_history) and not ref2va:
             raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
         original_refs = positive[0].get("minimax_refs", ())
+        linear_original_refs = None
+        if linear_color_compute and any(ref.get("kind") == "image" for ref in original_refs):
+            # Ref2VA's DiT payload is distinct from Qwen's image tokens. Build
+            # matching linear VAE latents once and install them per video below.
+            linear_original_refs = _linear_ref2va_image_refs(original_refs, images, vae)
         video_number = 1 + sum(ref["kind"] in ("video", "video_audio") for ref in original_refs)
         audio_number = 1 + sum(ref["kind"] in ("audio", "video_audio") for ref in original_refs)
+        picture_number = 1 + sum(ref["kind"] == "image" for ref in original_refs)
         planned_prompts = _planned_chunk_prompts(
             prompt,
             plan,
@@ -3946,7 +4791,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
             ref2va,
             video_number,
             audio_number,
+            legacy=pre_production is None,
+            taomate=use_taomate,
         )
+        if manual_prompts is not None:
+            planned_prompts = [(manual_prompts.get_chunk_prompt(index + 1), _debug_chunk_prompt(index, chunk, chunk["frame_start"] + chunk.get("output_trim_frames", 0), manual_prompts.get_chunk_prompt(index + 1))) for index, chunk in enumerate(active_plan)]
         if debug:
             logging.info(
                 "HR Endless Sampler independent continuation controls: "
@@ -3961,7 +4810,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             if use_video_continuation and not use_masked_av_overlap and not include_video1_reference:
                 logging.info(
                     "HR Endless Sampler Video1 isolation experiment: "
-                    "five-frame visual boundary keyframe enabled; Qwen/DiT/prompt Video1 reference disabled"
+                    "native visual boundary keyframe enabled; Qwen/DiT/prompt Video1 reference disabled"
                 )
         if prompt_preview_only:
             prompt_preview = "\n\n".join(debug_prompt for _chunk_prompt, debug_prompt in planned_prompts)
@@ -3974,14 +4823,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 {
                     "fps": fps,
                     "total_frames": active_plan[-1]["frame_end"],
-                    "chunks": [
-                        {
-                            "chunk": index + 1,
-                            "start": chunk["frame_start"] + chunk.get("output_trim_frames", 0),
-                            "end": chunk["frame_end"] - 1,
-                        }
-                        for index, chunk in enumerate(active_plan)
-                    ],
+                    "chunks": _preview_ranges_for_plan(
+                        active_plan,
+                        keep_physical_prefix=keep_continuation_prefix,
+                    ),
                     "shots": _preview_shot_ranges(prompt, plan[-1]["frame_end"], active_plan[-1]["frame_end"], fps),
                 },
                 fps=fps,
@@ -4002,14 +4847,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
         replay_prefix_noises = {}
         replay_timing_plan = None
         replay_prompt_changed = False
-        replay_cache_enabled = _replay_cache_enabled()
+        replay_cache_enabled = _replay_cache_enabled() and not use_taomate
         if not replay_cache_enabled and debug_start_chunk:
             logging.info(
                 "HR Endless Sampler replay cache is disabled; ignoring debug_start_chunk=%d and sampling from Chunk 1.",
                 debug_start_chunk,
             )
             debug_start_chunk = 0
-        if not replay_cache_enabled:
+        if not replay_cache_enabled and not use_taomate:
             logging.info(
                 "HR Endless Sampler replay cache is disabled; this run will ignore the old cache and record a fresh replacement."
             )
@@ -4026,6 +4871,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
             video_continuation_res=video_continuation_res,
             ref2va=ref2va,
         )
+        replay_fingerprint["color_correction"] = color_correction
+        replay_fingerprint["linear_color_compute"] = linear_color_compute
+        replay_fingerprint["audio_feathered_overlap"] = audio_feathered_overlap
+        replay_fingerprint["av_feather_version"] = 2
+        replay_fingerprint["minimax_visual_cond_noise_aug"] = minimax_visual_cond_noise_aug
+        replay_fingerprint["pre_production"] = pre_production.fingerprint() if pre_production is not None else {"provider": "legacy-static-camera-v3"}
+        # Precision comparisons must never restore chunks from a different compute mode.
+        replay_fingerprint["compute_dtype"] = compute_dtype
+        replay_fingerprint["video1_first_frame_picture"] = True
+        replay_fingerprint["keep_continuation_prefix"] = keep_continuation_prefix
+        replay_fingerprint["chunk_summary_policy"] = "original-opening-current-continuation-v1"
+        replay_fingerprint["audio_sr"] = bool(audio_sr)
+        replay_fingerprint["prefix_noise_source"] = "full_sequence_tail_v1" if TOGGLE_SINGLE_NOISE else "per_chunk_seed_v1"
         replay_cached_initial = None
         auto_resumed = False
         if replay_cache_enabled and debug_start_chunk == 0:
@@ -4184,7 +5042,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         # The cache toggle controls reuse only. Every multi-chunk run records
         # a fresh checkpoint so disabling reuse is also a simple way to
         # replace an unwanted interrupted cache with the current render.
-        if len(active_plan) > 1 and replay_cache is None:
+        if len(active_plan) > 1 and replay_cache is None and not use_taomate:
             candidate_cache = _LastRunReplayCache()
             try:
                 candidate_cache.create(
@@ -4218,10 +5076,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
         # only its corresponding decoded output unavailable; latent sampling
         # and recovery continue normally.
         decoded_output_frames = []
+        # Keep inverse-gamma compute frames for H3 re-encode paths. Seam/shot
+        # matching temporarily converts these float32 frames to display sRGB.
+        decoded_linear_output_frames = [] if linear_color_compute else decoded_output_frames
         decoded_output_audio = []
         decoded_video_complete = vae is not None
         decoded_audio_complete = audio_vae is not None
         decoded_audio_sample_rate = None
+        enhanced_audio_output = None
         previous_video = None
         previous_audio = None
         previous_frame_count = None
@@ -4237,10 +5099,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
         # Gemma request can then pair the exact prior directed description with
         # stills from the same rendered chunk, never with an unsampled plan.
         previous_gemma_description = None
+        previous_h3_prompt = None
         previous_gemma_timing_plan = None
         previous_gemma_end_state = None
         previous_gemma_last_seen_character_state = None
         color_diagnostics = {}
+        entire_shot_color_anchors = {}
         output_template = None
         denoised_template = None
         completed_chunks = 0
@@ -4268,6 +5132,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 previous_audio = previous_state["sampled_audio"].to(device=audio.device, dtype=audio.dtype)
                 previous_frame_count = int(previous_state["previous_frame_count"])
                 previous_gemma_description = previous_state.get("gemma_description")
+                previous_h3_prompt = previous_state.get("h3_prompt")
                 previous_gemma_timing_plan = previous_state.get("gemma_timing_plan")
                 previous_gemma_end_state = previous_state.get("gemma_end_state")
                 previous_gemma_last_seen_character_state = previous_state.get("gemma_last_seen_character_state")
@@ -4277,6 +5142,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     # rendered stills, which are more reliable evidence for
                     # the first rerun chunk than stale textual instructions.
                     previous_gemma_description = None
+                    previous_h3_prompt = None
                     previous_gemma_timing_plan = None
                     previous_gemma_end_state = None
                     previous_gemma_last_seen_character_state = None
@@ -4290,11 +5156,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
             except (KeyError, RuntimeError, ValueError) as error:
                 raise RuntimeError(f"HR Endless Sampler replay cache has invalid completed chunk state: {error}") from error
         gemma_director = (
-            Gemma4ContinuityDirector(
+            pre_production.create_session(
                 debug=debug,
-                gemma4_mtp=bool(gemma4_mtp),
                 seed=replay_noise_seed,
                 observation_image_directory=gemma_image_log,
+                render_context={"prompt": prompt, "fps": fps, "chunk_layout": plan, "latent": latent_image, "guider": guider, "images": images, "clip": clip, "vae": vae, "audio_vae": audio_vae},
             )
             if gemma_director_needed else None
         )
@@ -4330,14 +5196,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     error,
                 )
         gemma_system_logged = False
-        preview_chunk_ranges = [
-            {
-                "chunk": index + 1,
-                "start": chunk["frame_start"] + chunk.get("output_trim_frames", 0),
-                "end": chunk["frame_end"] - 1,
-            }
-            for index, chunk in enumerate(active_plan)
-        ]
+        preview_chunk_ranges = _preview_ranges_for_plan(
+            active_plan,
+            keep_physical_prefix=keep_continuation_prefix,
+            show_replaced_tail=bool(use_masked_av_mode and TRIM_MASKED_AV_PREFIX),
+        )
+        if use_taomate:
+            for preview_range, taomate_chunk in zip(preview_chunk_ranges, active_plan):
+                preview_range["taomate_completed_frames"] = 0
+                preview_range["taomate_phase_count"] = len(taomate_chunk.get("phases", (taomate_chunk,)))
+                preview_range["taomate_phase_work"] = [
+                    phase["frame_end"] - TaoMateStreaming.frames(phase["video_start"])
+                    for phase in taomate_chunk.get("phases", (taomate_chunk,))
+                ]
         for index, state in enumerate(replay_prior_chunks):
             description = state.get("gemma_description")
             if isinstance(description, str) and description.strip() and index < len(preview_chunk_ranges):
@@ -4346,6 +5217,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     retention_analysis = _chunk_retention_analysis(state.get("gemma_retention_analysis"))
                     if retention_analysis:
                         preview_chunk_ranges[index]["gemma_retention_analysis"] = retention_analysis
+            h3_prompt = state.get("h3_prompt")
+            if isinstance(h3_prompt, str) and h3_prompt.strip() and index < len(preview_chunk_ranges):
+                preview_chunk_ranges[index]["h3_prompt"] = h3_prompt.strip()
             if index < len(preview_chunk_ranges):
                 for key in (
                     "h3_render_seconds",
@@ -4358,12 +5232,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         preview_chunk_ranges[index][key] = float(value)
         preview_end = active_plan[-1]["frame_end"]
         preview_shot_ranges = _preview_shot_ranges(prompt, plan[-1]["frame_end"], preview_end, fps)
+        reused_chunk_numbers = [
+            *range(1, len(replay_prior_chunks) + 1),
+            *range(len(active_plan) - len(replay_cached_suffix) + 1, len(active_plan) + 1),
+        ]
         preview_execution = begin_preview_execution(
             guider.model_patcher,
             preview_chunk_ranges,
             preview_shot_ranges,
-            reusing_cached_chunks=bool(replay_prior_chunks),
-            cached_chunk_count=len(replay_prior_chunks),
+            reusing_cached_chunks=bool(reused_chunk_numbers),
+            cached_chunk_count=len(reused_chunk_numbers),
+            reused_chunk_numbers=reused_chunk_numbers,
         )
         intermediate_writer = None
         intermediate_prefix = _connected_save_video_prefix(dynprompt, unique_id)
@@ -4410,9 +5289,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     "sampled_end": restored_plan["frame_end"] - 1,
                     "output_start": restored_range["start"],
                     "output_end": restored_range["end"],
-                    "trim_steps": restored_plan.get("context_video_t", 0),
+                    "trim_steps": 0 if keep_continuation_prefix else restored_plan.get("context_video_t", 0),
                     "gemma_detailed_description": restored_range.get("gemma_detailed_description"),
                     "gemma_retention_analysis": restored_range.get("gemma_retention_analysis"),
+                    "h3_prompt": restored_range.get("h3_prompt"),
                 })
             if vae is None:
                 decoded_video_complete = False
@@ -4441,9 +5321,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     try:
                         correction_overlap = max(0, int(restored_plan.get("output_trim_frames", 0)))
                         keep_masked_av_prefix = (
-                            use_masked_av_overlap
-                            and restored_index > 0
-                            and not TRIM_MASKED_AV_PREFIX
+                            keep_continuation_prefix and restored_index > 0
                         )
                         (
                             decoded_frames,
@@ -4459,20 +5337,23 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             output_trim_frames=restored_plan.get("output_trim_frames", 0),
                             context_audio_t=(
                                 0 if restored_index == 0
-                                or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
+                                or (keep_continuation_prefix)
                                 else restored_plan.get("context_audio_t", 0)
                             ),
-                            output_frames=restored["output_end"] - restored["output_start"] + 1,
+                            output_frames=restored_plan["frame_end"] - restored_plan["frame_start"] - correction_overlap,
                             fps=fps,
                             masked_audio_overlap_frames=(
                                 restored_plan.get("output_trim_frames", 0)
                                 if use_masked_av_overlap and TRIM_MASKED_AV_PREFIX and restored_index > 0
                                 else 0
                             ),
+                            replace_audio_tail_ticks=bool(use_masked_av_mode and TRIM_MASKED_AV_PREFIX and restored_index > 0),
                             keep_masked_av_prefix=keep_masked_av_prefix,
                         )
                         retained_start = 0 if keep_masked_av_prefix else correction_overlap
-                        correction_reference = _decoded_frame_tail(decoded_output_frames, correction_overlap)
+                        decoded_display_frames = _convert_image_transfer(decoded_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else decoded_frames
+                        correction_reference = _decoded_frame_before_tail(decoded_linear_output_frames, retained_start)
+                        correction_reference = _convert_image_transfer(correction_reference, _inverse_gamma_compute_to_srgb) if linear_color_compute else correction_reference
                         correction_frame_count = _same_shot_correction_frames(
                             gemma_shots,
                             restored["output_start"],
@@ -4480,26 +5361,44 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         )
                         corrected_frames, color_transform, corrected_frame_count = _correct_decoded_chunk_color(
                             correction_reference,
-                            decoded_frames,
-                            correction_overlap,
-                            correction_frame_count,
+                            decoded_display_frames,
+                            0,
+                            correction_frame_count + (retained_start if correction_frame_count else 0),
+                            enabled=correct_chunk_boundaries,
                         )
+                        if correct_all_chunks:
+                            corrected_frames = _correct_ready_entire_shot_frames(
+                                corrected_frames,
+                                restored["output_start"],
+                                gemma_shots,
+                                gemma_preproduction_timing_plan,
+                                entire_shot_color_anchors,
+                            )
+                        corrected_frames = _convert_image_transfer(corrected_frames, _srgb_to_inverse_gamma_compute_rgb) if linear_color_compute else corrected_frames
                         retained_count = restored["output_end"] - restored["output_start"] + 1
-                        if keep_masked_av_prefix:
-                            retained_count += correction_overlap
-                        retained_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
+                        retained_linear_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
+                        retained_frames = _convert_image_transfer(retained_linear_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else retained_linear_frames
                         _log_output_color_correction(
                             "restored Chunk %d" % (restored_index + 1),
                             color_transform,
                             corrected_frame_count,
                         )
-                        restored_preview_start = (
-                            restored_plan["frame_start"] if keep_masked_av_prefix else restored["output_start"]
-                        )
-                        restored_preview_end = (
-                            restored_plan["frame_end"] - 1 if keep_masked_av_prefix else restored["output_end"]
-                        )
-                        decoded_output_frames.append(retained_frames)
+                        restored_preview_start = restored["output_start"]
+                        restored_preview_end = restored["output_end"]
+                        if retained_start and decoded_linear_output_frames:
+                            _replace_decoded_frame_tail(decoded_linear_output_frames, corrected_frames[:retained_start])
+                            if linear_color_compute:
+                                _replace_decoded_frame_tail(decoded_output_frames, _convert_image_transfer(corrected_frames[:retained_start], _inverse_gamma_compute_to_srgb))
+                            if preview_execution is not None:
+                                previous_range = preview_chunk_ranges[restored_index - 1]
+                                preview_execution.replace_video_tail(
+                                    restored_index - 1, decoded_output_frames[-1], previous_range["start"], previous_range["end"],
+                                    gemma_detailed_description=previous_range.get("gemma_detailed_description"),
+                                    gemma_retention_analysis=previous_range.get("gemma_retention_analysis"),
+                                )
+                        decoded_linear_output_frames.append(retained_linear_frames)
+                        if linear_color_compute:
+                            decoded_output_frames.append(retained_frames)
                         restored_color_diagnostics = _safe_video_color_diagnostics(
                             retained_frames,
                             restored_index + 1,
@@ -4524,6 +5423,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             if restored_overlap_audio is not None:
                                 _replace_stream_tail(decoded_output_audio, restored_overlap_audio)
                             decoded_output_audio.append(restored_audio.clone())
+                        restored_audio, restored_audio_rate, restored_overlap_audio = _enhance_decoded_audio(restored_audio, restored_audio_rate, restored_overlap_audio, enabled=audio_sr, device=guider.model_patcher.load_device, seed=(replay_noise_seed + restored_index) % (2 ** 32))
                         if preview_execution is not None:
                             preview_execution.finalize_chunk(
                                 restored_index,
@@ -4653,7 +5553,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         chunk_noise=preflight_noise,
                         clip=clip,
                         vae=vae,
-                        images=images,
+                        images=h3_images,
                         positive=positive,
                         original_conds=original_conds,
                         chunk_prompt=planned_prompts[0][0],
@@ -4865,6 +5765,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     },
                 )
                 continuation = index > 0
+                continuation_picture_label = f"<Picture {picture_number}>" if continuation and include_video1_reference else None
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
                 chunk_label = f"Chunk {index + 1}/{len(active_plan)}"
                 if preview_execution is not None:
@@ -4962,6 +5863,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             target=True,
                         )
                         request = {
+                            "require_summary": True,
+                            "summary_required_tasks": (["video continuation"] if continuation and include_video1_reference else []) + (["audio reference"] if continuation and include_previous_audio_reference else []),
+                            "summary_forbidden_tasks": (["video continuation"] if not (continuation and include_video1_reference) else []) + (["audio reference", "audio reuse"] if not (continuation and include_previous_audio_reference) and not any(ref["kind"] in ("audio", "video_audio") for ref in original_refs) else []),
                             "chunk_number": index + 1,
                             "chunk_count": len(active_plan),
                             "fps": fps,
@@ -5012,6 +5916,17 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             ),
                             "original_prompt": prompt,
                         }
+                        # Give summary authorship the actual conditioning roles
+                        # and prior speaker bindings, not a guessed Video1.
+                        if continuation:
+                            request["conditioning_context"] += "\nThe original prompt summary describes only the first chunk's opening. Replace those opening picture/video/audio roles with the current chunk's supplied continuation references; do not repeat the original first-frame instruction."
+                        if continuation and (use_masked_av_mode or context_keyframes):
+                            request["summary_required_tasks"].append("keyframe completion")
+                        if continuation_picture_label is not None:
+                            request["summary_required_tasks"].append("keyframe completion")
+                            request["conditioning_context"] += f"\nAn ordinary image reference contains the final full frame of the previous chunk. Include this exact sentence in summary: {continuation_picture_label} serves as first frame of target video."
+                        if continuation and include_previous_audio_reference:
+                            request["conditioning_context"] += "\n" + _audio_reference_definition(continuation_audio_label, _audio_reference_speakers(previous_gemma_description))
                         if gemma_preproduction_cache_ready and gemma_preproduction_cache is not None:
                             request["preproduction_cache"] = gemma_preproduction_cache.worker_spec()
                             request["preproduction_current_slice"] = (
@@ -5028,6 +5943,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 chunk=index,
                                 live_console_bar=True,
                             ) as preparation_progress:
+                                gemma_director.render_context.update({"chunk_index": index, "chunk": chunk, "previous_video": previous_video, "previous_audio": previous_audio, "previous_frames": previous_decoded_frames, "observation_frames": observation_frames})
                                 result = gemma_director.direct(
                                     request,
                                     observation_frames,
@@ -5048,6 +5964,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 index + 1,
                                 len(active_plan),
                             )
+                        if continuation and ref2va:
+                            gemma_description = _reinforce_static_shot_grade(gemma_description, gemma_shots, content_start)
                         gemma_retention_analysis = (
                             _chunk_retention_analysis(result.retention_analysis)
                             if INCLUDE_PER_CHUNK_RETENTION_ANALYSIS
@@ -5102,24 +6020,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 prefix_video_noise = None
                 prefix_audio_noise = None
                 chunk_noise_mask = None
+                boundary_video_context = None
+                boundary_audio_context = None
                 if chunk.get("synthetic_prefix"):
                     prefix_video = video.new_zeros((*video.shape[:2], context_video_t, *video.shape[3:]))
                     prefix_audio = audio.new_zeros((*audio.shape[:-1], context_audio_t))
-                    cached_prefix = replay_prefix_noises.get(index)
-                    if cached_prefix is not None:
-                        prefix_video_noise = cached_prefix[0].to(device=video.device, dtype=video.dtype)
-                        prefix_audio_noise = cached_prefix[1].to(device=audio.device, dtype=audio.dtype)
-                        if prefix_video_noise.shape != prefix_video.shape or prefix_audio_noise.shape != prefix_audio.shape:
-                            raise RuntimeError(
-                                f"HR Endless Sampler replay cache prefix for Chunk {index + 1} has the wrong shape"
-                            )
-                    else:
-                        prefix_latent = fixed_latent.copy()
-                        prefix_latent["samples"] = comfy.nested_tensor.NestedTensor((prefix_video, prefix_audio))
-                        prefix_noise = noise.generate_noise(prefix_latent)
-                        if not prefix_noise.is_nested or len(prefix_noise.unbind()) != 2:
-                            raise ValueError("HR Endless Sampler expected nested video and audio prefix noise")
-                        prefix_video_noise, prefix_audio_noise = prefix_noise.unbind()
+                    # Reuse the preceding AV noise tokens from the same full
+                    # sequence as the new output, including on cache replay.
+                    prefix_video_noise, prefix_audio_noise = _full_noise_prefix(video_noise, audio_noise, vs, aus, context_video_t, context_audio_t)
+                    if use_taomate:
+                        # Transport halo is only for VAE decoding, never sampled twice.
+                        prefix_video = previous_video[:, :, -context_video_t:].clone()
+                        prefix_audio = previous_audio[..., -context_audio_t:].clone()
                     chunk_video = torch.cat((prefix_video, chunk_video), dim=2)
                     chunk_audio = torch.cat((prefix_audio, chunk_audio), dim=-1)
                     chunk_video_noise = torch.cat((prefix_video_noise, chunk_video_noise), dim=2)
@@ -5143,6 +6055,41 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         context_video_t,
                         context_audio_t,
                         min(MASKED_AV_AUDIO_FEATHER_TICKS, context_audio_t),
+                    )
+                elif continuation and use_masked_av_mode and chunk.get("synthetic_prefix"):
+                    # Native tails guide the prefix without VAE re-encoding.
+                    # Feathering additionally seeds and masks both targets.
+                    boundary_video_context, boundary_start = _video_continuation_boundary_guide(
+                        previous_video, chunk, context_keyframes, use_video_continuation,
+                    )
+                    boundary_audio_t = context_audio_t
+                    if previous_audio is None or int(previous_audio.shape[-1]) < boundary_audio_t:
+                        raise ValueError("Native audio boundary needs the prior chunk's final audio-latent ticks")
+                    boundary_audio_context = previous_audio[..., -boundary_audio_t:].clone()
+                    boundary_audio_feather_ticks = _last_dialogue_word_feather_ticks(
+                        previous_h3_prompt or previous_gemma_description,
+                        boundary_audio_t,
+                    ) if audio_feathered_overlap else 0
+                    if audio_feathered_overlap:
+                        chunk_video, chunk_audio, chunk_noise_mask = _native_audio_boundary_target(
+                            chunk_video,
+                            chunk_audio,
+                            boundary_audio_context,
+                            boundary_audio_t,
+                            boundary_audio_feather_ticks,
+                            previous_video=boundary_video_context,
+                        )
+                    logging.info(
+                        "HR Endless Sampler chunk %d/%d native-tail packing boundary: %d video frames "
+                        "from the prior latent's final 1+4 token pair and %d audio-latent ticks supplied as a keyframe at local frame %d; "
+                        "video/audio latent feathering is %s%s",
+                        index + 1,
+                        len(active_plan),
+                        int(chunk.get("output_trim_frames", 0)),
+                        boundary_audio_t,
+                        boundary_start,
+                        "enabled" if audio_feathered_overlap else "disabled",
+                        " over its final %d last-word ticks" % boundary_audio_feather_ticks if audio_feathered_overlap else "",
                     )
 
                 if continuation and warm_start_video_t:
@@ -5176,6 +6123,22 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 if chunk_noise_mask is not None:
                     chunk_latent["noise_mask"] = chunk_noise_mask
                 chunk_noise = comfy.nested_tensor.NestedTensor((chunk_video_noise, chunk_audio_noise))
+                if not TOGGLE_SINGLE_NOISE and index > 0 and not use_taomate:
+                    # Preserve Chunk 1's original full-shot noise slices, so
+                    # this experiment cannot change an existing first chunk.
+                    # Later prefixes belong to their chunk's independent AV
+                    # noise realization.
+                    per_chunk_noise_seed = _per_chunk_noise_seed(replay_noise_seed, index)
+                    chunk_noise = comfy.sample.prepare_noise(chunk_latent["samples"], per_chunk_noise_seed)
+                    chunk_video_noise, chunk_audio_noise = chunk_noise.unbind()
+                    if chunk.get("synthetic_prefix"):
+                        prefix_video_noise = chunk_video_noise[:, :, :context_video_t]
+                        prefix_audio_noise = chunk_audio_noise[..., :context_audio_t]
+                    if debug:
+                        logging.info(
+                            "HR Endless Sampler chunk %d/%d independent AV noise seed: %d.",
+                            index + 1, len(active_plan), per_chunk_noise_seed,
+                        )
 
                 guide_enabled = context_keyframes > 0
                 guide_audio_t = (
@@ -5184,15 +6147,22 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 )
                 video_context = None if previous_video is None or not guide_enabled else previous_video[:, :, -guide_video_t:].clone()
                 audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -guide_audio_t:].clone()
+                if boundary_video_context is not None:
+                    video_context = boundary_video_context
+                if boundary_audio_context is not None:
+                    audio_context = boundary_audio_context
                 video_contexts = ()
                 video_context_start = 0
                 audio_end_frame = float(keyframe_duration_frames)
-                if audio_context is not None:
+                if boundary_audio_context is not None:
+                    # The exact synthetic-prefix audio ticks begin at local
+                    # zero and use the same duration as the sampled prefix.
+                    audio_end_frame = boundary_audio_context.shape[-1] / FRAME_RESCALE
+                elif audio_context is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
                 video_items = []
                 video_refs = []
-                boundary_video_context = None
                 reference_audio = None
                 if continuation and include_previous_audio_reference:
                     # Audio is intentionally independent from Video1. This
@@ -5275,26 +6245,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             len(active_plan),
                             video_continuation,
                         )
-                # The discarded five-frame boundary keyframe is part of the
-                # Video1 path only. Masked-AV mode must not silently acquire
-                # it merely because its physical overlap is temporarily off.
+                # Video1 also receives the last full frame as an ordinary picture;
+                # this does not add a minimax_keyframes entry or change prefix noise.
                 if continuation and include_video1_reference:
-                    boundary_video_context, boundary_keyframe_index = _video_continuation_boundary_guide(
-                        previous_video,
-                        chunk,
-                        context_keyframes,
-                        use_video_continuation,
-                    )
-                    if boundary_video_context is not None:
-                        video_context = boundary_video_context
-                        video_context_start = boundary_keyframe_index
-                        if debug:
-                            logging.info(
-                                "HR Endless Sampler chunk %d/%d Video1 boundary keyframe: "
-                                "previous final five-frame latent tail anchored across discarded local frames 0-4",
-                                index + 1,
-                                len(active_plan),
-                            )
                     if include_video1_reference:
                         reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
                         full_reference_latent = reference_latent
@@ -5308,10 +6261,15 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             )
                         timer_started = time.perf_counter()
                         try:
+                            if previous_decoded_frames is None:
+                                previous_decoded_frames = _decode_video_frames(vae, previous_video).detach().to(device="cpu", dtype=torch.float32)
                             h3_context_frames, h3_context_kind = _h3_context_frames(
                                 previous_decoded_frames,
                                 previous_color_corrected_decoded_frames,
                             )
+                            picture_item, picture_ref = _last_frame_picture_reference(vae, h3_context_frames, width, height)
+                            video_items.append(picture_item)
+                            video_refs.append(picture_ref)
                             if h3_context_kind == "color-corrected":
                                 # This is intentionally an A/B path: the
                                 # display-corrected tail is re-encoded so H3
@@ -5400,6 +6358,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         raise RuntimeError("Gemma director completed without a detailed_description")
                     continuation_video_label = f"<Video {video_number}>" if continuation and include_video1_reference else None
                     continuation_audio_label = f"<Audio {audio_number}>" if continuation and include_previous_audio_reference else None
+                    audio_speakers = _audio_reference_speakers(previous_gemma_description) if continuation_audio_label else ()
                     chunk_prompt = _prompt_with_gemma_description(
                         prompt,
                         gemma_description,
@@ -5407,12 +6366,20 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         continuation_video_label=continuation_video_label,
                         continuation_audio_label=continuation_audio_label,
                         retention_analysis=gemma_retention_analysis,
+                        audio_speakers=audio_speakers,
+                        summary=result.summary if continuation else None,
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
                     chunk_prompt, debug_prompt = planned_prompts[index]
                     if gemma_report is not None:
                         debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
+                # Apply the same opening/continuation contract with every director or none.
+                if manual_prompts is not None:
+                    chunk_prompt = manual_prompts.get_chunk_prompt(index + 1)
+                else:
+                    chunk_prompt = _chunk_summary_prompt(chunk_prompt, prompt, continuation, picture_label=continuation_picture_label, video_label=f"<Video {video_number}>" if continuation and include_video1_reference else None, audio_label=f"<Audio {audio_number}>" if continuation and include_previous_audio_reference else None, boundary_keyframe=continuation and bool(use_masked_av_mode or context_keyframes))
+                debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 if return_prompts:
                     debug_prompts.append(debug_prompt)
                 if gemma_director is not None:
@@ -5431,6 +6398,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         gemma_system_logged = True
                 if debug:
                     logging.info("HR Endless Sampler debug:\n%s", debug_prompt)
+                preview_chunk_ranges[index]["h3_prompt"] = chunk_prompt
                 if vram_monitor is not None:
                     vram_monitor.report(
                         f"chunk {index + 1}/{len(active_plan)} before Qwen encode",
@@ -5447,7 +6415,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     preview_execution.set_phase(qwen_message, chunk=index)
                 timer_started = time.perf_counter()
                 try:
-                    encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation, video_items)
+                    encoded_prompt = _encode_prompt(clip, chunk_prompt, h3_images, positive, width, height, continuation, video_items)
                 finally:
                     timing.add("qwen", timer_started)
                 if continuation and include_video1_reference:
@@ -5488,7 +6456,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 )
                 guider.original_conds = _conditioning_for_chunk(
                     original_conds,
-                    chunk["frame_start"],
+                    chunk["frame_start"] + chunk["output_trim_frames"] if use_taomate else chunk["frame_start"],
                     chunk["frame_end"],
                     encoded_prompt,
                     video_context,
@@ -5497,6 +6465,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     video_refs,
                     video_context_start,
                     video_contexts,
+                    linear_original_refs,
                 )
 
                 # Every dependency on the previous sampler container has now
@@ -5517,15 +6486,20 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 if isinstance(gemma_retention_analysis, str) and gemma_retention_analysis.strip():
                     preview_chunk_ranges[index]["gemma_retention_analysis"] = gemma_retention_analysis.strip()
                 if preview_execution is not None:
+                    preview_range = preview_chunk_ranges[index]
+                    preview_keeps_prefix = bool(
+                        continuation and keep_continuation_prefix
+                    )
                     preview_execution.set_chunk(
                         index,
                         chunk["frame_start"],
                         chunk["frame_end"] - 1,
-                        content_start,
-                        chunk["frame_end"] - 1,
-                        context_video_t,
+                        preview_range["start"],
+                        preview_range["end"],
+                        0 if preview_keeps_prefix or use_taomate else context_video_t,
                         gemma_description,
                         gemma_retention_analysis,
+                        chunk_prompt,
                     )
                 try:
                     sampling_message = f"{chunk_label}: starting H3 inference"
@@ -5546,10 +6520,35 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         )
                     timer_started = time.perf_counter()
                     try:
-                        sampled, denoised = super().execute(
-                            _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
-                        )
+                        if debug and index == 0:
+                            from .python.h3_diagnostics import H3FirstStepDiagnostic
+                            first_diagnostic = H3FirstStepDiagnostic(video_continuation_method, {"prompt": chunk_prompt, "seed": chunk_seed, "sigmas": sigmas, "noise": chunk_noise.unbind(), "target": chunk_latent["samples"].unbind(), "noise_mask": chunk_latent.get("noise_mask"), "conditioning": guider.original_conds, "chunk": chunk, "cfg": getattr(guider, "cfg", None)})
+                            if use_taomate:
+                                taomate_backend.diagnostic = first_diagnostic
+                            else:
+                                guider.model_patcher.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "hr_first_step_diagnostic", first_diagnostic.forward)
+                        if use_taomate:
+                            def subchunk_start(phase):
+                                """Locate live previews on this phase's actual global frame range."""
+                                if preview_execution is not None:
+                                    preview_execution.set_subchunk(index, taomate_backend.frames(phase["video_start"]), phase["frame_end"] - 1, phase["video_start"], chunk["phases"].index(phase) + 1)
+
+                            def subchunk_complete(completed_frames):
+                                """Fill the request timeline as each internal phase finishes."""
+                                preview_chunk_ranges[index]["taomate_completed_frames"] = completed_frames
+                                if preview_execution is not None:
+                                    completed_phases = sum(1 for phase in chunk["phases"] if phase["frame_end"] - taomate_backend.frames(chunk["video_start"]) <= completed_frames)
+                                    preview_execution.set_subchunk_progress(index, completed_frames, completed_phases)
+                            sampled, denoised = taomate_backend.execute_chunk(super().execute, _FixedNoise, chunk_seed, chunk_noise, guider, sigmas, chunk_latent, chunk, on_subchunk=subchunk_complete, sampler=sampler, on_subchunk_start=subchunk_start, on_status=(lambda message: preview_execution.set_phase(message, chunk=index)) if preview_execution is not None else None, debug_timing=debug)
+                        else:
+                            sampled, denoised = super().execute(
+                                _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
+                            )
                     finally:
+                        if debug and index == 0:
+                            guider.model_patcher.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "hr_first_step_diagnostic")
+                            if use_taomate:
+                                taomate_backend.diagnostic = None
                         h3_render_seconds = timing.add("h3_sampling", timer_started)
                     if vram_monitor is not None:
                         vram_monitor.report(
@@ -5574,12 +6573,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
                 video_trim = 0 if (
                     continuation
-                    and use_masked_av_overlap
-                    and not TRIM_MASKED_AV_PREFIX
+                    and keep_continuation_prefix
                 ) else context_video_t
                 audio_trim = 0 if (
                     index == 0
-                    or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
+                    or (keep_continuation_prefix)
                 ) else context_audio_t
                 assembled_video = previous_video[:, :, video_trim:].clone()
                 masked_audio_prefix = None
@@ -5588,6 +6586,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     # The new chunk's feathered audio is authoritative across
                     # the overlap. Replace the matching accumulated tail, then
                     # append only audio beyond that physical overlap.
+                    masked_audio_prefix = previous_audio[..., :audio_trim].clone()
+                    masked_denoised_audio_prefix = denoised_chunk_audio[..., :audio_trim].clone()
+                    _replace_stream_tail(output_audio, masked_audio_prefix)
+                    _replace_stream_tail(denoised_audio, masked_denoised_audio_prefix)
+                elif continuation and use_masked_av_mode and TRIM_MASKED_AV_PREFIX and audio_trim:
+                    # Mirror the video-tail handoff directly in audio-latent
+                    # space; no audio VAE round trip reaches H3.
                     masked_audio_prefix = previous_audio[..., :audio_trim].clone()
                     masked_denoised_audio_prefix = denoised_chunk_audio[..., :audio_trim].clone()
                     _replace_stream_tail(output_audio, masked_audio_prefix)
@@ -5616,7 +6621,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 final_preview_audio = None
                 final_preview_audio_rate = None
                 final_preview_overlap_audio = None
-                preview_output_start = int(content_start)
+                preview_range = preview_chunk_ranges[index]
+                preview_output_start = int(preview_range["start"])
                 preview_trim_frames = 0
                 if vae is not None:
                     finalization_message = f"{chunk_label}: decoding final video/audio preview"
@@ -5633,14 +6639,16 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             dtype=torch.float32,
                         )
                         retained_start = max(0, int(chunk.get("output_trim_frames", 0)))
-                        preview_output_start = (
-                            int(chunk["frame_start"])
-                            if continuation and use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX
-                            else int(content_start)
+                        preview_keeps_prefix = bool(
+                            continuation and keep_continuation_prefix
                         )
-                        preview_trim_frames = 0 if preview_output_start == int(chunk["frame_start"]) else retained_start
-                        retained_count = max(0, int(chunk["frame_end"]) - preview_output_start)
-                        correction_reference = _decoded_frame_tail(decoded_output_frames, retained_start)
+                        preview_trim_frames = 0 if preview_keeps_prefix else retained_start
+                        retained_count = max(0, int(preview_range["end"]) - preview_output_start + 1)
+                        # MKL is a pixel-space color matcher. Keep the decoded
+                        # compute frames float32, but present sRGB values to it.
+                        decoded_display_frames = _convert_image_transfer(previous_decoded_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else previous_decoded_frames
+                        correction_reference = _decoded_frame_before_tail(decoded_linear_output_frames, preview_trim_frames)
+                        correction_reference = _convert_image_transfer(correction_reference, _inverse_gamma_compute_to_srgb) if linear_color_compute else correction_reference
                         correction_frame_count = _same_shot_correction_frames(
                             gemma_shots,
                             content_start,
@@ -5652,24 +6660,48 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             corrected_frame_count,
                         ) = _correct_decoded_chunk_color(
                             correction_reference,
-                            previous_decoded_frames,
-                            retained_start,
-                            correction_frame_count,
+                            decoded_display_frames,
+                            0,
+                            correction_frame_count + (preview_trim_frames if correction_frame_count else 0),
+                            enabled=correct_chunk_boundaries,
                         )
+                        if correct_all_chunks:
+                            corrected_decoded_frames = _correct_ready_entire_shot_frames(
+                                corrected_decoded_frames,
+                                preview_output_start,
+                                gemma_shots,
+                                gemma_preproduction_timing_plan,
+                                entire_shot_color_anchors,
+                            )
+                        corrected_decoded_frames = _convert_image_transfer(corrected_decoded_frames, _srgb_to_inverse_gamma_compute_rgb) if linear_color_compute else corrected_decoded_frames
                         # Keep the normal raw decode and a separate finalized
                         # corrected copy. The module-level experiment switch
                         # selects the latter only for H3's pixel-space
                         # continuation input on the next chunk.
                         previous_color_corrected_decoded_frames = corrected_decoded_frames
-                        final_preview_frames = corrected_decoded_frames[
+                        final_linear_frames = corrected_decoded_frames[
                             preview_trim_frames:preview_trim_frames + retained_count
                         ].clone()
+                        final_preview_frames = _convert_image_transfer(final_linear_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else final_linear_frames
                         if retained_count and int(final_preview_frames.shape[0]) != retained_count:
                             raise ValueError(
                                 f"Chunk {index + 1} decoded {int(previous_decoded_frames.shape[0])} frames, "
                                 f"but {retained_count} retained frames were required after trimming {retained_start}"
                             )
-                        decoded_output_frames.append(final_preview_frames)
+                        if preview_trim_frames and decoded_linear_output_frames and not use_taomate:
+                            _replace_decoded_frame_tail(decoded_linear_output_frames, corrected_decoded_frames[:preview_trim_frames])
+                            if linear_color_compute:
+                                _replace_decoded_frame_tail(decoded_output_frames, _convert_image_transfer(corrected_decoded_frames[:preview_trim_frames], _inverse_gamma_compute_to_srgb))
+                            if preview_execution is not None:
+                                previous_range = preview_chunk_ranges[index - 1]
+                                preview_execution.replace_video_tail(
+                                    index - 1, decoded_output_frames[-1], previous_range["start"], previous_range["end"],
+                                    gemma_detailed_description=previous_range.get("gemma_detailed_description"),
+                                    gemma_retention_analysis=previous_range.get("gemma_retention_analysis"),
+                                )
+                        decoded_linear_output_frames.append(final_linear_frames)
+                        if linear_color_compute:
+                            decoded_output_frames.append(final_preview_frames)
                         _log_output_color_correction(
                             "Chunk %d" % (index + 1),
                             color_transform,
@@ -5705,7 +6737,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     timer_started = time.perf_counter()
                     try:
                         retained_audio_frames = retained_count
-                        if continuation and use_masked_av_overlap and TRIM_MASKED_AV_PREFIX:
+                        if continuation and use_masked_av_mode and TRIM_MASKED_AV_PREFIX:
                             overlap_frames = max(0, int(chunk.get("output_trim_frames", 0)))
                             full_preview_audio, final_preview_audio_rate = _decode_audio_preview(
                                 audio_vae,
@@ -5716,7 +6748,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             )
                             overlap_samples = max(
                                 0,
-                                round(overlap_frames * final_preview_audio_rate / float(fps)),
+                                round(
+                                    audio_trim * final_preview_audio_rate / AUDIO_LATENT_FPS
+                                    if not use_masked_av_overlap else overlap_frames * final_preview_audio_rate / float(fps)
+                                ),
                             )
                             retained_samples = max(
                                 0,
@@ -5733,6 +6768,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 trim_latent_steps=audio_trim,
                                 output_frames=retained_audio_frames,
                                 fps=fps,
+                                normalize=not use_taomate,
                             )
                     except Exception as error:
                         decoded_audio_complete = False
@@ -5774,6 +6810,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 error,
                             )
 
+                # Preview enhancement happens only after original samples were stored above.
+                if audio_sr and final_preview_audio is not None:
+                    if preview_execution is not None:
+                        preview_execution.set_phase(f"{chunk_label}: AudioSR preview audio", chunk=index)
+                    audio_sr_started = time.perf_counter()
+                    final_preview_audio, final_preview_audio_rate, final_preview_overlap_audio = _enhance_decoded_audio(final_preview_audio, final_preview_audio_rate, final_preview_overlap_audio, enabled=True, device=guider.model_patcher.load_device, seed=chunk_seed % (2 ** 32))
+                    timing.add("audiosr_preview", audio_sr_started)
                 if (
                     preview_execution is not None
                     and final_preview_overlap_audio is not None
@@ -5796,7 +6839,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         index,
                         final_preview_frames,
                         preview_output_start,
-                        chunk["frame_end"] - 1,
+                        preview_range["end"],
                         audio_waveform=final_preview_audio,
                         audio_sample_rate=final_preview_audio_rate,
                         gemma_detailed_description=gemma_description,
@@ -5831,7 +6874,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         index,
                         final_preview_frames,
                         preview_output_start,
-                        chunk["frame_end"] - 1,
+                        preview_range["end"],
                         chunk_metadata=preview_chunk_ranges[index],
                         shot_ranges=preview_shot_ranges,
                         audio_waveform=final_preview_audio,
@@ -5842,6 +6885,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_timing_plan = result.timing_plan
                     previous_gemma_end_state = result.end_state
                     previous_gemma_last_seen_character_state = list(result.last_seen_character_state)
+                # The native audio seam uses the actual H3 prompt that just
+                # rendered, so a carried dialogue word is timed from its
+                # emitted text rather than the source prompt.
+                previous_h3_prompt = chunk_prompt
                 if replay_cache is not None:
                     try:
                         replay_cache.save_chunk(
@@ -5862,6 +6909,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "gemma_timing_plan": previous_gemma_timing_plan,
                                 "gemma_end_state": previous_gemma_end_state,
                                 "gemma_retention_analysis": gemma_retention_analysis,
+                                "h3_prompt": chunk_prompt,
                                 "gemma_last_seen_character_state": previous_gemma_last_seen_character_state,
                                 "h3_render_seconds": h3_render_seconds,
                                 "gemma_seconds": chunk_gemma_seconds,
@@ -5875,9 +6923,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 # restore the exact corrected IMAGE/preview
                                 # frames and audio without loading either VAE.
                                 "decoded_video_frames": previous_decoded_frames,
-                                "corrected_video_frames": previous_color_corrected_decoded_frames,
+                                "corrected_video_frames": _convert_image_transfer(previous_color_corrected_decoded_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else previous_color_corrected_decoded_frames,
                                 "decoded_preview_start": preview_output_start,
-                                "decoded_preview_end": int(chunk["frame_end"]) - 1,
+                                "decoded_preview_end": int(preview_range["end"]),
                                 "decoded_preview_offset": preview_trim_frames,
                                 "decoded_preview_audio": final_preview_audio,
                                 "decoded_preview_audio_rate": final_preview_audio_rate,
@@ -5941,9 +6989,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     restored_range = preview_chunk_ranges[index]
                     correction_overlap = max(0, int(restored_plan.get("output_trim_frames", 0)))
                     keep_masked_av_prefix = (
-                        use_masked_av_overlap
-                        and index > 0
-                        and not TRIM_MASKED_AV_PREFIX
+                        keep_continuation_prefix and index > 0
                     )
                     (
                         raw_frames,
@@ -5958,20 +7004,25 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         state.get("sampled_audio"),
                         output_trim_frames=restored_plan.get("output_trim_frames", 0),
                         context_audio_t=(
-                            0 if index == 0 or (use_masked_av_overlap and not TRIM_MASKED_AV_PREFIX)
+                            0 if index == 0 or (keep_continuation_prefix)
                             else restored_plan.get("context_audio_t", 0)
                         ),
-                        output_frames=int(restored_range["end"]) - int(restored_range["start"]) + 1,
+                        output_frames=restored_plan["frame_end"] - restored_plan["frame_start"] - correction_overlap,
                         fps=fps,
                         masked_audio_overlap_frames=(
                             restored_plan.get("output_trim_frames", 0)
                             if use_masked_av_overlap and TRIM_MASKED_AV_PREFIX and index > 0
                             else 0
                         ),
+                        replace_audio_tail_ticks=bool(use_masked_av_mode and TRIM_MASKED_AV_PREFIX and index > 0),
                         keep_masked_av_prefix=keep_masked_av_prefix,
                     )
                     retained_start = 0 if keep_masked_av_prefix else correction_overlap
-                    correction_reference = _decoded_frame_tail(decoded_output_frames, correction_overlap)
+                    # Cached chunk restoration follows the live decode path:
+                    # correct in float32 display sRGB, then retain compute RGB.
+                    raw_display_frames = _convert_image_transfer(raw_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else raw_frames
+                    correction_reference = _decoded_frame_before_tail(decoded_linear_output_frames, retained_start)
+                    correction_reference = _convert_image_transfer(correction_reference, _inverse_gamma_compute_to_srgb) if linear_color_compute else correction_reference
                     correction_frame_count = _same_shot_correction_frames(
                         gemma_shots,
                         restored_range["start"],
@@ -5979,17 +7030,24 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     )
                     corrected_frames, color_transform, corrected_frame_count = _correct_decoded_chunk_color(
                         correction_reference,
-                        raw_frames,
-                        correction_overlap,
-                        correction_frame_count,
+                        raw_display_frames,
+                        0,
+                        correction_frame_count + (retained_start if correction_frame_count else 0),
+                        enabled=correct_chunk_boundaries,
                     )
+                    if correct_all_chunks:
+                        corrected_frames = _correct_ready_entire_shot_frames(
+                            corrected_frames,
+                            restored_range["start"],
+                            gemma_shots,
+                            gemma_preproduction_timing_plan,
+                            entire_shot_color_anchors,
+                        )
+                    corrected_frames = _convert_image_transfer(corrected_frames, _srgb_to_inverse_gamma_compute_rgb) if linear_color_compute else corrected_frames
                     retained_count = int(restored_range["end"]) - int(restored_range["start"]) + 1
-                    if keep_masked_av_prefix:
-                        retained_count += correction_overlap
-                    cached_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
-                    cached_preview_start = (
-                        restored_plan["frame_start"] if keep_masked_av_prefix else int(restored_range["start"])
-                    )
+                    cached_linear_frames = corrected_frames[retained_start:retained_start + retained_count].clone()
+                    cached_frames = _convert_image_transfer(cached_linear_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else cached_linear_frames
+                    cached_preview_start = int(restored_range["start"])
                     _log_output_color_correction(
                         "restored Chunk %d" % (index + 1),
                         color_transform,
@@ -6013,6 +7071,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     description = state.get("gemma_description")
                     if isinstance(description, str) and description.strip():
                         preview_chunk_ranges[index]["gemma_detailed_description"] = description.strip()
+                    h3_prompt = state.get("h3_prompt")
+                    if isinstance(h3_prompt, str) and h3_prompt.strip():
+                        preview_chunk_ranges[index]["h3_prompt"] = h3_prompt.strip()
                     for key in (
                         "h3_render_seconds",
                         "gemma_seconds",
@@ -6023,7 +7084,20 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
                             preview_chunk_ranges[index][key] = float(value)
 
-                    decoded_output_frames.append(cached_frames)
+                    if retained_start and decoded_linear_output_frames:
+                        _replace_decoded_frame_tail(decoded_linear_output_frames, corrected_frames[:retained_start])
+                        if linear_color_compute:
+                            _replace_decoded_frame_tail(decoded_output_frames, _convert_image_transfer(corrected_frames[:retained_start], _inverse_gamma_compute_to_srgb))
+                        if preview_execution is not None:
+                            previous_range = preview_chunk_ranges[index - 1]
+                            preview_execution.replace_video_tail(
+                                index - 1, decoded_output_frames[-1], previous_range["start"], previous_range["end"],
+                                gemma_detailed_description=previous_range.get("gemma_detailed_description"),
+                                gemma_retention_analysis=previous_range.get("gemma_retention_analysis"),
+                            )
+                    decoded_linear_output_frames.append(cached_linear_frames)
+                    if linear_color_compute:
+                        decoded_output_frames.append(cached_frames)
                     cached_color_diagnostics = _safe_video_color_diagnostics(cached_frames, index + 1)
                     if cached_color_diagnostics is not None:
                         _record_color_diagnostics(
@@ -6042,6 +7116,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         if cached_overlap_audio is not None:
                             _replace_stream_tail(decoded_output_audio, cached_overlap_audio)
                         decoded_output_audio.append(cached_audio.clone())
+                    cached_audio, cached_audio_rate, cached_overlap_audio = _enhance_decoded_audio(cached_audio, cached_audio_rate, cached_overlap_audio, enabled=audio_sr, device=guider.model_patcher.load_device, seed=(replay_noise_seed + index) % (2 ** 32))
                     if preview_execution is not None:
                         preview_execution.finalize_chunk(
                             index,
@@ -6111,15 +7186,58 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         final_frames = None
                         comfy.model_management.unload_model_and_clones(vae.patcher)
                         comfy.model_management.soft_empty_cache(force=True)
-            if decoded_video_complete and decoded_output_frames and gemma_preproduction_timing_plan is not None:
+            if use_taomate and vae is not None and output_video:
+                # Publish from one continuous latent decode, as upstream does.
+                # output_video contains only new media, with transport halos removed.
+                taomate_backend.close()
+                if preview_execution is not None:
+                    preview_execution.set_phase("TaoMate: decoding continuous video timeline")
+                logging.info("TaoMate: decoding assembled video latent timeline for final output.")
+                timer_started = time.perf_counter()
+                decoded_output_frames.clear()
+                decoded_linear_output_frames.clear()
+                entire_shot_color_anchors.clear()
+                try:
+                    expected_frames = int(preview_chunk_ranges[completed_chunks - 1]["end"]) + 1
+                    full_frames = taomate_backend.decode_video_timeline(lambda latent: _decode_video_frames(vae, latent), output_video, expected_frames)
+                    # Apply the selected output-only grading to the new continuous
+                    # decode, never reuse pixels or anchors from provisional previews.
+                    prior_display = None
+                    for final_index, final_range in enumerate(preview_chunk_ranges[:completed_chunks]):
+                        start, end = int(final_range["start"]), int(final_range["end"]) + 1
+                        display_frames = full_frames[start:end]
+                        if linear_color_compute:
+                            display_frames = _convert_image_transfer(display_frames, _inverse_gamma_compute_to_srgb)
+                        correction_count = _same_shot_correction_frames(gemma_shots, start, end)
+                        display_frames, transform, corrected_count = _correct_decoded_chunk_color(prior_display, display_frames, 0, correction_count, enabled=correct_chunk_boundaries)
+                        if correct_all_chunks:
+                            display_frames = _correct_ready_entire_shot_frames(display_frames, start, gemma_shots, gemma_preproduction_timing_plan, entire_shot_color_anchors)
+                        prior_display = display_frames[-1:]
+                        decoded_output_frames.append(display_frames)
+                        if linear_color_compute:
+                            decoded_linear_output_frames.append(_convert_image_transfer(display_frames, _srgb_to_inverse_gamma_compute_rgb))
+                        _log_output_color_correction("TaoMate final Chunk %d" % (final_index + 1), transform, corrected_count)
+                        if preview_execution is not None:
+                            preview_execution.finalize_chunk(final_index, display_frames, start, end - 1, gemma_detailed_description=final_range.get("gemma_detailed_description"), gemma_retention_analysis=final_range.get("gemma_retention_analysis"))
+                    decoded_video_complete = True
+                    full_frames = None
+                finally:
+                    timing.add("vae_video_final", timer_started)
+                    comfy.model_management.unload_model_and_clones(vae.patcher)
+                    comfy.model_management.soft_empty_cache(force=True)
+            # Ready chunks were progressively matched as they decoded. Retain
+            # this fallback only when no source-shot anchor was available.
+            if correct_all_chunks and not entire_shot_color_anchors and completed_chunks == len(plan) and decoded_video_complete and decoded_linear_output_frames:
                 final_grade_started = time.perf_counter()
-                provisional_frames = torch.cat(decoded_output_frames, dim=0)
+                provisional_frames = torch.cat(decoded_linear_output_frames, dim=0)
+                provisional_display_frames = _convert_image_transfer(provisional_frames, _inverse_gamma_compute_to_srgb) if linear_color_compute else provisional_frames
                 final_frames, shot_grade_reports = _final_shot_color_correction(
-                    provisional_frames,
+                    provisional_display_frames,
                     gemma_shots,
                     gemma_preproduction_timing_plan,
                     preview_chunk_ranges[:completed_chunks],
                 )
+                final_frames = _convert_image_transfer(final_frames, _srgb_to_inverse_gamma_compute_rgb) if linear_color_compute else final_frames
                 if shot_grade_reports:
                     logging.info(
                         "HR Endless Sampler final output-only stable-lighting grade: %s.",
@@ -6130,13 +7248,16 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     )
                 if final_frames is not provisional_frames:
                     offset = 0
-                    for index, frames in enumerate(decoded_output_frames):
+                    for index, frames in enumerate(decoded_linear_output_frames):
                         next_offset = offset + int(frames.shape[0])
-                        decoded_output_frames[index] = final_frames[offset:next_offset].clone()
+                        decoded_linear_output_frames[index] = final_frames[offset:next_offset].clone()
+                        display_frames = _convert_image_transfer(decoded_linear_output_frames[index], _inverse_gamma_compute_to_srgb) if linear_color_compute else decoded_linear_output_frames[index]
+                        if linear_color_compute:
+                            decoded_output_frames[index] = display_frames
                         if preview_execution is not None:
                             preview_execution.finalize_chunk(
                                 index,
-                                decoded_output_frames[index],
+                                display_frames,
                                 preview_chunk_ranges[index]["start"],
                                 preview_chunk_ranges[index]["end"],
                                 gemma_detailed_description=preview_chunk_ranges[index].get("gemma_detailed_description"),
@@ -6144,8 +7265,40 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             )
                         offset = next_offset
                 timing.add("output_shot_color", final_grade_started)
+            if use_taomate and audio_vae is not None and output_audio:
+                # Upstream runner._publish joins the complete clean latent timeline
+                # before audio-VAE decoding. Group previews above are provisional.
+                # Release retained KV before loading the final decoder.
+                taomate_backend.close()
+                if preview_execution is not None:
+                    preview_execution.set_phase("TaoMate: decoding continuous audio timeline")
+                timer_started = time.perf_counter()
+                try:
+                    full_audio, decoded_audio_sample_rate = taomate_backend.decode_audio_timeline(audio_vae, output_audio)
+                    decoded_output_audio = [full_audio]
+                    decoded_audio_complete = True
+                finally:
+                    timing.add("vae_audio_preview", timer_started)
+                    comfy.model_management.unload_model_and_clones(audio_vae.patcher)
+                    comfy.model_management.soft_empty_cache(force=True)
+            if audio_sr and decoded_audio_complete and decoded_output_audio and decoded_audio_sample_rate is not None:
+                # One independent pass over the assembled original decodes, never
+                # the already-enhanced per-chunk preview audio or browser proxies.
+                if preview_execution is not None:
+                    preview_execution.set_phase("AudioSR: enhancing full original decoded audio")
+                audio_sr_started = time.perf_counter()
+                full_original_audio = torch.cat(decoded_output_audio, dim=-1)
+                full_audio, full_rate, _unused_overlap = _enhance_decoded_audio(full_original_audio, decoded_audio_sample_rate, enabled=True, device=guider.model_patcher.load_device, seed=replay_noise_seed % (2 ** 32))
+                enhanced_audio_output = {"waveform": full_audio, "sample_rate": full_rate}
+                timing.add("audiosr_final", audio_sr_started)
+            if use_taomate and preview_execution is not None and decoded_audio_complete and decoded_output_audio:
+                # Replace provisional browser audio with slices of the single decode.
+                published_audio = enhanced_audio_output or {"waveform": decoded_output_audio[0], "sample_rate": decoded_audio_sample_rate}
+                preview_execution.replace_audio_timeline(published_audio["waveform"], published_audio["sample_rate"], preview_chunk_ranges[:completed_chunks], fps)
             sampling_completed = True
         finally:
+            if taomate_backend is not None:
+                taomate_backend.close()
             guider.original_conds = original_conds
             if vram_monitor is not None:
                 guider.model_patcher.remove_wrappers_with_key(
@@ -6221,7 +7374,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             final_denoised_audio = final_denoised_audio.to(device=audio.device)
         output_template["samples"] = comfy.nested_tensor.NestedTensor((final_output_video, final_output_audio))
         denoised_template["samples"] = comfy.nested_tensor.NestedTensor((final_denoised_video, final_denoised_audio))
-        rendered_frames = active_plan[completed_chunks - 1]["frame_end"] if completed_chunks else 0
+        rendered_frames = preview_chunk_ranges[completed_chunks - 1]["end"] + 1 if completed_chunks else 0
         timeline = normalize_timeline(
             {
                 "fps": fps,
@@ -6263,10 +7416,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 "waveform": decoded_waveform,
                 "sample_rate": int(decoded_audio_sample_rate),
             }
+            if enhanced_audio_output is not None:
+                decoded_audio_output = enhanced_audio_output
             logging.info(
-                "HR Endless Sampler AUDIO output: %.3f seconds of corrected full audio-VAE output at %d Hz.",
-                decoded_waveform.shape[-1] / float(decoded_audio_sample_rate),
-                decoded_audio_sample_rate,
+                "HR Endless Sampler AUDIO output: %.3f seconds at %d Hz (%s).",
+                decoded_audio_output["waveform"].shape[-1] / float(decoded_audio_output["sample_rate"]),
+                decoded_audio_output["sample_rate"],
+                "AudioSR full-original pass" if enhanced_audio_output is not None else "original audio-VAE decode",
             )
         if replay_cache is not None and sampling_completed and debug_stop_chunk == 0:
             try:

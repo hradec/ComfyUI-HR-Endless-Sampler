@@ -2,6 +2,14 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 
+function chunkPromptDescription(chunk) {
+    // The actual H3 prompt is authoritative, including runs without a director.
+    const prompt = String(chunk.h3_prompt || "");
+    const field = prompt.match(/(?:^|\n)[ \t]*(?:detailed_description|integrated_multimodal_description)[ \t]*:[ \t]*([\s\S]*?)(?=\n[ \t]*(?:overall_soundscape|non_diegetic_music|retention_analysis|summary)[ \t]*:|$)/i);
+    return field ? field[1].trim() : String(chunk.gemma_detailed_description || "").trim();
+}
+
+
 function findEndlessPlayerNode(rootGraph, qualifiedId) {
     const parts = String(qualifiedId).split(":");
     let graph = rootGraph;
@@ -86,6 +94,14 @@ function finishedShotsOverlappingChunk(chunk, shotRanges) {
 function finishedColoredShotSegments(description, chunk, shotRanges) {
     const text = String(description || "");
     if (!text) return [];
+    // Full-prompt headers must not shift the description's shot-color mapping.
+    const body = chunkPromptDescription({ h3_prompt: text });
+    if (body && body !== text) {
+        const start = text.indexOf(body);
+        return [{ text: text.slice(0, start), color: "#b8b8d0" },
+            ...finishedColoredShotSegments(body, chunk, shotRanges),
+            { text: text.slice(start + body.length), color: "#b8b8d0" }];
+    }
     const overlapping = finishedShotsOverlappingChunk(chunk, shotRanges);
     const colorFor = shot => shot
         ? playerColors[(Math.max(1, Number(shot.shot) || 1) - 1) % playerColors.length]
@@ -147,7 +163,7 @@ function createFinishedChunkTooltip() {
     }
 
     return {
-        show(event, { help, chunk, timing, description, retentionAnalysis, shotRanges }) {
+        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, showFullPrompt, shotRanges }) {
             tooltip.replaceChildren();
             line(help, "color:#999;margin-bottom:6px;");
             const chunkNumber = Number(chunk.chunk) || 1;
@@ -158,22 +174,30 @@ function createFinishedChunkTooltip() {
             } else {
                 line("No render timing was saved for this chunk.", "color:#888;");
             }
-            if (retentionAnalysis) {
+            if (!showFullPrompt && retentionAnalysis) {
                 line("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
                 line(retentionAnalysis, "color:#d8c7a0;");
             }
-            line("Gemma detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
-            if (description) {
+            line(showFullPrompt ? "Full prompt sent to H3:" : "chunk detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+            const text = showFullPrompt ? fullPrompt : description;
+            if (text) {
                 const prompt = document.createElement("div");
-                for (const segment of finishedColoredShotSegments(description, chunk, shotRanges)) {
-                    const span = document.createElement("span");
-                    span.textContent = segment.text;
-                    span.style.color = segment.color;
-                    prompt.appendChild(span);
+                for (const segment of finishedColoredShotSegments(text, chunk, shotRanges)) {
+                    // H3 dialogue tags remain literal text; only their presentation changes.
+                    for (const [index, part] of segment.text.split(/(<d>[\s\S]*?<\/d>)/gi).entries()) {
+                        const span = document.createElement("span");
+                        span.textContent = part;
+                        span.style.color = segment.color;
+                        if (index % 2) {
+                            span.style.color = `color-mix(in srgb, ${segment.color} 65%, white)`;
+                            span.style.fontWeight = "700";
+                        }
+                        prompt.appendChild(span);
+                    }
                 }
                 tooltip.appendChild(prompt);
             } else {
-                line("No Gemma detailed_description was saved for this chunk.", "color:#888;");
+                line(showFullPrompt ? "No full H3 prompt was saved for this chunk." : "No chunk detailed_description was saved for this chunk.", "color:#888;");
             }
             tooltip.style.display = "block";
             position(event);
@@ -527,7 +551,7 @@ api.addEventListener("hr_endless_sampler_saved_video", event => {
 app.registerExtension({
     name: "HREndlessSampler.FinishedVideoPlayer",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (!new Set(["HREndlessSamplerSaveVideo", "HREndlessSamplerLoadVideo"]).has(nodeData?.name)) return;
+        if (!new Set(["HREndlessSamplerSaveVideo", "HREndlessSamplerLoadVideo", "HREndlessSamplerVideoCompare"]).has(nodeData?.name)) return;
 
         const previousCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -535,8 +559,11 @@ app.registerExtension({
             const node = this;
             const isLoadNode = nodeData?.name === "HREndlessSamplerLoadVideo";
             const isSaveNode = nodeData?.name === "HREndlessSamplerSaveVideo";
+            const isCompareNode = nodeData?.name === "HREndlessSamplerVideoCompare";
             const loadPathWidget = isLoadNode ? node.widgets?.find(widget => widget.name === "video") : null;
             const filenamePrefixWidget = isSaveNode ? node.widgets?.find(widget => widget.name === "filename_prefix") : null;
+            // LiteGraph serializes node properties with the workflow, so this survives refresh and execution.
+            const savedPlayerState = node.properties?.hr_endless_sampler_player || {};
             const root = document.createElement("div");
             root.style.cssText = "display:flex;flex-direction:column;width:100%;height:100%;min-height:355px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
             root.tabIndex = 0;
@@ -638,6 +665,18 @@ app.registerExtension({
             wipeSvg.appendChild(wipeHitLine);
             viewport.appendChild(wipeSvg);
 
+            // These labels identify the two IMAGE inputs and follow their clipped regions.
+            const compareInputLabels = document.createElement("div");
+            compareInputLabels.style.cssText = "position:absolute;inset:0;display:none;pointer-events:none;z-index:5;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;text-shadow:0 1px 2px #000;";
+            const compareImageLabels = ["Images1", "Images2"].map(name => {
+                const label = document.createElement("span");
+                label.textContent = name;
+                label.style.cssText = "position:absolute;padding:4px 6px;border:1px solid rgba(255,255,255,.5);border-radius:3px;background:rgba(0,0,0,.55);color:#f5f5f5;transform:translate(-50%,-50%);";
+                compareInputLabels.appendChild(label);
+                return label;
+            });
+            viewport.appendChild(compareInputLabels);
+
             const frameLabel = document.createElement("div");
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
             viewport.appendChild(frameLabel);
@@ -652,6 +691,12 @@ app.registerExtension({
             playButton.textContent = "▶";
             playButton.title = "Play/pause (Space). Use Left/Right arrows for one frame.";
             transport.appendChild(playButton);
+
+            const muteButton = document.createElement("button");
+            muteButton.type = "button";
+            muteButton.style.cssText = "display:flex;align-items:center;justify-content:center;width:23px;height:19px;padding:0;border:1px solid #555;border-radius:3px;background:#252525;color:#f4f4f4;font:13px/1 sans-serif;cursor:pointer;";
+            muteButton.title = "Mute/unmute video audio (M)";
+            transport.appendChild(muteButton);
 
             const timelineHelp = "Click or drag to seek; colors identify sampler chunks";
             const timelineShell = document.createElement("div");
@@ -677,7 +722,7 @@ app.registerExtension({
 
             const status = document.createElement("div");
             status.style.cssText = "box-sizing:border-box;padding:7px 9px;background:#1b1b1b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
-            status.textContent = "Waiting for a saved HR Endless Sampler render…";
+            status.textContent = isCompareNode ? "Waiting for two IMAGE videos…" : "Waiting for a saved HR Endless Sampler render…";
             root.appendChild(status);
 
             if (isSaveNode) {
@@ -709,11 +754,15 @@ app.registerExtension({
             let lastSavedStateId = null;
             let compareState = null;
             let compareSourceFps = 24;
+            let audioMuted = Boolean(savedPlayerState.muted);
+            let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame) ? savedPlayerState.frame : null;
             let wipePosition = 0.5;
             let wipeModeIndex = 0;
             let wipeDragging = false;
             let tooltipChunk = null;
             let tooltipSignature = null;
+            let tooltipPointer = null;
+            let shiftPromptVisible = false;
 
             function downloadFilename() {
                 try {
@@ -738,6 +787,37 @@ app.registerExtension({
                 downloadButton.title = available
                     ? `Download ${downloadFilename()} to your computer. This does not remove the copy in ComfyUI's output folder.`
                     : "Run this Save Video node or select a matching saved render before downloading.";
+            }
+
+            function persistPlayerState() {
+                node.properties = node.properties || {};
+                node.properties.hr_endless_sampler_player = {
+                    frame: currentFrame(),
+                    muted: audioMuted,
+                };
+            }
+
+            function renderMuteButton() {
+                media.muted = audioMuted;
+                muteButton.textContent = audioMuted ? "🔇" : "🔊";
+                muteButton.setAttribute("aria-label", audioMuted ? "Unmute video audio" : "Mute video audio");
+                muteButton.style.color = audioMuted ? "#999" : "#f4f4f4";
+                muteButton.style.background = audioMuted ? "#1d1d1d" : "#252525";
+            }
+
+            function setAudioMuted(value) {
+                audioMuted = Boolean(value);
+                renderMuteButton();
+                persistPlayerState();
+            }
+
+            function restorePersistedFrame() {
+                if (!Number.isFinite(pendingFrame) || !sourceFps) return;
+                const total = totalFrames();
+                if (!total) return;
+                media.currentTime = Math.max(0, Math.min(total - 1, Math.round(pendingFrame))) / sourceFps;
+                pendingFrame = null;
+                syncComparison(true);
             }
 
             function totalFrames() {
@@ -780,7 +860,7 @@ app.registerExtension({
                 return x - y - (2 * wipePosition - 1);
             }
 
-            function clippedComparisonPolygon() {
+            function clippedComparisonPolygon(positive=true) {
                 let polygon = [[0, 0], [1, 0], [1, 1], [0, 1]];
                 const output = [];
                 for (let index = 0; index < polygon.length; index++) {
@@ -788,8 +868,8 @@ app.registerExtension({
                     const end = polygon[(index + 1) % polygon.length];
                     const startDistance = wipeSignedDistance(start[0], start[1]);
                     const endDistance = wipeSignedDistance(end[0], end[1]);
-                    const startInside = startDistance >= -1e-9;
-                    const endInside = endDistance >= -1e-9;
+                    const startInside = positive ? startDistance >= -1e-9 : startDistance <= 1e-9;
+                    const endInside = positive ? endDistance >= -1e-9 : endDistance <= 1e-9;
                     if (startInside && endInside) {
                         output.push(end);
                     } else if (startInside !== endInside) {
@@ -804,7 +884,24 @@ app.registerExtension({
                 return output;
             }
 
+            function labelEdgePosition(positive) {
+                // Pick the outer viewport corner farthest from the divider.
+                const corners = [[0, 0], [1, 0], [1, 1], [0, 1]];
+                let selected = corners[0];
+                let distance = -Infinity;
+                for (const corner of corners) {
+                    const signed = wipeSignedDistance(corner[0], corner[1]);
+                    const score = positive ? signed : -signed;
+                    if (score > distance) {
+                        selected = corner;
+                        distance = score;
+                    }
+                }
+                return selected;
+            }
+
             function wipeBoundaryEndpoints() {
+
                 const corners = [[0, 0], [1, 0], [1, 1], [0, 1]];
                 const points = [];
                 function add(point) {
@@ -834,8 +931,17 @@ app.registerExtension({
                 const active = Boolean(compareState?.media_url);
                 compareMedia.style.display = active ? "block" : "none";
                 wipeSvg.style.display = active ? "block" : "none";
+                compareInputLabels.style.display = isCompareNode && active ? "block" : "none";
                 if (!active) return;
                 const polygon = clippedComparisonPolygon();
+                for (let index = 0; index < compareImageLabels.length; index++) {
+                    const [x, y] = labelEdgePosition(index === 1);
+                    const horizontal = x ? "calc(-100% - 8px)" : "8px";
+                    const vertical = y ? "calc(-100% - 8px)" : "8px";
+                    compareImageLabels[index].style.left = `${x * 100}%`;
+                    compareImageLabels[index].style.top = `${y * 100}%`;
+                    compareImageLabels[index].style.transform = `translate(${horizontal},${vertical})`;
+                }
                 compareMedia.style.clipPath = polygon.length
                     ? `polygon(${polygon.map(point => `${point[0] * 100}% ${point[1] * 100}%`).join(",")})`
                     : "polygon(0 0,0 0,0 0)";
@@ -998,6 +1104,7 @@ app.registerExtension({
                 if (!total) return;
                 const target = Math.max(0, Math.min(total - 1, Math.round(frame)));
                 media.currentTime = target / sourceFps;
+                persistPlayerState();
                 syncComparison(true);
                 renderStatus();
             }
@@ -1010,6 +1117,7 @@ app.registerExtension({
             }
 
             function tooltipForPointer(event) {
+                tooltipPointer = { clientX: event.clientX, clientY: event.clientY };
                 const frame = frameAtPointer(event);
                 const chunk = containing(chunks(), frame);
                 if (!chunk) {
@@ -1018,10 +1126,12 @@ app.registerExtension({
                     chunkTooltip.hide();
                     return;
                 }
-                const description = String(chunk.gemma_detailed_description || "").trim();
+                const description = chunkPromptDescription(chunk);
                 const retentionAnalysis = String(chunk.gemma_retention_analysis || "").trim();
+                const fullPrompt = String(chunk.h3_prompt || "").trim();
+                const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);
                 const timing = finishedChunkTimingLines(chunk);
-                const signature = JSON.stringify([description, retentionAnalysis, timing, shots()]);
+                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, showFullPrompt, timing, shots()]);
                 if (tooltipChunk === chunk && tooltipSignature === signature) {
                     chunkTooltip.move(event);
                     return;
@@ -1029,17 +1139,21 @@ app.registerExtension({
                 tooltipChunk = chunk;
                 tooltipSignature = signature;
                 chunkTooltip.show(event, {
-                    help: timelineHelp,
+                    help: `${timelineHelp}\nHold Shift to show the full prompt sent to H3.`,
                     chunk,
                     timing,
                     description,
                     retentionAnalysis,
+                    fullPrompt,
+                    showFullPrompt,
                     shotRanges: shots(),
                 });
             }
 
             function setState(data) {
                 if (!data?.media_url || !data?.timeline) return;
+                const visibleFrame = currentFrame();
+                if (Number.isFinite(visibleFrame)) pendingFrame = visibleFrame;
                 state = data;
                 updateDownloadButton();
                 timeline = data.timeline;
@@ -1050,8 +1164,26 @@ app.registerExtension({
                 media.src = data.media_url;
                 media.load();
                 applyPlaybackRate();
+                if (isCompareNode) setFixedComparison(data);
                 syncComparison(true);
                 renderStatus();
+            }
+
+            function setFixedComparison(data) {
+                const mediaUrl = String(data?.compare_media_url || "");
+                if (!mediaUrl) {
+                    clearComparison();
+                    return;
+                }
+                compareState = { media_url: mediaUrl };
+                compareSourceFps = validEndlessFps(data.compare_source_fps)
+                    || validEndlessFps(data.source_fps) || sourceFps;
+                compareMedia.pause();
+                compareMedia.removeAttribute("src");
+                const separator = mediaUrl.includes("?") ? "&" : "?";
+                compareMedia.src = `${mediaUrl}${separator}_hr_compare=${encodeURIComponent(data.state_id || Date.now())}`;
+                compareMedia.load();
+                renderComparisonWipe();
             }
 
             function savedStateWithCacheBust(data) {
@@ -1168,9 +1300,11 @@ app.registerExtension({
                 compareMedia.pause();
                 compareMedia.removeAttribute("src");
                 compareMedia.load();
-                comparePathLabel.textContent = "No comparison video selected";
-                comparePathLabel.title = "The normal Save/Matching video is shown on the first side; choose a comparison video to enable the interactive wipe.";
-                compareButton.disabled = false;
+                if (comparePathLabel) {
+                    comparePathLabel.textContent = "No comparison video selected";
+                    comparePathLabel.title = "The normal Save/Matching video is shown on the first side; choose a comparison video to enable the interactive wipe.";
+                }
+                if (compareButton) compareButton.disabled = false;
                 renderComparisonWipe();
             }
 
@@ -1182,10 +1316,13 @@ app.registerExtension({
             const previousExecuted = node.onExecuted;
             node.onExecuted = function (message) {
                 const result = previousExecuted?.apply(this, arguments);
-                if (isSaveNode) {
+                if (isSaveNode || isCompareNode) {
                     const values = message?.hr_endless_sampler_saved_video;
                     const saved = Array.isArray(values) ? values[values.length - 1] : values;
-                    if (saved) applyAuthoritativeSavedState(saved);
+                    if (saved) {
+                        if (isSaveNode) applyAuthoritativeSavedState(saved);
+                        else setState(saved);
+                    }
                 }
                 return result;
             };
@@ -1244,7 +1381,7 @@ app.registerExtension({
                 });
             }
 
-            matchingButton.addEventListener("click", async event => {
+            matchingButton?.addEventListener("click", async event => {
                 event.preventDefault();
                 event.stopPropagation();
                 const source = isLoadNode ? loadPathWidget?.value : filenamePrefixWidget?.value;
@@ -1269,6 +1406,13 @@ app.registerExtension({
                 const selected = await openMatchingVideoDropdown(compareButton, source, false, "up", true);
                 if (selected === "") clearComparison();
                 else if (selected) await previewComparisonPath(selected);
+            });
+
+            muteButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                setAudioMuted(!audioMuted);
+                root.focus({ preventScroll: true });
             });
 
             playButton.addEventListener("click", event => {
@@ -1327,10 +1471,19 @@ app.registerExtension({
                 });
             }
             timelineShell.addEventListener("mouseleave", () => {
+                tooltipPointer = null;
                 tooltipChunk = null;
                 tooltipSignature = null;
                 chunkTooltip.hide();
             });
+            // Update a stationary hover immediately when Shift is pressed/released.
+            const updateShiftPrompt = event => {
+                if (event.key !== "Shift") return;
+                shiftPromptVisible = event.type === "keydown";
+                if (tooltipPointer && tooltipChunk) tooltipForPointer({ ...tooltipPointer, shiftKey: shiftPromptVisible });
+            };
+            document.addEventListener("keydown", updateShiftPrompt);
+            document.addEventListener("keyup", updateShiftPrompt);
             root.addEventListener("keydown", event => {
                 if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
                     event.preventDefault();
@@ -1342,10 +1495,16 @@ app.registerExtension({
                     event.stopPropagation();
                     if (media.paused) media.play().catch(error => console.warn("HR Endless Sampler video playback failed", error));
                     else media.pause();
+                } else if (event.key === "m" || event.key === "M") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setAudioMuted(!audioMuted);
                 }
             });
             for (const eventName of ["loadedmetadata", "loadeddata", "timeupdate", "seeking", "seeked", "pause", "play", "ended", "ratechange"]) {
                 media.addEventListener(eventName, () => {
+                    if (eventName === "loadedmetadata") restorePersistedFrame();
+                    if (["timeupdate", "seeking", "seeked", "pause"].includes(eventName)) persistPlayerState();
                     applyPlaybackRate();
                     if (["loadedmetadata", "loadeddata", "seeking", "seeked", "pause", "play", "ended"].includes(eventName)) {
                         syncComparison(true);
@@ -1361,6 +1520,7 @@ app.registerExtension({
                 });
             }
 
+            renderMuteButton();
             node.addDOMWidget("player", "hr_endless_sampler_finished_video", root, { serialize: false });
             node.setSize([
                 Math.max(node.size?.[0] || 480, 480),
@@ -1409,6 +1569,8 @@ app.registerExtension({
 
             const previousRemoved = node.onRemoved;
             node.onRemoved = function () {
+                document.removeEventListener("keydown", updateShiftPrompt);
+                document.removeEventListener("keyup", updateShiftPrompt);
                 if (animation != null) cancelAnimationFrame(animation);
                 media.pause();
                 media.removeAttribute("src");

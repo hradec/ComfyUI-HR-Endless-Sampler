@@ -1,5 +1,62 @@
 # External dependencies and update checks
 
+- 2026-09-20 (TaoMate KV cache codecs): added sampler-selected `none`, `zstd lossless`, `int8`, and `turboquant` cache representations without a new runtime package. `turboquant` uses the 128-wide 4-bit MSE TurboQuant rotation/codebook method described in arXiv:2504.19874 and cross-checked against MIT-licensed `jorgebmann/pyturboquant` at its then-current main branch. It quantizes on GPU before CPU transfer and reconstructs one current H3 attention layer on GPU. The current SDPA path consumes reconstructed K/V, so it deliberately does not store TurboQuant's QJL residual: that residual only helps a fused approximate-inner-product attention implementation. This mode is lossy and experimental; retain `zstd lossless` for exact continuity comparisons.
+
+- 2026-09-19 (TaoMate audio/publication audit): fetched upstream main; it remains
+  `b933d8e98358241085f421d1a7d3c0944d506b42`. No vendored update required.
+  Six runtime files compare byte-identical; denoise.py retains only its documented
+  ParallelContext import substitution. Corrected final audio publication to join
+  clean latents before decoding, without per-group waveform normalization.
+  See `TAOMATE_UPSTREAM_AUDIT.md` for the remaining differences and validation limits.
+
+- 2026-09-09 (legacy dialogue global-clock correction): llama.cpp issue
+  #27439 remains open, last updated 2026-08-20, with no confirmed fix. The
+  latest upstream llama-cpp-python release remains `v0.3.35-hip-radeon`
+  (published 2026-08-17). This change uses phonemizer/espeak to derive
+  word-exact source-clock dialogue ownership: it honors one source
+  opening-silence interval, makes later chunks continue rather than restart,
+  and supplies the immutable result for Gemma preproduction to verify.
+  Preserve the disposable worker and operation-local non-MTP retry.
+
+## AudioSR optional worker runtime (2026-09-07)
+
+- Source: <https://github.com/haoheliu/versatile_audio_super_resolution>.
+  The reviewed upstream `audiosr/pipeline.py` exposes `build_model` and
+  `super_resolution`; this integration uses the published `audiosr==0.0.7`
+  wheel, with `torchlibrosa==0.1.0` and `progressbar==2.5`.
+- The main `requirements.txt` declares unpinned NumPy, Transformers, and
+  librosa so it retains ComfyUI's selected versions, and installs
+  `torchlibrosa==0.1.0` and `progressbar==2.5`. ComfyUI Manager then runs the root `install.py`, which
+  installs `audiosr==0.0.7` into the same ComfyUI Python with `--no-deps` and
+  verifies the import. Never install AudioSR's pinned NumPy <=1.23.5, librosa
+  0.9.2, or Transformers 4.30.2 over ComfyUI. Full backend import and real CPU
+  inference passed with torch/torchaudio 2.8.0, NumPy 2.2.6, librosa 0.11.0,
+  Transformers 5.13.0, torchvision 0.23.0, scipy 1.16.3, pandas 2.3.2,
+  timm 1.0.22, huggingface-hub 1.22.0, and PyTorch Lightning 2.5.5.
+- The basic checkpoint comes from <https://huggingface.co/haoheliu/audiosr_basic>
+  (`pytorch_model.bin`) through upstream's download helper. The worker enables
+  the legacy checkpoint loader needed by this trusted upstream artifact;
+  local request/result files use explicit `weights_only=True`. Do not extend
+  the legacy loader to user-provided checkpoint files.
+- Upstream normalizes input/output and processes mono audio. The adapter runs
+  channels separately, restores source amplitude, pads to the 5.12-second grid,
+  and uses bounded overlap-add for long audio. Full output is enhanced from
+  original VAE decodes, independently of chunk-enhanced preview audio. Never
+  substitute lossy cached preview audio for the original decoded waveform.
+- Validation: five standalone tests passed and a real two-step CPU inference
+  returned a finite, non-silent 48 kHz mono waveform with exact 0.5-second
+  duration. GPU integration and subjective artifact reduction are unverified.
+  Existing Gemma/llama.cpp runtime and fallback policies are unchanged.
+
+- 2026-09-07 (Video1 first-frame picture reference): issue #27439 remains
+  open, last updated 2026-08-20, with no close date. The latest upstream
+  llama-cpp-python release remains `v0.3.35-hip-radeon`; tag `v0.3.35`
+  vendors llama.cpp `4df29be4f4c3673f428170fda944a5b19f743bb8`.
+  JamePeng's latest release remains `v0.3.49-cu131-win-20260831` from the
+  previously reviewed 0.3.49 release set. No new fixed runtime was identified.
+  This change only supplies an ordinary H3 picture reference and its summary
+  contract; preserve the disposable worker and operation-local non-MTP retry.
+
 Read this file before changing the Gemma prompt director or refreshing vendored
 documentation. The files below are reviewed runtime source data used to
 maintain Gemma's compact prompt summary; they are not contributor or
@@ -380,3 +437,152 @@ decoder. Preserve the typed early handoff until upstream MTP is reliable.
   acceptance), versus roughly 2.3 token/s at `draft_n_max=4`; changing draft
   GPU placement between `auto` and `all` did not materially affect that result.
   Keep four draft tokens.
+
+- 2026-09-04 (preproduction request-structure review): llama.cpp issue #27439
+  remains open, labeled `bug-unconfirmed`, with no linked branch or pull
+  request. JamePeng's latest GitHub release endpoint reports
+  `v0.3.49-cu131-win-20260831`; the applicable CUDA 12.4 Linux release remains
+  the already reviewed `v0.3.49-cu124-linux-20260831` from the same 0.3.49
+  release set. Upstream `abetlen/llama-cpp-python` still reports
+  `v0.3.35-hip-radeon` as its latest release. No newly published package is
+  confirmed to fix #27439. Preserve the disposable worker, request/cache
+  fields, and operation-local non-MTP retry unchanged.
+
+- 2026-09-04 (SGLang feasibility review): llama.cpp issue #27439 remains open,
+  labeled `bug-unconfirmed`, with no linked fix or pull request. The latest
+  upstream `abetlen/llama-cpp-python` release is still
+  `v0.3.35-hip-radeon`; JamePeng's latest release is still the 0.3.49
+  `v0.3.49-cu131-win-20260831` artifact set, while this project uses its
+  matching CUDA 12.4 Linux build. No newly published llama-cpp-python package
+  contains a confirmed fix, so preserve the disposable worker and exact
+  operation-local non-MTP retry.
+
+  SGLang `main` now has native Gemma 4 multimodal inference and Frozen-KV MTP,
+  including the multimodal `Gemma4ForConditionalGeneration` target. That path
+  consumes Hugging Face-format target and assistant checkpoints; it is not a
+  drop-in runtime for this project's Q4_0 GGUF target, separate MTMD projector,
+  and Q8_0 GGUF assistant. Its current Gemma 4 12B cookbook targets H200/B200
+  class GPUs, and the documented QAT `q4_0-unquantized` checkpoint keeps BF16
+  weights rather than providing the approximately 6.6 GiB GGUF footprint used
+  here. On this 16 GiB RTX 4070 Ti SUPER, no reviewed SGLang configuration is
+  presently equivalent to the existing 32K multimodal worker plus MTP while
+  leaving enough memory for reliable startup and inference. SGLang also has no
+  reviewed public cross-process KV-state export/import equivalent to the
+  current preproduction snapshot. Do not replace `gemma4.py` with an SGLang
+  backend until a separately isolated environment passes target-only and MTP
+  multimodal capture replays, clean worker teardown, 32K-context memory checks,
+  append-only correction turns, and the captured Chunk 2 test on this GPU.
+
+- 2026-09-04 (alternative Gemma 4 multimodal/MTP runtime review): llama.cpp
+  issue #27439 remains open, labeled `bug-unconfirmed`, with no linked fix or
+  pull request. The newest upstream `abetlen/llama-cpp-python` release remains
+  `v0.3.35-hip-radeon`; JamePeng's newest release remains the 0.3.49
+  `v0.3.49-cu131-win-20260831` artifact set, while this project uses the
+  matching CUDA 12.4 Linux build. Preserve the disposable worker and exact
+  operation-local non-MTP retry.
+
+  Three exact 12B alternatives were verified. Hugging Face Transformers has an
+  official `google/gemma-4-12B-it` plus
+  `google/gemma-4-12B-it-assistant` multimodal assisted-generation path and is
+  the smallest independent implementation to prototype. Current vLLM `main`
+  supports the 12B unified multimodal target and matching MTP assistant, but
+  open issue #48503 reports a CUDA-graph capture crash; `--enforce-eager` is a
+  workaround which also removes the principal fast path. Native current
+  `llama-server` supports MTMD multimodal requests plus external GGUF MTP and
+  can reuse this project's target, projector, and assistant artifacts, but it
+  remains subject to llama.cpp's open speculative/state bugs and therefore
+  must be isolated and replay-tested rather than assumed reliable.
+
+  LiteRT-LM exposes Gemma 4 MTP, but its published 12B `.litertlm` package does
+  not contain the required drafter payload (open issue #2498). TensorRT-LLM
+  supports multimodal MTP for E2B, E4B, 26B-A4B, and 31B, but explicitly does
+  not support the 12B unified target/assistant architecture. Neither is an
+  exact replacement for the current 12B workflow. Any prototype must first
+  pass target-only and MTP multimodal capture replays, full worker teardown,
+  32K-context memory checks, correction turns, and captured Chunk 2 before it
+  can replace the existing path or its fallback.
+
+## TaoMate-H3 streaming core (2026-09-18)
+
+Vendored from https://github.com/TaoLiveAIGC/TaoMate-H3 at
+`b933d8e98358241085f421d1a7d3c0944d506b42`, the checked-out upstream main
+revision for this integration. `python/taomate_upstream/PROVENANCE.md` records
+source paths, SHA-256 hashes and adaptation boundaries. Geometry, clean-KV
+retention, attention routing and the three-step schedule are copied unchanged;
+LICENSE and NOTICE accompany them. No new pip dependency is required.
+The adapter uses native ComfyUI H3 projections/RoPE with PyTorch SDPA, CPU KV
+storage, and joint audio generation. Upstream's Base10 teacher and distributed
+runtime are not ported. This backend is experimental and T2AV-only. CPU tests
+exercise native H3 forwards and 50-layer clean commits; full model GPU quality
+and throughput still need validation.
+
+- TaoMate adapter follow-up: removed the policy gates rejecting native image,
+  video and audio references/keyframes, nonempty latents, CFG values other than
+  1, and other diffusion wrappers. Native PackedLayout now carries condition
+  rows; only generated AV enters persistent KV. CFG branches retain separate
+  histories. Keyframe timing excludes the decoding-only halo. Native spatial
+  padding is preserved. Upstream vendored files are unchanged. CPU checks
+  include real conditioned H3 forwards and independent positive/negative
+  commits; full-model GPU/reference quality remains unverified. The native
+  batch/shape contract, existing chunk-mask limitation, and lack of KV disk
+  resume still apply.
+
+- TaoMate prompt/request correction: rechecked upstream main at the same
+  b933d8e commit. Its config requires one prompt per nominal five-second
+  request, and runtime reuses that conditioning across four internal phases.
+  The adapter now groups those phases into one outer sampler/prompt chunk,
+  preserving request-level text/reference positions while target AV advances.
+  Manual prompt generation and dialogue timing share this request plan. Output
+  decoding occurs after assembling the request, with its transport halo.
+
+- TaoMate audio-teacher integration: copied upstream model/architecture.py and
+  model/packed_sequence.py unchanged, and model/denoise.py with only its
+  distributed-context import replaced by a typing alias. Provenance and hashes
+  are recorded in python/taomate_upstream/PROVENANCE.md. The native ComfyUI
+  adapter executes the copied nine-forward Base10 loop without video tokens,
+  projections, or heads. It captures states 3/6/9, retains a frozen 40-tick
+  previous clean tail, injects per-phase audio after student Euler updates,
+  commits the guided clean AV KV, and checks exact published clean audio.
+  Native carried-audio scaling is accounted for, with only known carry/un-carry
+  roundoff removed before exact assembly verification. Audio KV drops every
+  12 requests as upstream specifies.
+  User explicitly requested the SAME model WITH its LoRA for this experiment:
+  do not remove the LoRA, require a separate BF16 model, or describe the teacher
+  as equivalent to upstream's BF16 base-model artifact. Loaded precision is
+  retained (including the sampler's explicit fp32 override). No new package
+  dependency or model download is needed. Teacher work adds nine audio-only
+  forwards per request; audio is then used by every video phase. Preparation
+  uses the exact same audio noise as the student rather than upstream's
+  separate artifact-producer seed sequence.
+  Validation: 234 tests passed, one skipped, including native H3 teacher
+  forwards with CPU SDPA, frozen-tail invariance, milestone audio carry,
+  exact output assembly and mismatch rejection. Full-model GPU rendering and
+  LoRA-teacher speech quality are not yet verified.
+
+## Lossless TaoMate KV storage experiment
+
+Uses installed `blosc2==3.12.1` (declared `blosc2>=3.12.1` in requirements),
+byte-shuffle with native tensor element size and Zstd level 1. No upstream
+TaoMate update is needed for this adapter-local CPU storage change. Decode
+restores the exact tensor bytes; there is no BF16/FP32 conversion or truncation.
+
+TaoMate duration clarification (issue #4, contributor reply 2026-09-20 UTC):
+https://github.com/TaoLiveAIGC/TaoMate-H3/issues/4#issuecomment-5747481599
+The five-second prompt-management interval is a configurable demo choice;
+model duration remains within the original model's supported range. Adapter
+request grouping now follows chunk_frames, retaining bounded upstream phase
+sizes (shortened only at requested group boundaries). Vendored geometry stays
+unchanged; no upstream runtime update is needed for this grouping change.
+
+## Optional GPU KV decompression
+
+Installed and verified `nvidia-nvcomp-cu12==5.3.0.16` (including matching
+libnvcomp) on RTX 4070 Ti SUPER with PyTorch CUDA 12.8. Official API:
+https://docs.nvidia.com/cuda/nvcomp/py_api.html
+The GPU toggle uses CPU byte-shuffle + standard Zstd level 1 frames, decoded
+with nvCOMP RAW Zstd on the consuming PyTorch CUDA stream and byte-unshuffled
+on GPU. It does not pass Blosc containers to nvCOMP. CPU cache maintenance can
+read the same raw format; disabling the GPU toggle restores Blosc storage on
+new renders. Tests verify exact BF16/FP32 bits over multiple 32 MiB blocks and
+a short tail, including a non-default CUDA stream. No full-render speedup is
+claimed; the initial implementation synchronizes after each decoded block.

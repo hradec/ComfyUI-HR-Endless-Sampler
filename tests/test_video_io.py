@@ -87,6 +87,7 @@ class FinishedVideoIOTest(unittest.TestCase):
                         "start": -2,
                         "end": 4,
                         "gemma_detailed_description": "  Continue the action.  ",
+                        "h3_prompt": " summary: The target video continues.\ndetailed_description: Continue the action. ",
                         "gemma_retention_analysis": "  Preserve Tila's mounted pose.  ",
                         "h3_render_seconds": 42.5,
                         "gemma_seconds": 3.25,
@@ -106,6 +107,7 @@ class FinishedVideoIOTest(unittest.TestCase):
             "start": 0,
             "end": 4,
             "gemma_detailed_description": "Continue the action.",
+            "h3_prompt": "summary: The target video continues.\ndetailed_description: Continue the action.",
             "gemma_retention_analysis": "Preserve Tila's mounted pose.",
             "h3_render_seconds": 42.5,
             "gemma_seconds": 3.25,
@@ -419,6 +421,31 @@ class FinishedVideoIOTest(unittest.TestCase):
         self.assertEqual(payload["title"], output_path.name)
         self.assertEqual(payload["timeline"], timeline)
         publish.assert_called_once_with("144", payload)
+
+    def test_compare_node_writes_two_temp_player_proxies_without_output_files(self):
+        images = torch.zeros((2, 4, 6, 3), dtype=torch.float32)
+        left_path = Path("/tmp/left.mp4")
+        right_path = Path("/tmp/right.mp4")
+        with patch.object(video_io, "_save_native_h264", side_effect=[left_path, right_path]) as encode, \
+                patch.object(video_io, "_view_url", side_effect=["/view?filename=left.mp4&type=temp", "/view?filename=right.mp4&type=temp"]), \
+                patch.object(video_io, "_node_unique_id", return_value="145"), \
+                patch.object(video_io, "_publish_player_state") as publish:
+            result = video_io.HREndlessSamplerVideoCompare.execute(images, images, fps=30)
+
+        payload = result.ui[video_io.PLAYER_EVENT][0]
+        self.assertEqual(payload["origin"], "compare")
+        self.assertEqual(payload["source_fps"], 30)
+        self.assertIn("left.mp4", payload["media_url"])
+        self.assertIn("right.mp4", payload["compare_media_url"])
+        self.assertEqual(encode.call_count, 2)
+        self.assertTrue(all(call.kwargs["save_output"] is False for call in encode.call_args_list))
+        publish.assert_called_once_with("145", payload)
+
+    def test_compare_node_requires_matching_image_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "same width and height"):
+            video_io.HREndlessSamplerVideoCompare.execute(
+                torch.zeros((1, 4, 6, 3)), torch.zeros((1, 5, 6, 3)),
+            )
 
     def test_exr_prefers_final_sampler_images_over_a_connected_raw_latent(self):
         images = torch.full((2, 4, 6, 3), 1.25, dtype=torch.float32)

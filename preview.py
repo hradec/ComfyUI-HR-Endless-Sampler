@@ -32,6 +32,7 @@ FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _PREVIEW_CACHE_LIMIT = 8
 _PREVIEW_CACHE = OrderedDict()
 _PREVIEW_CACHE_LOCK = threading.Lock()
+_PREVIEW_EXECUTION_ID = 0
 
 
 def _cache_payload(payload):
@@ -121,7 +122,11 @@ def _cache_payload(payload):
                 retention_analysis = payload.get("gemma_retention_analysis")
                 if isinstance(retention_analysis, str) and retention_analysis.strip():
                     chunk_ranges[chunk_index]["gemma_retention_analysis"] = retention_analysis.strip()
+                h3_prompt = payload.get("h3_prompt")
+                if isinstance(h3_prompt, str) and h3_prompt.strip():
+                    chunk_ranges[chunk_index]["h3_prompt"] = h3_prompt.strip()
                 for key in (
+                    "taomate_completed_frames",
                     "h3_render_seconds",
                     "gemma_seconds",
                     "gemma_preproduction_seconds",
@@ -159,7 +164,7 @@ def _cached_snapshot(node_id):
 
 
 def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chunks, *, fps,
-                                        max_resolution=0, quality=75):
+                                        max_resolution=0, quality=75, progress_callback=None):
     """Encode finalized replay media into one browser-restorable snapshot.
 
     This deliberately consumes the sampler's CPU checkpoint media only.  It
@@ -183,6 +188,7 @@ def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chun
         "shot_ranges": [dict(item) for item in shot_ranges],
         "reusing_cached_chunks": True,
         "cached_chunk_count": len(chunks),
+        "reused_chunk_numbers": sorted(int(item["index"]) + 1 for item in chunks),
         "total_frames": max((int(item.get("end", -1)) for item in normalized_ranges), default=-1) + 1,
         "fps": resolved_fps,
         "elapsed_ms": 0.0,
@@ -190,7 +196,9 @@ def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chun
     }
     _cache_payload(reset)
 
-    for chunk in chunks:
+    for position, chunk in enumerate(chunks):
+        if progress_callback is not None:
+            progress_callback(position, len(chunks))
         frames = chunk.get("frames")
         if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or not int(frames.shape[0]):
             continue
@@ -233,6 +241,7 @@ def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chun
         for key in (
             "gemma_detailed_description",
             "gemma_retention_analysis",
+            "h3_prompt",
             "h3_render_seconds",
             "gemma_seconds",
             "gemma_preproduction_seconds",
@@ -248,6 +257,8 @@ def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chun
         "execution": execution,
         "elapsed_ms": 0.0,
     })
+    if progress_callback is not None:
+        progress_callback(len(chunks), len(chunks))
     return _cached_snapshot(node_id)
 
 
@@ -398,14 +409,14 @@ def _tiny_frames(video, decoder, indices, max_resolution):
     return [_tensor_image(decoder.decode_frame(video[0, :, index].unsqueeze(0)), max_resolution) for index in indices]
 
 
-def _frame_selection(video_t, trim_steps, stride, fps, output_start=0):
+def _frame_selection(video_t, trim_steps, stride, fps, output_start=0, temporal_offset=0):
     indices = list(range(trim_steps, video_t, stride))
     durations = []
     frame_numbers = []
     preview_frames = 0
     for index in indices:
         frame_numbers.append(int(output_start) + preview_frames)
-        span = sum(FRAME_PER_TOKEN[position % len(FRAME_PER_TOKEN)] for position in range(index, min(video_t, index + stride)))
+        span = sum(FRAME_PER_TOKEN[(temporal_offset + position) % len(FRAME_PER_TOKEN)] for position in range(index, min(video_t, index + stride)))
         next_preview_frames = preview_frames + span
         durations.append(max(1, round(next_preview_frames * 1000.0 / fps) - round(preview_frames * 1000.0 / fps)))
         preview_frames = next_preview_frames
@@ -461,7 +472,7 @@ def _send(payload):
 
 class _PreviewExecution:
     def __init__(self, wrappers, chunk_ranges, shot_ranges, reusing_cached_chunks=False,
-                 cached_chunk_count=0):
+                 cached_chunk_count=0, reused_chunk_numbers=()):
         self.items = [(
             wrapper,
             wrapper.begin(
@@ -469,11 +480,12 @@ class _PreviewExecution:
                 shot_ranges,
                 reusing_cached_chunks=reusing_cached_chunks,
                 cached_chunk_count=cached_chunk_count,
+                reused_chunk_numbers=reused_chunk_numbers,
             ),
         ) for wrapper in wrappers]
 
     def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
-                  gemma_detailed_description=None, gemma_retention_analysis=None):
+                  gemma_detailed_description=None, gemma_retention_analysis=None, h3_prompt=None):
         for wrapper, execution_id in self.items:
             wrapper.set_chunk(
                 execution_id,
@@ -485,11 +497,23 @@ class _PreviewExecution:
                 trim_steps,
                 gemma_detailed_description,
                 gemma_retention_analysis,
+                h3_prompt,
             )
 
     def set_phase(self, phase, *, chunk=None):
         for wrapper, execution_id in self.items:
             wrapper.set_phase(execution_id, phase, chunk=chunk)
+
+    def set_subchunk(self, index, start, end, temporal_offset, subchunk_number):
+        """Set the current TaoMate phase without resetting its five-second group."""
+        for wrapper, execution_id in self.items:
+            if execution_id == wrapper.execution_id and wrapper.current_chunk is not None and wrapper.current_chunk["index"] == index:
+                wrapper.current_chunk = dict(wrapper.current_chunk, subchunk_start=start, subchunk_end=end, temporal_offset=temporal_offset, subchunk=subchunk_number)
+
+    def set_subchunk_progress(self, chunk, completed_frames, completed_phases):
+        """Publish frame-exact TaoMate completion through restorable metadata."""
+        for wrapper, execution_id in self.items:
+            _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk, "taomate_completed_frames": completed_frames, "taomate_completed_phases": completed_phases})
 
     def restore_chunks(self, chunks, latent_format):
         """Rebuild completed replay chunks before new sampling resumes."""
@@ -539,6 +563,21 @@ class _PreviewExecution:
         for wrapper, execution_id in self.items:
             wrapper.replace_audio_tail(execution_id, index, waveform, sample_rate)
 
+    def replace_audio_timeline(self, waveform, sample_rate, ranges, fps):
+        """Publish slices of the final continuous audio decode to existing chunks."""
+        for wrapper, execution_id in self.items:
+            wrapper.replace_audio_timeline(execution_id, waveform, sample_rate, ranges, fps)
+
+    def replace_video_tail(self, index, frames, output_start, output_end, *,
+                           gemma_detailed_description=None, gemma_retention_analysis=None):
+        """Re-publish one finalized chunk after its decoded tail is replaced."""
+        for wrapper, execution_id in self.items:
+            wrapper.finalize_chunk(
+                execution_id, index, frames, output_start, output_end,
+                gemma_detailed_description=gemma_detailed_description,
+                gemma_retention_analysis=gemma_retention_analysis,
+            )
+
     def clear_chunk(self):
         for wrapper, execution_id in self.items:
             wrapper.clear_chunk(execution_id)
@@ -549,7 +588,7 @@ class _PreviewExecution:
 
 
 def begin_preview_execution(model_patcher, chunk_ranges, shot_ranges=(), reusing_cached_chunks=False,
-                            cached_chunk_count=0):
+                            cached_chunk_count=0, reused_chunk_numbers=()):
     wrappers = model_patcher.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, PREVIEW_WRAPPER_KEY)
     return _PreviewExecution(
         wrappers,
@@ -557,6 +596,7 @@ def begin_preview_execution(model_patcher, chunk_ranges, shot_ranges=(), reusing
         shot_ranges,
         reusing_cached_chunks=reusing_cached_chunks,
         cached_chunk_count=cached_chunk_count,
+        reused_chunk_numbers=reused_chunk_numbers,
     ) if wrappers else None
 
 
@@ -576,13 +616,21 @@ class _AccumulatedPreviewWrapper:
         self.started_at = None
         self.final_audio = {}
         self.final_audio_rates = {}
+        self.live_subchunks = {}
 
     def _elapsed_ms(self):
         return None if self.started_at is None else (time.perf_counter() - self.started_at) * 1000.0
 
     def begin(self, chunk_ranges, shot_ranges=(), reusing_cached_chunks=False,
-              cached_chunk_count=0):
-        self.execution_id += 1
+              cached_chunk_count=0, reused_chunk_numbers=()):
+        """Start a render with an ordered ID shared across wrapper instances."""
+        global _PREVIEW_EXECUTION_ID
+        # Microseconds fit JavaScript's safe integers and survive server restarts.
+        # ponytail: assumes the system clock does not jump backward across restarts;
+        # explicit Reconnect can adopt the server snapshot if that ever happens.
+        with _PREVIEW_CACHE_LOCK:
+            _PREVIEW_EXECUTION_ID = max(time.time_ns() // 1000, _PREVIEW_EXECUTION_ID + 1)
+            self.execution_id = _PREVIEW_EXECUTION_ID
         if isinstance(chunk_ranges, int):
             chunk_ranges = [{"chunk": index + 1} for index in range(chunk_ranges)]
         chunk_ranges = [dict(item) for item in chunk_ranges]
@@ -594,6 +642,7 @@ class _AccumulatedPreviewWrapper:
         self.started_at = time.perf_counter()
         self.final_audio = {}
         self.final_audio_rates = {}
+        self.live_subchunks = {}
         _send({
             "node_id": self.node_id,
             "action": "reset",
@@ -603,6 +652,10 @@ class _AccumulatedPreviewWrapper:
             "shot_ranges": shot_ranges,
             "reusing_cached_chunks": bool(reusing_cached_chunks),
             "cached_chunk_count": max(0, min(int(cached_chunk_count), self.chunk_count)),
+            "reused_chunk_numbers": [
+                number for number in (int(value) for value in reused_chunk_numbers)
+                if 1 <= number <= self.chunk_count
+            ],
             "total_frames": max((int(item.get("end", -1)) for item in chunk_ranges), default=-1) + 1,
             "fps": self.fps,
             "elapsed_ms": 0.0,
@@ -625,7 +678,7 @@ class _AccumulatedPreviewWrapper:
         _send(payload)
 
     def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
-                  gemma_detailed_description=None, gemma_retention_analysis=None):
+                  gemma_detailed_description=None, gemma_retention_analysis=None, h3_prompt=None):
         if execution_id == self.execution_id:
             self.current_chunk = {
                 "index": index,
@@ -649,6 +702,10 @@ class _AccumulatedPreviewWrapper:
                 retention_analysis = gemma_retention_analysis.strip()
                 self.current_chunk["gemma_retention_analysis"] = retention_analysis
                 metadata["gemma_retention_analysis"] = retention_analysis
+            if isinstance(h3_prompt, str) and h3_prompt.strip():
+                prompt = h3_prompt.strip()
+                self.current_chunk["h3_prompt"] = prompt
+                metadata["h3_prompt"] = prompt
             if len(metadata) > 4:
                 _send(metadata)
 
@@ -658,7 +715,8 @@ class _AccumulatedPreviewWrapper:
 
     def restore_chunk(self, execution_id, *, index, video, sampled_start, sampled_end,
                       output_start, output_end, trim_steps, latent_format,
-                      gemma_detailed_description=None, gemma_retention_analysis=None):
+                      gemma_detailed_description=None, gemma_retention_analysis=None,
+                      h3_prompt=None):
         """Publish a cached completed latent as an ordinary playable chunk."""
         if execution_id != self.execution_id:
             return
@@ -734,6 +792,8 @@ class _AccumulatedPreviewWrapper:
                 payload["gemma_detailed_description"] = gemma_detailed_description.strip()
             if isinstance(gemma_retention_analysis, str) and gemma_retention_analysis.strip():
                 payload["gemma_retention_analysis"] = gemma_retention_analysis.strip()
+            if isinstance(h3_prompt, str) and h3_prompt.strip():
+                payload["h3_prompt"] = h3_prompt.strip()
             _send(payload)
         except Exception as error:
             logging.warning(
@@ -841,6 +901,27 @@ class _AccumulatedPreviewWrapper:
                 error,
             )
 
+    def replace_audio_timeline(self, execution_id, waveform, sample_rate, ranges, fps):
+        """Replace each group's provisional audio using global sample boundaries."""
+        if execution_id != self.execution_id:
+            return
+        for index, chunk in enumerate(ranges):
+            # Round absolute boundaries, never accumulate per-group rounding errors.
+            start = round(int(chunk["start"]) * sample_rate / float(fps))
+            end = round((int(chunk["end"]) + 1) * sample_rate / float(fps))
+            audio = waveform[..., start:end].detach().to(device="cpu", dtype=torch.float32).clone()
+            self.final_audio[index] = audio
+            self.final_audio_rates[index] = int(sample_rate)
+            _send({
+                "node_id": self.node_id,
+                "action": "chunk_audio_update",
+                "execution": execution_id,
+                "chunk": index,
+                "audio": _encode_audio_wav(audio, sample_rate),
+                "audio_mime": "audio/wav",
+                "audio_sample_rate": int(sample_rate),
+            })
+
     def replace_audio_tail(self, execution_id, index, waveform, sample_rate):
         """Replace finalized preview audio immediately before one chunk.
 
@@ -933,6 +1014,21 @@ class _AccumulatedPreviewWrapper:
                 self.decoder_failed = True
         return self.decoder
 
+    def merge_subchunk_preview(self, payload):
+        """Replace only the current phase's frames and retain earlier phase previews."""
+        if "subchunk_start" not in payload:
+            return payload
+        pieces = self.live_subchunks.setdefault(payload["chunk"], {})
+        pieces[payload["subchunk_start"]] = payload
+        ordered = [pieces[start] for start in sorted(pieces)]
+        merged = dict(payload)
+        for key in ("frames", "frame_durations_ms", "frame_numbers"):
+            merged[key] = [value for part in ordered for value in part[key]]
+        merged["output_start"] = ordered[0]["output_start"]
+        merged["output_end"] = ordered[-1]["output_end"]
+        merged["duration_ms"] = sum(merged["frame_durations_ms"])
+        return merged
+
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes):
         chunk = self.current_chunk
         if chunk is None:
@@ -968,6 +1064,7 @@ class _AccumulatedPreviewWrapper:
         _send({
             "node_id": self.node_id,
             "action": "sample_start",
+            "subchunk": chunk.get("subchunk"),
             "execution": execution_id,
             "chunk": chunk_index,
             "chunk_count": self.chunk_count,
@@ -1002,6 +1099,7 @@ class _AccumulatedPreviewWrapper:
                     _send({
                         "node_id": self.node_id,
                         "action": "progress",
+                        "subchunk": chunk.get("subchunk"),
                         "execution": execution_id,
                         "chunk": chunk_index,
                         "chunk_count": self.chunk_count,
@@ -1022,7 +1120,8 @@ class _AccumulatedPreviewWrapper:
                         chunk["trim_steps"],
                         self.frame_stride,
                         self.fps,
-                        chunk["output_start"],
+                        chunk.get("subchunk_start", chunk["output_start"]),
+                        chunk.get("temporal_offset", 0),
                     )
                     if decoder is not None:
                         try:
@@ -1040,6 +1139,7 @@ class _AccumulatedPreviewWrapper:
                         payload = {
                             "node_id": self.node_id,
                             "action": "chunk",
+                            "subchunk": chunk.get("subchunk"),
                             "execution": execution_id,
                             "chunk": chunk_index,
                             "chunk_count": self.chunk_count,
@@ -1048,8 +1148,8 @@ class _AccumulatedPreviewWrapper:
                             "sigmas": sigmas_list,
                             "sampled_start": chunk["sampled_start"],
                             "sampled_end": chunk["sampled_end"],
-                            "output_start": chunk["output_start"],
-                            "output_end": chunk["output_end"],
+                            "output_start": chunk.get("subchunk_start", chunk["output_start"]),
+                            "output_end": chunk.get("subchunk_end", chunk["output_end"]),
                             "frame_numbers": frame_numbers,
                             "duration_ms": sum(durations),
                             "width": frames[0].width,
@@ -1058,6 +1158,8 @@ class _AccumulatedPreviewWrapper:
                             "previewer": previewer_name,
                             "elapsed_ms": self._elapsed_ms(),
                         }
+                        if "subchunk_start" in chunk:
+                            payload["subchunk_start"] = chunk["subchunk_start"]
                         if chunk.get("gemma_detailed_description"):
                             payload["gemma_detailed_description"] = chunk["gemma_detailed_description"]
                         if chunk.get("gemma_retention_analysis"):
@@ -1068,7 +1170,7 @@ class _AccumulatedPreviewWrapper:
                             if encoded:
                                 payload["frames"] = encoded
                                 payload["frame_durations_ms"] = frame_durations
-                                _send(payload)
+                                _send(self.merge_subchunk_preview(payload))
 
                         encoder.submit(encode_and_send)
             except Exception as error:

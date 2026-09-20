@@ -1,0 +1,36 @@
+// Run: node tests/test_taomate_timeline.js
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const source = fs.readFileSync(`${__dirname}/../web/unlimited_preview.js`, 'utf8');
+const start = source.indexOf('const stops = [];', source.indexOf('function renderTransport()'));
+const end = source.indexOf('timelineTrack.style.background', start);
+const stops = new Function('chunkRanges', 'spans', 'total', 'chunkColors', 'available', 'chunks', `let offset = 0; ${source.slice(start, end)} return stops;`);
+const draw = (completed, previewEnd) => stops([{start: 0, taomate_completed_frames: completed}], [124], 124, ['#ff0000'], () => true, [{outputEnd: previewEnd}]);
+assert.deepEqual(draw(0), ['color-mix(in srgb, #ff0000 50%, black) 0%', 'color-mix(in srgb, #ff0000 50%, black) 100%']);
+assert.equal(draw(39).length, 4);
+assert.equal(draw(39)[1], `#ff0000e8 ${39 / 124 * 100}%`);
+assert.deepEqual(draw(124), ['#ff0000e8 0%', '#ff0000e8 100%']);
+assert.deepEqual(draw(undefined), ['#ff0000e8 0%', '#ff0000e8 100%']);
+assert.equal(draw(0, 38)[1], `#ff0000e8 ${39 / 124 * 100}%`);
+assert.equal(draw(39, 72)[1], `#ff0000e8 ${73 / 124 * 100}%`);
+assert.equal(draw(73, 38)[1], `#ff0000e8 ${73 / 124 * 100}%`);
+console.log('TaoMate timeline completion checks passed.');
+
+const cursorStart = source.indexOf('const before = spans.slice(0, playing)', end);
+const cursorEnd = source.indexOf('timelinePlayhead.style.left', cursorStart);
+const cursor = new Function('spans', 'total', 'playing', 'playingFrame', 'chunks', 'chunkRanges', `${source.slice(cursorStart, cursorEnd)} return position;`);
+const group = {frames: Array(12), frameNumbers: [0, 1, 5, 9, 13, 17, 18, 22, 26, 30, 34, 35], outputStart: 0, outputEnd: 38};
+assert.equal(cursor([124, 119], 243, 0, 11, [group], [{start: 0}]), 35 / 243 * 100);
+const second = {...group, frameNumbers: group.frameNumbers.map(n => n + 124), outputStart: 124, outputEnd: 162};
+assert.equal(cursor([124, 119], 243, 1, 11, [group, second], [{start: 0}, {start: 124}]), 159 / 243 * 100);
+assert.equal(cursor([124], 124, 0, 11, [{...group, frameNumbers: []}], [{start: 0}]), 38 / 124 * 100);
+console.log('TaoMate partial-preview cursor checks passed.');
+const labelLine = source.split('\n').find(line => line.includes('const chunk = chunkCount ?'));
+assert.ok(labelLine);
+const label = new Function('chunkCount', 'activeChunk', 'activeSubchunk', `${labelLine} return chunk;`);
+assert.equal(label(13, 0, 1), 'C 1.1/13');
+assert.equal(label(13, 0, 2), 'C 1.2/13');
+assert.equal(label(13, 1, 4), 'C 2.4/13');
+assert.equal(label(13, 0, null), 'C 1/13');
+assert.equal(label(0, 0, null), 'C —/—');
+console.log('TaoMate sub-chunk status labels passed.');

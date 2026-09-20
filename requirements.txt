@@ -13,6 +13,28 @@ llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/downloa
 llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.49-cu124-win-20260831/llama_cpp_python-0.3.49%2Bcu124-cp314-cp314-win_amd64.whl ; sys_platform == "win32" and python_version == "3.14"
 
 huggingface-hub>=0.34.0
+# Deterministic dialogue pacing uses espeak phoneme counts; the host must also
+# provide the phonemizer-supported espeak backend.
+phonemizer>=3.3.0
+# ColorMatchV2-compatible output-only MKL seam correction.
+color-matcher
+
 # Finished-video EXR sequences and their float-WAV audio sidecar use PyAV.
 # ComfyUI currently supplies this too, but declare the direct runtime use here.
 av>=16.0.0
+
+# AudioSR 0.0.7 imports these directly. Unpinned packages retain the versions
+# already selected by ComfyUI; this integration was tested with NumPy 2.2.6,
+# Transformers 5.13.0, and librosa 0.11.0. install.py installs AudioSR itself
+# with --no-deps because its 2023 metadata would otherwise downgrade them.
+numpy
+transformers
+librosa
+torchlibrosa==0.1.0
+progressbar==2.5
+
+# Lossless TaoMate CPU KV storage: byte-shuffle + Zstd.
+blosc2>=3.12.1
+# Optional GPU KV decompression toggle (Linux NVIDIA CUDA 12 runtime).
+zstandard>=0.23
+nvidia-nvcomp-cu12==5.3.0.16 ; sys_platform == "linux" and platform_machine == "x86_64"
