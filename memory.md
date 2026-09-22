@@ -2453,6 +2453,29 @@ assuming the marker number is a global shot number. When a chunk starts in the
 middle of an existing shot, unmarked continuation prose receives the active
 shot's color and the first subsequent marker receives the next shot's color.
 
+## 2026-08-30 — Local Gemma 4 / Qwen3.5 director selection
+
+`HR Endless Sampler` now explicitly selects `gemma4` or `qwen3.5`, plus a local
+GGUF model and MTMD projector discovered recursively beneath
+`models/llama_cpp` and `models/LLM/GGUF`. Values remain relative to those roots;
+URLs, absolute paths, traversal, non-GGUF files, and model/projector role
+mismatches fail at the load boundary. Qwen never downloads a model.
+
+Gemma remains the default and preserves its original automatic model path, MTP,
+preproduction KV cache, prompts, worker retry, and serialized workflow inputs.
+It also accepts an explicit local model/projector pair. Qwen reuses the validated
+shot-plan and chunk-result contracts through a small adapter, runs ordinary MTMD
+multimodal decoding with context 4096 and batch 256, and explicitly rejects
+Gemma MTP and the Gemma KV cache. Both backends remain disposable subprocesses,
+so llama.cpp exits before H3 is reloaded. The prompt contract writes English H3
+visual/action/camera prose while preserving original dialogue, lyrics, and
+visible text language.
+
+Replay fingerprints include the director backend and selected files so a cached
+Gemma timing plan cannot be silently reused for a Qwen A/B run. Internal
+`gemma_*` timeline/replay fields and last-run filenames remain unchanged for
+backward compatibility.
+
 ## 2026-08-28 — Explicit PyTorch allocator ceiling
 
 The sampler exposes `pytorch_memory_fraction`, defaulting to `0.85`. At the

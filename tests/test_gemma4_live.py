@@ -198,4 +198,3 @@ class Gemma4LiveIntegrationTest(unittest.TestCase):
         result = director.direct(request, self._load_observation_frames(self.capture_path, capture))
         self.assertTrue(result.raw_json.strip().startswith("{"))
         self.assertTrue(result.detailed_description.strip())
-

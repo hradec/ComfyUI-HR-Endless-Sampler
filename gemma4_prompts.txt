@@ -280,9 +280,6 @@ Create the one-time timing plan for {{chunk_count}} physical chunks at {{fps}} f
 Complete source shots to schedule:
 {{source_shots}}
 
-Physical output ownership that later chunk directors must serve:
-{{physical_chunk_map}}
-
 Complete unchanged user prompt for global intent, reference definitions, soundscape, music, dialogue, and relationships:
 --- BEGIN ORIGINAL PROMPT ---
 {{original_prompt}}

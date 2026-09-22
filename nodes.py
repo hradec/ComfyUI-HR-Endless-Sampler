@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import psutil
@@ -24,6 +25,9 @@ from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from tqdm.auto import tqdm
 from tqdm import tqdm as _cli_tqdm
 
+from .director_backend import DIRECTOR_BACKENDS, QWEN_DIRECTOR_BACKENDS, director_model_options, resolve_director_selection
+from .director_config import HRDirectorConfig, normalize_qwen38_config
+from .director_errors import DirectorDependencyError, DirectorObservationError
 from .gemma4 import (
     Gemma4ContinuityDirector,
     Gemma4DependencyError,
@@ -31,11 +35,18 @@ from .gemma4 import (
     Gemma4PreproductionCache,
     _timing_plan_from_payload,
     _timing_plan_payload,
+    is_official_gemma4_pair,
 )
 from .preview import begin_preview_execution
+from .qwen35 import Qwen35ContinuityDirector
+from .reference_set import HRReferenceSet, reference_images, reference_presentation_items
 from .video_io import HREndlessTimeline, normalize_timeline
 
 
+HREndlessRetakePlan = io.Custom("HR_RETAKE_PLAN")
+HREndlessContinuationPlan = io.Custom("HR_CONTINUATION_PLAN")
+HREndlessExternalContinuation = io.Custom("HR_H3_EXTERNAL_CONTINUATION")
+HRH3EventLedger = io.Custom("HR_H3_EVENT_LEDGER")
 AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
 MIN_VIDEO_STEPS = 2
@@ -69,7 +80,10 @@ GEMMA_PROMPT_LOG_DIRNAME = "comfyui-hr-endless-sampler"
 GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
-REPLAY_CACHE_FORMAT = 2
+REPLAY_CACHE_FORMAT = 3
+REPLAY_HISTORY_DIRNAME = "history"
+REPLAY_HISTORY_LIMIT = 5
+_REPLAY_RUN_ID = re.compile(r"^[a-f0-9]{32}$")
 DETAILED_DESCRIPTION_FIELD = re.compile(r"detailed_description\s*:", re.IGNORECASE)
 INTEGRATED_DESCRIPTION_FIELD = re.compile(r"integrated_multimodal_description\s*:", re.IGNORECASE)
 SHOT_MARKER = re.compile(r"\[Shot\s+(\d+)\](?:\s+At\s+(\d+):(\d{2})\.(\d{3}),)?", re.IGNORECASE)
@@ -87,18 +101,20 @@ def _description_field(prompt, start=0):
 def _begin_last_gemma_prompt_log(chunk_frames, context_keyframes, guide_overlap,
                                  video_continuation, video_continuation_res, fps, chunk_count,
                                  cache_gemma_preproduction=False,
-                                 gemma4_mtp=False):
+                                 gemma4_mtp=False, director_name="Gemma 4",
+                                 director_model="auto"):
     """Replace the fixed temp capture so it always represents the latest run."""
     path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / GEMMA_PROMPT_LOG_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "HR Endless Sampler last-run Gemma chunk prompts\n"
+            f"HR Endless Sampler last-run {director_name} chunk prompts\n"
             f"Started: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
             f"Configuration: chunk_frames={chunk_frames}, context_keyframes={context_keyframes}, "
             f"guide_overlap={guide_overlap}, video_continuation={video_continuation}, "
             f"video_continuation_res={video_continuation_res}, "
             f"fps={fps:g}, chunks={chunk_count}, "
+            f"director={director_name}, director_model={director_model}, "
             f"cache_gemma_preproduction={bool(cache_gemma_preproduction)}, "
             f"gemma4_mtp={bool(gemma4_mtp)}\n\n",
             encoding="utf-8",
@@ -183,19 +199,80 @@ def _reset_last_gemma_image_log():
     return path
 
 
-def _replay_cache_root():
-    """Return the bounded, disposable cache for debug chunk replays."""
-    return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / REPLAY_CACHE_DIRNAME
+def _replay_history_root():
+    try:
+        import folder_paths
+        output = Path(folder_paths.get_output_directory())
+    except ImportError:
+        output = Path.cwd() / "output"
+    return output / "hr_endless_sampler" / REPLAY_HISTORY_DIRNAME
+
+
+def _replay_cache_root(run_id=None):
+    """Return the active cache or one validated completed-run archive."""
+    if run_id is None:
+        return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / REPLAY_CACHE_DIRNAME
+    run_id = str(run_id)
+    if _REPLAY_RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("Invalid replay run ID")
+    return _replay_history_root() / run_id
+
+
+def _replay_history_runs():
+    result = []
+    history = _replay_history_root()
+    try:
+        paths = (path for path in history.iterdir() if path.is_dir() and _REPLAY_RUN_ID.fullmatch(path.name))
+        for path in paths:
+            try:
+                manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if manifest.get("status") == "complete" and manifest.get("run_id") == path.name:
+                result.append({"run_id": path.name, "created": manifest.get("created"),
+                               "completed_chunks": manifest.get("completed_chunks", 0),
+                               "archived_ns": path.stat().st_mtime_ns})
+    except OSError:
+        pass
+    return sorted(result, key=lambda item: item.get("archived_ns", 0), reverse=True)[:REPLAY_HISTORY_LIMIT]
+
+
+def _replay_control_path():
+    return _replay_cache_root() / "control.json"
+
+
+def _set_replay_control(action):
+    if action not in {"keep", "delete", "restart"}:
+        raise ValueError("Unknown replay control action")
+    _replay_write_json(_replay_control_path(), {"action": action, "created": time.time()})
+
+
+def _consume_replay_control():
+    path = _replay_control_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "keep"
+    except (OSError, json.JSONDecodeError):
+        return "keep"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    action = value.get("action")
+    return action if action in {"keep", "delete", "restart"} else "keep"
 
 
 def _remove_replay_cache():
-    """Remove only the sampler's fixed temporary replay cache."""
+    """Remove the active replay cache without deleting completed history."""
     path = _replay_cache_root()
     try:
         if path.is_symlink() or path.is_file():
             path.unlink()
         elif path.exists():
-            shutil.rmtree(path)
+            for child in path.iterdir():
+                if child.name != REPLAY_HISTORY_DIRNAME:
+                    shutil.rmtree(child) if child.is_dir() else child.unlink()
     except OSError as error:
         logging.warning("HR Endless Sampler could not clear replay cache %s: %s", path, error)
 
@@ -246,9 +323,39 @@ def _replay_plan_signature(plan):
     return [{key: chunk.get(key) for key in keys} for chunk in plan]
 
 
+def _director_file_fingerprint(path):
+    if path is None:
+        return None
+    stat = path.stat()
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _tensor_fingerprint(value):
+    if not isinstance(value, torch.Tensor):
+        return None
+    tensor = value.detach().to(device="cpu").contiguous()
+    return {"shape": list(tensor.shape), "dtype": str(tensor.dtype),
+            "sha256": hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()}
+
+
+def _reference_set_fingerprint(value):
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: [
+            _tensor_fingerprint(item) if isinstance(item, torch.Tensor)
+            else {"waveform": _tensor_fingerprint(item.get("waveform")), "sample_rate": item.get("sample_rate")}
+            if isinstance(item, dict) else None
+            for item in value.get(key, ())
+        ]
+        for key in ("images", "videos", "video_audios", "audios")
+    }
+
+
 def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
                         context_keyframes, guide_overlap, video_continuation,
-                        video_continuation_res, ref2va):
+                        video_continuation_res, ref2va, director_backend="gemma4",
+                        director_model="auto", director_mmproj="auto", external_continuation=None):
     """Describe the immutable tensor/layout inputs required for an exact replay.
 
     The source prompt intentionally is not part of this signature: editing it
@@ -267,7 +374,19 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
         "video_continuation": int(video_continuation),
         "video_continuation_res": str(video_continuation_res),
         "ref2va": bool(ref2va),
+        "director_backend": str(director_backend),
+        "director_model": director_model,
+        "director_mmproj": director_mmproj,
         "plan": _replay_plan_signature(plan),
+        "external_continuation": None if external_continuation is None else {
+            "type": external_continuation.get("type"),
+            "version": external_continuation.get("version"),
+            "prompt": external_continuation.get("prompt"),
+            "audio_mode": external_continuation.get("audio_mode", "mute"),
+            "video_context": _tensor_fingerprint(external_continuation.get("video_context")),
+            "audio_context": _tensor_fingerprint(external_continuation.get("audio_context")),
+            "reference_set": _reference_set_fingerprint(external_continuation.get("reference_set")),
+        },
     }
 
 
@@ -280,8 +399,9 @@ class _LastRunReplayCache:
     earlier H3 calls.
     """
 
-    def __init__(self):
-        self.root = _replay_cache_root()
+    def __init__(self, run_id=None):
+        self.run_id = None if run_id is None else str(run_id)
+        self.root = _replay_cache_root(self.run_id)
 
     @property
     def manifest_path(self):
@@ -298,12 +418,31 @@ class _LastRunReplayCache:
     def chunk_path(self, chunk_number):
         return self.root / "chunks" / f"chunk_{int(chunk_number):04d}.pt"
 
+    def chunk_metadata_path(self, chunk_number):
+        return self.root / "prompts" / f"chunk_{int(chunk_number):04d}.json"
+
+    def _archive_observation_images(self, chunk_number, source_directory):
+        if source_directory is None:
+            return []
+        destination = self.root / "observations"
+        destination.mkdir(parents=True, exist_ok=True)
+        archived = []
+        for source in sorted(Path(source_directory).glob(f"chunk_{int(chunk_number):03d}_source_frame_*.jpg")):
+            target = destination / source.name
+            temporary = target.with_name(target.name + ".tmp")
+            temporary.write_bytes(source.read_bytes())
+            temporary.replace(target)
+            archived.append(target.relative_to(self.root).as_posix())
+        return archived
+
     def clear(self):
+        if self.run_id is not None:
+            raise ValueError("Completed replay archives are immutable")
         _remove_replay_cache()
 
     def create(self, fingerprint, source_prompt, initial_tensors):
         self.clear()
-        self.root.mkdir(parents=True, exist_ok=False)
+        self.root.mkdir(parents=True, exist_ok=True)
         manifest = {
             "format": REPLAY_CACHE_FORMAT,
             "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -354,6 +493,33 @@ class _LastRunReplayCache:
     def load_chunk(self, chunk_number):
         return _replay_load_tensor_file(self.chunk_path(chunk_number))
 
+    def load_active_chunk(self, chunk_number):
+        metadata = json.loads(self.chunk_metadata_path(chunk_number).read_text(encoding="utf-8"))
+        active = int(metadata.get("active_revision", 0))
+        if active == 0:
+            return self.load_chunk(chunk_number)
+        revision = next((item for item in metadata.get("revisions", []) if int(item.get("revision", -1)) == active), None)
+        if revision is None:
+            raise RuntimeError(f"Chunk {chunk_number} active revision {active} is missing")
+        path = (self.root / str(revision["tensor_path"])).resolve()
+        if self.root.resolve() not in path.parents:
+            raise RuntimeError(f"Chunk {chunk_number} revision path leaves replay cache")
+        return _replay_load_tensor_file(path)
+
+    def activate_revision(self, chunk_number, revision):
+        number, revision = int(chunk_number), int(revision)
+        metadata_path = self.chunk_metadata_path(number)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if revision != 0 and not any(int(item.get("revision", -1)) == revision for item in metadata.get("revisions", [])):
+            raise ValueError(f"Chunk {number} revision {revision} does not exist")
+        metadata["active_revision"] = revision
+        _replay_write_json(metadata_path, metadata)
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        for item in manifest.get("chunks", []):
+            if int(item.get("chunk", -1)) == number:
+                item["active_revision"] = revision
+        _replay_write_json(self.manifest_path, manifest)
+
     def has_chunk(self, chunk_number):
         return self.chunk_path(chunk_number).is_file()
 
@@ -371,9 +537,45 @@ class _LastRunReplayCache:
                 source_prompt_sha256=hashlib.sha256(source_prompt.encode("utf-8")).hexdigest()
             )
 
-    def save_chunk(self, chunk_number, state):
-        _replay_write_tensor_file(self.chunk_path(chunk_number), state)
-        self._update_manifest(status="recording", completed_chunks=int(chunk_number))
+    def save_chunk(self, chunk_number, state, metadata=None, observation_image_directory=None):
+        number = int(chunk_number)
+        _replay_write_tensor_file(self.chunk_path(number), state)
+        chunk_metadata = dict(metadata or {})
+        chunk_metadata.update({
+            "chunk": number,
+            "tensor_path": self.chunk_path(number).relative_to(self.root).as_posix(),
+            "observation_images": self._archive_observation_images(number, observation_image_directory),
+            "active_revision": 0,
+            "revisions": [],
+        })
+        _replay_write_json(self.chunk_metadata_path(number), chunk_metadata)
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        chunks = [item for item in manifest.get("chunks", []) if int(item.get("chunk", -1)) != number]
+        chunks.append({"chunk": number, "metadata_path": self.chunk_metadata_path(number).relative_to(self.root).as_posix(),
+                       "active_revision": 0})
+        self._update_manifest(status="recording", completed_chunks=number,
+                              chunks=sorted(chunks, key=lambda item: int(item["chunk"])))
+
+    def save_revision(self, chunk_number, state, *, mode, prompt):
+        number = int(chunk_number)
+        metadata_path = self.chunk_metadata_path(number)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        revisions = list(metadata.get("revisions", []))
+        revision = max((int(item.get("revision", 0)) for item in revisions), default=0) + 1
+        tensor_path = self.root / "revisions" / f"chunk_{number:04d}" / f"revision_{revision:04d}.pt"
+        _replay_write_tensor_file(tensor_path, state)
+        entry = {"revision": revision, "mode": str(mode), "prompt": str(prompt),
+                 "tensor_path": tensor_path.relative_to(self.root).as_posix(),
+                 "created": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
+        revisions.append(entry)
+        metadata.update(active_revision=revision, revisions=revisions)
+        _replay_write_json(metadata_path, metadata)
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        for item in manifest.get("chunks", []):
+            if int(item.get("chunk", -1)) == number:
+                item["active_revision"] = revision
+        _replay_write_json(self.manifest_path, manifest)
+        return entry
 
     def begin_from(self, chunk_number):
         """Mark a restored cache as actively recording its rerun suffix."""
@@ -390,7 +592,41 @@ class _LastRunReplayCache:
         self._update_manifest(status="debug_stop", completed_chunks=max(0, int(completed_chunks)))
 
     def mark_complete(self, completed_chunks):
-        self._update_manifest(status="complete", completed_chunks=max(0, int(completed_chunks)))
+        completed_chunks = max(0, int(completed_chunks))
+        self._update_manifest(status="complete", completed_chunks=completed_chunks)
+        if completed_chunks and self.run_id is None:
+            self._archive_complete_run(completed_chunks)
+
+    def _archive_complete_run(self, completed_chunks):
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        entries = manifest.get("chunks", ())
+        if len(entries) != completed_chunks or any(
+            not self.chunk_path(int(entry.get("chunk", -1))).is_file()
+            or not self.chunk_metadata_path(int(entry.get("chunk", -1))).is_file()
+            for entry in entries
+        ):
+            return
+        run_id = manifest.get("run_id")
+        if not isinstance(run_id, str) or _REPLAY_RUN_ID.fullmatch(run_id) is None:
+            run_id = uuid.uuid4().hex
+            self._update_manifest(run_id=run_id)
+        history = _replay_history_root()
+        history.mkdir(parents=True, exist_ok=True)
+        target = history / run_id
+        if target.exists():
+            return
+        temporary = history / (run_id + ".tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        shutil.copytree(self.root, temporary, ignore=shutil.ignore_patterns(REPLAY_HISTORY_DIRNAME, "*.tmp"))
+        temporary.replace(target)
+        archives = sorted(
+            (path for path in history.iterdir() if path.is_dir() and _REPLAY_RUN_ID.fullmatch(path.name)),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in archives[REPLAY_HISTORY_LIMIT:]:
+            shutil.rmtree(stale, ignore_errors=True)
 
     def truncate_from(self, chunk_number):
         directory = self.root / "chunks"
@@ -403,6 +639,12 @@ class _LastRunReplayCache:
                 continue
             if cached_number >= int(chunk_number):
                 path.unlink()
+                metadata_path = self.chunk_metadata_path(cached_number)
+                if metadata_path.is_file():
+                    metadata_path.unlink()
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        retained = [item for item in manifest.get("chunks", []) if int(item.get("chunk", -1)) < int(chunk_number)]
+        self._update_manifest(chunks=retained)
 
 
 def _pixel_frames(latent_t):
@@ -827,7 +1069,7 @@ def _last_seen_retention_lines(description, last_seen_character_state):
 
 def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=False,
                                    continuation_video_label=None, continuation_audio_label=None,
-                                   last_seen_character_state=()):
+                                   last_seen_character_state=(), event_ledger=None):
     if drop_picture_anchors:
         prompt = _drop_picture_anchors(prompt)
     field = _description_field(prompt)
@@ -843,6 +1085,19 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
         replace_start = description_start
     rewritten = prompt[:replace_start] + " " + description.strip() + " " + prompt[description_end:]
     retention_lines = _last_seen_retention_lines(description, last_seen_character_state)
+    if isinstance(event_ledger, dict):
+        seen_events = set()
+        for bucket in ("completed", "forbidden"):
+            for item in event_ledger.get(bucket, ()):
+                if not isinstance(item, dict):
+                    continue
+                event_id = str(item.get("id", "")).strip()
+                summary = str(item.get("summary", "")).strip()
+                if event_id and summary and event_id not in seen_events:
+                    seen_events.add(event_id)
+                    retention_lines.append(
+                        f"- Forbidden replay [{event_id}]: {summary}. This event already happened; do not stage, restart, recap, or repeat it."
+                    )
     if retention_lines:
         retention = RETENTION_FIELD.search(rewritten)
         description_field = _description_field(
@@ -873,15 +1128,17 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
     return rewritten
 
 
-def _gemma_report(chunk_number, result):
+def _gemma_report(chunk_number, result, director_name="Gemma 4"):
     report = (
-        f"=== Gemma 4 chunk prompt director: Chunk {chunk_number} ===\n"
+        f"=== {director_name} chunk prompt director: Chunk {chunk_number} ===\n"
         f"confidence: {result.confidence}\n"
         f"progress summary: {result.analysis or 'none'}\n"
         f"timing plan: {result.timing_plan or 'none'}\n"
         f"Gemma-only end state: {result.end_state or 'none'}\n"
         "Gemma-only last-seen character state:\n"
         f"{json.dumps(list(result.last_seen_character_state), ensure_ascii=False, indent=2)}\n"
+        "Director event ownership ledger:\n"
+        f"{json.dumps(getattr(result, 'event_ledger', {}), ensure_ascii=False, indent=2)}\n"
         f"H3 detailed_description: {result.detailed_description}\n"
         f"Gemma JSON attempts:\n{_gemma_response_transcript(result)}"
     )
@@ -933,12 +1190,14 @@ def _gemma_timing_plan_transcript(result):
 
 
 def _resize(image, width, height, crop):
+    image = image.reshape(-1, *image.shape[-3:])
     samples = image[..., :3].movedim(-1, 1)
     samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop)
     return samples.movedim(1, -1)
 
 
 def _reference_image(image, width, height):
+    image = image.reshape(-1, *image.shape[-3:])[:1]
     source_height, source_width = image.shape[1:3]
     scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
     target_width = max(CANVAS_MULTIPLE, round(source_width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
@@ -946,15 +1205,28 @@ def _reference_image(image, width, height):
     return _resize(image, target_width, target_height, "disabled")
 
 
-def _reference_video_canvas(width, height):
-    """Match ComfyUI's native MiniMax H3 reference-video presentation.
+def _image_reference_blocks(vae, image_list, width, height):
+    blocks = []
+    for image in image_list:
+        resized = _reference_image(image, width, height)
+        latent = vae.encode(resized)
+        blocks.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "latent": latent})
+    return blocks
 
-    H3 reference videos use a 768-pixel nominal short edge with a 768x1344
-    area cap, aligned to 32 pixels. Smaller sources are never enlarged. This
-    keeps internally generated Video1 frames equivalent to videos supplied to
-    the stock H3 Ref2VA conditioning node instead of applying an undocumented
-    lower-resolution sampler-only path.
-    """
+
+def _source_images(images, source_images):
+    if images is not None and source_images:
+        raise ValueError("Connect either images or source_images, not both")
+    if source_images:
+        def index(item):
+            match = re.search(r"_(\d+)$", item[0])
+            return int(match.group(1)) if match else -1
+        return [image[:1] for _, image in sorted(source_images.items(), key=index) if image is not None]
+    return [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
+
+
+def _reference_video_canvas(width, height):
+    """Match ComfyUI's native MiniMax H3 reference-video presentation."""
     ratio = width / height
     if ratio >= 1.0:
         nominal_width = H3_REFERENCE_VIDEO_SHORT_EDGE * ratio
@@ -974,10 +1246,11 @@ def _reference_video_canvas(width, height):
     return target_width, target_height
 
 
-def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items=()):
+def _prompt_tokens(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
     refs = positive[0].get("minimax_refs") if positive else None
-    image_list = [] if images is None else [images[index:index + 1] for index in range(images.shape[0])]
     if refs:
+        if base_reference_items is not None:
+            return clip.tokenize(prompt, minimax_ref_items=[*base_reference_items, *video_items])
         ref_items = []
         image_index = 0
         for ref in refs:
@@ -1005,8 +1278,10 @@ def _prompt_tokens(clip, prompt, images, positive, width, height, continuation, 
     return clip.tokenize(prompt, images=prompt_images)
 
 
-def _encode_prompt(clip, prompt, images, positive, width, height, continuation, video_items=()):
-    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(clip, prompt, images, positive, width, height, continuation, video_items))
+def _encode_prompt(clip, prompt, image_list, positive, width, height, continuation, video_items=(), base_reference_items=None):
+    conditioning = clip.encode_from_tokens_scheduled(_prompt_tokens(
+        clip, prompt, image_list, positive, width, height, continuation, video_items, base_reference_items
+    ))
     if len(conditioning) != 1:
         raise ValueError("HR Endless Sampler expects one MiniMax H3 conditioning segment")
     return conditioning[0]
@@ -1077,19 +1352,67 @@ def _chunk_plan_without_overlap(video_t, audio_t, chunk_frames):
     return plan
 
 
+def _h3_supports_keyframes_with_refs():
+    """Whether ComfyUI appends keyframe and reference visual latents together."""
+    try:
+        import inspect
+        from comfy.model_base import MiniMaxH3
+        source = inspect.getsource(MiniMaxH3.extra_conds)
+    except (ImportError, AttributeError, OSError, TypeError):
+        return False
+    return 'payload.get("cond_video_latents", []) + [r["latent"]' in source
+
+
 def _video_continuation_boundary_guide(previous_video, chunk, context_keyframes, use_video_continuation):
     if not use_video_continuation or context_keyframes:
         return None, 0
-    if not chunk.get("synthetic_prefix") or chunk.get("output_trim_frames") != 5:
-        raise ValueError("Video1 boundary keyframe needs the five-frame discarded packing prefix")
-    guide_t = _video_steps(chunk["output_trim_frames"])
+    if not chunk.get("synthetic_prefix") or chunk.get("output_trim_frames") not in (0, 5):
+        raise ValueError("Video1 boundary keyframe needs a five-frame synthetic packing prefix")
+    guide_t = _video_steps(5)
     if previous_video.shape[2] < guide_t:
         raise ValueError("Previous chunk is too short for the five-frame Video1 boundary keyframe")
     return previous_video[:, :, -guide_t:].clone(), 0
 
 
+def _pad_h3_keyframe_video(latent, target_video):
+    """Match ComfyUI's 2x2 target patch padding for visual keyframe latents."""
+    if latent is None:
+        return None
+    target_h = (int(target_video.shape[-2]) + 1) // 2 * 2
+    target_w = (int(target_video.shape[-1]) + 1) // 2 * 2
+    source_h, source_w = int(latent.shape[-2]), int(latent.shape[-1])
+    if source_h > target_h or source_w > target_w or target_h - source_h > 1 or target_w - source_w > 1:
+        raise ValueError(
+            "MiniMax H3 continuation keyframe spatial shape does not match the target: "
+            f"keyframe={source_w}x{source_h}, target={target_w}x{target_h} latent pixels"
+        )
+    if (source_h, source_w) == (target_h, target_w):
+        return latent
+    padded = latent
+    if source_w < target_w:
+        padded = torch.cat((padded, padded[..., :1]), dim=-1)
+    if source_h < target_h:
+        padded = torch.cat((padded, padded[..., :1, :]), dim=-2)
+    return padded
+
+
+def _normalize_h3_video_ref(block):
+    """Make H3 reference layout metadata authoritative from its actual latent tensor."""
+    normalized = dict(block)
+    latent = normalized.get("latent")
+    if latent is None:
+        return normalized
+    if latent.ndim != 5:
+        raise ValueError(f"MiniMax H3 visual reference must be [B,C,T,H,W], got {tuple(latent.shape)}")
+    normalized["latent_t"] = int(latent.shape[2])
+    normalized["latent_h"] = int(latent.shape[3])
+    normalized["latent_w"] = int(latent.shape[4])
+    return normalized
+
+
 def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prompt, video_context=None,
-                            audio_context=None, audio_end_frame=5.0, video_refs=(), video_context_start=0):
+                            audio_context=None, audio_end_frame=5.0, video_refs=(), video_context_start=0,
+                            target_video=None):
     conds = {name: [item.copy() for item in values] for name, values in original_conds.items()}
     positive = conds.get("positive")
     if positive is None:
@@ -1103,17 +1426,26 @@ def _conditioning_for_chunk(original_conds, frame_start, frame_end, encoded_prom
             cond["minimax_token_tags"] = token_tags
         else:
             cond.pop("minimax_token_tags", None)
-        if video_refs:
-            cond["minimax_refs"] = [*cond.get("minimax_refs", ()), *video_refs]
+        existing_refs = [_normalize_h3_video_ref(ref) for ref in cond.get("minimax_refs", ())]
+        if existing_refs or video_refs:
+            cond["minimax_refs"] = [*existing_refs, *(_normalize_h3_video_ref(ref) for ref in video_refs)]
         keyframes = []
         for keyframe in cond.get("minimax_keyframes", ()):
             position = keyframe["resolved_frame_index"]
             if frame_start <= position < frame_end:
                 local_keyframe = keyframe.copy()
                 local_keyframe["resolved_frame_index"] = position - frame_start
+                if target_video is not None and local_keyframe.get("latent") is not None:
+                    local_keyframe["latent"] = _pad_h3_keyframe_video(local_keyframe["latent"], target_video)
                 keyframes.append(local_keyframe)
 
         if video_context is not None:
+            if target_video is not None:
+                video_context = _pad_h3_keyframe_video(video_context, target_video)
+            keyframes = [keyframe for keyframe in keyframes if not (
+                keyframe.get("latent") is not None
+                and keyframe.get("resolved_frame_index") == video_context_start
+            )]
             keyframes.append({"resolved_frame_index": video_context_start, "latent": video_context})
         if audio_context is not None:
             audio_start = audio_end_frame - audio_context.shape[-1] / FRAME_RESCALE
@@ -1157,6 +1489,7 @@ def _sample_decoded_video_frames(frames, include_final=False, start_frame=0, ret
     target_width, target_height = _reference_video_canvas(width, height)
     if (target_width, target_height) != (width, height):
         sampled_frames = _resize(sampled_frames, target_width, target_height, "disabled")
+    sampled_frames = sampled_frames.detach().to(device="cpu", copy=True)
     if return_final_frame:
         return sampled_frames, sample_indices, final_frame
     return sampled_frames, sample_indices
@@ -2286,7 +2619,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Int.Input("chunk_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Maximum frames sampled at once. MiniMax H3 values are snapped down to its 17k+5 frame grid."),
                 io.Image.Input("images", optional=True,
-                               tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
+                               tooltip="Legacy batch input containing the original backend conditioning images."),
+                io.Autogrow.Input("source_images", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("source_image", tooltip="One original Ref2VA reference image, in conditioning order."),
+                        prefix="source_image_", min=0, max=9)),
                 io.Int.Input("video_continuation", default=22, min=5, max=3600, step=17,
                              tooltip="Completed continuation tail length. MiniMax H3 currently uses the synchronized Ref2VA <Audio N> + <Video N> continuation path; values at or above chunk_frames are clamped to the effective chunk size."),
                 io.Combo.Input(
@@ -2302,22 +2639,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 ),
                 io.Vae.Input("vae", optional=True,
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
+                HREndlessExternalContinuation.Input("external_continuation", optional=True,
+                                                    tooltip="Qwen3.5-analyzed ordinary-video continuation. Applies its source tail only to the first physical chunk."),
+                HREndlessRetakePlan.Input("retake_plan", optional=True,
+                                          tooltip="Optional validated chunk plan from HR Endless Segment Retake Director."),
                 io.Boolean.Input("cache_gemma_preproduction", default=False,
                                  tooltip="Save one clean post-preproduction Gemma KV context in temporary RAM and restore it for each chunk. Avoids re-feeding static source intent and timing plans; needs several GiB of system RAM."),
                 io.Boolean.Input("gemma4_mtp", default=True,
-                                 tooltip="Use native Gemma 4 draft-MTP with four speculative tokens. Disable it to compare against the original non-MTP decoder."),
+                                 tooltip="Use native MTP speculative decoding when the selected Gemma or Qwen GGUF supports it. Qwen uses MTP only for text-only timing preproduction; visual chunk directing remains MTMD."),
                 io.Float.Input(
                     "pytorch_memory_fraction",
                     default=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                    min=0.50,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        "Global PyTorch CUDA allocator limit applied when this sampler starts. 0.85 reserves "
-                        "15% of VRAM outside PyTorch so cached memory is pressured before a driver-level OOM. "
-                        "The setting remains active for the ComfyUI process until another run changes it; "
-                        "set 1.0 for the normal unrestricted allocator limit."
-                    ),
+                    tooltip="Compatibility placeholder retained to preserve old workflow widget positions; execution always uses the internal 0.85 limit.",
                 ),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt and detailed VRAM snapshots. Before a multi-chunk render, also run a disposable three-step continuation preflight to test the expected Chunk 2 memory footprint, then unload it completely. chunk_prompts is returned whether debug is enabled or not."),
@@ -2325,6 +2658,38 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Stop after this 1-based chunk number and return the partial result. 0 samples every chunk."),
                 io.Int.Input("debug_start_chunk", default=0, min=0, max=10000, step=1,
                              tooltip="Resume or rerun from this 1-based chunk using the automatically recorded last-run recovery cache. Leave this at 0 to automatically continue a compatible interrupted render; nonzero forces a specific chunk for debugging."),
+                io.Combo.Input("director_backend", options=list(DIRECTOR_BACKENDS), default="gemma4",
+                               tooltip="Local multimodal model used to plan and direct chunks."),
+                io.Combo.Input("director_model", options=director_model_options(), default="auto",
+                               tooltip="Local GGUF director model. Auto keeps the selected backend's existing default."),
+                io.Combo.Input("director_mmproj", options=director_model_options(projector=True), default="auto",
+                               tooltip="Local multimodal projector. Auto keeps the selected backend's existing default."),
+                io.Int.Input("director_mtp_draft_tokens", default=2, min=1, max=8, step=1,
+                             tooltip="Maximum Qwen3.6/Qwen3.8 MTP draft tokens per step. Qwen3.5 does not support MTP; Gemma keeps its native fixed configuration."),
+                io.Combo.Input("director_reasoning_effort", options=["xhigh", "medium", "low"], default="xhigh",
+                               tooltip="Qwen3.8 reasoning effort. The Qwen director disables free-form thinking for JSON reliability but passes this native template setting."),
+                io.Boolean.Input("director_cpu_moe", default=False,
+                                 tooltip="Qwen3.6/Qwen3.8: offload all MoE expert weights to CPU memory. This reduces VRAM but is usually slower."),
+                io.Int.Input("director_n_cpu_moe", default=0, min=0, max=256, step=1,
+                             tooltip="Qwen3.6/Qwen3.8: offload experts in the first N layers. Ignored when director_cpu_moe is enabled."),
+                HRDirectorConfig.Input(
+                    "director_config",
+                    optional=True,
+                    tooltip=("Optional shared HR Qwen3.8 configuration. When connected, it overrides the legacy "
+                             "director widgets so Planner and Sampler use the same model and runtime settings."),
+                ),
+                HRReferenceSet.Input(
+                    "reference_set",
+                    optional=True,
+                    tooltip=("Optional shared MiniMax H3 image/video/audio references. Connect the Reference Conditioning "
+                             "passthrough output so Planner, conditioning, and Sampler use one media connection."),
+                ),
+                HRH3EventLedger.Input(
+                    "initial_event_ledger", optional=True,
+                    tooltip="Optional event ownership seed from HR H3 Prompt Skill Compiler.",
+                ),
+                HREndlessContinuationPlan.Input("continuation_plan", optional=True,
+                                                tooltip="Continue from an immutable HR Endless continuation checkpoint."),
             ],
             outputs=[
                 io.Latent.Output(display_name="output"),
@@ -2341,16 +2706,78 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=22, video_continuation_res="full", vae=None, cache_gemma_preproduction=False,
-                gemma4_mtp=True,
+                source_images=None, video_continuation=22, video_continuation_res="full", vae=None, retake_plan=None,
+                cache_gemma_preproduction=False, gemma4_mtp=True, director_mtp_draft_tokens=2,
+                director_reasoning_effort="xhigh", director_cpu_moe=False, director_n_cpu_moe=0,
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
-                debug=False, debug_stop_chunk=0, debug_start_chunk=0,
-                **_deprecated_inputs):
-        _set_pytorch_memory_fraction(pytorch_memory_fraction, guider.model_patcher.load_device)
+                debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
+                director_model="auto", director_mmproj="auto", director_config=None, reference_set=None,
+                continuation_plan=None, external_continuation=None, initial_event_ledger=None, **_deprecated_inputs):
+        _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
+        if retake_plan is not None and continuation_plan is not None:
+            raise ValueError("retake_plan and continuation_plan cannot be used together")
+        if external_continuation is not None and (retake_plan is not None or continuation_plan is not None):
+            raise ValueError("external_continuation cannot be used with retake_plan or continuation_plan")
+        external_active = external_continuation is not None
+        if external_active:
+            if not isinstance(external_continuation, dict) or external_continuation.get("type") != "HR_H3_EXTERNAL_CONTINUATION":
+                raise ValueError("external_continuation must come from HR MiniMax H3 Continuation Apply")
+            if not isinstance(external_continuation.get("video_context"), torch.Tensor):
+                raise ValueError("external_continuation is missing its encoded source video tail")
+            prompt = str(external_continuation.get("prompt", prompt)).strip()
+            if not prompt:
+                raise ValueError("external_continuation has an empty H3 prompt")
+            if reference_set is None and external_continuation.get("reference_set") is not None:
+                reference_set = external_continuation["reference_set"]
+        continuation_manifest = continuation_state = None
+        continuation_audio_mode = "continue"
+        if continuation_plan is not None:
+            from .continuation import load_checkpoint
+            continuation_manifest, continuation_state = load_checkpoint({
+                "type": "HR_CONTINUATION_CHECKPOINT", "version": 1,
+                "checkpoint_id": continuation_plan.get("checkpoint_id", ""),
+            })
+            prompt = str(continuation_plan.get("prompt", "")).strip()
+            if not prompt:
+                raise ValueError("Continuation prompt cannot be empty")
+            continuation_audio_mode = str(continuation_plan.get("audio_mode", "continue"))
+            if continuation_plan.get("reference_set") is not None:
+                reference_set = continuation_plan["reference_set"]
+            if continuation_audio_mode not in {"continue", "new_segment", "mute"}:
+                raise ValueError(f"Unknown continuation audio mode: {continuation_audio_mode}")
+        if director_config is not None:
+            shared = normalize_qwen38_config(director_config)
+            director_backend = shared["backend"]
+            director_model = shared["model"]
+            director_mmproj = shared["mmproj"]
+            gemma4_mtp = shared["mtp"]
+            director_mtp_draft_tokens = shared["mtp_draft_tokens"]
+            director_reasoning_effort = shared["reasoning_effort"]
+            director_cpu_moe = shared["cpu_moe"]
+            director_n_cpu_moe = shared["n_cpu_moe"]
+            debug = shared["debug"]
         # Keep the former experiment code available for development, but make
         # the released UI a single, unambiguous continuation method. Ignore
         # serialized legacy values too: an old workflow must not quietly enable
         # an experimental overlap, keyframe, Qwen-history, or preview-only path.
+        director_selection = resolve_director_selection(director_backend, director_model, director_mmproj)
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+            if director_selection.model_path is None or director_selection.mmproj_path is None:
+                raise ValueError("Qwen requires a local GGUF model and mmproj")
+            if cache_gemma_preproduction:
+                raise ValueError("Qwen does not support the Gemma preproduction KV cache")
+        elif (director_selection.model_path is None) != (director_selection.mmproj_path is None):
+            raise ValueError("Gemma 4 requires both a local GGUF model and mmproj, or auto for both")
+        elif gemma4_mtp and director_selection.model_path is not None and not is_official_gemma4_pair(
+            director_selection.model_path,
+            director_selection.mmproj_path,
+        ):
+            raise ValueError("gemma4_mtp is supported only by the official Gemma 4 model/projector pair")
+
+        if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+            director_name = director_selection.backend.replace("qwen", "Qwen")
+        else:
+            director_name = "Gemma 4"
         prompt_preview_only = False
         context_keyframes_enable = False
         context_keyframes = 5
@@ -2380,6 +2807,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
             return io.NodeOutput(sampled[0], sampled[1], "", normalize_timeline(None, fps=fps, total_frames=0))
 
         video, audio = streams
+        width = int(video.shape[4]) * 16
+        height = int(video.shape[3]) * 16
         context_keyframes = int(context_keyframes_enable) * context_keyframes
         guide_overlap = int(guide_overlap_enable) * guide_overlap
         video_continuation = int(video_continuation_enable) * video_continuation
@@ -2417,16 +2846,54 @@ class HREndlessSampler(SamplerCustomAdvanced):
         if debug_start_chunk and debug_stop_chunk and debug_start_chunk > debug_stop_chunk:
             raise ValueError("debug_start_chunk cannot be greater than debug_stop_chunk")
         active_plan = plan if debug_stop_chunk == 0 else plan[:debug_stop_chunk]
+        external_frame_count = 0
+        external_audio_mode = "mute"
+        if external_active:
+            external_video = external_continuation["video_context"]
+            external_audio = external_continuation.get("audio_context")
+            external_frame_count = int(external_continuation.get("tail_frames", 0) or 0)
+            if external_frame_count <= 0:
+                external_frame_count = 5 + max(0, (int(external_video.shape[2]) - 2) // 5) * 17
+            external_audio_mode = str(external_continuation.get("audio_mode", "mute"))
+            if external_audio_mode not in {"continue", "mute"}:
+                raise ValueError(f"Unknown external continuation audio mode: {external_audio_mode}")
+            active_plan = [dict(chunk) for chunk in active_plan]
+            active_plan[0].update(
+                context_video_t=int(external_video.shape[2]),
+                context_audio_t=int(external_audio.shape[-1]) if isinstance(external_audio, torch.Tensor) else _audio_steps(external_frame_count),
+                output_trim_frames=0,
+                synthetic_prefix=True,
+            )
+            plan = active_plan if debug_stop_chunk == 0 else [*active_plan, *plan[len(active_plan):]]
+        if continuation_state is not None:
+            if abs(float(continuation_manifest["fps"]) - float(fps)) > 1e-6:
+                raise ValueError("Continuation checkpoint FPS does not match the new segment")
+            active_plan = [dict(chunk) for chunk in active_plan]
+            active_plan[0].update(context_video_t=_video_steps(5), context_audio_t=_audio_steps(5),
+                                  output_trim_frames=0, synthetic_prefix=True)
+            plan = active_plan if debug_stop_chunk == 0 else [*active_plan, *plan[len(active_plan):]]
         _gemma_markers, gemma_shots, _gemma_description_end = _parse_prompt_shots(prompt, plan[-1]["frame_end"], fps)
-        gemma_director_needed = bool(gemma_shots)
+        gemma_director_needed = bool(gemma_shots) and continuation_state is None and not external_active
 
         original_conds = guider.original_conds
         positive = original_conds.get("positive")
         if positive is None:
             raise ValueError("HR Endless Sampler requires a standard guider with positive conditioning")
         ref2va = bool(positive[0].get("minimax_refs"))
+        if reference_set is not None and (images is not None or source_images) and continuation_state is None and not external_active:
+            raise ValueError("Connect reference_set or legacy images/source_images, not both")
+        image_list = list(reference_images(reference_set)) if reference_set is not None else _source_images(images, source_images)
+        base_reference_items = reference_presentation_items(reference_set, width, height) if reference_set is not None else None
+        if image_list and not ref2va:
+            if vae is None:
+                raise ValueError("Reference images require the MiniMax H3 video VAE")
+            image_refs = _image_reference_blocks(vae, image_list, width, height)
+            positive = [[item[0], {**item[1], "minimax_refs": image_refs}] for item in positive]
+            original_conds = {**original_conds, "positive": positive}
+            ref2va = True
+            logging.info("HR Endless Sampler automatically encoded %d image references from its images input.", len(image_refs))
         if len(active_plan) > 1 and (use_video_continuation or qwen_full_history) and not ref2va:
-            raise ValueError("Experimental video conditioning requires positive conditioning from MiniMax H3 Reference to Video")
+            raise ValueError("Chunk continuation requires reference images or MiniMax H3 Ref2VA conditioning")
         original_refs = positive[0].get("minimax_refs", ())
         video_number = 1 + sum(ref["kind"] in ("video", "video_audio") for ref in original_refs)
         audio_number = 1 + sum(ref["kind"] in ("audio", "video_audio") for ref in original_refs)
@@ -2504,10 +2971,50 @@ class HREndlessSampler(SamplerCustomAdvanced):
             video_continuation=video_continuation,
             video_continuation_res=video_continuation_res,
             ref2va=ref2va,
+            director_backend=director_selection.backend,
+            director_model=_director_file_fingerprint(director_selection.model_path),
+            director_mmproj=_director_file_fingerprint(director_selection.mmproj_path),
+            external_continuation=external_continuation,
         )
         replay_cached_initial = None
         auto_resumed = False
-        if debug_start_chunk == 0:
+        retake_chunks = {}
+        retake_cached_chunks = {}
+        retake_mode = None
+        if retake_plan is not None:
+            if not isinstance(retake_plan, dict) or retake_plan.get("mode") not in {"video_only", "isolated_av", "continuous_av"}:
+                raise ValueError("HR Endless Sampler received an unsupported retake plan")
+            retake_mode = retake_plan["mode"]
+            candidate_cache = _LastRunReplayCache(retake_plan.get("run_id"))
+            loaded_cache, cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
+            if loaded_cache is None:
+                raise ValueError(f"Retake cache is unavailable: {cache_reason}")
+            identity_payload = {"format": loaded_cache["manifest"].get("format"),
+                                "fingerprint": loaded_cache["manifest"].get("fingerprint"),
+                                "source_prompt_sha256": loaded_cache["manifest"].get("source_prompt_sha256"),
+                                "created": loaded_cache["manifest"].get("created")}
+            cache_identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            if retake_plan.get("cache_identity") != cache_identity:
+                raise ValueError("Retake plan does not match the current last-run cache")
+            retake_chunks = {int(item["chunk"]): item for item in retake_plan.get("chunks", ())}
+            if not retake_chunks:
+                raise ValueError("Retake plan contains no chunks")
+            if not all(candidate_cache.has_chunk(number) for number in range(1, len(active_plan) + 1)):
+                raise ValueError("Retake requires a complete cached baseline for every chunk")
+            retake_cached_chunks = {number: candidate_cache.load_active_chunk(number) for number in range(1, len(active_plan) + 1)}
+            if retake_mode == "continuous_av":
+                first = min(retake_chunks)
+                for number in range(first, len(active_plan) + 1):
+                    if number not in retake_chunks:
+                        metadata = json.loads(candidate_cache.chunk_metadata_path(number).read_text(encoding="utf-8"))
+                        retake_chunks[number] = {"chunk": number, "prompt_override": "",
+                                                 "original_h3_prompt": metadata["effective_h3_prompt"]}
+            replay_cached_initial = loaded_cache["initial"]
+            replay_cache = candidate_cache
+            gemma_director_needed = False
+            logging.info("HR Endless Sampler video-only retake: sampling chunks %s and preserving cached audio.",
+                         ", ".join(str(number) for number in sorted(retake_chunks)))
+        if retake_plan is None and debug_start_chunk == 0:
             candidate_cache = _LastRunReplayCache()
             loaded_cache, _cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
             if loaded_cache is not None:
@@ -2528,7 +3035,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     # manifest from before lifecycle tracking is a new render
                     # rather than an automatic continuation candidate.
                     candidate_cache.clear()
-        if debug_start_chunk:
+        if retake_plan is None and debug_start_chunk:
             candidate_cache = _LastRunReplayCache()
             loaded_cache, cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
             required_prior_numbers = range(1, debug_start_chunk)
@@ -2613,6 +3120,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
             len(active_plan),
             cache_gemma_preproduction=cache_gemma_preproduction,
             gemma4_mtp=gemma4_mtp,
+            director_name=director_name,
+            director_model=(
+                director_selection.model_path.name
+                if director_selection.model_path is not None
+                else "auto"
+            ),
         )
         gemma_image_log = _reset_last_gemma_image_log()
         timing = _SamplerTiming(guider.model_patcher.load_device)
@@ -2664,8 +3177,6 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     error,
                 )
 
-        width = int(video.shape[4]) * 16
-        height = int(video.shape[3]) * 16
         output_video = []
         output_audio = []
         denoised_video = []
@@ -2673,6 +3184,22 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_video = None
         previous_audio = None
         previous_frame_count = None
+        if external_active:
+            previous_video = external_continuation["video_context"].to(device=video.device, dtype=video.dtype)
+            previous_audio = external_continuation.get("audio_context")
+            if isinstance(previous_audio, torch.Tensor):
+                previous_audio = previous_audio.to(device=audio.device, dtype=audio.dtype)
+            else:
+                previous_audio = audio.new_zeros((*audio.shape[:-1], _audio_steps(external_frame_count)))
+            if external_audio_mode == "mute":
+                previous_audio = torch.zeros_like(previous_audio)
+            previous_frame_count = external_frame_count
+        if continuation_state is not None:
+            previous_video = continuation_state["sampled_video"].to(device=video.device, dtype=video.dtype)
+            previous_audio = continuation_state["sampled_audio"].to(device=audio.device, dtype=audio.dtype)
+            previous_frame_count = int(continuation_state.get("previous_frame_count", _pixel_frames(previous_video.shape[2])))
+            if continuation_audio_mode != "continue":
+                previous_audio = torch.zeros_like(previous_audio)
         # Only promote this after a stock sampler call succeeds. The next
         # Gemma request can then pair the exact prior directed description with
         # stills from the same rendered chunk, never with an unsampled plan.
@@ -2680,6 +3207,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_gemma_timing_plan = None
         previous_gemma_end_state = None
         previous_gemma_last_seen_character_state = None
+        if initial_event_ledger is None:
+            previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
+        else:
+            if not isinstance(initial_event_ledger, dict) or any(
+                not isinstance(initial_event_ledger.get(name, []), (list, tuple))
+                for name in ("completed", "active", "pending", "forbidden")
+            ):
+                raise ValueError("initial_event_ledger must come from HR H3 Prompt Skill Compiler")
+            previous_event_ledger = {
+                name: [dict(item) for item in initial_event_ledger.get(name, ()) if isinstance(item, dict)]
+                for name in ("completed", "active", "pending", "forbidden")
+            }
         output_template = None
         denoised_template = None
         completed_chunks = 0
@@ -2704,7 +3243,13 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 previous_gemma_timing_plan = previous_state.get("gemma_timing_plan")
                 previous_gemma_end_state = previous_state.get("gemma_end_state")
                 previous_gemma_last_seen_character_state = previous_state.get("gemma_last_seen_character_state")
-                if replay_prompt_changed:
+                previous_event_ledger = previous_state.get("gemma_event_ledger") or {
+                    "completed": [], "active": [], "pending": [], "forbidden": [],
+                }
+                previous_prompt_changed = previous_state.get("source_prompt_sha256") != hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest()
+                if replay_prompt_changed or previous_prompt_changed:
                     # These were authored against the old source prompt. The
                     # predecessor still remains available as chronological
                     # rendered stills, which are more reliable evidence for
@@ -2713,6 +3258,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_timing_plan = None
                     previous_gemma_end_state = None
                     previous_gemma_last_seen_character_state = None
+                    previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
                     logging.info(
                         "HR Endless Sampler replay: discarded stale prior Gemma text; "
                         "the edited plan will use the retained predecessor frames as evidence."
@@ -2722,19 +3268,50 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 completed_chunks = replay_start_index
             except (KeyError, RuntimeError, ValueError) as error:
                 raise RuntimeError(f"HR Endless Sampler replay cache has invalid completed chunk state: {error}") from error
-        gemma_director = (
-            Gemma4ContinuityDirector(
-                debug=debug,
-                gemma4_mtp=bool(gemma4_mtp),
-                observation_image_directory=gemma_image_log,
-            )
-            if gemma_director_needed else None
-        )
+        gemma_director = None
+        if gemma_director_needed:
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+                gemma_director = Qwen35ContinuityDirector(
+                    director_selection.model_path,
+                    director_selection.mmproj_path,
+                    debug=debug,
+                    observation_image_directory=gemma_image_log,
+                    mtp_enabled=gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"},
+                    mtp_draft_tokens=director_mtp_draft_tokens,
+                    reasoning_effort=director_reasoning_effort,
+                    cpu_moe=director_cpu_moe,
+                    n_cpu_moe=director_n_cpu_moe,
+                    backend=director_selection.backend,
+                )
+            else:
+                gemma_director = Gemma4ContinuityDirector(
+                    debug=debug,
+                    gemma4_mtp=bool(gemma4_mtp),
+                    observation_image_directory=gemma_image_log,
+                    model_path=director_selection.model_path,
+                    mmproj_path=director_selection.mmproj_path,
+                )
         if gemma_director is not None:
-            logging.info(
-                "HR Endless Sampler Gemma 4 mode: %s.",
-                "native draft-MTP (4 draft tokens)" if gemma4_mtp else "original non-MTP decoding",
-            )
+            if director_selection.backend in QWEN_DIRECTOR_BACKENDS:
+                logging.info(
+                    "HR Endless Sampler director: %s (%s, context %d, CPU vision projector, MTP=%s, draft tokens=%d).",
+                    director_name,
+                    director_selection.model_path.name,
+                    65536 if director_selection.backend == "qwen3.5" else 32768,
+                    bool(gemma4_mtp and director_selection.backend in {"qwen3.6", "qwen3.8"}),
+                    int(director_mtp_draft_tokens),
+                )
+            else:
+                logging.info(
+                    "HR Endless Sampler director: Gemma 4 (%s).",
+                    (
+                        director_selection.model_path.name
+                        if director_selection.model_path is not None
+                        else "default model"
+                    ) + ", " + (
+                        "native draft-MTP (4 draft tokens)" if gemma4_mtp else "original non-MTP decoding"
+                    ),
+                )
         gemma_preproduction_timing_plan = None
         gemma_preproduction_cache = None
         gemma_preproduction_cache_ready = False
@@ -2846,7 +3423,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         chunk_noise=preflight_noise,
                         clip=clip,
                         vae=vae,
-                        images=images,
+                        images=image_list,
                         positive=positive,
                         original_conds=original_conds,
                         chunk_prompt=planned_prompts[0][0],
@@ -2911,14 +3488,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     if vae is not None:
                         comfy.model_management.unload_model_and_clones(vae.patcher)
                     comfy.model_management.soft_empty_cache(force=True)
-                    vram_monitor.report("before Gemma 4 shot-timing preproduction")
+                    vram_monitor.report(f"before {director_name} shot-timing preproduction")
                     timer_started = time.perf_counter()
                     try:
                         with _PreparationProgress(
                             (
-                                "Restoring cached Gemma 4 timing plan"
+                                f"Restoring cached {director_name} timing plan"
                                 if replay_timing_plan is not None
-                                else f"Gemma 4 is planning {len(preproduction_shots)} source shots for "
+                                else f"{director_name} is planning {len(preproduction_shots)} source shots for "
                                 f"{len(active_plan)} chunks before H3 sampling"
                             ),
                             preview_execution,
@@ -2951,7 +3528,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         validation_warnings=gemma_preproduction_timing_plan.validation_warnings,
                     )
                     logging.info(
-                        "HR Endless Sampler Gemma 4 preproduction timing plan is ready for %d source shots.",
+                        "HR Endless Sampler %s preproduction timing plan is ready for %d source shots.",
+                        director_name,
                         len(gemma_preproduction_timing_plan.shots),
                     )
                     if gemma_preproduction_cache is not None and replay_timing_plan is not None:
@@ -2996,10 +3574,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "HR Endless Sampler Gemma 4 clean preproduction KV cache was not produced; "
                                 "each chunk will receive the ordinary full directing request."
                             )
-                    vram_monitor.report("after Gemma 4 shot-timing preproduction release")
-                except Gemma4DependencyError:
+                    vram_monitor.report(f"after {director_name} shot-timing preproduction release")
+                except (Gemma4DependencyError, DirectorDependencyError):
                     raise
-                except Gemma4ObservationError as error:
+                except (Gemma4ObservationError, DirectorObservationError) as error:
                     logging.warning(
                         "HR Endless Sampler Gemma 4 shot-timing preproduction failed; "
                         "sampling is stopping before Chunk 1 and no sampler-authored timing fallback will be used: %s",
@@ -3015,6 +3593,27 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     )
                     raise
             for index, chunk in enumerate(active_plan[replay_start_index:], start=replay_start_index):
+                retake_number = index + 1
+                if retake_chunks and retake_number not in retake_chunks:
+                    state = retake_cached_chunks[retake_number]
+                    output_video.append(state["output_video"])
+                    output_audio.append(state["output_audio"])
+                    denoised_video.append(state["denoised_video"])
+                    denoised_audio.append(state["denoised_audio"])
+                    previous_video = state["sampled_video"].to(device=video.device, dtype=video.dtype)
+                    previous_audio = state["sampled_audio"].to(device=audio.device, dtype=audio.dtype)
+                    previous_frame_count = int(state["previous_frame_count"])
+                    output_template = state.get("output_template")
+                    denoised_template = state.get("denoised_template")
+                    if state.get("debug_prompt"):
+                        debug_prompts.append(str(state["debug_prompt"]))
+                    completed_chunks = retake_number
+                    continue
+                if retake_chunks and retake_mode != "continuous_av" and index > 0:
+                    predecessor = retake_cached_chunks[index]
+                    previous_video = predecessor["sampled_video"].to(device=video.device, dtype=video.dtype)
+                    previous_audio = predecessor["sampled_audio"].to(device=audio.device, dtype=audio.dtype)
+                    previous_frame_count = int(predecessor["previous_frame_count"])
                 timing.observe_memory()
                 timing.start_chunk(index)
                 gemma_chunk_seconds = 0.0
@@ -3030,7 +3629,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         "previous chunk": (previous_video, previous_audio),
                     },
                 )
-                continuation = index > 0
+                continuation = index > 0 or continuation_state is not None or external_active
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
                 chunk_label = f"Chunk {index + 1}/{len(active_plan)}"
                 if preview_execution is not None:
@@ -3052,7 +3651,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         comfy.model_management.soft_empty_cache(force=True)
                         if vram_monitor is not None:
                             vram_monitor.report(
-                                f"chunk {index + 1}/{len(active_plan)} before Gemma 4 prompt directing",
+                                f"chunk {index + 1}/{len(active_plan)} before {director_name} prompt directing",
                                 {"previous chunk": previous_video},
                             )
 
@@ -3119,6 +3718,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             "previous_gemma_timing_plan": previous_gemma_timing_plan,
                             "previous_gemma_end_state": previous_gemma_end_state,
                             "previous_last_seen_character_state": previous_gemma_last_seen_character_state,
+                            "previous_event_ledger": previous_event_ledger,
                             "target_shots": target_shots,
                             "preproduction_timing_plan": gemma_preproduction_timing_plan.for_target_shots(
                                 target_shots,
@@ -3150,7 +3750,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         timer_started = time.perf_counter()
                         try:
                             with _PreparationProgress(
-                                f"{chunk_label}: Gemma 4 is directing the chunk prompt",
+                                f"{chunk_label}: {director_name} is directing the chunk prompt",
                                 preview_execution,
                                 chunk=index,
                                 live_console_bar=True,
@@ -3167,20 +3767,21 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         gemma_response = _gemma_response_transcript(result)
                         gemma_description = result.detailed_description
                         gemma_validation_warnings = result.validation_warnings
-                        gemma_report = _gemma_report(index + 1, result)
+                        gemma_report = _gemma_report(index + 1, result, director_name)
                         if vram_monitor is not None:
                             vram_monitor.report(
-                                f"chunk {index + 1}/{len(active_plan)} after Gemma 4 release",
+                                f"chunk {index + 1}/{len(active_plan)} after {director_name} release",
                             )
-                    except Gemma4DependencyError:
+                    except (Gemma4DependencyError, DirectorDependencyError):
                         raise
-                    except Gemma4ObservationError as error:
+                    except (Gemma4ObservationError, DirectorObservationError) as error:
                         gemma_system_prompt = gemma_director.last_system_prompt
                         gemma_observation_prompt = gemma_director.last_observation_prompt
                         gemma_response = error.raw_json or f"{type(error).__name__}: {error}"
                         logging.warning(
-                            "HR Endless Sampler Gemma 4 prompt directing for chunk %d/%d failed; "
+                            "HR Endless Sampler %s prompt directing for chunk %d/%d failed; "
                             "sampling is stopping and no algorithmic source-prompt fallback will be used: %s",
+                            director_name,
                             index + 1,
                             len(active_plan),
                             error,
@@ -3276,6 +3877,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 audio_context = None if previous_audio is None or not guide_enabled else previous_audio[..., -guide_audio_t:].clone()
                 video_context_start = 0
                 audio_end_frame = float(keyframe_duration_frames)
+                if external_active and index == 0:
+                    video_context = previous_video.clone()
+                    audio_context = previous_audio.clone() if external_audio_mode == "continue" else None
+                    audio_end_frame = float(external_frame_count)
                 if audio_context is not None:
                     overhang = previous_audio.shape[-1] - FRAME_RESCALE * previous_frame_count
                     audio_end_frame += overhang / FRAME_RESCALE
@@ -3290,15 +3895,28 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         use_video_continuation,
                     )
                     if boundary_video_context is not None:
-                        video_context = boundary_video_context
-                        video_context_start = boundary_keyframe_index
-                        if debug:
-                            logging.info(
-                                "HR Endless Sampler chunk %d/%d Video1 boundary keyframe: "
-                                "previous final five-frame latent tail anchored across discarded local frames 0-4",
+                        if include_video1_reference and not _h3_supports_keyframes_with_refs():
+                            boundary_video_context = None
+                            video_context = None
+                            audio_context = None
+                            logging.warning(
+                                "HR Endless Sampler chunk %d/%d: this ComfyUI H3 version overwrites visual "
+                                "keyframe latents when references are present; using Video1 without the optional "
+                                "five-frame boundary keyframe to avoid an invalid packed layout. Update ComfyUI "
+                                "to enable both together.",
                                 index + 1,
                                 len(active_plan),
                             )
+                        else:
+                            video_context = boundary_video_context
+                            video_context_start = boundary_keyframe_index
+                            if debug:
+                                logging.info(
+                                    "HR Endless Sampler chunk %d/%d Video1 boundary keyframe: "
+                                    "previous final five-frame latent tail anchored across discarded local frames 0-4",
+                                    index + 1,
+                                    len(active_plan),
+                                )
                     if include_video1_reference:
                         reference_latent = previous_video[:, :, -_video_steps(video_continuation):].clone()
                         full_reference_latent = reference_latent
@@ -3396,10 +4014,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         continuation_video_label=continuation_video_label,
                         continuation_audio_label=continuation_audio_label,
                         last_seen_character_state=result.last_seen_character_state,
+                        event_ledger=getattr(result, "event_ledger", None),
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
                     chunk_prompt, debug_prompt = planned_prompts[index]
+                    if external_active and index == 0:
+                        chunk_prompt = str(external_continuation["prompt"])
+                        debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, None)
+                    if retake_chunks:
+                        retake_item = retake_chunks[index + 1]
+                        chunk_prompt = retake_item.get("prompt_override") or retake_item["original_h3_prompt"]
+                        debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, None)
                     if gemma_report is not None:
                         debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 if return_prompts:
@@ -3436,7 +4062,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     preview_execution.set_phase(qwen_message, chunk=index)
                 timer_started = time.perf_counter()
                 try:
-                    encoded_prompt = _encode_prompt(clip, chunk_prompt, images, positive, width, height, continuation, video_items)
+                    encoded_prompt = _encode_prompt(
+                        clip, chunk_prompt, image_list, positive, width, height, continuation, video_items,
+                        base_reference_items,
+                    )
                 finally:
                     timing.add("qwen", timer_started)
                 if continuation and include_video1_reference:
@@ -3480,6 +4109,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     audio_end_frame,
                     video_refs,
                     video_context_start,
+                    chunk_video,
                 )
 
                 # Every dependency on the previous sampler container has now
@@ -3551,11 +4181,19 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 denoised_chunk_video, denoised_chunk_audio = denoised["samples"].unbind()
 
                 video_trim = context_video_t
-                audio_trim = 0 if index == 0 else context_audio_t
+                audio_trim = 0 if index == 0 and continuation_state is None and not external_active else context_audio_t
                 assembled_video = previous_video[:, :, video_trim:].clone()
                 assembled_audio = previous_audio[..., audio_trim:].clone()
                 assembled_denoised_video = denoised_chunk_video[:, :, video_trim:].clone()
                 assembled_denoised_audio = denoised_chunk_audio[..., audio_trim:].clone()
+                if (continuation_state is not None and continuation_audio_mode == "mute") or (external_active and external_audio_mode == "mute" and index == 0):
+                    assembled_audio = torch.zeros_like(assembled_audio)
+                    assembled_denoised_audio = torch.zeros_like(assembled_denoised_audio)
+                if retake_chunks:
+                    original_state = retake_cached_chunks[index + 1]
+                    if retake_mode == "video_only":
+                        assembled_audio = original_state["output_audio"]
+                        assembled_denoised_audio = original_state["denoised_audio"]
                 if replay_output_on_cpu:
                     output_video.append(assembled_video.to(device="cpu"))
                     output_audio.append(assembled_audio.to(device="cpu"))
@@ -3595,7 +4233,28 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_timing_plan = result.timing_plan
                     previous_gemma_end_state = result.end_state
                     previous_gemma_last_seen_character_state = list(result.last_seen_character_state)
-                if replay_cache is not None:
+                    ledger = getattr(result, "event_ledger", None)
+                    if isinstance(ledger, dict):
+                        previous_event_ledger = {
+                            name: [dict(item) for item in ledger.get(name, ()) if isinstance(item, dict)]
+                            for name in ("completed", "active", "pending", "forbidden")
+                        }
+                if replay_cache is not None and retake_chunks:
+                    try:
+                        replay_cache.save_revision(index + 1, {
+                            "sampled_video": previous_video,
+                            "sampled_audio": original_state["sampled_audio"] if retake_mode == "video_only" else previous_audio,
+                            "previous_frame_count": previous_frame_count,
+                            "output_video": assembled_video,
+                            "output_audio": assembled_audio,
+                            "denoised_video": assembled_denoised_video,
+                            "denoised_audio": assembled_denoised_audio,
+                            "output_template": output_template,
+                            "denoised_template": denoised_template,
+                        }, mode=retake_mode, prompt=chunk_prompt)
+                    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                        logging.warning("HR Endless Sampler could not save retake revision for Chunk %d: %s", index + 1, error)
+                if replay_cache is not None and not retake_chunks:
                     try:
                         replay_cache.save_chunk(
                             index + 1,
@@ -3609,10 +4268,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "denoised_audio": assembled_denoised_audio,
                                 "output_template": output_template,
                                 "denoised_template": denoised_template,
+                                "source_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                                 "gemma_description": previous_gemma_description,
                                 "gemma_timing_plan": previous_gemma_timing_plan,
                                 "gemma_end_state": previous_gemma_end_state,
                                 "gemma_last_seen_character_state": previous_gemma_last_seen_character_state,
+                                "gemma_event_ledger": previous_event_ledger,
                                 "h3_render_seconds": h3_render_seconds,
                                 "gemma_seconds": chunk_gemma_seconds,
                                 "gemma_preproduction_seconds": chunk_preproduction_seconds,
@@ -3621,6 +4282,27 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "prefix_video_noise": prefix_video_noise,
                                 "prefix_audio_noise": prefix_audio_noise,
                             },
+                            metadata={
+                                "frame_start": int(chunk["frame_start"]),
+                                "frame_end": int(chunk["frame_end"]),
+                                "video_start": int(chunk["video_start"]),
+                                "video_end": int(chunk["video_end"]),
+                                "audio_start": int(chunk["audio_start"]),
+                                "audio_end": int(chunk["audio_end"]),
+                                "output_trim_frames": int(chunk.get("output_trim_frames", 0)),
+                                "source_prompt": prompt,
+                                "source_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                                "effective_h3_prompt": chunk_prompt,
+                                "director_system_prompt": gemma_system_prompt,
+                                "director_observation_prompt": gemma_observation_prompt,
+                                "director_response": gemma_response,
+                                "director_description": previous_gemma_description,
+                                "director_timing_plan": previous_gemma_timing_plan,
+                                "director_end_state": previous_gemma_end_state,
+                                "director_last_seen_character_state": previous_gemma_last_seen_character_state,
+                                "director_event_ledger": previous_event_ledger,
+                            },
+                            observation_image_directory=gemma_image_log,
                         )
                     except (OSError, RuntimeError, ValueError) as error:
                         logging.warning(
@@ -3691,23 +4373,29 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 },
             )
             if not sampling_completed and replay_cache is not None:
-                resume_chunk = min(completed_chunks + 1, len(active_plan))
-                try:
-                    replay_cache.mark_interrupted(completed_chunks)
-                except (OSError, RuntimeError, ValueError) as error:
-                    logging.warning(
-                        "HR Endless Sampler could not mark its recovery checkpoint as interrupted: %s",
-                        error,
+                control = _consume_replay_control()
+                if control in {"delete", "restart"}:
+                    replay_cache.clear()
+                    logging.warning("HR Endless Sampler deleted the interrupted render%s.",
+                                    " before restarting" if control == "restart" else "")
+                else:
+                    resume_chunk = min(completed_chunks + 1, len(active_plan))
+                    try:
+                        replay_cache.mark_interrupted(completed_chunks)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        logging.warning(
+                            "HR Endless Sampler could not mark its recovery checkpoint as interrupted: %s",
+                            error,
+                        )
+                    logging.error(
+                        "HR Endless Sampler preserved the interrupted render through Chunk %d in %s. "
+                        "Queue the same workflow again with debug_start_chunk=0 to continue automatically from Chunk %d "
+                        "without rerendering completed chunks. Set a nonzero debug_start_chunk only to force a specific "
+                        "debug replay point.",
+                        completed_chunks,
+                        replay_cache.root,
+                        resume_chunk,
                     )
-                logging.error(
-                    "HR Endless Sampler preserved the interrupted render through Chunk %d in %s. "
-                    "Queue the same workflow again with debug_start_chunk=0 to continue automatically from Chunk %d "
-                    "without rerendering completed chunks. Set a nonzero debug_start_chunk only to force a specific "
-                    "debug replay point.",
-                    completed_chunks,
-                    replay_cache.root,
-                    resume_chunk,
-                )
             elif sampling_completed and debug_stop_chunk and replay_cache is not None:
                 try:
                     replay_cache.mark_debug_stop(completed_chunks)

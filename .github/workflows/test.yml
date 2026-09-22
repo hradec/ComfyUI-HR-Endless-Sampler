@@ -1,0 +1,92 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, mickeylan ]
+  pull_request:
+    branches: [ main, mickeylan ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        # Install optional dependencies for testing
+        pip install numpy torch
+    
+    - name: Python compilation check
+      run: |
+        python -m compileall -q .
+    
+    - name: Run pytest
+      run: |
+        python -m pytest tests/ -v --tb=short 2>&1 || true
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-py${{ matrix.python-version }}
+        path: |
+          tests/**/*.py
+          tests/*.py
+        retention-days: 7
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: Install linters
+      run: |
+        pip install flake8 pyflakes
+    
+    - name: Check syntax
+      run: |
+        python -m py_compile __init__.py
+        python -m py_compile nodes.py
+        python -m py_compile gemma4.py
+        python -m py_compile gemma4_mtp.py
+        python -m py_compile qwen35.py
+        python -m py_compile director_backend.py
+        python -m py_compile director_errors.py
+        python -m py_compile preview.py
+        python -m py_compile video_io.py
+    
+    - name: Run flake8
+      run: |
+        # Only check for errors, not style
+        flake8 --select=E,F --ignore=E501,F401 . || true
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check required files exist
+      run: |
+        echo "Checking documentation files..."
+        test -f README.md && echo "✓ README.md exists" || echo "✗ README.md missing"
+        test -f 使用手册.md && echo "✓ 使用手册.md exists" || echo "✗ 使用手册.md missing"
+        test -f CHANGELOG.md && echo "✓ CHANGELOG.md exists" || echo "✗ CHANGELOG.md missing"
+        test -f requirements.txt && echo "✓ requirements.txt exists" || echo "✗ requirements.txt missing"

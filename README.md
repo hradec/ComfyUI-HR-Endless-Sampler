@@ -1,13 +1,53 @@
-# ComfyUI-HR-Endless-Sampler 
-## (the older ComfyUI MiniMax H3 Sampler Unlimited)
+# ComfyUI-MiniMax-H3-Sampler-Unlimited (mickeylan fork)
+## HR Endless Sampler 中文增强与低显存长视频工具集
 
+> ⚠️ **注意**：这是 [hradec/ComfyUI-HR-Endless-Sampler](https://github.com/hradec/ComfyUI-HR-Endless-Sampler) 的中文用户/低显存优化分支。
 
+本项目以 **HR Endless Sampler 节点族**为核心：在保留 MiniMax H3 低显存 physical chunk 连续采样的基础上，加入多导演、统一参考媒体、实时预览、Timeline、Save/Load、断点重跑、分块重拍和持久续写。
 
 https://github.com/user-attachments/assets/5da194ea-4d29-4fd3-9b1c-edd537b88431
 
 - video generated with HR Endless Sampler at 1080p 625 frames on a 16GB GPU
 
+## 🎯 本分支特色
 
+本分支专为 **中文用户** 和 **低显存（12GB）用户** 设计：
+
+| 特性 | 原版 | 本分支 |
+|------|------|--------|
+| Gemma 4 导演 | ✅ 支持 | ✅ 支持 |
+| Qwen3.5 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.6 导演 | ❌ 不支持 | ✅ 支持 |
+| Qwen3.8 导演 | ❌ 不支持 | ✅ 支持 |
+| 12GB VRAM 支持 | ❌ Gemma 12B 太大 | ✅ Qwen 27B MoE + UD-IQ2-mtp |
+| 中文提示词 | ⚠️ 需要翻译 | ✅ 原生支持 |
+| MoE CPU Offload | ❌ 不支持 | ✅ 支持 |
+| 分块重拍与 Revision | ❌ 不支持 | ✅ 已实现，待实机验收 |
+| 持久续写 Checkpoint | ❌ 不支持 | ✅ 已实现，待实机验收 |
+| 统一参考媒体输入 | ❌ 分散接线 | ✅ 图片/视频/音轨/独立音频 |
+| Replay/断点重跑 | ⚠️ 基础能力 | ✅ 最近 5 次完整生成可选，缓存、重拍和续写共用 |
+| 生成中控制 | ❌ 不支持 | ✅ 停止保留、停止删除、删除后从头重排 |
+
+### 为什么选择 Qwen3.6/3.8？
+
+- **Qwen3.6/3.8 是 27B MoE 模型**，可使用 UD-IQ2-mtp 量化降低显存占用
+- MoE 架构只激活部分参数，适合显存受限环境
+- 本分支用户实测 Qwen3.6/3.8 可在 12GB VRAM 上运行；稳定参数仍取决于 GGUF、CUDA、参考媒体、分辨率和 chunk 大小
+- Gemma 4 12B 在该 12GB 测试环境中不可用，因此保留为旧工作流默认后端，不作为 12GB 推荐方案
+- Qwen3.6/3.8 支持内置 MTP 推测解码和 MoE offload
+
+### 12GB VRAM 推荐配置
+
+```text
+director_backend = qwen3.8           # 27B MoE + UD-IQ2-mtp
+director_mtp = true                  # 内置 MTP
+director_reasoning_effort = medium   # 平衡质量与速度
+chunk_frames = 56-62                 # 1080p 推荐值
+video_continuation = 22
+pytorch_memory_fraction = 0.82
+```
+
+---
 
 `HR Endless Sampler` is a chunked replacement for ComfyUI's
 `SamplerCustomAdvanced` for long video/audio latents, currently supports 
@@ -15,10 +55,11 @@ Minimax H3 only. The plan is to add support to LTX 2.5 in the near future.
 
 `HR Endless Sampler` is able to render videos of any length by automatically 
 splitting the inference into small chunks of the same long latent. It uses 
-Gemma4 12B QAT internally to analyze the original prompt and all references, 
-plan the action-timing for each shot and each chunk, then analyzes previous 
-rendered frames and writes new small prompts for each chunk, maintaining 
-the continuity and coherence of the entire video. 
+a user-selected local Gemma 4 or Qwen3.5 multimodal director to analyze the
+original prompt and references, plan action timing for every shot and chunk,
+then inspect previous rendered frames and write the next H3 prompt while
+maintaining continuity and coherence. Gemma 4 remains the default for old
+workflows.
 
 Using `HR Endless Sampler Preview` node (based on the amazing KJ Live preview node) 
 allows to visualize the whole video as it is infered, with a timeslider that displays
@@ -47,18 +88,84 @@ The way to use is pretty straight forward - just replace the normal "Sampler" no
 
 ## Included nodes
 
-The extension installs four nodes:
+### HR Endless Sampler 主节点族
 
 | Node | Purpose |
 | --- | --- |
-| `HR Endless Sampler` | Samples a long latent serially, asks Gemma to plan the complete production and direct each chunk, and outputs the finished latent, chunk prompts, and timeline metadata. |
-| `HR Endless Sampler Preview` | Patches the model with the live accumulated preview, ordered chunk playback, shot brackets, prompt/timing tooltips, frame stepping, performance graphs, and browser-refresh recovery. |
-| `HR Endless Sampler Save Video` | Saves ordinary video, animated VHS formats, or float EXR sequences while preserving the Endless timeline, prompts, shot/chunk mapping, render timing, and optional audio. |
-| `HR Endless Sampler Load Video` | Browses or uploads finished media, restores its interactive timeline immediately in the browser, and outputs decoded video/images, audio, dimensions, FPS, frame count, filename, and timeline to a queued workflow. |
+| `HR Endless Sampler` | 串行采样长音视频 latent，生成 chunk prompts、成品 latent 和 Timeline，并接收重拍或续写计划。 |
+| `HR Endless Sampler Preview` | 实时累计预览、chunk 播放、Shot 标记、提示词/耗时悬停、逐帧控制、性能图表和刷新恢复。 |
+| `HR Endless Sampler Save Video` | 保存普通视频、VHS 格式或 float EXR 序列，同时保留 Timeline、提示词、渲染耗时和可选音频。 |
+| `HR Endless Sampler Load Video` | 浏览或上传成品媒体，恢复交互式 Timeline，并输出 VIDEO/IMAGE/AUDIO、尺寸、FPS、帧数和文件名。 |
+| `HR MiniMax H3 Continuation Analyzer` | 仅使用本地 Qwen3.5 分析普通视频最后 22 帧，输出 H3 prompt、尾帧上下文、分析 JSON 和预览；可选参考图只提供给 Qwen，不会成为 H3 reference。 |
+| `HR MiniMax H3 Continuation Apply` | 接收现有 MiniMax H3 conditioning 与 latent，使用 Analyzer 上下文编码并合并同位置 keyframe；原有 `cross_attn`、token tags 和 refs 原样保留，不重新 tokenization。输出可接 SelfLift，也保留 `external_continuation` 给 HR Endless Sampler。 |
+| `HR Video Bridge Extract` | 提取视频 A 最后 22 帧、视频 B 最前 22 帧及对应音频，建立桥接源数据。 |
+| `HR Video Bridge Director` | 使用隔离的 Qwen3.6/3.8 分析人物参考图和 A/B 边界，输出结构化过渡计划及 H3 提示词。 |
+| `HR Video Bridge Conditioning` | 将人物图和 B 头作为 references、A 尾作为首端 continuation，输出可接 HR Endless Sampler 的 conditioning、latent 和 external continuation。 |
+| `HR Video Bridge Assemble` | 自动搜索 A/Bridge/B 的低差异接缝，组装帧、音频、Timeline 和接缝报告。 |
+| `HR Endless Segment Retake Director` | 浏览最近一次完整 replay cache，选择 physical chunks、编辑 H3 prompt 并生成重拍计划。 |
+
+接线：`Analyzer.H3 prompt → 现有 MiniMax H3 conditioning`；`conditioning.positive + latent → Apply`；`Analyzer.context → Apply`；`Apply.positive + latent → SelfLift`。
+| `HR Endless Retake Assemble` | 根据每个 chunk 当前选中的原版/重拍 revision，无采样重新拼接 output、denoised output 和 Timeline。 |
+| `HR Endless Continuation Checkpoint` | 将最近一次完整 replay 固化为可跨重启保存的续写 checkpoint。 |
+| `HR Endless Continuation Plan` | 设置新提示词、音频策略以及参考媒体继承/替换/合并策略。 |
+| `HR Endless Continuation Assemble` | 将 checkpoint 中的旧音视频 latent 与本次续写结果拼接。 |
+
+### Sampler 辅助节点
+
+| Node | Purpose |
+| --- | --- |
+| `HR Qwen Director Config` | 为 Sampler 和提示词编译器共享本地 Qwen3.5/3.6/3.8 model/mmproj/runtime 配置。 |
+| `HR H3 Prompt Skill Compiler` | 将普通故事编译成带原子事件所有权、Shot 起止状态、禁止重复项和差异化机位的 H3 六字段提示词；自动使用连接的 Director Config 后端。 |
+| `HR MiniMax H3 Reference Set` | 统一输入最多 9 张图片、3 个视频及对应音轨、3 条独立音频。 |
+| `HR MiniMax H3 Reference Conditioning` | 创建 MiniMax H3 Ref2VA conditioning 和 nested AV latent。 |
+
+提示词编译接线：人物图片 → `HR MiniMax H3 Reference Set`；同一个 `HR Qwen Director Config` 同时连接 `HR H3 Prompt Skill Compiler` 和 `HR Endless Sampler`；Compiler 的 `H3 prompt` 接 Reference Conditioning 与 Sampler 的 `prompt`。用户在 Director Config 选择 Qwen3.5 时两者都使用 3.5，选择 Qwen3.6/3.8 时同理。
+
+视频桥接接线：两个 `HR Endless Sampler Load Video.images/audio/fps` → `HR Video Bridge Extract`；人物图片 → `HR MiniMax H3 Reference Set`；Extract + Reference Set + `HR Qwen Director Config` → Director → Conditioning；Conditioning 的 `positive` 接 Guider，`latent`、`external_continuation`、`bridge_reference_set`、`prompt` 接 `HR Endless Sampler`；Sampler latent 经 VAE Decode 后与 Extract 输出一起接 `HR Video Bridge Assemble`。详细说明见 [`视频自然过渡节点实施计划.md`](视频自然过渡节点实施计划.md)。
 
 The Save and Load players use the same colored chunk timeline and shot brackets
 as the live Preview node, but omit the live sampling graphs. Hovering a chunk
 shows its H3 prompt and the sampler/Gemma/miscellaneous timing breakdown.
+
+## Chunk retake（分块重拍）
+
+先让 `HR Endless Sampler` 完整生成一次基线，随后在 `HR Endless Segment Retake Director` 中刷新最近一次 replay cache、选择 chunks、修改提示词并选择模式：
+
+- `video_only`：只重拍画面，保留缓存中的原音频；
+- `isolated_av`：只重拍选中 chunks 的画面和音频；
+- `continuous_av`：从最早选中的 chunk 连续重拍到结尾，后续块继承新的前块状态。
+
+将 Director 的 `retake plan` 接入原 `HR Endless Sampler.retake_plan` 后重新运行。每次成功重拍都会创建 revision，不覆盖原版。在 Director 中选择各 chunk 的活动 revision，再运行 `HR Endless Retake Assemble` 即可无采样重新拼接。
+
+> 重拍代码闭环已实现，但尚未完成真实 ComfyUI + H3 + GPU 的完整验收。首次测试请保留基线视频、日志、Timeline 和 replay cache。
+
+详细接线和验收步骤见 [`HR重拍与续写操作手册.md`](HR重拍与续写操作手册.md)。
+
+## Durable continuation（持久续写）
+
+续写建议分三次 Queue：
+
+1. 用 `HR Endless Sampler` 完整生成原片段；
+2. 单独运行 `HR Endless Continuation Checkpoint`，把完整 replay 固化到 `output/hr_endless_sampler/continuations/`；
+3. 用 `HR Endless Continuation Plan` 设置新提示词、音频和参考策略，将其接入新的 `HR Endless Sampler.continuation_plan`，最后用 `HR Endless Continuation Assemble` 拼接旧结果与新结果。
+
+音频策略：
+
+- `continue`：继承旧片末尾 Audio1；
+- `new_segment`：保持视频连续，但不延续旧音频内容；
+- `mute`：将新增片段输出音频静音。
+
+参考媒体策略：
+
+- `inherit`：使用 checkpoint 保存的 Reference Set；
+- `replace`：只使用新连接的 Reference Set；
+- `inherit_plus_replace`：在原参考媒体后追加新参考媒体。
+
+续写 Sampler 的 `latent_image` 只表示新增片段长度，FPS 必须与 checkpoint 相同；`retake_plan` 和 `continuation_plan` 不能同时连接。
+
+> 续写代码闭环已实现，但尚未完成真实 ComfyUI + H3 + GPU 的完整验收。
+
+详细接线、策略说明和测试模板见 [`HR重拍与续写操作手册.md`](HR重拍与续写操作手册.md)。
 
 ## Main settings
 
@@ -66,6 +173,8 @@ shows its H3 prompt and the sampler/Gemma/miscellaneous timing breakdown.
 value that fits in VRAM. Smaller chunks use less VRAM, but need more handoffs.
 For example, 39 frames is a practical 1080p starting point on a 16 GB GPU.
 H3 uses a `5 + 17k` frame grid, so the effective size is aligned to that grid.
+
+Qwen3.6/3.8 chunk directing also maintains an automatic event ownership ledger. Completed actions are persisted in replay state and injected into later H3 prompts as forbidden replays; active and pending events remain separately tracked. This is intended to reduce the chance that a later physical chunk restages an action or shot that already appeared. Qwen3.5 remains unchanged, and this mitigation still requires real multi-chunk GPU validation.
 
 `video_continuation` is the number of completed frames carried from the last
 chunk into the next one. H3 sees them as a synchronized `<Video N>` and
@@ -95,6 +204,14 @@ presentation and does not change when only `video_continuation_res` changes.
 The sampler also uses the previous chunk's final five frames as a small H3
 boundary keyframe. This is automatic. It helps adjacent chunks meet cleanly.
 
+`director_backend` explicitly selects `gemma4`, `qwen3.5`, `qwen3.6`, or
+`qwen3.8`. The existing `qwen3.5` value remains compatible with old workflows.
+`director_model` and `director_mmproj` select local files discovered recursively
+beneath `models/llama_cpp` and `models/LLM/GGUF`. For each Qwen backend, `auto`
+selects only a same-directory model/projector pair from that exact Qwen series.
+Explicit Qwen selections must match the selected series and directory. URLs, external paths, and non-GGUF files
+are rejected. Qwen never downloads a model.
+
 `cache_gemma_preproduction` saves Gemma's static preproduction context in
 system RAM. This can make later Gemma requests much faster because they do not
 need the full source prompt and shot plan again. Linux uses `/dev/shm` when it
@@ -102,8 +219,13 @@ has enough free RAM; otherwise the normal temporary directory is used. The
 cache uses several GiB of RAM, never VRAM. It is optional and does not change
 the generated video.
 
-`gemma4_mtp` enables Gemma's native four-token draft-MTP decoder. Turn it off
-to run the original non-MTP decoder and compare speed on the same workflow.
+`gemma4_mtp` enables native MTP where the selected director supports it.
+Gemma uses its four-token configuration. Qwen3.5 does not support MTP.
+Qwen3.6 and Qwen3.8 use embedded NextN/MTP layers for both text timing and visual
+MTMD requests. `director_mtp_draft_tokens` controls their draft length. A native Qwen
+MTP failure is retried once in a fresh non-MTP worker; invalid model-authored
+JSON is not repeatedly regenerated. Turn the setting off to compare ordinary
+decoding on the same workflow.
 The console reports generated tokens/second and, in MTP mode, the assistant's
 draft-token acceptance rate, proposal count, verification work, rollback
 replays, and checkpoint time. This is real speculative decoding: the matching
@@ -176,9 +298,38 @@ ${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_chunk_prompts.txt
 ${TMPDIR}/comfyui-hr-endless-sampler/last_gemma_images/
 ```
 
-The text file includes the preproduction plan, each request to Gemma, Gemma's
-JSON response, any correction request, and the final prompt sent to H3. The
-image directory contains the stills that Gemma saw. A new render replaces both.
+The text file includes the preproduction plan, each request to the selected
+director, its JSON response, any correction request, and the final prompt sent
+to H3. The image directory contains the stills that the director saw. The legacy
+`last_gemma_*` filenames remain unchanged for workflow/tool compatibility. A new
+render replaces both.
+
+## Qwen3.5, Qwen3.6, and Qwen3.8 setup
+
+Place the local model and projector beneath `models/LLM/GGUF`, for example:
+
+```text
+models/LLM/GGUF/qwen3.5-9B/
+├── Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf
+└── mmproj-Huihui-Qwen3.5-9B-abliterated.gguf
+```
+
+Select the matching `qwen3.5`, `qwen3.6`, or `qwen3.8` value in
+`director_backend`; `auto` then discovers only that series. Qwen uses a disposable llama.cpp worker
+with a 256-token batch. Qwen3.5 uses a 65536-token context; Qwen3.6 and Qwen3.8
+use 32768 to match Gemma 4's director context. Qwen3.8 reads the GGUF's native
+chat template, supports `xhigh`, `medium`, and `low` reasoning effort, and adapts
+that template for its mmproj. Qwen3.6 and Qwen3.8 can optionally pass `cpu_moe` or
+`n_cpu_moe`. The Gemma preproduction KV cache remains unsupported. The same
+directing contract accepts Chinese source prompts, writes H3 visual/action/
+camera prose in English, and preserves original dialogue, lyrics, visible text,
+required shot markers, and prior chunk continuity context.
+
+The Qwen worker exits before H3 sampling resumes, so its llama.cpp CUDA context
+cannot remain allocated beside H3. The plugin does not use Transformers,
+Hugging Face fallback loading, or any Qwen network request. Runtime support for
+a particular GGUF/mmproj pair still depends on the installed pinned
+`llama-cpp-python` build.
 
 ## Gemma 4 setup
 
@@ -347,16 +498,16 @@ The console shows chunk progress, H3 step progress, and Gemma preparation
 progress with live generated tokens/second. The end-of-run report includes H3, Qwen, VAE, and Gemma time,
 plus peak RAM and VRAM use.
 
-## Current limits
+## Current limits and verification status
 
-- The released backend currently supports MiniMax H3 only.
+- The released sampling backend currently supports MiniMax H3 only; LTX 2.5 is still planned.
 - Multi-chunk H3 rendering needs the H3 video VAE.
 - Chunked denoise masks are not supported.
-- The sampler can reconstruct image and audio Ref2VA inputs. It cannot turn an
-  image input back into an original video Ref2VA source.
-- Gemma observes generated video frames, not generated audio. It preserves
-  dialogue and sound instructions from the source prompt, but does not judge
-  the resulting soundtrack.
+- Gemma/Qwen observes generated video frames, not generated audio. It preserves dialogue and sound instructions from the source prompt, but does not judge the resulting soundtrack.
+- 重拍和持久续写已经完成代码、缓存协议及模拟测试，但尚未完成真实 ComfyUI + H3 + GPU 的端到端验收。
+- Reference Set 的真实视频、同步音轨和独立音频路径仍需实机联调。
+- 12GB VRAM 可用性来自本分支用户对特定 Qwen3.6/3.8 UD-IQ2-mtp 配置的实测，不代表所有模型、分辨率和参考媒体组合都能稳定运行。
+- 上游 llama.cpp issue #27439 截至 2026-09-10 仍为 open；必须保留 disposable worker 和 operation-local non-MTP fallback。
 
 ## TIPS TO RENDER 1080p with 16GB of VRAM:  
  - These tips are from my workflow using ref2va with 5 images at 720p resolution as reference. 
