@@ -22,9 +22,11 @@ from PIL import Image
 try:
     from .director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
     from .story_format import compile_h3_prompt, validate_storyboard_plan
+    from .prompt_skill import compile_prompt_skill, prompt_skill_messages
 except ImportError:  # Direct worker execution.
     from director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
     from story_format import compile_h3_prompt, validate_storyboard_plan
+    from prompt_skill import compile_prompt_skill, prompt_skill_messages
 
 
 QWEN35_CONTEXT_TOKENS = 65536
@@ -41,6 +43,7 @@ QWEN38_IMAGE_MIN_TOKENS = 256
 QWEN38_IMAGE_MAX_TOKENS = 1344
 QWEN38_CHUNK_RESPONSE_TOKENS = 4096
 QWEN38_TIMING_RESPONSE_TOKENS = 8192
+QWEN_PROMPT_SKILL_RESPONSE_TOKENS = 8192
 QWEN_JZL_RESPONSE_TOKENS = 32768
 QWEN35_PROMPTS_PATH = Path(__file__).with_name("qwen35_prompts.txt")
 _WORKER_RESULT_PREFIX = "MINIMAX_H3_QWEN35_RESULT="
@@ -851,12 +854,13 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
 
     Llama, MTMDChatHandler, Qwen35ChatHandler, Jinja2ChatFormatter, handler_factory, SpecConfig, SpeculativeType = _load_runtime()
     operation = request["operation"]
-    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "video_bridge"}:
+    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "video_bridge", "prompt_skill_compile"}:
         raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
     timing = operation == "timing_plan"
     storyboard = operation == "storyboard"
     jzl_storyboard = operation == "jzl_storyboard"
     video_bridge = operation == "video_bridge"
+    prompt_skill = operation == "prompt_skill_compile"
     family = _qwen_family(request["director_model_path"])
     handler = None if timing or family == "qwen3.8" else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"], verbose=False, use_gpu=False,
@@ -925,6 +929,8 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             system, prompt = _storyboard_messages(request)
         elif video_bridge:
             system, prompt = _video_bridge_messages(request)
+        elif prompt_skill:
+            system, prompt = prompt_skill_messages(request)
         else:
             system, prompt = _chunk_messages(request)
         content: Any = prompt
@@ -937,7 +943,7 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             "temperature": 0.7,
             "top_p": 0.8 if family == "qwen3.8" else 0.9,
             "top_k": 40,
-            "max_tokens": QWEN_JZL_RESPONSE_TOKENS if jzl_storyboard else {
+            "max_tokens": QWEN_JZL_RESPONSE_TOKENS if jzl_storyboard else QWEN_PROMPT_SKILL_RESPONSE_TOKENS if prompt_skill else {
                 "qwen3.5": QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS,
                 "qwen3.6": QWEN36_TIMING_RESPONSE_TOKENS if timing else QWEN36_CHUNK_RESPONSE_TOKENS,
                 "qwen3.8": QWEN38_TIMING_RESPONSE_TOKENS if timing else QWEN38_CHUNK_RESPONSE_TOKENS,
@@ -954,14 +960,15 @@ def _complete(request: dict[str, Any]) -> dict[str, Any]:
             result = text
         else:
             value, raw = _extract_json(text)
-            result = (_video_bridge_result(value, request) if video_bridge else
+            result = (compile_prompt_skill(value, request) if prompt_skill else
+                      _video_bridge_result(value, request) if video_bridge else
                       _storyboard_result(value, request) if storyboard else
                       _timing_plan(value, request, raw, system, prompt) if timing else
                       _chunk_prompt(value, raw, system, prompt, request))
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         stats = getattr(llm, "last_speculative_stats", None)
         return {
-            "jzl_storyboard" if jzl_storyboard else ("video_bridge" if video_bridge else ("storyboard" if storyboard else ("timing_plan" if timing else "chunk_prompt"))): result if storyboard or jzl_storyboard or video_bridge else _payload(result),
+            "jzl_storyboard" if jzl_storyboard else ("prompt_skill_compile" if prompt_skill else ("video_bridge" if video_bridge else ("storyboard" if storyboard else ("timing_plan" if timing else "chunk_prompt")))): result if storyboard or jzl_storyboard or video_bridge or prompt_skill else _payload(result),
             "generation": {
                 "finish_reason": choice.get("finish_reason"),
                 "prompt_tokens": usage.get("prompt_tokens"),

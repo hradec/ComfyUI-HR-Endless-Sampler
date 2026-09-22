@@ -46,6 +46,7 @@ from .video_io import HREndlessTimeline, normalize_timeline
 HREndlessRetakePlan = io.Custom("HR_RETAKE_PLAN")
 HREndlessContinuationPlan = io.Custom("HR_CONTINUATION_PLAN")
 HREndlessExternalContinuation = io.Custom("HR_H3_EXTERNAL_CONTINUATION")
+HRH3EventLedger = io.Custom("HR_H3_EVENT_LEDGER")
 AUDIO_LATENT_FPS = 40
 VIDEO_FPS = 24
 MIN_VIDEO_STEPS = 2
@@ -2683,6 +2684,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     tooltip=("Optional shared MiniMax H3 image/video/audio references. Connect the Reference Conditioning "
                              "passthrough output so Planner, conditioning, and Sampler use one media connection."),
                 ),
+                HRH3EventLedger.Input(
+                    "initial_event_ledger", optional=True,
+                    tooltip="Optional event ownership seed from HR H3 Prompt Skill Compiler.",
+                ),
                 HREndlessContinuationPlan.Input("continuation_plan", optional=True,
                                                 tooltip="Continue from an immutable HR Endless continuation checkpoint."),
             ],
@@ -2707,7 +2712,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 pytorch_memory_fraction=DEFAULT_PYTORCH_MEMORY_FRACTION,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0, director_backend="gemma4",
                 director_model="auto", director_mmproj="auto", director_config=None, reference_set=None,
-                continuation_plan=None, external_continuation=None, **_deprecated_inputs):
+                continuation_plan=None, external_continuation=None, initial_event_ledger=None, **_deprecated_inputs):
         _set_pytorch_memory_fraction(DEFAULT_PYTORCH_MEMORY_FRACTION, guider.model_patcher.load_device)
         if retake_plan is not None and continuation_plan is not None:
             raise ValueError("retake_plan and continuation_plan cannot be used together")
@@ -3202,7 +3207,18 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_gemma_timing_plan = None
         previous_gemma_end_state = None
         previous_gemma_last_seen_character_state = None
-        previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
+        if initial_event_ledger is None:
+            previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
+        else:
+            if not isinstance(initial_event_ledger, dict) or any(
+                not isinstance(initial_event_ledger.get(name, []), (list, tuple))
+                for name in ("completed", "active", "pending", "forbidden")
+            ):
+                raise ValueError("initial_event_ledger must come from HR H3 Prompt Skill Compiler")
+            previous_event_ledger = {
+                name: [dict(item) for item in initial_event_ledger.get(name, ()) if isinstance(item, dict)]
+                for name in ("completed", "active", "pending", "forbidden")
+            }
         output_template = None
         denoised_template = None
         completed_chunks = 0

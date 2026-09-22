@@ -22,9 +22,11 @@ from PIL import Image
 try:
     from .director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
     from .story_format import compile_h3_prompt, validate_storyboard_plan
+    from .prompt_skill import compile_prompt_skill, prompt_skill_messages
 except ImportError:  # Direct worker execution.
     from director_errors import DirectorDependencyError, DirectorObservationError, DirectorWorkerError
     from story_format import compile_h3_prompt, validate_storyboard_plan
+    from prompt_skill import compile_prompt_skill, prompt_skill_messages
 
 
 QWEN35_CONTEXT_TOKENS = 65536
@@ -33,6 +35,7 @@ QWEN35_IMAGE_MAX_TOKENS = 1344
 QWEN35_BATCH_SIZE = 256
 QWEN35_CHUNK_RESPONSE_TOKENS = 8192
 QWEN35_TIMING_RESPONSE_TOKENS = 32768
+QWEN35_PROMPT_SKILL_RESPONSE_TOKENS = 16384
 QWEN36_CONTEXT_TOKENS = 32768
 QWEN36_CHUNK_RESPONSE_TOKENS = 4096
 QWEN36_TIMING_RESPONSE_TOKENS = 8192
@@ -706,12 +709,13 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         raise Qwen35DependencyError("Qwen3.5 requires llama-cpp-python with MTMD support") from error
 
     operation = request["operation"]
-    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "external_video_continuation"}:
+    if operation not in {"timing_plan", "chunk", "storyboard", "jzl_storyboard", "external_video_continuation", "prompt_skill_compile"}:
         raise Qwen35ObservationError(f"Unknown Qwen operation: {operation}")
     timing = operation == "timing_plan"
     storyboard = operation == "storyboard"
     jzl_storyboard = operation == "jzl_storyboard"
     external = operation == "external_video_continuation"
+    prompt_skill = operation == "prompt_skill_compile"
     handler = None if timing else MTMDChatHandler(
         clip_model_path=request["director_mmproj_path"],
         image_min_tokens=QWEN35_IMAGE_MIN_TOKENS,
@@ -736,6 +740,8 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
             system, prompt = _storyboard_messages(request)
         elif external:
             system, prompt = _external_messages(request)
+        elif prompt_skill:
+            system, prompt = prompt_skill_messages(request)
         else:
             system, prompt = _chunk_messages(request)
         content: Any = prompt
@@ -746,7 +752,9 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
         response = llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
             response_format=None if jzl_storyboard else {"type": "json_object"}, temperature=0.7, top_p=0.9, top_k=40,
-            max_tokens=QWEN_JZL_RESPONSE_TOKENS if jzl_storyboard else (QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS),
+            max_tokens=(QWEN_JZL_RESPONSE_TOKENS if jzl_storyboard else
+                        QWEN35_PROMPT_SKILL_RESPONSE_TOKENS if prompt_skill else
+                        QWEN35_TIMING_RESPONSE_TOKENS if timing else QWEN35_CHUNK_RESPONSE_TOKENS),
             reasoning_budget=0,
         )
         message = response["choices"][0]["message"]
@@ -759,6 +767,8 @@ def _complete_qwen35(request: dict[str, Any]) -> dict[str, Any]:
             return {"storyboard": _storyboard_result(value, request)}
         if external:
             return {"external_continuation": _payload(_external_result(value, raw, system, prompt))}
+        if prompt_skill:
+            return {"prompt_skill_compile": compile_prompt_skill(value, request)}
         result = _timing_plan(value, request, raw, system, prompt) if timing else _chunk_prompt(value, raw, system, prompt, request)
         return {"timing_plan" if timing else "chunk_prompt": _payload(result)}
     finally:
@@ -1006,6 +1016,29 @@ def _run_worker(request: dict[str, Any], timing: bool):
     return _from_payload(value["timing_plan" if timing else "chunk_prompt"], timing)
 
 
+def _run_prompt_skill_worker(request: dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(json.dumps(request, ensure_ascii=False))
+    payload["operation"] = "prompt_skill_compile"
+    process, value = _run_worker_once(payload, timeout=600)
+    native_failure = value is None or value.get("error_type") not in {
+        "Qwen35ObservationError", "Qwen35DependencyError", "ValueError"
+    }
+    if payload.get("director_mtp", False) and native_failure:
+        payload["director_mtp"] = False
+        process, value = _run_worker_once(payload, timeout=600)
+    if value is None:
+        raise DirectorWorkerError(
+            f"Qwen prompt skill worker exited with status {process.returncode} without a result",
+            returncode=process.returncode,
+        )
+    if not value.get("ok"):
+        raise Qwen35ObservationError(
+            str(value.get("message", "Qwen prompt skill worker failed")),
+            raw_json=str(value.get("raw_json", "")),
+        )
+    return dict(value["prompt_skill_compile"])
+
+
 def _run_storyboard_worker(request: dict[str, Any]) -> dict[str, Any]:
     payload = json.loads(json.dumps(request, ensure_ascii=False))
     payload["operation"] = "storyboard"
@@ -1128,6 +1161,19 @@ class Qwen35ContinuityDirector:
         return QwenExternalContinuation(result.confidence, result.observed_end_state, result.transition_plan,
                                         result.h3_prompt, result.raw_json, result.system_prompt or system,
                                         result.observation_prompt or prompt, result.validation_warnings)
+
+    def compile_prompt_skill(self, request: dict[str, Any], frames: Sequence[torch.Tensor]) -> dict[str, Any]:
+        frames = tuple(frames)
+        if len(frames) < 1 or len(frames) > 9 or any(
+            not isinstance(frame, torch.Tensor) or frame.ndim != 4 or frame.shape[0] != 1
+            for frame in frames
+        ):
+            raise Qwen35ObservationError("Prompt Skill Compiler requires 1 to 9 single-image NHWC batches")
+        payload = dict(request)
+        payload["image_count"] = len(frames)
+        payload["image_urls"] = [_image_url(frame[0]) for frame in frames]
+        self._configure_request(payload)
+        return _run_prompt_skill_worker(payload)
 
     def plan_storyboard(self, story: str, frames: Sequence[torch.Tensor], *, duration_seconds: float, fps: float,
                         style: str = "cinematic realism", shot_density: str = "medium") -> dict[str, Any]:
