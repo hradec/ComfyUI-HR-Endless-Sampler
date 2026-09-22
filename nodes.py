@@ -1068,7 +1068,7 @@ def _last_seen_retention_lines(description, last_seen_character_state):
 
 def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=False,
                                    continuation_video_label=None, continuation_audio_label=None,
-                                   last_seen_character_state=()):
+                                   last_seen_character_state=(), event_ledger=None):
     if drop_picture_anchors:
         prompt = _drop_picture_anchors(prompt)
     field = _description_field(prompt)
@@ -1084,6 +1084,19 @@ def _prompt_with_gemma_description(prompt, description, drop_picture_anchors=Fal
         replace_start = description_start
     rewritten = prompt[:replace_start] + " " + description.strip() + " " + prompt[description_end:]
     retention_lines = _last_seen_retention_lines(description, last_seen_character_state)
+    if isinstance(event_ledger, dict):
+        seen_events = set()
+        for bucket in ("completed", "forbidden"):
+            for item in event_ledger.get(bucket, ()):
+                if not isinstance(item, dict):
+                    continue
+                event_id = str(item.get("id", "")).strip()
+                summary = str(item.get("summary", "")).strip()
+                if event_id and summary and event_id not in seen_events:
+                    seen_events.add(event_id)
+                    retention_lines.append(
+                        f"- Forbidden replay [{event_id}]: {summary}. This event already happened; do not stage, restart, recap, or repeat it."
+                    )
     if retention_lines:
         retention = RETENTION_FIELD.search(rewritten)
         description_field = _description_field(
@@ -1123,6 +1136,8 @@ def _gemma_report(chunk_number, result, director_name="Gemma 4"):
         f"Gemma-only end state: {result.end_state or 'none'}\n"
         "Gemma-only last-seen character state:\n"
         f"{json.dumps(list(result.last_seen_character_state), ensure_ascii=False, indent=2)}\n"
+        "Director event ownership ledger:\n"
+        f"{json.dumps(getattr(result, 'event_ledger', {}), ensure_ascii=False, indent=2)}\n"
         f"H3 detailed_description: {result.detailed_description}\n"
         f"Gemma JSON attempts:\n{_gemma_response_transcript(result)}"
     )
@@ -3187,6 +3202,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
         previous_gemma_timing_plan = None
         previous_gemma_end_state = None
         previous_gemma_last_seen_character_state = None
+        previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
         output_template = None
         denoised_template = None
         completed_chunks = 0
@@ -3211,6 +3227,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 previous_gemma_timing_plan = previous_state.get("gemma_timing_plan")
                 previous_gemma_end_state = previous_state.get("gemma_end_state")
                 previous_gemma_last_seen_character_state = previous_state.get("gemma_last_seen_character_state")
+                previous_event_ledger = previous_state.get("gemma_event_ledger") or {
+                    "completed": [], "active": [], "pending": [], "forbidden": [],
+                }
                 previous_prompt_changed = previous_state.get("source_prompt_sha256") != hashlib.sha256(
                     prompt.encode("utf-8")
                 ).hexdigest()
@@ -3223,6 +3242,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_timing_plan = None
                     previous_gemma_end_state = None
                     previous_gemma_last_seen_character_state = None
+                    previous_event_ledger = {"completed": [], "active": [], "pending": [], "forbidden": []}
                     logging.info(
                         "HR Endless Sampler replay: discarded stale prior Gemma text; "
                         "the edited plan will use the retained predecessor frames as evidence."
@@ -3682,6 +3702,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             "previous_gemma_timing_plan": previous_gemma_timing_plan,
                             "previous_gemma_end_state": previous_gemma_end_state,
                             "previous_last_seen_character_state": previous_gemma_last_seen_character_state,
+                            "previous_event_ledger": previous_event_ledger,
                             "target_shots": target_shots,
                             "preproduction_timing_plan": gemma_preproduction_timing_plan.for_target_shots(
                                 target_shots,
@@ -3977,6 +3998,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         continuation_video_label=continuation_video_label,
                         continuation_audio_label=continuation_audio_label,
                         last_seen_character_state=result.last_seen_character_state,
+                        event_ledger=getattr(result, "event_ledger", None),
                     )
                     debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 else:
@@ -4195,6 +4217,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     previous_gemma_timing_plan = result.timing_plan
                     previous_gemma_end_state = result.end_state
                     previous_gemma_last_seen_character_state = list(result.last_seen_character_state)
+                    ledger = getattr(result, "event_ledger", None)
+                    if isinstance(ledger, dict):
+                        previous_event_ledger = {
+                            name: [dict(item) for item in ledger.get(name, ()) if isinstance(item, dict)]
+                            for name in ("completed", "active", "pending", "forbidden")
+                        }
                 if replay_cache is not None and retake_chunks:
                     try:
                         replay_cache.save_revision(index + 1, {
@@ -4229,6 +4257,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "gemma_timing_plan": previous_gemma_timing_plan,
                                 "gemma_end_state": previous_gemma_end_state,
                                 "gemma_last_seen_character_state": previous_gemma_last_seen_character_state,
+                                "gemma_event_ledger": previous_event_ledger,
                                 "h3_render_seconds": h3_render_seconds,
                                 "gemma_seconds": chunk_gemma_seconds,
                                 "gemma_preproduction_seconds": chunk_preproduction_seconds,
@@ -4255,6 +4284,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 "director_timing_plan": previous_gemma_timing_plan,
                                 "director_end_state": previous_gemma_end_state,
                                 "director_last_seen_character_state": previous_gemma_last_seen_character_state,
+                                "director_event_ledger": previous_event_ledger,
                             },
                             observation_image_directory=gemma_image_log,
                         )

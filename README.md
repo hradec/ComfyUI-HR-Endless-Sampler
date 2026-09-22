@@ -171,6 +171,8 @@ value that fits in VRAM. Smaller chunks use less VRAM, but need more handoffs.
 For example, 39 frames is a practical 1080p starting point on a 16 GB GPU.
 H3 uses a `5 + 17k` frame grid, so the effective size is aligned to that grid.
 
+Qwen3.6/3.8 chunk directing also maintains an automatic event ownership ledger. Completed actions are persisted in replay state and injected into later H3 prompts as forbidden replays; active and pending events remain separately tracked. This is intended to reduce the chance that a later physical chunk restages an action or shot that already appeared. Qwen3.5 remains unchanged, and this mitigation still requires real multi-chunk GPU validation.
+
 `video_continuation` is the number of completed frames carried from the last
 chunk into the next one. H3 sees them as a synchronized `<Video N>` and
 `<Audio N>` reference. `22` frames is a good default for continuity. `5` is
