@@ -10,21 +10,107 @@ import comfy.ldm.minimax.model as h3
 
 from .taomate_upstream.denoise import MiniMaxH3DenoiseBranch, minimax_h3_denoise_loop
 from .taomate_upstream.denoise_schedule import select_time_shift_sigmas
-from .taomate_upstream.packed_sequence import minimax_h3_audio_only_packed_sequence, minimax_h3_audio_only_frozen_prefix_packed_sequence
+from .taomate_upstream.packed_sequence import minimax_h3_audio_only_packed_sequence
+from .taomate_upstream.attention_hook import HookMode
+
+# Experiment: anchor clean teacher-audio feature statistics to its first chunk.
+TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO = True
 
 
 class Base10AudioTeacher:
     """Generate request-wide audio states with the supplied LoRA and no video tokens."""
 
-    def __init__(self, model_patcher):
+    def __init__(self, model_patcher, cache_factory=None, hook_factory=None):
         """Share the supplied model and LoRA; isolate streaming attention patches."""
         self.patcher = model_patcher.clone()
-        self.previous_clean = None
-        self.previous_count = None
+        self.cache_factory = cache_factory
+        self.hook_factory = hook_factory
+        self.cache = None
+        self.hook = None
+        self.clean_cache_pass = False
+        self.audio_time_origin = None
         self.branch = None
         self.model = None
         self.options = None
         self.receipt = None
+        self.audio_anchor = None
+
+    def _renorm_clean_audio_rows(self, rows):
+        """Match packed audio feature statistics to the first teacher chunk."""
+        if not TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO:
+            return rows
+        current = rows.detach().float()
+        mean = current.mean(dim=0, keepdim=True)
+        std = current.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+        if self.audio_anchor is None:
+            self.audio_anchor = (mean.cpu(), std.cpu())
+            return rows
+        # Keep only small feature statistics between chunks, never a GPU latent.
+        anchor_mean, anchor_std = self.audio_anchor
+        return ((current - mean).div(std).mul(anchor_std.to(current)).add(anchor_mean.to(current))).to(rows.dtype)
+
+    def attention_forward(self, attention, layer):
+        """Build the teacher's audio-only KV attention adapter for one H3 layer."""
+        def forward(x, rope_freqs=None, transformer_options=None):
+            """Let new audio attend text, its clean teacher history and current rows."""
+            count = x.shape[0]
+            q, k, v = attention.qkv_proj(x).split(attention.heads * attention.head_dim, dim=-1)
+            v = v.reshape(count, attention.heads, attention.head_dim)
+            q = q.reshape(1, count, attention.heads, attention.head_dim)
+            k = k.reshape(1, count, attention.heads, attention.head_dim)
+            qw = comfy.model_management.cast_to(attention.q_norm.weight, device=x.device)
+            kw = comfy.model_management.cast_to(attention.k_norm.weight, device=x.device)
+            q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, rope_freqs, qw, kw, epsilon=attention.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
+            q, k = q[0], k[0]
+            if self.cache is None:
+                if self.cache_factory is None or self.hook_factory is None:
+                    raise RuntimeError("teacher audio KV cache requires cache and attention-hook factories")
+                self.cache = self.cache_factory(attention.heads, attention.head_dim, k.dtype)
+                self.hook = self.hook_factory(self.cache)
+            self.cache.on_status = None
+            if self.clean_cache_pass and not self.cache.clean_commit_active:
+                self.cache.begin_clean_commit(self.cache.committed_blocks)
+            tags = self.branch.block_token_tags[:count]
+            commit_mask = torch.zeros(count, dtype=torch.bool, device=x.device)
+            commit_mask.index_fill_(0, self.branch.audio_target_seq_idx, True)
+            self.hook.activate(HookMode.CLEAN_COMMIT if self.clean_cache_pass else HookMode.NOISY)
+            try:
+                output = self.hook(attention=type("AttentionScale", (), {"softmax_scale": attention.head_dim ** -0.5})(), layer_name="blocks.%d.attn" % layer, query=q, key=k, value=v, token_tags=tags, commit_mask=commit_mask, cu_seqlens_host=(0, count))
+            finally:
+                self.hook.deactivate()
+            return attention.out_proj(output.reshape(count, -1))
+        return forward
+
+    def _install_cache_attention(self):
+        """Temporarily replace attention only while this isolated teacher owns the model."""
+        if self.cache_factory is None:
+            return []
+        originals = []
+        for layer, block in enumerate(self.model.blocks):
+            originals.append((block.attn, block.attn.forward))
+            block.attn.forward = self.attention_forward(block.attn, layer)
+        return originals
+
+    @staticmethod
+    def _restore_attention(originals):
+        """Restore the shared model modules after one teacher operation."""
+        for attention, forward in originals:
+            attention.forward = forward
+
+    def _commit_clean_audio_cache(self, audio_rows):
+        """Capture target-only KV from one clean teacher-audio forward at sigma zero."""
+        if self.cache is None:
+            return
+        clean_timestep = self.branch.prepare_timestep_plan(video_timesteps=[1.0], audio_timesteps=[1.0])[0]
+        self.clean_cache_pass = True
+        try:
+            self.forward(**self.branch.forward_kwargs(video_rows=torch.empty(0, 96, device=audio_rows.device), audio_rows=audio_rows, step_timesteps=clean_timestep))
+            if self.cache.clean_commit_active:
+                self.cache.commit()
+        finally:
+            self.clean_cache_pass = False
+            if self.cache.clean_commit_active:
+                self.cache.rollback()
 
     def forward(self, **kwargs):
         """Run native H3 audio/text layers against upstream packed-row metadata."""
@@ -73,29 +159,30 @@ class Base10AudioTeacher:
         return rows.new_empty((0, 96)), output
 
     @torch.inference_mode()
-    def generate(self, conditioning, noise, height, width, sigmas=None, video_shift=12.0, audio_shift=3.0):
-        """Capture exact student sigma endpoints, keeping the previous tail frozen."""
+    def generate(self, conditioning, noise, height, width, sigmas=None, video_shift=12.0, audio_shift=3.0, audio_time_start=0):
+        """Capture exact student sigma endpoints using persistent clean audio KV."""
         video_sigmas, audio_sigmas, capture_steps = self.guidance_schedule(sigmas, video_shift, audio_shift)
         device = self.patcher.load_device
         logging.info("TaoMate audio teacher: %d audio-only forwards, %d guidance states, shifts video=%g audio=%g; supplied model and LoRA.", len(video_sigmas) - 1, len(capture_steps), video_shift, audio_shift)
         comfy.model_management.load_models_gpu([self.patcher])
         self.patcher.pre_run()
+        originals = []
         try:
             self.model = self.patcher.get_model_object("diffusion_model")
+            originals = self._install_cache_attention()
             self.options = self.patcher.model_options.get("transformer_options", {}).copy()
             dtype = self.patcher.model.get_dtype_inference()
             context = conditioning["cross_attn"].to(device=device, dtype=dtype)
             context = self.model.preprocess_text_embeds(context)[0]
             count, text_len = noise.shape[-1], context.shape[0]
             height, width = (height + 1) // 2 * 2, (width + 1) // 2 * 2
-            if self.previous_clean is None:
-                packed = minimax_h3_audio_only_packed_sequence(text_len=text_len, audio_t=count, latent_h=height, latent_w=width)
-                initial = h3.pack_audio(noise.float())
-            else:
-                tail = self.previous_clean[..., -40:]
-                tail_count = tail.shape[-1]
-                packed = minimax_h3_audio_only_frozen_prefix_packed_sequence(text_len=text_len, ref_audio_t=tail_count, audio_t=count, latent_h=height, latent_w=width, reference_time_start=text_len + self.previous_count - tail_count, target_time_start=text_len + self.previous_count)
-                initial = torch.cat((h3.pack_audio(tail), h3.pack_audio(noise.float())), dim=0)
+            # Preserve H3's native first audio coordinate, then advance only by
+            # the sampler's global audio timeline. Later prompt lengths cannot
+            # move media relative to committed teacher KV.
+            if self.audio_time_origin is None:
+                self.audio_time_origin = text_len
+            packed = minimax_h3_audio_only_packed_sequence(text_len=text_len, audio_t=count, latent_h=height, latent_w=width, time_start=audio_time_start, audio_time_origin=self.audio_time_origin)
+            initial = h3.pack_audio(noise.float())
             tags = conditioning.get("minimax_token_tags")
             if tags is not None:
                 packed["token_tags"][packed["text_pos"]] = tags.detach().cpu().view(-1)
@@ -107,16 +194,22 @@ class Base10AudioTeacher:
                 if step + 1 in capture_steps:
                     captured[step + 1] = h3.unpack_audio(audio[self.branch.audio_target_slice]).detach().float().cpu().clone()
 
-            minimax_h3_denoise_loop(model=self.forward, positive=self.branch, initial_video_rows=torch.empty(0, 96), initial_audio_rows=initial, sigmas_video=video_sigmas, sigmas_audio=audio_sigmas, device=device, on_step=capture)
+            _, clean_audio_rows = minimax_h3_denoise_loop(model=self.forward, positive=self.branch, initial_video_rows=torch.empty(0, 96), initial_audio_rows=initial, sigmas_video=video_sigmas, sigmas_audio=audio_sigmas, device=device, on_step=capture)
+            # Correct clean targets before both KV capture and clean guidance publication.
+            target_slice = self.branch.audio_target_slice
+            clean_audio_rows[target_slice] = self._renorm_clean_audio_rows(clean_audio_rows[target_slice])
+            final_step = len(video_sigmas) - 1
+            if final_step in captured:
+                captured[final_step] = h3.unpack_audio(clean_audio_rows[target_slice]).detach().float().cpu().clone()
             milestones = [captured[number] for number in capture_steps]
             if not all(torch.isfinite(value).all() for value in milestones):
                 raise RuntimeError("TaoMate Base10 teacher produced non-finite audio")
-            self.receipt = {"executed_forwards": len(video_sigmas) - 1, "states": capture_steps, "video_sigmas": video_sigmas, "audio_sigmas": audio_sigmas, "reference_ticks": 0 if self.previous_clean is None else min(40, self.previous_count), "published_clean_audio_exact_match": False}
-            self.previous_clean = milestones[-1]
-            self.previous_count = count
+            self._commit_clean_audio_cache(clean_audio_rows)
+            self.receipt = {"executed_forwards": len(video_sigmas) - 1, "states": capture_steps, "video_sigmas": video_sigmas, "audio_sigmas": audio_sigmas, "reference_ticks": 0, "audio_kv_ticks": 0 if self.cache is None else self.cache.history_tokens // 2, "audio_time_start": audio_time_start, "audio_time_end": audio_time_start + count, "published_clean_audio_exact_match": False}
             logging.info("TaoMate Base10 audio teacher prepared: %s", self.receipt)
             return milestones
         finally:
+            self._restore_attention(originals)
             self.branch = None
             self.model = None
             self.options = None
@@ -139,6 +232,11 @@ class Base10AudioTeacher:
         return video, audio, [video.index(sigma) for sigma in requested[1:]]
 
     def close(self):
-        """Release request audio retained for teacher rollover."""
-        self.previous_clean = None
+        """Release request-local teacher KV."""
+        self.audio_time_origin = None
+        self.audio_anchor = None
+        if self.cache is not None:
+            self.cache.clear()
+        self.cache = None
+        self.hook = None
         self.branch = None

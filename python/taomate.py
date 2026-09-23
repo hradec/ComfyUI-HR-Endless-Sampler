@@ -35,6 +35,9 @@ from .taomate_upstream.denoise_schedule import select_time_shift_sigmas, DISTILL
 TOGGLE_TAOMATE_DIVERGENCY_CONDITION_ATTENDS_CURRENT_AV = True
 # Experiment: True restores prompt/reference movement at five-second boundaries.
 TOGGLE_TAOMATE_DIVERGENCY_MOVE_PROMPT_REFERENCES = False
+# Experiment: use near-equal phases while never ending a phase on H3's
+# singleton temporal token. False keeps the upstream tail cadence.
+TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS = False
 # Deprecated test compatibility switch; node input selects the runtime codec.
 TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV = True
 # NVIDIA CUDA experiment: transfer compressed bytes, decode and unshuffle on GPU.
@@ -242,13 +245,13 @@ class QuantizedKV:
         return restored.to(self.dtype)
 
 
-class CPUStreamingCache(CleanAVKVCache):
-    """Upstream cache policy with CPU storage and per-layer device transfers."""
+class TaoMateKVCache(CleanAVKVCache):
+    """Reusable H3 KV storage, codecs and transactional retention machinery."""
 
     def __init__(self, contract, compression_mode=None):
-        """Keep one render's selected KV representation on CPU."""
+        """Keep one render's selected KV representation; TurboQuant is the base default."""
         super().__init__(contract)
-        self.compression_mode = compression_mode or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none")
+        self.compression_mode = compression_mode or "turboquant"
         if self.compression_mode not in KV_CACHE_COMPRESSION_MODES:
             raise ValueError("unknown KV cache compression mode %r" % self.compression_mode)
 
@@ -275,32 +278,45 @@ class CPUStreamingCache(CleanAVKVCache):
         return stored, raw
 
     def history(self, layer_name):
-        """Fetch only the current layer onto its execution device."""
+        """Restore one stored layer, then let the runtime adapter expose it."""
         started = (time.perf_counter(), time.process_time())
         try:
             pair = super().history(layer_name)
+            if pair is None:
+                return None
             if isinstance(pair, QuantizedKV):
-                return AVKV(pair.tensor(0, self.active_device), pair.tensor(1, self.active_device))
-            if isinstance(pair, CompressedKV) and TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV and torch.device(self.active_device).type == "cuda":
-                return AVKV(pair.tensor(0, self.active_device), pair.tensor(1, self.active_device))
-            return None if pair is None else AVKV(pair.key.to(self.active_device), pair.value.to(self.active_device))
+                pair = AVKV(pair.tensor(0, self.active_device), pair.tensor(1, self.active_device))
+            elif isinstance(pair, CompressedKV) and TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV and torch.device(self.active_device).type == "cuda":
+                pair = AVKV(pair.tensor(0, self.active_device), pair.tensor(1, self.active_device))
+            else:
+                pair = AVKV(pair.key.to(self.active_device), pair.value.to(self.active_device))
+            return self.restore_pair(pair)
         finally:
             _profile_add(getattr(self, "profile", None), "KV restore", started)
 
     def stage(self, layer_name, key, value, token_tags, commit_mask):
-        """Keep all persistent and staged KV in CPU RAM."""
+        """Capture adapter-selected rows and persist them through the selected codec."""
         started = (time.perf_counter(), time.process_time())
         try:
-            if self.compression_mode in ("int8", "turboquant"):
-                self._stage_quantized(layer_name, key, value, token_tags, commit_mask)
-                return
-            super().stage(layer_name, key.cpu(), value.cpu(), token_tags.cpu(), commit_mask.cpu())
-            self._staged[layer_name] = self.store_pair(self._staged[layer_name])
+            indices = self.capture_rows(layer_name, key, value, token_tags, commit_mask)
+            pair = AVKV(key.index_select(0, indices).detach(), value.index_select(0, indices).detach())
+            if self.compression_mode not in ("int8", "turboquant"):
+                pair = AVKV(pair.key.cpu(), pair.value.cpu())
+                _validate_av_pair(pair, self.contract, layer_name=layer_name)
+            self._staged[layer_name] = self.store_pair(pair)
         finally:
             _profile_add(getattr(self, "profile", None), "KV stage/compress", started)
 
-    def _stage_quantized(self, layer_name, key, value, token_tags, commit_mask):
-        """Select media rows and quantize them while the source KV is still on GPU."""
+    def capture_rows(self, layer_name, key, value, token_tags, commit_mask):
+        """Select one layer's cache rows; subclasses define their media contract."""
+        raise NotImplementedError("TaoMateKVCache subclasses must implement capture_rows()")
+
+    def restore_pair(self, pair):
+        """Adapt one restored raw KV pair for the runtime attention implementation."""
+        raise NotImplementedError("TaoMateKVCache subclasses must implement restore_pair()")
+
+    def _capture_indices(self, layer_name, key, value, token_tags, commit_mask, expected_tags):
+        """Validate a capture and keep its row selection identical across layers."""
         if not self.clean_commit_active:
             raise RuntimeError("begin_clean_commit() must be called before stage()")
         self._validate_layer_name(layer_name)
@@ -312,13 +328,11 @@ class CPUStreamingCache(CleanAVKVCache):
             indices = torch.nonzero(commit_mask.to(torch.bool), as_tuple=False).flatten()
             selected_tags = token_tags.index_select(0, indices)
             tags = tuple(int(tag) for tag in selected_tags.detach().cpu().tolist())
-            if not indices.numel() or frozenset(tags) != frozenset((VIDEO_TOKEN_TAG, 2)):
-                raise RuntimeError("clean commit did not contain both video and audio KV")
+            if not indices.numel() or frozenset(tags) != frozenset(expected_tags):
+                raise RuntimeError("clean commit does not match the cache adapter media rows")
             self._staged_indices = indices
             self._staged_tags = tags
-        indices = self._staged_indices
-        pair = AVKV(key.index_select(0, indices).detach(), value.index_select(0, indices).detach())
-        self._staged[layer_name] = self.store_pair(pair)
+        return self._staged_indices
 
     def commit(self):
         """Evict expired history after the clean pass, before upstream concatenation."""
@@ -336,12 +350,7 @@ class CPUStreamingCache(CleanAVKVCache):
         missing = [name for name in MAIN_LAYER_NAMES if name not in self._staged]
         if missing:
             raise RuntimeError("clean KV commit is missing %d transformer layers" % len(missing))
-        count = len(self._commit_token_counts)
-        if count >= 2:
-            # The incoming commit becomes the newest recent; only one old recent
-            # and the first video's anchor remain necessary after this clean pass.
-            self.report_status("KV cache: evicting outgoing history")
-            self._retain_commit_rows([(0, True), (count - 1, False)])
+        self.prepare_commit()
         self.report_status("KV cache: committing new history")
         if self.compression_mode == "none":
             super().commit()
@@ -365,6 +374,10 @@ class CPUStreamingCache(CleanAVKVCache):
         self._commit_token_tags.append(self._staged_tags)
         self._block_index += 1
         self._clear_staging()
+
+    def prepare_commit(self):
+        """Evict stale rows before append; subclasses own their retention policy."""
+        return None
 
     def report_status(self, message):
         """Publish optional execution-local progress without changing cache contents."""
@@ -434,6 +447,51 @@ class CPUStreamingCache(CleanAVKVCache):
         self._history = next_history
         self._commit_token_counts = selected_counts
         self._commit_token_tags = selected_tags
+
+
+class VideoSubchunkKVCache(TaoMateKVCache):
+    """Capture complete AV rows for TaoMate's video sub-chunk attention stream."""
+
+    def capture_rows(self, layer_name, key, value, token_tags, commit_mask):
+        """Keep the current clean video and audio rows for every H3 layer."""
+        return self._capture_indices(layer_name, key, value, token_tags, commit_mask, (VIDEO_TOKEN_TAG, 2))
+
+    def restore_pair(self, pair):
+        """Expose the stored AV pair directly to the H3 streaming attention hook."""
+        return pair
+
+    def prepare_commit(self):
+        """Keep the video sink and one recent AV block before appending a new block."""
+        count = len(self._commit_token_counts)
+        if count >= 2:
+            self.report_status("KV cache: evicting outgoing history")
+            self._retain_commit_rows([(0, True), (count - 1, False)])
+
+
+class TeacherAudioKVCache(TaoMateKVCache):
+    """Capture only clean audio rows for the independent Base10 teacher stream."""
+
+    def capture_rows(self, layer_name, key, value, token_tags, commit_mask):
+        """Keep the full generated audio chunk for the next teacher inference."""
+        return self._capture_indices(layer_name, key, value, token_tags, commit_mask, (2,))
+
+    def restore_pair(self, pair):
+        """Expose the stored audio pair directly to the teacher attention adapter."""
+        return pair
+
+    def prepare_commit(self):
+        """Retain every preceding complete teacher-audio chunk without an anchor."""
+        # Audio continuity needs the entire spoken history, unlike video where
+        # the anchor plus two recent visual phases bounds the streaming state.
+        return None
+
+
+class CPUStreamingCache(VideoSubchunkKVCache):
+    """Compatibility name for tests and extensions using the original video cache."""
+
+    def __init__(self, contract, compression_mode=None):
+        """Preserve the legacy implicit codec while new adapters default to TurboQuant."""
+        super().__init__(contract, compression_mode or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none"))
 
 
 class ComfyStreamingHook(H3StreamingAttentionHook):
@@ -547,8 +605,14 @@ class TaoMateStreaming:
         start = 0
         while start < video_t:
             index = len(plan)
-            # 39 produces the upstream 39/34/34/17 then 34/34/34/17 cadence.
-            count = first_count if index == 0 else 5 if index % 4 == 3 else continuation_count
+            if TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS:
+                # Every third N-token phase would end on H3's one-frame token.
+                # Use N, N, N-1 so every full phase instead ends on a four-frame
+                # token while retaining the selected near-equal phase width.
+                count = first_count - (1 if index % 3 == 2 else 0)
+            else:
+                # 39 produces the upstream 39/34/34/17 then 34/34/34/17 cadence.
+                count = first_count if index == 0 else 5 if index % 4 == 3 else continuation_count
             end = min(start + count, video_t)
             first_frame, end_frame = cls.frames(start), cls.frames(end)
             audio_start, audio_end = round(first_frame * h3.FRAME_RESCALE), round(end_frame * h3.FRAME_RESCALE)
@@ -620,9 +684,16 @@ class TaoMateStreaming:
         self.prepared_model = None
         self.reuse_preparation = False
         self.phase_profile = None
+        self.debug_kv_table = False
         self.kv_cache_seconds = {}
         self.kv_cache_peak_stored_bytes = 0
         self.kv_cache_peak_raw_bytes = 0
+        self.kv_cache_memory_history = []
+        self.audio_kv_memory_history = []
+        self.current_phase_number = 0
+        self.current_phase_total = 0
+        self.current_chunk_number = 0
+        self.current_chunk_total = 0
         self.kv_cache_compression = kv_cache_compression or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none")
         if self.kv_cache_compression not in KV_CACHE_COMPRESSION_MODES:
             raise ValueError("unknown KV cache compression mode %r" % self.kv_cache_compression)
@@ -642,7 +713,7 @@ class TaoMateStreaming:
         logging.info("TaoMate KV cache compression=%s", self.kv_cache_compression)
         logging.info("TaoMate TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV=%s; CPU codec workers=%d", TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV, TAOMATE_KV_CPU_WORKERS)
         from .taomate_audio_teacher import Base10AudioTeacher
-        self.audio_teacher = Base10AudioTeacher(guider.model_patcher)
+        self.audio_teacher = Base10AudioTeacher(guider.model_patcher, lambda heads, head_dim, dtype: TeacherAudioKVCache(KVContract(local_heads=heads, head_dim=head_dim, dtype=dtype, device_type="cpu"), self.kv_cache_compression), ComfyStreamingHook)
         # Leave other preparation wrappers in control of their own lifecycle.
         self.reuse_preparation = not guider.model_patcher.get_all_wrappers(comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING)
         result = copy.copy(guider)
@@ -662,9 +733,17 @@ class TaoMateStreaming:
             if name.startswith("KV "):
                 self.kv_cache_seconds[name] = self.kv_cache_seconds.get(name, 0.0) + values[0]
 
+    def _all_kv_caches(self):
+        """Return the independent video and teacher-audio stores owned by this render."""
+        caches = [cache for cache, hook in self.caches.values()]
+        teacher_cache = getattr(self.audio_teacher, "cache", None) if self.audio_teacher is not None else None
+        if teacher_cache is not None:
+            caches.append(teacher_cache)
+        return caches
+
     def kv_cache_report(self):
         """Return retained cache bytes and accumulated cache operation time."""
-        sizes = [cache.storage_bytes() for cache, hook in self.caches.values()]
+        sizes = [cache.storage_bytes() for cache in self._all_kv_caches()]
         stored = sum(size[0] for size in sizes)
         raw = sum(size[1] for size in sizes)
         return {
@@ -675,6 +754,42 @@ class TaoMateStreaming:
             "peak_stored_bytes": self.kv_cache_peak_stored_bytes,
             "peak_raw_bytes": self.kv_cache_peak_raw_bytes,
         }
+
+    def kv_cache_memory_table(self):
+        """Format every completed sub-chunk's retained-KV RAM measurement."""
+        lines = [
+            "TaoMate KV cache memory by completed sub-chunk:",
+            "  chunk       codec                 retained CPU RAM    raw BF16 RAM      saved",
+            "  ----------  --------------------  ------------------  ----------------  ------",
+        ]
+        for entry in self.kv_cache_memory_history:
+            saved = 100.0 * (1.0 - entry["stored"] / entry["raw"]) if entry["raw"] else 0.0
+            lines.append(
+                "  C%d.%d/%d.%d     %-20s  %8.3f GiB        %8.3f GiB   %5.1f%%"
+                % (entry["chunk"], entry["phase"], entry["chunk_total"], entry["phase_total"], self.kv_cache_compression, entry["stored"] / 1024 ** 3, entry["raw"] / 1024 ** 3, saved)
+            )
+        return "\n".join(lines)
+
+    def audio_kv_cache_memory_table(self):
+        """Format the teacher's complete audio-history KV memory table."""
+        lines = [
+            "TaoMate teacher audio KV cache by completed chunk:",
+            "  chunk       codec                 retained CPU RAM    raw BF16 RAM      saved   groups  audio ticks",
+            "  ----------  --------------------  ------------------  ----------------  ------  ------  -----------",
+        ]
+        for entry in self.audio_kv_memory_history:
+            saved = 100.0 * (1.0 - entry["stored"] / entry["raw"]) if entry["raw"] else 0.0
+            total = str(entry["chunk_total"]) if entry["chunk_total"] else "?"
+            lines.append("  C%d/%-7s %-20s  %8.3f GiB        %8.3f GiB   %5.1f%%  %6d  %11d" % (entry["chunk"], total, self.kv_cache_compression, entry["stored"] / 1024 ** 3, entry["raw"] / 1024 ** 3, saved, entry["groups"], entry["ticks"]))
+        return "\n".join(lines)
+
+    def record_audio_kv_memory(self):
+        """Record the teacher cache immediately after its clean commit finishes."""
+        cache = getattr(self.audio_teacher, "cache", None) if self.audio_teacher is not None else None
+        if cache is None:
+            return
+        stored, raw = cache.storage_bytes()
+        self.audio_kv_memory_history.append({"chunk": self.current_chunk_number or self.request_count + 1, "chunk_total": self.current_chunk_total, "stored": stored, "raw": raw, "groups": len(cache._commit_token_counts), "ticks": cache.history_tokens // 2})
 
     def prepare_sampling(self, executor, model, noise_shape, conds, model_options=None, force_full_load=False, force_offload=False):
         """Reuse resident weights between phases without repeating native loading."""
@@ -749,7 +864,7 @@ class TaoMateStreaming:
                 k = attention.k_norm(k.reshape(count, attention.heads, attention.head_dim))
             # CFG branches need independent history and clean commits.
             if self.branch not in self.caches:
-                cache = CPUStreamingCache(KVContract(local_heads=attention.heads, head_dim=attention.head_dim, dtype=k.dtype, device_type="cpu"), self.kv_cache_compression)
+                cache = VideoSubchunkKVCache(KVContract(local_heads=attention.heads, head_dim=attention.head_dim, dtype=k.dtype, device_type="cpu"), self.kv_cache_compression)
                 self.caches[self.branch] = (cache, ComfyStreamingHook(cache))
             self.cache, self.hook = self.caches[self.branch]
             self.cache.on_status = self.report_status
@@ -827,11 +942,14 @@ class TaoMateStreaming:
                     cache.commit()
                     self.report_status("KV cache: checking anchor and recent history retention")
                     cache.retain_sink_and_recent_commits()
-            sizes = [cache.storage_bytes() for cache, hook in self.caches.values()]
+            sizes = [cache.storage_bytes() for cache in self._all_kv_caches()]
             stored, raw = sum(size[0] for size in sizes), sum(size[1] for size in sizes)
             self.kv_cache_peak_stored_bytes = max(self.kv_cache_peak_stored_bytes, stored)
             self.kv_cache_peak_raw_bytes = max(self.kv_cache_peak_raw_bytes, raw)
+            self.kv_cache_memory_history.append({"chunk": self.current_chunk_number, "chunk_total": self.current_chunk_total, "phase": self.current_phase_number, "phase_total": self.current_phase_total, "stored": stored, "raw": raw})
             logging.info("TaoMate retained CPU KV: %.3f GiB stored / %.3f GiB raw, %.1f%% saved across %d branches. Staging and model weights are additional.", stored / 1024 ** 3, raw / 1024 ** 3, 100 * (1 - stored / raw) if raw else 0, len(self.caches))
+            if self.debug_kv_table:
+                logging.info("\n%s", self.kv_cache_memory_table())
             self.report_status("KV cache ready: %.2f GiB stored / %.2f GiB raw" % (stored / 1024 ** 3, raw / 1024 ** 3))
         finally:
             self.clean = False
@@ -866,6 +984,7 @@ class TaoMateStreaming:
     def execute_chunk(self, execute_sampler, noise_factory, seed, noise, guider, sigmas, latent, chunk, on_subchunk=None, sampler=None, on_subchunk_start=None, on_status=None, debug_timing=False):
         """Sample only new media; prepend historical tokens for VAE decoding only."""
         self.on_status = on_status
+        self.debug_kv_table = bool(debug_timing)
         video, audio = latent["samples"].unbind()
         vn, an = noise.unbind()
         vt, at = chunk["context_video_t"], chunk["context_audio_t"]
@@ -879,8 +998,11 @@ class TaoMateStreaming:
             sampling = guider.model_patcher.get_model_object("model_sampling")
             video_shift = float(sampling.shift)
             audio_shift = float(sampling.audio_shift if sampling.audio_shift is not None else sampling.shift)
-            self.teacher_milestones = self.audio_teacher.generate(positive, an[..., at:], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift)
+            self.teacher_milestones = self.audio_teacher.generate(positive, an[..., at:], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, chunk["audio_start"])
             self.audio_scale = float(sampling.audio_scale)
+            self.record_audio_kv_memory()
+            if self.debug_kv_table:
+                logging.info("\n%s", self.audio_kv_cache_memory_table())
         self.prepared_model = None
         output_video, output_audio = [], []
         # All phases share the same guider conditioning, encoded once per request.
@@ -888,6 +1010,8 @@ class TaoMateStreaming:
         with tqdm(total=len(phases), desc="TaoMate group %d: video sub-chunks" % (self.request_count + 1), unit="sub-chunk", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
             for phase_number, phase in enumerate(phases, 1):
                 logging.info("TaoMate group %d: video sub-chunk %d/%d", self.request_count + 1, phase_number, len(phases))
+                self.current_phase_number = phase_number
+                self.current_phase_total = len(phases)
                 phase_started = (time.perf_counter(), time.process_time())
                 # Always retain cache timings for the final render report; debug
                 # only controls the per-phase console detail.

@@ -586,3 +586,40 @@ read the same raw format; disabling the GPU toggle restores Blosc storage on
 new renders. Tests verify exact BF16/FP32 bits over multiple 32 MiB blocks and
 a short tail, including a non-default CUDA stream. No full-render speedup is
 claimed; the initial implementation synchronizes after each decoded block.
+
+## ComfyUI frontend widget API (2026-09-22)
+
+The selective-LoRA panel in `web/selective_lora_ui.js` is a DOM widget, and it
+depends on frontend behavior that is not part of the documented extension API.
+It was reviewed on 2026-09-22 against the installed
+`comfyui_frontend_package` 1.53.6 (bundle assets under
+`tools/LPy64-3.11.10/install/lib/python3.11/site-packages/comfyui_frontend_package/static/assets`),
+using the original `.vue`/`.ts` sources recovered from that bundle's source
+maps, and then confirmed live in both the classic canvas UI and Nodes 2.0.
+These are the members the panel uses:
+
+- `widget.label` and `widget.hidden` for artist-facing names and for removing a
+  widget from both frontends without deleting it;
+- `node.addDOMWidget(name, type, element, options)`, whose fourth argument
+  becomes `widget.options`, and the `widget.serialize` field it does *not*
+  set;
+- `widget.options.step2` as the real fine step, `step` as its tenfold coarse
+  twin, and `round`/`precision` for stored granularity;
+- `--comfy-widget-min-height` / `--comfy-widget-height` in the element's
+  computed style for reserving panel height.
+
+Two of these are easy to get wrong and were verified against source rather than
+assumed. `widget.serialize === false` excludes a widget from `widgets_values`,
+while `widget.options.serialize === false` excludes it from the API prompt;
+they are independent, and only the second is set by the `addDOMWidget` options.
+And `LGraphNode.serialize` skips only `serialize === false` widgets, so hiding
+a widget never moves another widget's stored position.
+
+Before updating the frontend package, re-check `LGraphNode.isWidgetVisible`,
+`LGraphNode.serialize`, `serializeValue`/`serialiseWidgetValues`, the Nodes 2.0
+`isWidgetVisible` used by the widget render model, and `addDOMWidget` itself.
+Then re-run `node tests/test_selective_lora_ui.js` and re-run the headless
+browser probe in both frontends, since the unit test cannot catch a frontend
+that stops honoring `hidden`, `serialize`, or the height variables. Note that
+ComfyUI intercepts `wheel` at document capture over every DOM widget and
+re-dispatches it to the canvas, so the panel deliberately has no wheel handler.

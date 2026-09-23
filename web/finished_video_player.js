@@ -27,6 +27,14 @@ const playerColors = [
     "#f08a4b", "#55c7b3", "#d6cf57", "#6f9ee8", "#d676d4",
 ];
 
+// The L button's SVG filter id must be unique per node, and `node.id` cannot supply
+// it: LiteGraph assigns the real id in graph.add afterwards (and LGraph.configure
+// sets it after createNode has already run), so onNodeCreated always sees -1. Every
+// player in the page would then write the same id, and since a url(#id) reference
+// resolves to whichever single element carries it - silently applying no filter when
+// nothing matches - the players would all depend on one shared element.
+let inverseGammaFilterSerial = 0;
+
 
 function validEndlessFps(value) {
     const fps = Number(value);
@@ -524,8 +532,11 @@ function openMatchingVideoDropdown(button, value, stripCounter, direction = "dow
                 row.type = "button";
                 row.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) 82px 145px;gap:7px;align-items:center;width:100%;padding:7px 9px;border:0;border-bottom:1px solid #292929;background:transparent;color:#ddd;text-align:left;cursor:pointer;";
                 const date = entry.modified ? new Date(entry.modified * 1000).toLocaleString() : "";
-                row.innerHTML = '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><span style="text-align:right;color:#999"></span><span style="text-align:right;color:#777"></span>';
-                row.children[0].textContent = entry.name;
+                row.innerHTML = '<span style="display:flex;min-width:0;flex-direction:column;gap:3px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c8ad37;font:10px/1.1 sans-serif"></span></span><span style="text-align:right;color:#999"></span><span style="text-align:right;color:#777"></span>';
+                row.children[0].children[0].textContent = entry.name;
+                row.children[0].children[1].textContent = entry.annotation || "";
+                row.children[0].children[1].title = entry.annotation || "";
+                row.title = entry.annotation || entry.name;
                 row.children[1].textContent = formatBrowserBytes(entry.size);
                 row.children[2].textContent = date;
                 row.addEventListener("mouseenter", () => { row.style.background = "#3a321c"; });
@@ -640,6 +651,42 @@ app.registerExtension({
             media.playsInline = true;
             viewport.appendChild(media);
 
+            // Browser compositing applies this transfer to whichever finished
+            // video is on screen - the primary one, the comparison one, or both
+            // halves of an active wipe. It never re-decodes or refetches media.
+            const inverseGammaFilterId = `hr-endless-player-inverse-gamma-${++inverseGammaFilterSerial}`;
+            const filterSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            filterSvg.setAttribute("width", "0");
+            filterSvg.setAttribute("height", "0");
+            filterSvg.style.cssText = "position:absolute;pointer-events:none;";
+            const filter = document.createElementNS("http://www.w3.org/2000/svg", "filter");
+            filter.setAttribute("id", inverseGammaFilterId);
+            // SVG filters default to linearRGB. This player deliberately applies
+            // pow() to the displayed RGB samples themselves, matching the live
+            // preview's display experiment rather than a color-managed conversion.
+            filter.setAttribute("color-interpolation-filters", "sRGB");
+            const transfer = document.createElementNS("http://www.w3.org/2000/svg", "feComponentTransfer");
+            for (const channel of ["R", "G", "B"]) {
+                const curve = document.createElementNS("http://www.w3.org/2000/svg", `feFunc${channel}`);
+                curve.setAttribute("type", "gamma");
+                curve.setAttribute("amplitude", "1");
+                curve.setAttribute("exponent", "0.45");
+                curve.setAttribute("offset", "0");
+                transfer.appendChild(curve);
+            }
+            filter.appendChild(transfer);
+            filterSvg.appendChild(filter);
+            viewport.appendChild(filterSvg);
+
+            const linearDisplayButton = document.createElement("button");
+            linearDisplayButton.type = "button";
+            linearDisplayButton.textContent = "L";
+            linearDisplayButton.title = "Every video frame: RGB sRGB^0.45, browser-only";
+            // Above the comparison wipe overlay, whose wide hit line would
+            // otherwise swallow clicks landing on this corner while a wipe is open.
+            linearDisplayButton.style.cssText = "position:absolute;right:8px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#aaa;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:7;";
+            viewport.appendChild(linearDisplayButton);
+
             const compareMedia = document.createElement("video");
             compareMedia.style.cssText = "position:absolute;inset:0;display:none;width:100%;height:100%;object-fit:contain;background:#090909;pointer-events:none;clip-path:polygon(50% 0,100% 0,100% 100%,50% 100%);";
             compareMedia.preload = "metadata";
@@ -676,6 +723,36 @@ app.registerExtension({
                 return label;
             });
             viewport.appendChild(compareInputLabels);
+
+            const videoAnnotations = [0, 1].map(index => {
+                const label = document.createElement("div");
+                label.style.cssText = "position:absolute;top:10px;z-index:6;max-width:48%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ffe600;font:bold 15px/1.2 sans-serif;-webkit-text-stroke:1px #000;text-shadow:1px 1px 0 #000,-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,0 2px 3px #000;pointer-events:none;user-select:none;display:none;";
+                label.style.left = index === 0 ? "12px" : "auto";
+                label.style.right = index === 1 ? "12px" : "auto";
+                label.style.textAlign = index === 0 ? "center" : "center";
+                viewport.appendChild(label);
+                return label;
+            });
+
+            function renderVideoAnnotations() {
+                const comparisonActive = Boolean(isCompareNode ? state?.compare_media_url : compareState?.media_url);
+                const values = [
+                    state?.timeline?.annotation || state?.annotation || "",
+                    isCompareNode
+                        ? state?.compare_timeline?.annotation || state?.compare_annotation || ""
+                        : compareState?.timeline?.annotation || compareState?.annotation || "",
+                ];
+                for (let index = 0; index < videoAnnotations.length; index++) {
+                    const label = videoAnnotations[index];
+                    label.textContent = values[index];
+                    label.title = values[index];
+                    label.style.left = index === 0 ? "12px" : "auto";
+                    label.style.right = index === 1 ? "12px" : "auto";
+                    label.style.width = comparisonActive ? "calc(50% - 18px)" : "auto";
+                    label.style.maxWidth = comparisonActive ? "calc(50% - 18px)" : "calc(100% - 24px)";
+                    label.style.display = values[index] && (index === 0 || comparisonActive) ? "block" : "none";
+                }
+            }
 
             const frameLabel = document.createElement("div");
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
@@ -755,6 +832,7 @@ app.registerExtension({
             let compareState = null;
             let compareSourceFps = 24;
             let audioMuted = Boolean(savedPlayerState.muted);
+            let inverseGammaDisplay = Boolean(savedPlayerState.inverseGammaDisplay);
             let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame) ? savedPlayerState.frame : null;
             let wipePosition = 0.5;
             let wipeModeIndex = 0;
@@ -794,6 +872,7 @@ app.registerExtension({
                 node.properties.hr_endless_sampler_player = {
                     frame: currentFrame(),
                     muted: audioMuted,
+                    inverseGammaDisplay,
                 };
             }
 
@@ -809,6 +888,17 @@ app.registerExtension({
                 audioMuted = Boolean(value);
                 renderMuteButton();
                 persistPlayerState();
+            }
+
+            function renderInverseGammaDisplay() {
+                const displayCurve = inverseGammaDisplay ? `url(#${inverseGammaFilterId})` : "none";
+                media.style.filter = displayCurve;
+                // Set independently of the wipe: clip-path and filter compose, so
+                // the clipped side of a comparison is curved inside its polygon only.
+                compareMedia.style.filter = displayCurve;
+                linearDisplayButton.style.color = inverseGammaDisplay ? "#82d7ff" : "#aaa";
+                linearDisplayButton.style.background = inverseGammaDisplay ? "rgba(20,68,88,.95)" : "rgba(28,28,28,.9)";
+                linearDisplayButton.setAttribute("aria-pressed", String(inverseGammaDisplay));
             }
 
             function restorePersistedFrame() {
@@ -1157,6 +1247,7 @@ app.registerExtension({
                 state = data;
                 updateDownloadButton();
                 timeline = data.timeline;
+                renderVideoAnnotations();
                 sourceFps = validEndlessFps(data.source_fps) || validEndlessFps(timeline.fps) || 24;
                 bracketKey = null;
                 media.pause();
@@ -1281,6 +1372,7 @@ app.registerExtension({
                     compareMedia.load();
                     comparePathLabel.textContent = path;
                     comparePathLabel.title = path;
+                    renderVideoAnnotations();
                     renderComparisonWipe();
                     applyPlaybackRate();
                 } catch (error) {
@@ -1296,6 +1388,7 @@ app.registerExtension({
             function clearComparison() {
                 ++compareRequestSerial;
                 compareState = null;
+                renderVideoAnnotations();
                 compareSourceFps = 24;
                 compareMedia.pause();
                 compareMedia.removeAttribute("src");
@@ -1415,6 +1508,15 @@ app.registerExtension({
                 root.focus({ preventScroll: true });
             });
 
+            linearDisplayButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                inverseGammaDisplay = !inverseGammaDisplay;
+                renderInverseGammaDisplay();
+                persistPlayerState();
+                root.focus({ preventScroll: true });
+            });
+
             playButton.addEventListener("click", event => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -1521,6 +1623,7 @@ app.registerExtension({
             }
 
             renderMuteButton();
+            renderInverseGammaDisplay();
             node.addDOMWidget("player", "hr_endless_sampler_finished_video", root, { serialize: false });
             node.setSize([
                 Math.max(node.size?.[0] || 480, 480),

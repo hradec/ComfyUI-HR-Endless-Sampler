@@ -43,3 +43,16 @@ Deferred investigation; no inference changes requested yet.
 
 Compare against the current five-second teacher baseline with continuous final
 audio decoding. This proposal differs from upstream's per-group teacher generation.
+
+## Low-resolution KV reference bank
+
+- [ ] Explore a separate, lossless low-resolution video/audio KV reference bank
+  for high-resolution TaoMate generation. Keep it distinct from ordinary past
+  timeline history, so target frames do not collide with same-time reference
+  K/V positions.
+- [ ] Reuse the existing multi-source attention hook to route reference K/V
+  separately from text, streaming history, and current target media. Do not
+  decode or re-encode reference frames through the VAE.
+- [ ] Define and test temporal/spatial position and attention-weight policies.
+  Validate subject, camera, and motion retention against raw latent/pixel
+  references, and measure whether the reference overpowers target generation.

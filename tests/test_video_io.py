@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,6 +25,31 @@ nodes = importlib.import_module(PLUGIN_ROOT.name + ".nodes")
 
 
 class FinishedVideoIOTest(unittest.TestCase):
+    def test_save_interrupted_preview_joins_completed_movies(self):
+        """Export real tiny movies in chunk order and retain their audio stream."""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for index, color in enumerate(("red", "blue")):
+                path = os.path.join(directory, "chunk %d.mp4" % index)
+                subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=%s:s=32x32:r=24" % color, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.25", "-c:v", "libx264", "-threads", "1", "-c:a", "aac", path], check=True)
+                paths.append(path)
+            writer = object.__new__(video_io.IntermediateChunkVideoWriter)
+            writer.destination = (directory, "render")
+            writer.completed_paths = {2: paths[1], 1: paths[0]}
+            output = writer.save_preview()
+            self.assertTrue(output.endswith("_saved_preview.mp4"))
+            with av.open(output) as container:
+                self.assertEqual(len(container.streams.audio), 1)
+                frames = list(container.decode(video=0))
+                self.assertEqual(len(frames), 12)
+                first = frames[0].to_ndarray(format="rgb24").mean(axis=(0, 1))
+                last = frames[-1].to_ndarray(format="rgb24").mean(axis=(0, 1))
+                self.assertGreater(first[0], first[2])
+                self.assertGreater(last[2], last[0])
+            writer.completed_paths = {}
+            with self.assertRaises(ValueError):
+                writer.save_preview()
+
     def test_sampler_preserves_legacy_outputs_and_appends_decoded_media(self):
         schema = nodes.HREndlessSampler.define_schema()
         self.assertEqual(len(schema.outputs), 6)

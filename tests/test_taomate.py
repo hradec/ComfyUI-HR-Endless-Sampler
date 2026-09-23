@@ -20,6 +20,21 @@ module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate")
 class TaoMateTest(unittest.TestCase):
     """Check timing, state boundaries and real H3 forward integration."""
 
+    def test_teacher_audio_renorm_anchor_and_toggle(self):
+        """Correct affine feature drift, preserve the first chunk and allow bypass."""
+        teacher_module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate_audio_teacher")
+        teacher = teacher_module.Base10AudioTeacher(SimpleNamespace(clone=lambda: None))
+        rows = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        with patch.object(teacher_module, "TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO", True):
+            self.assertIs(teacher._renorm_clean_audio_rows(rows), rows)
+            torch.testing.assert_close(teacher._renorm_clean_audio_rows(rows * 3 + 7), rows)
+            self.assertTrue(torch.isfinite(teacher._renorm_clean_audio_rows(torch.ones_like(rows))).all())
+        with patch.object(teacher_module, "TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO", False):
+            changed = rows * 2
+            self.assertIs(teacher._renorm_clean_audio_rows(changed), changed)
+        teacher.close()
+        self.assertIsNone(teacher.audio_anchor)
+
     def test_kv_cache_report_accumulates_time_and_peak_ram(self):
         """Final-report data retains cache timing after the live cache is released."""
         state = module.TaoMateStreaming("none")
@@ -30,7 +45,46 @@ class TaoMateTest(unittest.TestCase):
         self.assertEqual(report["seconds"], {"KV restore": 1.25, "KV commit": 2.5})
         self.assertEqual(report["peak_stored_bytes"], 4096)
         self.assertEqual(report["peak_raw_bytes"], 8192)
+        state.kv_cache_memory_history = [{"chunk": 1, "chunk_total": 6, "phase": 1, "phase_total": 3, "stored": 4096, "raw": 8192}]
+        table = state.kv_cache_memory_table()
+        self.assertIn("codec", table)
+        self.assertIn("none", table)
+        self.assertIn("C1.1/6.3", table)
+        state.audio_kv_memory_history = [{"chunk": 1, "chunk_total": 6, "stored": 1024, "raw": 2048, "groups": 2, "ticks": 80}]
+        audio_table = state.audio_kv_cache_memory_table()
+        self.assertIn("teacher audio", audio_table)
+        self.assertIn("C1/6", audio_table)
+        self.assertIn("80", audio_table)
 
+    def test_teacher_audio_cache_adapter_captures_complete_audio_rows(self):
+        """The audio adapter retains every target-audio row in its teacher chunk."""
+        contract = module.KVContract(local_heads=1, head_dim=2, dtype=torch.float32, device_type="cpu")
+        cache = module.TeacherAudioKVCache(contract, "none")
+        cache.active_device = torch.device("cpu")
+        cache.begin_clean_commit(0)
+        tags = torch.tensor([1] + [2] * 84)
+        mask = torch.tensor([False] + [True] * 84)
+        values = torch.arange(170, dtype=torch.float32).reshape(85, 1, 2)
+        for name in module.MAIN_LAYER_NAMES:
+            cache.stage(name, values, values + 1, tags, mask)
+        cache.commit()
+        self.assertEqual(cache.compression_mode, "none")
+        self.assertEqual(cache.history_tokens, 84)
+        restored = cache.history("blocks.0.attn")
+        self.assertTrue(torch.equal(restored.key, values[1:]))
+        self.assertTrue(torch.equal(restored.value, values[1:] + 1))
+
+    def test_teacher_audio_positions_ignore_later_prompt_length(self):
+        """A later prompt length cannot shift audio RoPE relative to teacher KV."""
+        packed_module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate_upstream.packed_sequence")
+        first = packed_module.minimax_h3_audio_only_packed_sequence(text_len=7, audio_t=5, latent_h=2, latent_w=2, time_start=0, audio_time_origin=7)
+        second = packed_module.minimax_h3_audio_only_packed_sequence(text_len=19, audio_t=4, latent_h=2, latent_w=2, time_start=5, audio_time_origin=7)
+        first_times = first["img_position_ids"][first["audio_pos"], 0]
+        second_times = second["img_position_ids"][second["audio_pos"], 0]
+        self.assertTrue(torch.equal(first_times, torch.tensor([7., 8., 9., 10., 11., 7., 8., 9., 10., 11.])))
+        self.assertTrue(torch.equal(second_times, torch.tensor([12., 13., 14., 15., 12., 13., 14., 15.])))
+
+    @patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False)
     def test_chunk_frames_controls_groups_without_enlarging_phases(self):
         """Different prompt durations preserve the global AV clock and bounded KV phases."""
         state = module.TaoMateStreaming
@@ -294,6 +348,7 @@ class TaoMateTest(unittest.TestCase):
         self.assertTrue(torch.equal(waveform, expected))
         self.assertGreater(float(waveform.max()), 1.0)
 
+    @patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False)
     def test_group_audio_boundaries_match_upstream_across_rounding_cycle(self):
         """Preserve upstream's alternating 198/199-tick continuation lengths."""
         groups = module.TaoMateStreaming.request_plan(142, round(module.TaoMateStreaming.frames(142) * module.h3.FRAME_RESCALE))
@@ -329,12 +384,27 @@ class TaoMateTest(unittest.TestCase):
             self.assertEqual(sum(item["audio_end"] - item["audio_start"] for item in plan), audio)
             self.assertEqual(sum(item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan), frames)
         plan = module.TaoMateStreaming.plan(72, 405)
-        self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [39, 34, 34, 17, 34, 34, 34, 17])
-        plan = module.TaoMateStreaming.plan(72, 405, continuation_frames=22)
-        self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [22] + [17] * 13)
+        self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [12, 12, 11, 12, 12, 11, 2])
+        with patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False):
+            plan = module.TaoMateStreaming.plan(72, 405)
+            self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [39, 34, 34, 17, 34, 34, 34, 17])
+            plan = module.TaoMateStreaming.plan(72, 405, continuation_frames=22)
+            self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [22] + [17] * 13)
+
+    def test_equal_phases_never_end_on_singleton_temporal_token(self):
+        """Near-equal phases preserve the H3 one-frame token for their next phase."""
+        state = module.TaoMateStreaming
+        video_t = 97
+        audio_t = round(state.frames(video_t) * module.h3.FRAME_RESCALE)
+        for continuation in (22, 39, 56, 73):
+            plan = state.plan(video_t, audio_t, continuation)
+            spans = [state.frames(item["video_end"]) - state.frames(item["video_end"] - 1) for item in plan]
+            self.assertTrue(all(span == 4 for span in spans))
+        plan = state.plan(video_t, audio_t, 73)
+        self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [22, 22, 21, 22, 10])
 
     def test_request_prompts_cover_four_phases(self):
-        """Two nominal five-second prompts cover eight phases without lost media."""
+        """Two nominal five-second prompts cover every phase without lost media."""
         state = module.TaoMateStreaming()
         requests = state.request_plan(72, 405)
         self.assertEqual(len(requests), 2)
@@ -478,8 +548,8 @@ class TaoMateTest(unittest.TestCase):
         state.close()
         self.assertEqual(state.cache.history_tokens, 0)
 
-    def test_audio_teacher_uses_no_video_and_rolls_clean_tail(self):
-        """Nine actual H3 forwards capture milestones and retain a frozen tail."""
+    def test_audio_teacher_uses_no_video_or_frozen_audio_prefix(self):
+        """Nine actual H3 forwards capture milestones without duplicating audio tails."""
         self.addCleanup(torch.set_num_threads, torch.get_num_threads())
         torch.set_num_threads(1)
         teacher_module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate_audio_teacher")
@@ -494,9 +564,9 @@ class TaoMateTest(unittest.TestCase):
         original = teacher.forward
 
         def forward(**kwargs):
-            """Inspect the frozen reference throughout all nine updates."""
+            """Inspect the direct teacher input throughout all nine updates."""
             rows = kwargs["audio_x"][0].index_select(0, teacher.branch.audio_pos_dev)
-            observed.append(rows[:teacher.branch.audio_target_start].clone())
+            observed.append((teacher.branch.audio_target_start, rows.clone()))
             return original(**kwargs)
 
         teacher.forward = forward
@@ -510,10 +580,36 @@ class TaoMateTest(unittest.TestCase):
             second = teacher.generate(conditioning, torch.randn(1, 32, 2, 57), 2, 2, requested, 8., 2.)
         self.assertEqual(len(observed), teacher.receipt["executed_forwards"])
         self.assertEqual(len(second), 6)
-        expected = module.h3.pack_audio(first[-1][..., -40:])
-        self.assertTrue(all(torch.equal(rows, expected) for rows in observed))
-        self.assertEqual(teacher.receipt["reference_ticks"], 40)
-        self.assertTrue(torch.equal(teacher.previous_clean, second[-1]))
+        self.assertTrue(all(start == 0 for start, rows in observed))
+        self.assertTrue(all(rows.shape[0] == 2 * 57 for start, rows in observed))
+        self.assertEqual(teacher.receipt["reference_ticks"], 0)
+        self.assertEqual(teacher.receipt["audio_time_start"], 0)
+        self.assertEqual(teacher.receipt["audio_time_end"], 57)
+        teacher.close()
+
+    def test_audio_teacher_reuses_clean_kv_between_groups(self):
+        """Teacher audio restores the first group's clean H3 state before group two."""
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        torch.set_num_threads(1)
+        teacher_module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate_audio_teacher")
+        model = module.h3.MiniMaxH3Model(hidden_size=96, num_layers=50, token_refiner_num_layers=0, num_attention_heads=1, attention_head_dim=96, ffn_hidden_size=128, text_dim=96, timestep_input_dim=8, time_embed_hidden_size=32, time_embed_dim=16, dtype=torch.float32, device="cpu", operations=torch.nn)
+        model.rope.inv_freq.fill_(0.01)
+        patcher = SimpleNamespace(load_device=torch.device("cpu"), model=SimpleNamespace(get_dtype_inference=lambda: torch.float32), model_options={}, pre_run=lambda: None, cleanup=lambda: None, get_model_object=lambda name: model)
+        patcher.clone = lambda: patcher
+        model.requires_grad_(False)
+        factory = lambda heads, head_dim, dtype: module.TeacherAudioKVCache(module.KVContract(local_heads=heads, head_dim=head_dim, dtype=dtype, device_type="cpu"), "none")
+        teacher = teacher_module.Base10AudioTeacher(patcher, factory, module.ComfyStreamingHook)
+        conditioning = {"cross_attn": torch.randn(1, 4, 96)}
+        with patch.object(module.h3, "optimized_attention", module.comfy.ldm.modules.attention.attention_pytorch), patch.object(teacher_module.comfy.model_management, "load_models_gpu"):
+            first = teacher.generate(conditioning, torch.randn(1, 32, 2, 65), 2, 2)
+            self.assertEqual(teacher.cache.committed_blocks, 1)
+            second = teacher.generate(conditioning, torch.randn(1, 32, 2, 57), 2, 2)
+            third = teacher.generate(conditioning, torch.randn(1, 32, 2, 50), 2, 2)
+        self.assertTrue(torch.isfinite(first[-1]).all())
+        self.assertTrue(torch.isfinite(second[-1]).all())
+        self.assertTrue(torch.isfinite(third[-1]).all())
+        self.assertEqual(teacher.cache.committed_blocks, 3)
+        self.assertEqual(teacher.cache.history_tokens, 2 * (65 + 57 + 50))
         teacher.close()
 
     def test_teacher_schedule_captures_all_six_supplied_endpoints(self):
@@ -597,6 +693,7 @@ class TaoMateTest(unittest.TestCase):
         self.assertTrue(torch.equal(observed[1][1], torch.full((1, 1, 512), .5)))
         self.assertTrue(torch.equal(result[..., 192:], torch.full((1, 1, 512), 2.4)))
 
+    @patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False)
     def test_phase_preparation_initializes_guidance_shape_before_solver(self):
         """Exercise preparation through wrapped Heun without prefilling video_shape."""
         from comfy.k_diffusion.sampling import sample_heun

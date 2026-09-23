@@ -3437,3 +3437,279 @@ balance. It is monotonic and limited to a `0.75..1.30` luma ratio and
 changes. It is still strictly post-sampling: raw VAE frames alone remain H3
 conditioning/keyframes. The focused helper test suite passed 60 tests after
 this replacement.
+
+## 2026-09-22 — The selective-LoRA panel is the editor, in both frontends
+
+`web/selective_lora_ui.js` is now the whole feature. Earlier revisions drew the
+group bars on the node canvas and then as a Nodes 2.0 DOM overlay behind the
+real sliders; both fought the frontend for pixels and lost. The panel is one
+DOM widget instead, so it renders the same way in the classic canvas UI and
+under Nodes 2.0, and every pixel inside it is ours.
+
+Each group row paints its share of the adapter as its own background gradient:
+the bright band is the share the current strength keeps, the dim band is the
+part a reduced strength drops, and the rest is an empty track. The radar draws
+the adapter as trained (dashed grey) against the current settings (yellow),
+scaled by a shared peak so a strength above 100% rescales instead of clipping.
+The five strength widgets stay in `node.widgets` - their values must keep
+serializing and `load_lora` must not change - but they are labelled with
+`widget.label` and removed from both frontends with `widget.hidden = true`.
+Each group therefore has exactly one editor, the panel, and the graph can never
+disagree with it.
+
+The percentage field at the right of each row is that editor. Committing a
+value writes `widget.value`, rounded to the widget's own `round`/`precision`
+and clamped to its `min`/`max`, then calls `widget.callback` so extensions
+watching the node still see the edit. Enter commits, Escape restores the text,
+the arrow keys step by the widget's real fine step (`options.step2`, which the
+frontend rewrites from the declared `step`), shift and PageUp/PageDown step by
+its tenfold coarse twin, a double click resets to 100%, a vertical drag of four
+pixels per fine step scrubs, and blur restores the stored value in case
+`change` never arrived. A strength change never refetches; only the LoRA picker
+does.
+
+Frontend behavior this relies on was read from the installed
+`comfyui_frontend_package` 1.53.6 sources (extracted from its source maps) and
+then confirmed in a real browser:
+
+- `widget.hidden` is honored by both frontends, and hidden widgets still occupy
+  their `widgets_values` position, because `LGraphNode.serialize` skips only
+  widgets whose `serialize === false`.
+- `widget.serialize` and `widget.options.serialize` are separate flags: the
+  first controls workflow persistence, the second controls API prompt
+  inclusion. Passing `{ serialize: false }` to `addDOMWidget` only sets the
+  options copy, because that argument becomes `widget.options`; the widget
+  object itself must also be flagged or a stray empty value is appended to
+  `widgets_values`.
+- DOM widget room comes from `--comfy-widget-min-height` /
+  `--comfy-widget-height` in the element's computed style, so the panel
+  declares its own height.
+- Nodes 2.0 reuses the real widget objects and drives its own number field from
+  `modelValue`, so a write to `widget.value` shows up in both frontends.
+- ComfyUI intercepts `wheel` at document capture over every DOM widget and
+  re-dispatches it to the canvas. No wheel listener in a custom panel can ever
+  run, so the panel has none, and scrolling over it zooms the graph as it does
+  everywhere else. An earlier revision's scroll-to-scrub was dead code.
+
+Verified in headless Chromium through Playwright against the live server, with
+every non-GET request intercepted and answered locally so no probe could write
+settings, workflows or queue state. In both frontends the node's sliders are
+absent while the panel is visible and interactive, real pixel samples of the
+rows match the computed geometry (`#4aa3ff` at 0.45 over the panel background
+at 12% of the attention row, `#f0a03c` at 0.45 across 60% of the texture row),
+every editing path lands in `widget.value`, `serialize()` returns the original
+six values in their original order, and `graphToPrompt()` sends exactly the six
+node inputs - never `lora_groups` - carrying the strengths the panel shows.
+`tests/test_selective_lora_ui.js` was rewritten to drive the real module against
+a small DOM stand-in, replacing the earlier tests of the removed canvas and
+overlay paths.
+
+Weight statistics still say where an adapter writes, not what it controls. The
+bars and the radar are a map of stored strength, and camera attribution still
+needs the GPU ablation.
+
+## 2026-09-22 — `lms_r64` only fails on the full model because of the AdaLN stack
+
+`minimax_h3_lms_v1.0_r64.safetensors` was trained against a `use_adaln_curves`
+checkpoint. Its 258 modules were classified against every base model in
+`models/unet/` with the loader's own `classify_module`, and the counts are
+decisive:
+
+- `minimax_h3_ref2va_bf16` (535 tensors): 208 modules load, **all 50
+  `blocks.N.adaln_proj.linear` modules are dropped**.
+- every pruned `int8_convrot` build (932 tensors, incl. fl2va and the Singularity
+  v1.3 repack): **258 of 258 load**.
+
+All four base models have exactly 50 blocks, `0..49`, and the adapter covers that
+whole stack (attention `qkv_proj` + `out_proj`, mlp `fc1` + `fc2`, eight
+`token_refiner` modules, one `adaln_proj.linear` per block), so the modulation
+group is the only difference between the two runs.
+
+The shapes say why. The pruned builds delete `time_embedder` and instead
+condition on a learned look-up: `adaln_t_table [1025, 8]`, interpolated per
+timestep and fed to `adaln_proj.linear.weight [96768, 8]`. The full build keeps
+the MLP and takes `[96768, 2688]`. The adapter's modulation modules are
+`A [64, 8] x B [96768, 64]` - rank 64 on an 8-wide input, so `B·A` spans the
+input space completely and is a *rewrite* of the timestep-to-modulation map, not
+a nudge. `AdalnProj` is what injects the timestep into every block
+(`expand=6, modalities=3, hidden=5376` -> 96768 shift/scale/gate vectors), so the
+modulation group is 49.965% of the adapter (309,683,200 params) and is the part
+that speaks to schedule position.
+
+The error log is therefore not noise, it identifies the mechanism. At patch time
+`comfy/weight_adapter/lora.py:270` builds `mm(A, B)` -> `[96768, 8]` = 774144
+elements and tries `.reshape(weight.shape)`; the `except` at line 285 logs
+`ERROR lora <key> shape '[96768, 2688]' is invalid for input of size 774144` and
+returns the weight **unpatched**. A live full-model run at 19:26:55-19:27:57
+produced 330 such lines, block indices `0..49` only, ~6.6 per module from weight
+re-patching under offload. Nothing else is ever reported, and the adapter still
+changes the render through the 208 attention/mlp/refiner modules that do load.
+
+That is a load-compatibility fact, not a causal one: it proves the modulation
+group is absent on the full model and present on the pruned one, not that it
+moves the camera. The pruned builds also differ architecturally (curve
+conditioning, int8 convrot). The cheap discriminating run is the panel itself -
+on the pruned model set the conditioning group to 0% and leave the other four at
+100%. If the initial camera position stops changing, it is the modulation LoRA;
+if it persists, it is the pruned model and the adapter only amplifies it.
+
+The error is a property of the patch, not of any loader, and our loader only
+looked immune because those runs had the conditioning group at zero. Three
+independent confirmations:
+
+- The log's own patch count tracks the group. `Model ... prepared for dynamic
+  VRAM loading. <N>MB Staged. <N> patches attached.` reports 258 for
+  `UNETLoader -> our loader, modulation 1.0` on the pruned model at 18:51 (zero
+  errors - the shapes match there), 208 for every run with modulation 0 (19:13
+  pruned, 19:19 and 19:20 full bf16), and 258 for the 19:26 full run, which is
+  the first time any `ERROR lora` appears in the log. 208 is attention 100 +
+  feed_forward 100 + token_refiner 8; the 50 modulation keys are the difference.
+- `/history` holds the executed graphs. In `e7bf4c26` (19:26) the chain is
+  `UNETLoader minimax_h3_ref2va_bf16 -> LoraLoaderModelOnly minimax_h3_lms_v1.0_r64
+  @1.0 -> HREndlessSamplerSelectiveLora minimax_h3_taomate_3step -> sampler`, and
+  the older selective node for `lms_r64` (attention 0, modulation 0) is orphaned,
+  `consumed by None`, so it never ran. The standard loader cannot be told to skip
+  a group, so it attaches all 258 and the 50 doomed ones fail per weight reload.
+- Reproduced with no loader in the picture at all: calling
+  `LoRAAdapter.calculate_weight` on a `[96768, 2688]` weight logs the identical
+  line and returns the weight unmodified (`/tmp/hrlora/why_no_error.py`), and
+  our loader's grouping of the same file on the full model is 50 modulation +
+  100 attention + 100 feed_forward + 8 token_refiner, i.e. 208 attached at
+  modulation 0 and 258 at modulation 1.
+
+Because a failed patch is discarded and behaves exactly like an absent one,
+`LoraLoaderModelOnly` at 1.0 on the full model is functionally the same as this
+node with modulation 0 - just louder. So loader choice is ruled out as the cause
+of the pruned-versus-full difference: every full-BF16 run so far, under either
+loader, has had the modulation stack switched off.
+
+## 2026-09-22 — The preview's L curve now covers latent previews too
+
+`web/unlimited_preview.js` used to apply its browser-only `sRGB^0.45` curve only
+to finalized decodes: `renderInverseGammaDisplay` took a `finalized` flag, the
+playback and paused-frame paths passed `Boolean(group.finalized)`, step-graph
+inspection passed `false`, and a test pinned the rule with the note that the
+curve "must never alter latent step previews". The owner asked for the L button
+to cover the latent preview, so that gate is gone.
+
+The `finalized` parameter is deleted rather than ignored: `displaySource` now
+takes `(source, valid, displayed)`, all three of its callers dropped their flag,
+and `renderInverseGammaDisplay()` applies the curve whenever the toggle is on and
+whatever image is on screen - live latent frames, tiny-VAE or Latent2RGB
+previews, step-graph inspection, and decoded chunks alike. The toggle itself, the
+persisted `inverseGammaDisplay` player state and the SVG filter are unchanged, so
+saved workflows and browser restores are unaffected.
+
+Why this is only a decision, not a correctness fix: the latent preview frames
+arrive from `_latent_rgb_frames` (Latent2RGB) or a tiny VAE decode, and under
+`linear_color_compute` the server restores decoded previews to display sRGB
+while the latent path carries no such restore. Applying the same curve to both
+therefore shows the same experiment on both surfaces rather than a color-managed
+result - which is exactly what the button claims to be.
+
+Verified in real Chromium (Playwright) with the filter markup and
+`renderInverseGammaDisplay` lifted verbatim out of the module, so no ComfyUI
+server was involved: the filter reports `color-interpolation-filters: sRGB` and
+`exponent: 0.45`, the toggle sets `image.style.filter` to
+`url("#hr-endless-inverse-gamma-1")`, a solid `rgb(64)` frame renders as
+`rgb(136,136,136)` and `rgb(128)` as `rgb(186,186,186)` (both the
+`pow(value/255, 0.45)` result within rounding), the curve survives an `image.src`
+swap of the kind a latent frame update performs, and toggling off restores
+`rgb(128,128,128)` with `filter: none`.
+`tests/test_chunk_director_helpers.py::test_preview_inverse_gamma_toggle_applies_to_every_preview_image`
+replaces the old assertion: it pins the three argument-free call sites, requires
+`displaySource` to have three parameters, and forbids `Boolean(group.finalized),`
+from returning to any display path.
+
+## 2026-09-22 — The finished-video player's L button, and the filter id it needed
+
+The owner asked for the preview's `L` button on the other nodes. Save Video, Load
+Video and Video Compare turn out to share one extension and one player
+(`HREndlessSampler.FinishedVideoPlayer` in `web/finished_video_player.js`), so
+this is one implementation, not three. Its viewport holds two `<video>` elements:
+`media`, the primary render, and `compareMedia`, inset over it with a `clip-path`
+that `renderComparisonWipe` rewrites on every drag, right-click orientation
+change and comparison selection. Compare nodes drive that same pair from
+`compare_media_url` instead of a matching-list picker.
+
+The markup, the `color-interpolation-filters: sRGB` declaration and the three
+`0.45` gamma curves are the preview's, verbatim. The button sits in the viewport's
+top-right corner exactly as the preview's does, but at `z-index: 7` instead of
+`2`: this viewport also contains an interactive wipe overlay whose 28-pixel hit
+line is a live pointer target, and a lower button would lose clicks that land on
+it. `renderInverseGammaDisplay` writes the filter to **both** videos, which is
+what makes an active wipe (primary on one side, comparison on the other) curve as
+one image; it deliberately does not touch `clip-path`, so the clipped side stays
+clipped. The toggle is persisted as `inverseGammaDisplay` alongside `frame` and
+`muted` in `node.properties.hr_endless_sampler_player`, so it survives a refresh
+and a workflow save like the preview's does.
+
+An earlier probe had left the `clip-path` question open, and it was a wrong
+expectation rather than a real failure: it stacked a filtered `rgb(64)` under a
+filtered `rgb(128)` and then compared the `rgb(128)` it sampled on the clipped
+side against the `rgb(64)` prediction. Re-probed with the two videos as distinct
+solid colours (`/tmp/hrlora/video_clip_probe.mjs`, real Chromium, no server), all
+six checks pass and the two properties are independent: `186` inside the clip
+polygon, `136` outside it (the bottom video), and `128`/`64` with the curve off.
+`filter` and `clip-path` compose; the clip does not suppress the curve, and the
+curve does not defeat the clip.
+
+### The filter id could not be `node.id`
+
+The first live run pinned the id as `hr-endless-inverse-gamma--1`, and that is a
+fact about `onNodeCreated`, not about the probe: `LiteGraph.createNode` runs
+`onNodeCreated` before `graph.add` assigns the real id (and `LGraph.configure`
+sets it after `createNode` has already run), so every one of the four node types
+reports `idAtCreation: -1` and only gets `1..4` afterwards
+(`/tmp/hrlora/filter_id_probe.mjs`). Writing `${node.id}` into the filter id would
+therefore give every player in the page the same id.
+
+Chromium's behavior for that was measured rather than assumed
+(`/tmp/hrlora/dangling_filter_probe.mjs`, four of four checks): with duplicate
+ids, `url(#id)` resolves to the **first element in tree order** - a first copy
+with the `0.45` curve won over a second copy carrying an identity curve, `186`
+versus `128`; removing the resolved element silently **rebinds** to the next
+match; and with no match at all Chromium **ignores** the filter, rendering the
+element unfiltered (`128`), rather than hiding it. So a shared id does not blank
+the media out, and the curve could stop applying with nothing but a stale-looking
+button to show for it.
+
+The player therefore takes an id from a module-level serial,
+`hr-endless-player-inverse-gamma-<n>`, which is correct at creation time by
+construction. `unlimited_preview.js` still writes `${node.id}`, and two preview
+nodes in a live page do put the same `hr-endless-inverse-gamma--1` into the
+document (`/tmp/hrlora/preview_id_probe.mjs`). That is benign where it is used -
+each node contributes its own identical filter element, so the reference always
+matches something, and all the definitions are the same - but duplicate element
+ids are invalid HTML, and aligning the preview with the player is a separate
+decision that this change did not take.
+
+### Verification
+
+Live, in the real frontend, against a real server, with every non-GET request
+intercepted by the harness (`/tmp/hrlora/live_l_button_probe.mjs`, 17 checks,
+none failing). Because the browser's real `/view` route serves
+`/NVME/comfyui/output` — not `ComfyUI/output`, which is why every file in
+`ComfyUI/output` 404s — the probe points the players at deterministic solid-colour
+H.264 clips it serves itself over GET. Scenario A, a real `HREndlessSamplerSaveVideo`
+node with one video: the button is in the document, off to start, a real mouse
+click turns it on, the referenced id exists exactly once, all 49 sampled pixels of
+the content box become `curve(128) = 186`, and a second click restores the
+untouched decode byte for byte. Scenario B, a real `HREndlessSamplerVideoCompare`
+node with the wipe active: the primary reads `128` on the left and the comparison
+`64` on the right before the click, and `186`/`186`/`136`/`136` after it — each
+half curved inside its own clipped region; the clip path string is unchanged by
+the filter write; the second node gets `-2` rather than reusing `-1`; and after
+dragging the divider to `0.961` so the 28-pixel hit line sits exactly on the
+button centre at `0.961`, a click there still toggles the curve and leaves the
+dragged clip path alone.
+
+`tests/test_chunk_director_helpers.py::test_finished_video_player_inverse_gamma_toggle_covers_both_videos`
+pins the new surface: the button text, the serial-based id and why (with a comment
+naming the `-1` cause), `sRGB`, the argument-free render function, a filter write
+to **both** videos, the untouched `compareMedia.style.clipPath` write, `z-index:7`,
+the persisted and restored flag, and exactly two call sites. The module's failure
+set is unchanged by this work: the same six failures and one error that the
+uncommitted tree already had (the four camera-sentence tests, the one-based seed
+multiples, the schema ordering, and the compute-precision error), with both curve
+tests green.

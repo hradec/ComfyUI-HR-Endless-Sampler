@@ -72,7 +72,7 @@ WORD_ONSET_SECONDS = 0.055
 COMMA_PAUSE_SECONDS = 0.15
 SENTENCE_PAUSE_SECONDS = 0.30
 ELLIPSIS_PAUSE_SECONDS = 0.50
-minimax_visual_cond_noise_aug = 0.9
+minimax_visual_cond_noise_aug = 0.99
 VIDEO_CONTINUATION_RESOLUTIONS = (
     "full",
     "0.98mp (1344x768 native)",
@@ -122,10 +122,10 @@ VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
 # Temporarily disable the disposable three-step continuation memory probe.  It
 # remains implemented below so the experiment can be restored by changing this
 # single flag after its startup cost is useful again.
-ENABLE_DEBUG_MEMORY_PREFLIGHT = False
+ENABLE_DEBUG_MEMORY_PREFLIGHT = True
 # Experimental A/B switch. False regenerates complete AV noise for every
 # chunk with seed * chunk_number; True preserves one sliced full-sequence noise.
-TOGGLE_SINGLE_NOISE = False
+TOGGLE_SINGLE_NOISE = True
 # Set this to False only for the isolation experiment that retains the
 # native visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
 # DiT references, and prompt text.
@@ -163,6 +163,25 @@ RETENTION_FIELD = re.compile(r"(?im)^\s*retention_analysis\s*:\s*$")
 PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
 DIALOGUE_BLOCK = re.compile(r"<d>(.*?)</d>", re.IGNORECASE | re.DOTALL)
 SUBJECT_SPEAKER = re.compile(r"(<Subject\s+\d+>)\s*\((S\d+)\)", re.IGNORECASE)
+
+
+def _preserve_global_prompt_sections(chunk_prompt, global_prompt):
+    """Keep global subjects, summary and retention verbatim across chunk directors."""
+    headers = r"subject_definitions|summary|retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music|non_diegetic_audio"
+    for field in ("subject_definitions", "summary", "retention_analysis"):
+        section = re.compile(r"(?im)^[ \t]*" + field + r"[ \t]*:[\s\S]*?(?=^[ \t]*(?:" + headers + r")[ \t]*:|\Z)")
+        original = section.search(global_prompt)
+        replacement = original.group(0) if original else ""
+        if section.search(chunk_prompt):
+            chunk_prompt = section.sub(lambda match: replacement, chunk_prompt)
+        elif original:
+            # Missing sections go before the description without altering source text.
+            following = headers.split("|")[headers.split("|").index(field) + 1:]
+            position = re.search(r"(?im)^[ \t]*(?:" + "|".join(following) + r")[ \t]*:", chunk_prompt)
+            offset = position.start() if position else 0
+            separator = "" if replacement.endswith("\n") else "\n"
+            chunk_prompt = chunk_prompt[:offset] + replacement + separator + chunk_prompt[offset:]
+    return chunk_prompt
 
 
 def _description_field(prompt, start=0):
@@ -1526,7 +1545,7 @@ def _legacy_static_camera_prompt(prompt, previous_prompt=None):
     # Preserve the required opening shot marker before its descriptive prose.
     marker = SHOT_MARKER.match(prompt, start + len(prompt[start:]) - len(prompt[start:].lstrip()))
     insert_at = marker.end() if marker is not None else start
-    sentence = "The camera stays static in the stablished frame."
+    sentence = "The camera stays fixed in the stablished frame."
     if prompt[insert_at:].lstrip().startswith(sentence):
         return prompt
     return prompt[:insert_at] + " " + sentence + " " + prompt[insert_at:].lstrip()
@@ -1577,6 +1596,7 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
             has_opening_frames=guide_enabled,
             body_overrides=body_overrides,
         )
+        chunk_prompt = _preserve_global_prompt_sections(chunk_prompt, prompt)
         debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt)
         planned.append((chunk_prompt, debug_prompt))
     return planned
@@ -4506,12 +4526,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Maximum chunk frames, snapped down to H3's 17k+5 grid. In TaoMate this sets the prompt/audio-teacher group size; inference still uses small sub-chunks."),
                 io.Image.Input("images", optional=True,
                                tooltip="Original backend conditioning images as a batch. For MiniMax H3 Ref2VA, keep reference images in their original order."),
-                io.Int.Input("video_continuation", default=22, min=5, max=3600, step=17,
+                io.Int.Input("video_continuation", default=39, min=5, max=3600, step=17,
                                tooltip="Completed continuation tail length. Video1 reference uses it for a synchronized Video1/Audio1 reference; Masked AV uses it for native boundary keyframes and the matching decoded/latent tail replacement inside chunk_frames."),
                 io.Combo.Input(
                     "video_continuation_method",
                     options=list(VIDEO_CONTINUATION_METHODS),
-                    default=VIDEO_CONTINUATION_METHOD_VIDEO1,
+                    default=VIDEO_CONTINUATION_METHOD_TAOMATE,
                     tooltip=(
                         "Video1 reference keeps the current Ref2VA <Video N>/<Audio N> path plus its five-frame "
                         "packing prefix. Masked AV creates native video/audio boundary keyframes covering this "
@@ -4542,11 +4562,11 @@ class HREndlessSampler(SamplerCustomAdvanced):
                              tooltip="Video VAE required by the current MiniMax H3 continuation and Gemma visual-directing backend."),
                 io.Vae.Input("audio_vae", optional=True,
                              tooltip="MiniMax H3 audio VAE. When connected, each completed chunk's final decoded audio is synchronized with its full-VAE browser preview."),
-                io.Combo.Input("color_correction", options=list(COLOR_CORRECTION_MODES), default="chunk boundaries", tooltip="Disable grading, match chunk boundaries with ColorMatchV2's MKL transfer, match entire shots after generation, or apply both. This changes preview/final pixels only; H3 continuation latents remain native and unchanged. Changing this setting requires a fresh cache."),
+                io.Combo.Input("color_correction", options=list(COLOR_CORRECTION_MODES), default="disable", tooltip="Disable grading, match chunk boundaries with ColorMatchV2's MKL transfer, match entire shots after generation, or apply both. This changes preview/final pixels only; H3 continuation latents remain native and unchanged. Changing this setting requires a fresh cache."),
                 io.Boolean.Input("linear_color_compute", default=False, tooltip="Use float32 inverse-gamma compute color: convert input reference RGB with sRGB^(1/2.4) before H3/VAE encoding, then restore preview and IMAGE output with value^2.4. Changes inference behavior and requires a fresh cache."),
                 io.Combo.Input("compute_precision", options=["default", "fp32 (full precision but more VRAM needed)"], default="default", tooltip="default preserves the incoming model precision. fp32 forces diffusion computation to 32-bit for video and audio, increasing memory use and runtime. VAE and text encoder precision are unchanged."),
-                io.Combo.Input("kv_cache_compression", options=["none", "zstd lossless", "int8", "turboquant"], default="none", tooltip="TaoMate only: none keeps exact BF16 KV in RAM. zstd lossless stores exact BF16 bytes with Zstd. int8 uses per-vector signed INT8 plus a scale. turboquant uses a GPU 4-bit rotated-vector codec. The last two are lossy and experimental."),
-                io.Boolean.Input("audio_sr", default=True, tooltip="Apply AudioSR to each decoded chunk for preview, then separately to the assembled original decoded audio for the final 48 kHz AUDIO output. Requires audio_vae and python/audio_sr.py --install. Adds processing time; does not change H3 reference latents."),
+                io.Combo.Input("kv_cache_compression", options=["none", "zstd lossless", "int8", "turboquant"], default="turboquant", tooltip="TaoMate only: none keeps exact BF16 KV in RAM. zstd lossless stores exact BF16 bytes with Zstd. int8 uses per-vector signed INT8 plus a scale. turboquant uses a GPU 4-bit rotated-vector codec. The last two are lossy and experimental."),
+                io.Boolean.Input("audio_sr", default=False, tooltip="Apply AudioSR to each decoded chunk for preview, then separately to the assembled original decoded audio for the final 48 kHz AUDIO output. Requires audio_vae and python/audio_sr.py --install. Adds processing time; does not change H3 reference latents."),
                 HRPreProduction.Input("pre_production", optional=True, tooltip="Connect Gemma 4 for model-directed prompts or Legacy Chunk Prompts for editable, pre-baked prompts. Unconnected uses native legacy prompts without an LLM."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log every chunk prompt, raw Gemma response, and detailed VRAM snapshots. chunk_prompts is returned whether debug is enabled or not."),
@@ -4587,16 +4607,16 @@ class HREndlessSampler(SamplerCustomAdvanced):
     @classmethod
     @_guard_replay_cache
     def execute(cls, noise, guider, sampler, sigmas, latent_image, clip, prompt, fps=24.0, chunk_frames=124, images=None,
-                video_continuation=22, video_continuation_method=VIDEO_CONTINUATION_METHOD_VIDEO1,
+                video_continuation=39, video_continuation_method=VIDEO_CONTINUATION_METHOD_TAOMATE,
                 video_continuation_res="full", vae=None, audio_vae=None,
                 debug=False, debug_stop_chunk=0, debug_start_chunk=0,
-                unique_id=None, dynprompt=None, color_correction="chunk boundaries",
+                unique_id=None, dynprompt=None, color_correction="disable",
                 pre_production=None,
                 linear_color_compute=False,
                 audio_feathered_overlap=False,
                 compute_precision="default",
-                kv_cache_compression="none",
-                audio_sr=True,
+                kv_cache_compression="turboquant",
+                audio_sr=False,
                 **_deprecated_inputs):
         use_taomate = video_continuation_method == VIDEO_CONTINUATION_METHOD_TAOMATE
         taomate_backend = None
@@ -5282,6 +5302,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     "HR Endless Sampler will save temporary finalized chunk videos using prefix %s.",
                     intermediate_prefix,
                 )
+                intermediate_writer.register_preview(preview_execution)
             except (OSError, RuntimeError, ValueError) as error:
                 logging.warning(
                     "HR Endless Sampler could not prepare temporary chunk-video output; "
@@ -6401,6 +6422,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     chunk_prompt = manual_prompts.get_chunk_prompt(index + 1)
                 else:
                     chunk_prompt = _chunk_summary_prompt(chunk_prompt, prompt, continuation, picture_label=continuation_picture_label, video_label=f"<Video {video_number}>" if continuation and include_video1_reference else None, audio_label=f"<Audio {audio_number}>" if continuation and include_previous_audio_reference else None, boundary_keyframe=continuation and bool(use_masked_av_mode or context_keyframes))
+                chunk_prompt = _preserve_global_prompt_sections(chunk_prompt, prompt)
                 debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
                 if return_prompts:
                     debug_prompts.append(debug_prompt)
@@ -6550,6 +6572,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                             else:
                                 guider.model_patcher.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "hr_first_step_diagnostic", first_diagnostic.forward)
                         if use_taomate:
+                            taomate_backend.current_chunk_number = index + 1
+                            taomate_backend.current_chunk_total = len(active_plan)
                             def subchunk_start(phase):
                                 """Locate live previews on this phase's actual global frame range."""
                                 if preview_execution is not None:
@@ -7407,6 +7431,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 "total_frames": rendered_frames,
                 "chunks": preview_chunk_ranges[:completed_chunks],
                 "render_total_seconds": timing.elapsed(),
+                "annotation": preview_execution.annotation() if preview_execution is not None else "",
                 "shots": [
                     shot for shot in preview_shot_ranges
                     if int(shot.get("start", rendered_frames)) < rendered_frames

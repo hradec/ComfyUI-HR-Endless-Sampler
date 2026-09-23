@@ -351,8 +351,9 @@ app.registerExtension({
             image.draggable = false;
             viewport.appendChild(image);
 
-            // Browser compositing applies this transfer to the already decoded
-            // preview image; it never requests a VAE decode or new frame data.
+            // Browser compositing applies this transfer to whichever preview
+            // image is on screen, decoded or latent; it never requests a VAE
+            // decode or new frame data.
             const inverseGammaFilterId = `hr-endless-inverse-gamma-${node.id}`;
             const filterSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
             filterSvg.setAttribute("width", "0");
@@ -361,7 +362,7 @@ app.registerExtension({
             const filter = document.createElementNS("http://www.w3.org/2000/svg", "filter");
             filter.setAttribute("id", inverseGammaFilterId);
             // SVG filters default to linearRGB. This preview deliberately applies
-            // pow() to the decoded sRGB samples themselves, matching the sampler
+            // pow() to the displayed RGB samples themselves, matching the sampler
             // display experiment rather than doing a color-managed conversion.
             filter.setAttribute("color-interpolation-filters", "sRGB");
             const transfer = document.createElementNS("http://www.w3.org/2000/svg", "feComponentTransfer");
@@ -395,6 +396,82 @@ app.registerExtension({
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
             viewport.appendChild(frameLabel);
 
+            let previewAnnotation = "";
+            const annotationLabel = document.createElement("div");
+            annotationLabel.style.cssText = "position:absolute;left:12px;right:12px;top:10px;z-index:3;text-align:center;color:#ffe600;font:bold 16px/1.2 sans-serif;-webkit-text-stroke:1px #000;text-shadow:1px 1px 0 #000,-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,0 2px 3px #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none;user-select:none;display:none;";
+            viewport.appendChild(annotationLabel);
+
+            function renderAnnotation() {
+                annotationLabel.textContent = previewAnnotation;
+                annotationLabel.title = previewAnnotation;
+                annotationLabel.style.display = previewAnnotation ? "block" : "none";
+            }
+
+            async function saveAnnotation(value) {
+                previewAnnotation = String(value || "").replace(/[\r\n]+/g, " ").trim().slice(0, 256);
+                renderAnnotation();
+                const response = await api.fetchApi("/hr_endless_sampler_preview/annotation", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ node_id: node.id, execution, annotation: previewAnnotation }),
+                });
+                const body = await response.text();
+                let result = {};
+                if (body) {
+                    try { result = JSON.parse(body); }
+                    catch (error) {
+                        if (response.status === 404 || response.status === 405) {
+                            throw new Error("The annotation endpoint is not loaded. Restart ComfyUI, then refresh the browser.");
+                        }
+                        throw new Error(`Annotation save failed (HTTP ${response.status}): ${body.slice(0, 240)}`);
+                    }
+                }
+                if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+                if (typeof result.annotation !== "string") throw new Error("The annotation endpoint returned an invalid response.");
+                previewAnnotation = result.annotation;
+                renderAnnotation();
+            }
+
+            function openAnnotationWindow() {
+                const backdrop = document.createElement("div");
+                backdrop.style.cssText = "position:fixed;inset:0;z-index:10002;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);";
+                const dialog = document.createElement("div");
+                dialog.style.cssText = "width:min(360px,calc(100vw - 32px));padding:12px;background:#242424;border:1px solid #666;border-radius:5px;box-shadow:0 5px 24px #000;color:#eee;font:12px sans-serif;";
+                const heading = document.createElement("div");
+                heading.textContent = "Preview annotation";
+                heading.style.cssText = "margin-bottom:8px;font-weight:bold;";
+                const input = document.createElement("input");
+                input.type = "text";
+                input.maxLength = 256;
+                input.value = previewAnnotation;
+                input.placeholder = "Type one line to show over the video";
+                input.style.cssText = "box-sizing:border-box;width:100%;height:30px;padding:5px 7px;background:#111;border:1px solid #666;border-radius:3px;color:#fff;font:12px sans-serif;";
+                const actions = document.createElement("div");
+                actions.style.cssText = "display:flex;justify-content:flex-end;gap:6px;margin-top:10px;";
+                const cancel = document.createElement("button");
+                cancel.textContent = "Cancel";
+                const save = document.createElement("button");
+                save.textContent = "Save";
+                for (const button of [cancel, save]) button.style.cssText = "padding:4px 10px;border:1px solid #666;border-radius:3px;background:#333;color:#eee;cursor:pointer;";
+                const close = () => backdrop.remove();
+                cancel.addEventListener("click", close);
+                backdrop.addEventListener("pointerdown", event => { if (event.target === backdrop) close(); });
+                input.addEventListener("keydown", event => {
+                    if (event.key === "Escape") close();
+                    if (event.key === "Enter") save.click();
+                });
+                save.addEventListener("click", async () => {
+                    save.disabled = true;
+                    try { await saveAnnotation(input.value); close(); }
+                    catch (error) { window.alert(error.message); save.disabled = false; }
+                });
+                actions.append(cancel, save);
+                dialog.append(heading, input, actions);
+                backdrop.appendChild(dialog);
+                document.body.appendChild(backdrop);
+                input.focus();
+                input.select();
+            }
+
             const cacheReuseLabel = document.createElement("div");
             cacheReuseLabel.style.cssText = "position:absolute;left:8px;bottom:6px;color:#69b76f;font:bold 11px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.1px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;white-space:nowrap;";
             viewport.appendChild(cacheReuseLabel);
@@ -402,7 +479,7 @@ app.registerExtension({
             const linearDisplayButton = document.createElement("button");
             linearDisplayButton.type = "button";
             linearDisplayButton.textContent = "L";
-            linearDisplayButton.title = "Preview RGB: sRGB^0.45, browser-only";
+            linearDisplayButton.title = "Every preview image: RGB sRGB^0.45, browser-only";
             linearDisplayButton.style.cssText = "position:absolute;right:8px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#aaa;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:2;";
             viewport.appendChild(linearDisplayButton);
 
@@ -460,7 +537,41 @@ app.registerExtension({
             cacheButton.type = "button";
             cacheButton.textContent = "cache";
             cacheButton.style.cssText = "box-sizing:border-box;width:38px;height:14px;padding:0;border:1px solid #666;border-radius:3px;background:#292929;color:#ddd;font:9px/12px ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;";
-            transportRight.appendChild(cacheButton);
+            const transportButtons = document.createElement("div");
+            transportButtons.style.cssText = "display:flex;gap:3px;height:14px;flex-shrink:0;align-items:center;";
+            transportRight.appendChild(transportButtons);
+            transportButtons.appendChild(cacheButton);
+
+            const savePreviewButton = document.createElement("button");
+            savePreviewButton.type = "button";
+            savePreviewButton.textContent = "save";
+            savePreviewButton.title = "Save preview: after stopping the render, join completed chunk movies beside the Save Video output, with a saved_preview suffix.";
+            savePreviewButton.style.cssText = cacheButton.style.cssText;
+            transportButtons.appendChild(savePreviewButton);
+            savePreviewButton.addEventListener("click", async event => {
+                event.stopPropagation();
+                savePreviewButton.disabled = true;
+                savePreviewButton.textContent = "…";
+                try {
+                    const response = await api.fetchApi("/hr_endless_sampler_video/save_preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: node.id, execution }) });
+                    if (!(response.headers.get("content-type") || "").includes("application/json")) {
+                        const detail = await response.text();
+                        if (response.status === 404 || response.status === 405) throw new Error("Save preview is unavailable on this running server. Restart ComfyUI to load the new endpoint, then refresh the browser.");
+                        throw new Error(`Save preview failed (HTTP ${response.status}): ${detail.slice(0, 300)}`);
+                    }
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || "Could not save preview");
+                    savePreviewButton.title = `Save preview. Last saved: ${result.filename}`;
+                    window.alert(`Preview saved:\n${result.filename}`);
+                } catch (error) {
+                    window.alert(error.message);
+                } finally {
+                    savePreviewButton.disabled = false;
+                    savePreviewButton.textContent = "save";
+                }
+            });
+            let taomateMode = false;
+            let lastCacheStatus = null;
 
             const cacheHelp = "Enable or disable replay-cache reuse for the next HR Endless Sampler run. Disabled ignores the existing cache, but the sampler still saves a fresh cache and overwrites the previous one.";
             let replayCacheEnabled = true;
@@ -478,9 +589,10 @@ app.registerExtension({
                         ? `${labels[0]} and ${labels[1]}`
                         : `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`;
                 cacheReuseLabel.textContent = `reusing cached chunks ${chunks}`;
-                cacheReuseLabel.style.display = reusingCachedChunks && labels.length ? "block" : "none";
+                cacheReuseLabel.style.display = !taomateMode && reusingCachedChunks && labels.length ? "block" : "none";
             }
             function applyReplayCacheStatus(cacheStatus) {
+                lastCacheStatus = cacheStatus;
                 replayCacheEnabled = cacheStatus?.enabled !== false;
                 if (cacheStatus?.has_cache) {
                     const count = Math.max(0, Number(cacheStatus.completed_chunks) || 0);
@@ -495,13 +607,22 @@ app.registerExtension({
                     cachedChunkCount = 0;
                     cachedChunkIndices = new Set();
                 }
-                cacheButton.disabled = Boolean(cacheStatus?.active);
+                if (taomateMode) {
+                    cachedChunkCount = 0;
+                    cachedChunkIndices.clear();
+                }
+                cacheButton.disabled = taomateMode || Boolean(cacheStatus?.active);
                 cacheButton.style.background = replayCacheEnabled ? "#28662d" : "#202020";
                 cacheButton.style.borderColor = replayCacheEnabled ? "#69b76f" : "#444";
                 cacheButton.style.color = replayCacheEnabled ? "#e5ffe6" : "#888";
                 cacheButton.style.cursor = cacheButton.disabled ? "not-allowed" : "pointer";
                 renderCacheReuseLabel();
-                if (cacheStatus?.active) {
+                if (taomateMode) {
+                    cacheButton.title = "Replay cache is unavailable in TaoMate mode.";
+                    cacheButton.style.background = "#202020";
+                    cacheButton.style.color = "#888";
+                    cacheButton.style.borderColor = "#444";
+                } else if (cacheStatus?.active) {
                     cacheButton.title = `${cacheHelp}\nThe current render already chose its cache policy.`;
                 } else {
                     const count = Array.isArray(cacheStatus?.cached_chunks)
@@ -584,6 +705,15 @@ app.registerExtension({
                     closePreviewContextMenu();
                 });
                 menu.appendChild(reconnectButton);
+                const annotationButton = document.createElement("button");
+                annotationButton.type = "button";
+                annotationButton.textContent = "Annotation…";
+                annotationButton.title = "Set the one-line annotation shown over the image and stored in the video timeline JSON.";
+                annotationButton.style.cssText = reconnectButton.style.cssText;
+                annotationButton.addEventListener("mouseenter", () => { annotationButton.style.background = "#3e5f85"; });
+                annotationButton.addEventListener("mouseleave", () => { annotationButton.style.background = "transparent"; });
+                annotationButton.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); closePreviewContextMenu(); openAnnotationWindow(); });
+                menu.appendChild(annotationButton);
                 const canDeleteChunk = replayCacheEnabled && !cacheButton.disabled && Number.isInteger(chunkIndex)
                     && chunkIndex >= 0 && cachedChunkIndices.has(chunkIndex);
                 if (!canDeleteChunk) {
@@ -733,6 +863,71 @@ app.registerExtension({
             let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame)
                 ? savedPlayerState.frame : null;
             let pendingAudioSources = new Map();
+            let continuousAudioContext = null;
+            let continuousAudioGain = null;
+            let continuousAudio = [];
+            const decodedAudio = new Map();
+
+            function stopContinuousAudio() {
+                for (const entry of continuousAudio) entry.source.stop();
+                continuousAudio = [];
+            }
+
+            function prepareContinuousAudio(group) {
+                if (!group?.audioSource || decodedAudio.has(group.audioSource)) return;
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContext) return;
+                if (!continuousAudioContext) {
+                    continuousAudioContext = new AudioContext();
+                    continuousAudioGain = continuousAudioContext.createGain();
+                    continuousAudioGain.connect(continuousAudioContext.destination);
+                }
+                const source = group.audioSource;
+                decodedAudio.set(source, null);
+                fetch(source).then(response => response.arrayBuffer())
+                    .then(bytes => continuousAudioContext.decodeAudioData(bytes))
+                    .then(buffer => { if (decodedAudio.has(source)) decodedAudio.set(source, buffer); })
+                    .catch(error => console.warn("Preview audio decode failed", error));
+            }
+
+            function continuousAudioTime(group) {
+                const entry = continuousAudio.find(item => item.group === group && item.url === group.audioSource);
+                return entry ? Math.max(0, entry.offset + (continuousAudioContext.currentTime - entry.start) * entry.rate) : null;
+            }
+
+            function scheduleContinuousAudio(group, frameIndex, forceSeek) {
+                prepareContinuousAudio(group);
+                if (!decodedAudio.get(group.audioSource)) return false;
+                if (forceSeek) stopContinuousAudio();
+                if (continuousAudio.length && !continuousAudio.some(entry => entry.group === group && entry.url === group.audioSource)) stopContinuousAudio();
+                continuousAudioContext.resume().catch(() => {});
+                continuousAudioGain.gain.value = audioMuted ? 0 : 1;
+                let index = chunks.indexOf(group);
+                let start = continuousAudio.length ? continuousAudio[continuousAudio.length - 1].end : continuousAudioContext.currentTime + 0.02;
+                // Schedule ready, adjacent chunks ahead of time on the audio hardware clock.
+                for (; index >= 0 && index < chunks.length; index++) {
+                    const next = chunks[index];
+                    if (!next?.audioSource) break;
+                    prepareContinuousAudio(next);
+                    if (continuousAudio.some(entry => entry.group === next && entry.url === next.audioSource)) continue;
+                    const buffer = decodedAudio.get(next.audioSource);
+                    if (!buffer) break;
+                    const rate = Math.max(0.0625, Math.min(16, currentPlaybackFps() / (validFps(next.sourceFps) || validFps(sourceFps) || 24)));
+                    const offset = next === group ? audioOffset(group, frameIndex) : 0;
+                    if (offset >= buffer.duration) break;
+                    const source = continuousAudioContext.createBufferSource();
+                    source.buffer = buffer;
+                    source.playbackRate.value = rate;
+                    source.connect(continuousAudioGain);
+                    start = Math.max(start, continuousAudioContext.currentTime);
+                    const end = start + (buffer.duration - offset) / rate;
+                    source.start(start, offset);
+                    continuousAudio.push({ group: next, url: next.audioSource, source, start, end, offset, rate });
+                    start = end;
+                }
+                audioPlayer.pause();
+                return continuousAudioTime(group) != null;
+            }
 
             function stop() {
                 if (timer != null) clearTimeout(timer);
@@ -740,6 +935,7 @@ app.registerExtension({
                 framePending = false;
                 playbackSerial++;
                 audioPlayer.pause();
+                stopContinuousAudio();
             }
 
             function validFps(value) {
@@ -783,6 +979,8 @@ app.registerExtension({
 
             function syncAudio(group, frameIndex, shouldPlay, serial, forceSeek=false) {
                 const source = group?.audioSource;
+                if (source && shouldPlay && scheduleContinuousAudio(group, frameIndex, forceSeek)) return;
+                stopContinuousAudio();
                 if (!source) {
                     audioPlayer.pause();
                     audioGroup = null;
@@ -843,6 +1041,7 @@ app.registerExtension({
             }
 
             function preloadAudio(group) {
+                prepareContinuousAudio(group);
                 if (!group?.audioSource || group === audioGroup || group === standbyAudioGroup) return;
                 audioStandbyPlayer.pause();
                 audioStandbyPlayer.src = group.audioSource;
@@ -876,6 +1075,7 @@ app.registerExtension({
             }
 
             function renderMuteButton() {
+                if (continuousAudioGain) continuousAudioGain.gain.value = audioMuted ? 0 : 1;
                 audioPlayer.muted = audioMuted;
                 audioStandbyPlayer.muted = audioMuted;
                 muteButton.textContent = audioMuted ? "🔇" : "🔊";
@@ -890,10 +1090,8 @@ app.registerExtension({
                 persistPlayerState();
             }
 
-            function renderInverseGammaDisplay(finalized=false) {
-                const enabled = inverseGammaDisplay && finalized;
-                image.style.filter = enabled ? `url(#${inverseGammaFilterId})` : "none";
-                linearDisplayButton.disabled = false;
+            function renderInverseGammaDisplay() {
+                image.style.filter = inverseGammaDisplay ? `url(#${inverseGammaFilterId})` : "none";
                 linearDisplayButton.style.color = inverseGammaDisplay ? "#82d7ff" : "#aaa";
                 linearDisplayButton.style.background = inverseGammaDisplay ? "rgba(20,68,88,.95)" : "rgba(28,28,28,.9)";
                 linearDisplayButton.style.cursor = "pointer";
@@ -904,11 +1102,11 @@ app.registerExtension({
                 event.preventDefault();
                 event.stopPropagation();
                 inverseGammaDisplay = !inverseGammaDisplay;
-                renderInverseGammaDisplay(Boolean(chunks[playing]?.finalized) && hoverStep == null);
+                renderInverseGammaDisplay();
                 persistPlayerState();
                 root.focus({ preventScroll: true });
             });
-            renderInverseGammaDisplay(false);
+            renderInverseGammaDisplay();
 
             function setPlaybackFps(value, restart=true) {
                 const fps = validFps(value);
@@ -965,7 +1163,7 @@ app.registerExtension({
 
             function renderCachedChunkUnderlines(spans, total) {
                 cachedChunkUnderlines.replaceChildren();
-                if (!replayCacheEnabled || cachedChunkCount <= 0 || !total) return;
+                if (taomateMode || !replayCacheEnabled || cachedChunkCount <= 0 || !total) return;
                 let offset = 0;
                 for (let index = 0; index < spans.length; index++) {
                     const start = offset / total * 100;
@@ -1185,8 +1383,8 @@ app.registerExtension({
                 timelinePlayhead.style.display = "block";
             }
 
-            function displaySource(source, valid, displayed, finalized=false) {
-                renderInverseGammaDisplay(finalized);
+            function displaySource(source, valid, displayed) {
+                renderInverseGammaDisplay();
                 if (!source) {
                     displayed?.(false);
                     return;
@@ -1223,10 +1421,11 @@ app.registerExtension({
                 syncAudio(group, boundedFrame, true, serial, seekAudio);
                 const next = nextAvailable(index);
                 if (next >= 0 && next !== index) preloadAudio(chunks[next]);
-                if (group.audioSource && audioGroup === group && !audioPlayer.paused && audioPlayer.readyState >= 1) {
+                const continuousTime = continuousAudioTime(group);
+                if (continuousTime != null || (group.audioSource && audioGroup === group && !audioPlayer.paused && audioPlayer.readyState >= 1)) {
                     const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
                     const nextMediaTime = (boundedFrame + 1) / sourceRate;
-                    const wallDelay = (nextMediaTime - audioPlayer.currentTime) * 1000 / Math.max(0.0625, audioPlayer.playbackRate);
+                    const wallDelay = (nextMediaTime - (continuousTime ?? audioPlayer.currentTime)) * 1000 / Math.max(0.0625, currentPlaybackFps() / sourceRate);
                     if (Number.isFinite(wallDelay)) duration = Math.max(1, wallDelay);
                 }
                 framePending = true;
@@ -1244,11 +1443,12 @@ app.registerExtension({
                                 // decoding was late, skip the stale visual
                                 // frame instead of seeking audio backward and
                                 // creating a click.
-                                if (group.audioSource && audioGroup === group && !audioPlayer.paused) {
+                                const audioTime = continuousAudioTime(group);
+                                if (audioTime != null || (group.audioSource && audioGroup === group && !audioPlayer.paused)) {
                                     const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
                                     nextFrame = Math.max(
                                         nextFrame,
-                                        Math.floor(audioPlayer.currentTime * sourceRate + 1e-4),
+                                        Math.floor((audioTime ?? audioPlayer.currentTime) * sourceRate + 1e-4),
                                     );
                                 }
                                 if (nextFrame < group.frames.length) {
@@ -1258,12 +1458,12 @@ app.registerExtension({
                             }
                             if (boundedFrame + 1 >= group.frames.length || group.audioSource) {
                                 const next = nextAvailable(index);
-                                if (next >= 0) show(next);
+                                if (next === index + 1) playFrameGroup(next, chunks[next], 0, serial, false);
+                                else if (next >= 0) show(next);
                                 return;
                             }
                         }, duration);
                     },
-                    Boolean(group.finalized),
                 );
             }
 
@@ -1283,7 +1483,6 @@ app.registerExtension({
                         group.frames[playingFrame],
                         () => serial === playbackSerial && paused && hoverStep == null,
                         () => { framePending = false; },
-                        Boolean(group.finalized),
                     );
                 } else {
                     playFrameGroup(index, group, playingFrame, serial, true);
@@ -1441,7 +1640,11 @@ app.registerExtension({
                 const secondsPerStep = Number.isFinite(averageStepMs) ? `${(averageStepMs / 1000).toFixed(2)}s/step` : "—s/step";
                 const elapsedSeconds = completedElapsed ?? (startedAt == null ? NaN : (performance.now() - startedAt) / 1000);
                 const elapsed = formatEta(elapsedSeconds);
-                const chunk = chunkCount ? `C ${activeChunk + 1}${activeSubchunk ? `.${activeSubchunk}` : ""}/${chunkCount}` : "C —/—";
+                const activePhaseCount = Math.max(1, Number(chunkRanges[activeChunk]?.taomate_phase_count) || 1);
+                const chunk = chunkCount ? activeSubchunk
+                    ? `C${activeChunk + 1}.${activeSubchunk}/${chunkCount}.${activePhaseCount}`
+                    : `C${activeChunk + 1}/${chunkCount}`
+                    : "C—/—";
                 const displayStep = hoverStep ?? currentStep;
                 const inspecting = hoverStep == null ? "" : "Inspect · ";
                 const statePrefix = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}`;
@@ -1522,6 +1725,8 @@ app.registerExtension({
             }
 
             function resetExecution(data) {
+                stopContinuousAudio();
+                decodedAudio.clear();
                 execution = data.execution;
                 chunkCount = data.chunk_count || 0;
                 cachedChunkCount = Math.max(0, Math.min(Number(data.cached_chunk_count) || 0, chunkCount));
@@ -1530,6 +1735,11 @@ app.registerExtension({
                 activeSubchunk = null;
                 chunks = new Array(chunkCount);
                 chunkRanges = Array.isArray(data.chunk_ranges) ? data.chunk_ranges.map(range => ({ ...range })) : [];
+                previewAnnotation = String(data.annotation || "").replace(/[\r\n]+/g, " ").slice(0, 256);
+                if (node.properties) delete node.properties.hr_endless_sampler_annotation;
+                renderAnnotation();
+                taomateMode = chunkRanges.some(range => Number(range.taomate_phase_count) > 0);
+                applyReplayCacheStatus(lastCacheStatus);
                 shotRanges = Array.isArray(data.shot_ranges) ? data.shot_ranges.slice() : [];
                 timelineTotalFrames = Number.isFinite(Number(data.total_frames)) ? Number(data.total_frames) : 0;
                 shotBracketKey = null;
@@ -1715,6 +1925,8 @@ app.registerExtension({
                         audioGroup = null;
                     }
                     group.audioSource = updatedSource;
+                    stopContinuousAudio();
+                    prepareContinuousAudio(group);
                     pendingAudioSources.delete(index);
                     if (shouldResume && playing === index && timer == null && !framePending) {
                         show(index, playingFrame);
@@ -1775,6 +1987,7 @@ app.registerExtension({
                     }
                 }
                 chunks[index] = group;
+                prepareContinuousAudio(group);
                 if (!finalized) stepPreviews[currentStep] = group;
                 previewWidth = data.width;
                 previewHeight = data.height;
@@ -1886,7 +2099,6 @@ app.registerExtension({
                                 play(boundedFrame + 1);
                             }, duration);
                         },
-                        false,
                     );
                 };
                 play(0);
@@ -1962,6 +2174,9 @@ app.registerExtension({
 
             const previousRemoved = node.onRemoved;
             node.onRemoved = function () {
+                stopContinuousAudio();
+                decodedAudio.clear();
+                continuousAudioContext?.close();
                 stop();
                 audioPlayer.removeAttribute("src");
                 audioPlayer.load();

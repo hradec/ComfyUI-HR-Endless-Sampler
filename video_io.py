@@ -23,6 +23,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import sys
 import threading
 import uuid
@@ -154,6 +156,15 @@ def _matching_output_listing(value: str, *, strip_counter: bool = False) -> dict
         item for item in listing["entries"]
         if item["kind"] != "directory" and Path(str(item["path"])).name.startswith(name)
     ]
+    for item in entries:
+        try:
+            media_path = Path(folder_paths.get_output_directory()) / str(item["path"])
+            timeline, _media = _read_sidecar(media_path)
+            if isinstance(timeline, dict) and isinstance(timeline.get("annotation"), str):
+                item["annotation"] = timeline["annotation"][:256]
+        except (OSError, ValueError, KeyError, TypeError):
+            # ponytail: matching remains a file listing if optional metadata is missing.
+            pass
     entries.sort(key=lambda item: (-float(item.get("modified") or 0.0), str(item.get("name") or "").casefold()))
     normalized_prefix = f"{parent}/{name}" if parent else name
     return {"prefix": normalized_prefix, "entries": entries}
@@ -269,6 +280,9 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
         "chunks": chunks,
         "shots": shots,
     }
+    annotation = source.get("annotation")
+    if isinstance(annotation, str) and annotation.strip():
+        normalized["annotation"] = " ".join(annotation.splitlines()).strip()[:256]
     render_total_seconds = _number(source.get("render_total_seconds"), -1.0)
     if render_total_seconds >= 0:
         normalized["render_total_seconds"] = render_total_seconds
@@ -283,11 +297,16 @@ def _timeline_sidecar_path(media_path: Path) -> Path:
 
 def _write_sidecar(media_path: Path, timeline: dict, media: dict) -> Path:
     sidecar = _timeline_sidecar_path(media_path)
-    payload = _copy_json({
+    payload = {
         "schema_version": TIMELINE_SCHEMA_VERSION,
         "timeline": timeline,
         "media": media,
-    })
+    }
+    # Keep the annotation easy to find in the JSON while preserving the full
+    # timeline copy consumed by Load Video and older metadata readers.
+    if isinstance(timeline.get("annotation"), str) and timeline["annotation"]:
+        payload["annotation"] = timeline["annotation"]
+    payload = _copy_json(payload)
     temporary = sidecar.with_suffix(sidecar.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, sidecar)
@@ -302,7 +321,10 @@ def _read_sidecar(media_path: Path) -> tuple[dict | None, dict | None]:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict) and isinstance(payload.get("timeline"), dict):
-            return payload["timeline"], payload.get("media") if isinstance(payload.get("media"), dict) else None
+            timeline = payload["timeline"]
+            if not timeline.get("annotation") and isinstance(payload.get("annotation"), str):
+                timeline = {**timeline, "annotation": payload["annotation"]}
+            return timeline, payload.get("media") if isinstance(payload.get("media"), dict) else None
     return None, None
 
 
@@ -385,7 +407,31 @@ def _node_unique_id(node_class):
 
 
 _PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instance", None)
+# Only execution-registered writers can be exported; callers cannot supply paths.
+_PREVIEW_EXPORT_WRITERS = {}
 if _PROMPT_SERVER is not None:
+    @_PROMPT_SERVER.routes.post("/hr_endless_sampler_video/save_preview")
+    async def hr_endless_sampler_save_preview(request):
+        """Join completed intermediate movies after the sampler has stopped."""
+        data = await request.json()
+        entry = _PREVIEW_EXPORT_WRITERS.get(str(data.get("node_id", "")))
+        if entry is None or str(entry[0]) != str(data.get("execution")):
+            return web.json_response({"error": "No chunk movies registered for this preview. Connect a Save Video node and a video VAE before rendering."}, status=400)
+        writer = entry[1]
+        if not writer.closed:
+            return web.json_response({"error": "Stop the render and wait for chunk movies to finish writing first."}, status=409)
+        try:
+            annotation = ""
+            try:
+                from .preview import _preview_annotation
+                annotation = _preview_annotation(data.get("node_id", ""))
+            except ImportError:
+                pass
+            filename = await asyncio.to_thread(writer.save_preview, annotation)
+        except (OSError, RuntimeError, ValueError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+        return web.json_response({"filename": filename})
+
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_video/state")
     async def hr_endless_sampler_video_state(request):
         return web.json_response(
@@ -860,6 +906,8 @@ class IntermediateChunkVideoWriter:
             thread_name_prefix="hr-endless-intermediate-video",
         )
         self._futures = []
+        self.closed = False
+        self.completed_paths = {}
         if fresh_run:
             removed = _remove_intermediate_chunk_files(
                 self.filename_prefix,
@@ -897,13 +945,59 @@ class IntermediateChunkVideoWriter:
         self._executor.shutdown(wait=True, cancel_futures=False)
         for future in self._futures:
             try:
-                future.result()
+                path = future.result()
+                # Retain only the newest completed file for each chunk number.
+                number = int(path.name.split(INTERMEDIATE_CHUNK_MARKER, 1)[1].split("-", 1)[0])
+                self.completed_paths[number] = os.fspath(path)
             except Exception as error:
                 logging.warning(
                     "HR Endless Sampler could not save an intermediate chunk video: %s",
                     error,
                 )
         self._futures.clear()
+        self.closed = True
+
+    def register_preview(self, preview_execution):
+        """Associate this execution's files with its preview buttons."""
+        if preview_execution is not None:
+            for wrapper, execution in preview_execution.items:
+                _PREVIEW_EXPORT_WRITERS[str(wrapper.node_id)] = (execution, self)
+
+    def save_preview(self, annotation=""):
+        """Remux completed chunk movies in order without decoding the VAE again."""
+        paths = [self.completed_paths[index] for index in sorted(self.completed_paths)]
+        if not paths:
+            raise ValueError("No completed decoded chunk movies are available to save.")
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg is required to join preview movies.")
+        directory, prefix = self.destination
+        # A unique filename prevents replacing an earlier saved preview.
+        output = os.path.join(os.fspath(directory), prefix + "_" + uuid.uuid4().hex[:8] + "_saved_preview.mp4")
+        chunks = []
+        output_start = 0
+        for index, path in enumerate(paths):
+            match = re.search(r"_frames_(\d+)-(\d+)\.mp4$", path)
+            count = int(match.group(2)) - int(match.group(1)) + 1 if match else 0
+            if count > 0:
+                chunks.append({"chunk": index + 1, "start": output_start, "end": output_start + count - 1, "source_start": int(match.group(1)), "source_end": int(match.group(2))})
+                output_start += count
+        timeline = normalize_timeline({"fps": self.fps, "total_frames": output_start, "chunks": chunks, "annotation": annotation}, fps=self.fps, total_frames=output_start)
+        with tempfile.TemporaryDirectory(prefix="hr-preview-", dir=os.fspath(directory)) as temporary:
+            manifest = os.path.join(temporary, "chunks.txt")
+            with open(manifest, "w") as handle:
+                for path in paths:
+                    if "\n" in path or "\r" in path:
+                        raise ValueError("Preview filenames cannot contain newlines.")
+                    handle.write("file '" + path.replace("'", "'\\''") + "'\n")
+            partial = os.path.join(temporary, "joined.mp4")
+            result = subprocess.run([ffmpeg, "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", manifest, "-c", "copy", "-movflags", "+faststart", partial], capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError("Preview join failed: " + result.stderr[-2000:])
+            os.replace(partial, output)
+        _write_sidecar(Path(output), timeline, {"kind": "video", "filename": Path(output).name})
+        logging.info("HR Endless Sampler saved preview: %s", output)
+        return output
 
 
 def save_replay_preview_proxy(path, images, fps, *, audio_waveform=None, audio_sample_rate=None, crf=18):
@@ -1289,6 +1383,8 @@ class HREndlessSamplerVideoCompare(io.ComfyNode):
             inputs=[
                 io.Image.Input("images1", tooltip="Left-side video frames."),
                 io.Image.Input("images2", tooltip="Right-side video frames."),
+                HREndlessTimeline.Input("timeline1", optional=True, tooltip="Optional timeline for Images1, including its annotation."),
+                HREndlessTimeline.Input("timeline2", optional=True, tooltip="Optional timeline for Images2, including its annotation."),
                 io.Float.Input("fps", default=24.0, min=0.001, max=1000.0, step=0.001,
                                tooltip="Playback and temporary proxy frame rate."),
             ],
@@ -1298,7 +1394,7 @@ class HREndlessSamplerVideoCompare(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images1, images2, fps=24.0):
+    def execute(cls, images1, images2, fps=24.0, timeline1=None, timeline2=None):
         """Create viewable temporary proxies and publish their paired player state."""
         left = _normalize_frames(images1)
         right = _normalize_frames(images2)
@@ -1307,8 +1403,8 @@ class HREndlessSamplerVideoCompare(io.ComfyNode):
         resolved_fps = _number(fps, 24.0)
         if resolved_fps <= 0:
             raise ValueError("fps must be greater than zero")
-        left_timeline = normalize_timeline(None, fps=resolved_fps, total_frames=int(left.shape[0]))
-        right_timeline = normalize_timeline(None, fps=resolved_fps, total_frames=int(right.shape[0]))
+        left_timeline = normalize_timeline(timeline1, fps=resolved_fps, total_frames=int(left.shape[0]))
+        right_timeline = normalize_timeline(timeline2, fps=resolved_fps, total_frames=int(right.shape[0]))
         left_path = _save_native_h264(left, "hr_endless_sampler_preview/video_compare_left", resolved_fps, "yuv420p", 19, left_timeline, save_output=False)
         right_path = _save_native_h264(right, "hr_endless_sampler_preview/video_compare_right", resolved_fps, "yuv420p", 19, right_timeline, save_output=False)
         left_url = _view_url(left_path)
@@ -1327,6 +1423,8 @@ class HREndlessSamplerVideoCompare(io.ComfyNode):
             "compare_source_fps": resolved_fps,
             "timeline": left_timeline,
             "compare_timeline": right_timeline,
+            "annotation": left_timeline.get("annotation", ""),
+            "compare_annotation": right_timeline.get("annotation", ""),
         }
         _publish_player_state(_node_unique_id(cls), player_state)
         return io.NodeOutput(ui={PLAYER_EVENT: [player_state]})
@@ -1420,6 +1518,7 @@ def _load_video_payload(video: str, fps: float = 0.0, *, decoded: dict | None = 
         "media_kind": media_kind,
         "source_fps": normalized_timeline["fps"],
         "timeline": normalized_timeline,
+        "annotation": normalized_timeline.get("annotation", ""),
     }
     return normalized_timeline, filename, float(normalized_timeline["fps"]), state
 

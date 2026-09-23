@@ -605,14 +605,52 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("audioStandbyPlayer", source)
         self.assertIn("const shotNumber = Number(shot?.shot) || 1;", source)
 
-    def test_preview_inverse_gamma_toggle_applies_only_finalized_decodes(self):
-        """The browser-only display curve must never alter latent step previews."""
+    def test_preview_inverse_gamma_toggle_applies_to_every_preview_image(self):
+        """The browser-only curve covers latent step previews and decoded chunks alike."""
         source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
         self.assertIn('linearDisplayButton.textContent = "L";', source)
         self.assertIn('filter.setAttribute("color-interpolation-filters", "sRGB");', source)
-        self.assertIn('const enabled = inverseGammaDisplay && finalized;', source)
-        self.assertIn('Boolean(group.finalized),', source)
-        self.assertIn('\n                        false,\n                    );', source)
+        self.assertIn('image.style.filter = inverseGammaDisplay ? `url(#${inverseGammaFilterId})` : "none";', source)
+        self.assertIn("function renderInverseGammaDisplay() {", source)
+        self.assertIn("function displaySource(source, valid, displayed) {", source)
+        # Latent previews, step-graph inspection and decoded chunks all honor the
+        # toggle, so no display path may gate the curve on a finalized chunk.
+        self.assertNotIn("Boolean(group.finalized),", source)
+        calls = [
+            line.strip() for line in source.splitlines()
+            if "renderInverseGammaDisplay" in line and "function" not in line
+        ]
+        self.assertEqual(calls, ["renderInverseGammaDisplay();"] * 3, calls)
+        # The paused-frame path must not hand a finalized flag to displaySource.
+        self.assertIn("() => { framePending = false; },\n                    );", source)
+
+    def test_finished_video_player_inverse_gamma_toggle_covers_both_videos(self):
+        """Save/Load/Compare share one player, and its L button curves both videos."""
+        source = (PLUGIN_ROOT / "web" / "finished_video_player.js").read_text(encoding="utf-8")
+        self.assertIn('linearDisplayButton.textContent = "L";', source)
+        # node.id is still -1 inside onNodeCreated, so the filter id may not use it:
+        # a shared id would go dangling the moment one owner node was deleted, and a
+        # dangling filter reference renders its element invisible.
+        self.assertIn("let inverseGammaFilterSerial = 0;", source)
+        self.assertIn("const inverseGammaFilterId = `hr-endless-player-inverse-gamma-${++inverseGammaFilterSerial}`;", source)
+        self.assertIn('filter.setAttribute("color-interpolation-filters", "sRGB");', source)
+        self.assertIn("function renderInverseGammaDisplay() {", source)
+        # An animated wipe shows two videos at once, so both must carry the curve.
+        self.assertIn("media.style.filter = displayCurve;", source)
+        self.assertIn("compareMedia.style.filter = displayCurve;", source)
+        # A comparison's clip-path must survive the filter write, or the wipe
+        # would either stop clipping or lose its curve.
+        self.assertIn("compareMedia.style.clipPath = polygon.length", source)
+        # The button must outrank the wide wipe hit line it overlaps.
+        self.assertIn("z-index:7;", source)
+        # The toggle survives a browser or workflow reload with the player state.
+        self.assertIn("let inverseGammaDisplay = Boolean(savedPlayerState.inverseGammaDisplay);", source)
+        self.assertIn("muted: audioMuted,\n                    inverseGammaDisplay,", source)
+        calls = [
+            line.strip() for line in source.splitlines()
+            if "renderInverseGammaDisplay" in line and "function" not in line
+        ]
+        self.assertEqual(calls, ["renderInverseGammaDisplay();"] * 2, calls)
 
     def test_preview_cache_context_menu_targets_the_clicked_chunk(self):
         """Global reconnect remains available beside a local cache action."""

@@ -111,10 +111,12 @@ def minimax_h3_audio_only_packed_sequence(
     latent_h: int,
     latent_w: int,
     audio_channel: int = 2,
+    time_start: int = 0,
+    audio_time_origin: int | None = None,
 ) -> dict[str, Any]:
     """Build the Base teacher's text/audio sequence without video tokens."""
 
-    if min(text_len, audio_t, latent_h, latent_w, audio_channel) <= 0:
+    if min(text_len, audio_t, latent_h, latent_w, audio_channel) <= 0 or time_start < 0 or (audio_time_origin is not None and audio_time_origin < 0):
         raise ValueError("all MiniMax H3 audio-only dimensions must be positive")
     if latent_h % _PATCH_H or latent_w % _PATCH_W:
         raise ValueError("latent_h and latent_w must be divisible by the 2x2 patch")
@@ -131,7 +133,11 @@ def minimax_h3_audio_only_packed_sequence(
 
     grid = torch.zeros(seq_len, 3, dtype=torch.float64)
     grid[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
-    audio_t_grid = float(text_len) + torch.arange(audio_t, dtype=torch.float64)
+    # A streaming teacher keeps one audio timeline even when later prompts have
+    # a different token count. Default to native text-relative timing for users
+    # that do not provide a persistent audio origin.
+    origin = text_len if audio_time_origin is None else audio_time_origin
+    audio_t_grid = float(origin + time_start) + torch.arange(audio_t, dtype=torch.float64)
     grid[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
     sqrt_area = np.sqrt(latent_h * latent_w)
     w_grid = _axis_from_sqrt_area(latent_w, _PATCH_W, sqrt_area)

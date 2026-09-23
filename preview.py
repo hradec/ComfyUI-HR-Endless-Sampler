@@ -33,6 +33,13 @@ _PREVIEW_CACHE_LIMIT = 8
 _PREVIEW_CACHE = OrderedDict()
 _PREVIEW_CACHE_LOCK = threading.Lock()
 _PREVIEW_EXECUTION_ID = 0
+_PREVIEW_ANNOTATIONS = {}
+
+
+def _preview_annotation(node_id):
+    """Return the current one-line annotation associated with one preview."""
+    with _PREVIEW_CACHE_LOCK:
+        return _PREVIEW_ANNOTATIONS.get(str(node_id), "")
 
 
 def _cache_payload(payload):
@@ -265,6 +272,29 @@ def build_cached_final_preview_snapshot(node_id, chunk_ranges, shot_ranges, chun
 
 _PROMPT_SERVER = None if PromptServer is None else getattr(PromptServer, "instance", None)
 if _PROMPT_SERVER is not None:
+    @_PROMPT_SERVER.routes.post("/hr_endless_sampler_preview/annotation")
+    async def hr_endless_sampler_preview_annotation(request):
+        """Store an annotation only for the active execution of its preview."""
+        try:
+            data = await request.json()
+            node_id = str(data.get("node_id", ""))
+            annotation = data.get("annotation", "")
+            execution = data.get("execution")
+            if not isinstance(annotation, str):
+                raise ValueError("Annotation must be text.")
+            if len(annotation) > 256:
+                raise ValueError("Annotation must be 256 characters or fewer.")
+            annotation = " ".join(annotation.splitlines()).strip()
+            with _PREVIEW_CACHE_LOCK:
+                state = _PREVIEW_CACHE.get(node_id)
+                if state is None or str(state.get("execution")) != str(execution):
+                    return web.json_response({"error": "This preview is no longer attached to the active render."}, status=409)
+                _PREVIEW_ANNOTATIONS[node_id] = annotation
+                state["reset"]["annotation"] = annotation
+            return web.json_response({"annotation": annotation})
+        except (TypeError, ValueError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+
     @_PROMPT_SERVER.routes.get("/hr_endless_sampler_preview/state")
     async def hr_endless_sampler_preview_state(request):
         snapshot = _cached_snapshot(request.rel_url.query.get("node_id", ""))
@@ -485,6 +515,13 @@ class _PreviewExecution:
             ),
         ) for wrapper in wrappers]
 
+    def annotation(self):
+        """Return the annotation for this sampler's connected preview node."""
+        for wrapper, _execution_id in self.items:
+            if wrapper.node_id:
+                return _preview_annotation(wrapper.node_id)
+        return ""
+
     def set_chunk(self, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
                   gemma_detailed_description=None, gemma_retention_analysis=None, h3_prompt=None):
         for wrapper, execution_id in self.items:
@@ -633,6 +670,10 @@ class _AccumulatedPreviewWrapper:
         with _PREVIEW_CACHE_LOCK:
             _PREVIEW_EXECUTION_ID = max(time.time_ns() // 1000, _PREVIEW_EXECUTION_ID + 1)
             self.execution_id = _PREVIEW_EXECUTION_ID
+            # An annotation describes one rendered video, so a new execution
+            # starts clean instead of inheriting the previous video's label.
+            if self.node_id is not None:
+                _PREVIEW_ANNOTATIONS.pop(self.node_id, None)
         if isinstance(chunk_ranges, int):
             chunk_ranges = [{"chunk": index + 1} for index in range(chunk_ranges)]
         chunk_ranges = [dict(item) for item in chunk_ranges]
@@ -665,6 +706,7 @@ class _AccumulatedPreviewWrapper:
             "elapsed_ms": 0.0,
             "started_at_ms": self.started_at_ms,
             "phase": "Preparing sampler",
+            "annotation": _preview_annotation(self.node_id),
         })
         return self.execution_id
 
