@@ -73,6 +73,102 @@ class TaoMateTest(unittest.TestCase):
         restored = cache.history("blocks.0.attn")
         self.assertTrue(torch.equal(restored.key, values[1:]))
         self.assertTrue(torch.equal(restored.value, values[1:] + 1))
+        checkpoint = cache.checkpoint()
+        cache.begin_clean_commit(cache.committed_blocks)
+        for name in module.MAIN_LAYER_NAMES:
+            cache.stage(name, values, values + 1, tags, mask)
+        cache.commit()
+        self.assertEqual(cache.history_tokens, 168)
+        cache.restore_checkpoint(checkpoint)
+        self.assertEqual(cache.history_tokens, 84)
+        self.assertTrue(torch.equal(cache.history("blocks.0.attn").key, values[1:]))
+
+    def test_audio_first_prepass_uses_each_prompt_and_all_global_ticks(self):
+        """Precompute each request from new audio only and join clean targets."""
+        state = module.TaoMateStreaming("none")
+
+        class Teacher:
+            def __init__(self):
+                self.calls = []
+                self.cache = None
+
+            @staticmethod
+            def guidance_schedule(sigmas, video_shift, audio_shift):
+                return [1.0, 0.0], [], []
+
+            def generate(self, conditioning, noise, height, width, sigmas, video_shift, audio_shift, start, progress_callback=None):
+                self.calls.append((conditioning, noise.clone(), start))
+                if progress_callback is not None:
+                    progress_callback(1, 1)
+                return [noise.float() + 5]
+
+            def close(self):
+                self.closed = True
+
+        teacher = Teacher()
+        state.audio_teacher = teacher
+        state.record_audio_kv_memory = lambda: None
+        noise = torch.arange(10, dtype=torch.float32).reshape(1, 1, 1, 10)
+        video = torch.zeros((1, 24, 1, 2, 2))
+        chunks = [
+            {"audio_start": 0, "audio_end": 4, "context_audio_t": 0},
+            {"audio_start": 4, "audio_end": 9, "context_audio_t": 1},
+        ]
+        progress = []
+        joined = state.prepare_audio_first(["chunk one", "chunk two"], noise, video, chunks, None, 12, 3, on_progress=lambda *values: progress.append(values))
+        self.assertEqual([call[0] for call in teacher.calls], ["chunk one", "chunk two"])
+        self.assertEqual([call[2] for call in teacher.calls], [0, 4])
+        torch.testing.assert_close(teacher.calls[0][1], noise[..., :4])
+        torch.testing.assert_close(teacher.calls[1][1], noise[..., 4:9])
+        torch.testing.assert_close(joined.flatten(), torch.tensor([5, 6, 7, 8, 9, 10, 11, 12, 13], dtype=torch.float32))
+        self.assertTrue(teacher.closed)
+        self.assertTrue(state.audio_first_ready)
+        self.assertEqual(progress, [(1, 2, 1, 1), (2, 2, 1, 1)])
+
+    def test_audio_first_requests_next_conditioning_after_previous_audio(self):
+        """The next prompt can use a transcript published by the preceding chunk."""
+        state = module.TaoMateStreaming("none")
+        seen = []
+        state.audio_teacher = SimpleNamespace(cache=None, guidance_schedule=lambda *args: ([1., 0.], [], []), generate=lambda conditioning, noise, *args, **kwargs: seen.append(conditioning) or [noise.float()], close=lambda: None)
+        state.record_audio_kv_memory = lambda: None
+        transcript = [""]
+        chunks = [{"audio_start": 0, "audio_end": 2, "context_audio_t": 0}, {"audio_start": 2, "audio_end": 4, "context_audio_t": 0}]
+        state.prepare_audio_first(lambda index: "chunk %d after %s" % (index + 1, transcript[0]), torch.ones((1, 1, 1, 4)), torch.zeros((1, 24, 1, 2, 2)), chunks, None, 12, 3, on_chunk_complete=lambda index, *args: transcript.__setitem__(0, "spoken %d" % (index + 1)))
+        self.assertEqual(seen, ["chunk 1 after ", "chunk 2 after spoken 1"])
+
+    def test_audio_first_retry_discards_rejected_kv_and_publishes_second_take(self):
+        """A bad decoded take cannot contaminate subsequent teacher history."""
+        state = module.TaoMateStreaming("none")
+
+        class Cache:
+            def __init__(self):
+                self.history = []
+
+            def checkpoint(self):
+                return self.history[:]
+
+            def restore_checkpoint(self, checkpoint):
+                self.history = checkpoint
+
+        cache = Cache()
+        calls = []
+
+        def generate(conditioning, noise, *args, **kwargs):
+            cache.history.append(conditioning)
+            calls.append((conditioning, noise.clone()))
+            return [noise.float() + len(calls)]
+
+        state.audio_teacher = SimpleNamespace(cache=cache, audio_anchor=None, audio_time_origin=None, guidance_schedule=lambda *args: ([1., 0.], [], []), generate=generate, close=lambda: None)
+        state.record_audio_kv_memory = lambda: None
+        published = []
+        chunks = [{"audio_start": 0, "audio_end": 2, "context_audio_t": 0}]
+        noise = torch.tensor([[[[1.0, -2.0]]]])
+        result = state.prepare_audio_first(["first"], noise, torch.zeros((1, 24, 1, 2, 2)), chunks, None, 12, 3, on_audio_candidate=lambda *args: "corrected", on_chunk_complete=lambda index, audio, *args: published.append(audio))
+        self.assertEqual([call[0] for call in calls], ["first", "corrected"])
+        torch.testing.assert_close(calls[1][1], noise)
+        self.assertEqual(cache.history, ["corrected"])
+        torch.testing.assert_close(result, noise + 2)
+        self.assertEqual(len(published), 1)
 
     def test_teacher_audio_positions_ignore_later_prompt_length(self):
         """A later prompt length cannot shift audio RoPE relative to teacher KV."""
@@ -348,6 +444,22 @@ class TaoMateTest(unittest.TestCase):
         self.assertTrue(torch.equal(waveform, expected))
         self.assertGreater(float(waveform.max()), 1.0)
 
+    def test_audio_preview_segment_uses_previous_latent_then_discards_its_samples(self):
+        """Context stabilizes temporal decode while only new audio is published."""
+
+        class AudioVAE:
+            audio_sample_rate = 40
+
+            def decode(self, latent):
+                return torch.nn.functional.avg_pool1d(latent, 3, stride=1, padding=1).movedim(1, -1)
+
+        previous = torch.full((1, 2, 5), 2.0)
+        current = torch.full((1, 2, 4), 4.0)
+        waveform, rate = module.TaoMateStreaming.decode_audio_preview_segment(AudioVAE(), current, previous, 2, 40)
+        full = torch.nn.functional.avg_pool1d(torch.cat((previous[..., -2:], current), dim=-1), 3, stride=1, padding=1)
+        self.assertEqual(rate, 40)
+        self.assertTrue(torch.equal(waveform, full[..., 2:]))
+
     @patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False)
     def test_group_audio_boundaries_match_upstream_across_rounding_cycle(self):
         """Preserve upstream's alternating 198/199-tick continuation lengths."""
@@ -383,8 +495,9 @@ class TaoMateTest(unittest.TestCase):
             self.assertEqual(sum(item["video_end"] - item["video_start"] for item in plan), tokens)
             self.assertEqual(sum(item["audio_end"] - item["audio_start"] for item in plan), audio)
             self.assertEqual(sum(item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan), frames)
-        plan = module.TaoMateStreaming.plan(72, 405)
-        self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [12, 12, 11, 12, 12, 11, 2])
+        with patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", True):
+            plan = module.TaoMateStreaming.plan(72, 405)
+            self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [12, 12, 11, 12, 12, 11, 2])
         with patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", False):
             plan = module.TaoMateStreaming.plan(72, 405)
             self.assertEqual([item["frame_end"] - item["frame_start"] - item["output_trim_frames"] for item in plan], [39, 34, 34, 17, 34, 34, 34, 17])
@@ -400,8 +513,9 @@ class TaoMateTest(unittest.TestCase):
             plan = state.plan(video_t, audio_t, continuation)
             spans = [state.frames(item["video_end"]) - state.frames(item["video_end"] - 1) for item in plan]
             self.assertTrue(all(span == 4 for span in spans))
-        plan = state.plan(video_t, audio_t, 73)
-        self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [22, 22, 21, 22, 10])
+        with patch.object(module, "TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS", True):
+            plan = state.plan(video_t, audio_t, 73)
+            self.assertEqual([item["video_end"] - item["video_start"] for item in plan], [22, 22, 21, 22, 10])
 
     def test_request_prompts_cover_four_phases(self):
         """Two nominal five-second prompts cover every phase without lost media."""
@@ -570,7 +684,7 @@ class TaoMateTest(unittest.TestCase):
             return original(**kwargs)
 
         teacher.forward = forward
-        with patch.object(module.h3, "optimized_attention", module.comfy.ldm.modules.attention.attention_pytorch), patch.object(teacher_module.comfy.model_management, "load_models_gpu"), patch.object(model.video_patch_proj, "forward", side_effect=AssertionError("video projection executed")), patch.object(model.final_layer.video_out, "forward", side_effect=AssertionError("video head executed")):
+        with patch.object(module.h3, "optimized_attention", module.comfy.ldm.modules.attention.attention_pytorch), patch.object(teacher_module.comfy.model_management, "load_models_gpu"), patch.object(teacher_module.comfy.model_management, "unload_model_and_clones"), patch.object(model.video_patch_proj, "forward", side_effect=AssertionError("video projection executed")), patch.object(model.final_layer.video_out, "forward", side_effect=AssertionError("video head executed")):
             first = teacher.generate(conditioning, torch.randn(1, 32, 2, 65), 2, 2)
             self.assertEqual(len(observed), 9)
             self.assertEqual(len(first), 3)
@@ -600,7 +714,7 @@ class TaoMateTest(unittest.TestCase):
         factory = lambda heads, head_dim, dtype: module.TeacherAudioKVCache(module.KVContract(local_heads=heads, head_dim=head_dim, dtype=dtype, device_type="cpu"), "none")
         teacher = teacher_module.Base10AudioTeacher(patcher, factory, module.ComfyStreamingHook)
         conditioning = {"cross_attn": torch.randn(1, 4, 96)}
-        with patch.object(module.h3, "optimized_attention", module.comfy.ldm.modules.attention.attention_pytorch), patch.object(teacher_module.comfy.model_management, "load_models_gpu"):
+        with patch.object(module.h3, "optimized_attention", module.comfy.ldm.modules.attention.attention_pytorch), patch.object(teacher_module.comfy.model_management, "load_models_gpu"), patch.object(teacher_module.comfy.model_management, "unload_model_and_clones"):
             first = teacher.generate(conditioning, torch.randn(1, 32, 2, 65), 2, 2)
             self.assertEqual(teacher.cache.committed_blocks, 1)
             second = teacher.generate(conditioning, torch.randn(1, 32, 2, 57), 2, 2)
@@ -612,14 +726,15 @@ class TaoMateTest(unittest.TestCase):
         self.assertEqual(teacher.cache.history_tokens, 2 * (65 + 57 + 50))
         teacher.close()
 
-    def test_teacher_schedule_captures_all_six_supplied_endpoints(self):
-        """Extra video steps receive actual teacher states at their exact sigmas."""
+    def test_teacher_schedule_uses_video_step_count_and_audio_shift(self):
+        """Audio follows each video sigma instead of adding teacher forwards."""
         teacher_module = importlib.import_module(os.path.basename(ROOT) + ".python.taomate_audio_teacher")
         requested = torch.tensor([1., .98, .96, .92, .85, .70, 0.])
         original = requested.clone()
         video, audio, captures = teacher_module.Base10AudioTeacher.guidance_schedule(requested, 8., 2.)
-        self.assertEqual([video[i] for i in captures], requested.tolist()[1:])
+        self.assertEqual(video, requested.tolist())
         self.assertEqual(len(captures), 6)
+        self.assertEqual(len(video) - 1, len(requested) - 1)
         self.assertTrue(torch.equal(requested, original))
         self.assertEqual(len(video), len(audio))
         for sigma, audio_sigma in zip(video, audio):
@@ -701,7 +816,7 @@ class TaoMateTest(unittest.TestCase):
         self.assertIsNone(state.video_shape)
         state.renormalize = lambda value: value
         clean = torch.full((1, 32, 2, 207), .25)
-        state.audio_teacher = SimpleNamespace(generate=lambda *args: [clean] * 6, receipt={})
+        state.audio_teacher = SimpleNamespace(generate=lambda *args, **kwargs: [clean] * 6, guidance_schedule=lambda *args: (sigmas.tolist(), sigmas.tolist(), list(range(6))), receipt={})
         sampling = SimpleNamespace(audio_scale=4., shift=12., audio_shift=3.)
         guider = SimpleNamespace(original_conds={"positive": [{}]}, model_patcher=SimpleNamespace(get_model_object=lambda name: sampling))
         video = torch.zeros(1, 24, 37, 2, 2)
@@ -729,7 +844,8 @@ class TaoMateTest(unittest.TestCase):
         state = module.TaoMateStreaming()
         request = state.request_plan(37, 207)[0]
         clean = torch.randn(1, 32, 2, 207)
-        state.audio_teacher = SimpleNamespace(generate=lambda *args: [clean, clean, clean], receipt={})
+        seen_conditioning = []
+        state.audio_teacher = SimpleNamespace(generate=lambda conditioning, *args, **kwargs: seen_conditioning.append(conditioning) or [clean, clean, clean], guidance_schedule=lambda *args: ([1., 0.], [1., 0.], [0]), receipt={})
         guider = SimpleNamespace(original_conds={"positive": [{}]}, model_patcher=SimpleNamespace(get_model_object=lambda name: SimpleNamespace(audio_scale=4.0, shift=12.0, audio_shift=3.0)))
         video = torch.zeros(1, 24, 37, 2, 2)
         latent = {"samples": module.comfy.nested_tensor.NestedTensor((video, torch.zeros_like(clean)))}
@@ -741,7 +857,9 @@ class TaoMateTest(unittest.TestCase):
             target["samples"] = module.comfy.nested_tensor.NestedTensor((current_video, audio))
             return target, target
 
-        result, _ = state.execute_chunk(sample, lambda seed, value: value, 1, latent["samples"], guider, None, latent, request)
+        audio_conditioning = {"cross_attn": torch.ones(1, 2, 3)}
+        result, _ = state.execute_chunk(sample, lambda seed, value: value, 1, latent["samples"], guider, None, latent, request, audio_conditioning=audio_conditioning)
+        self.assertIs(seen_conditioning[0], audio_conditioning)
         self.assertTrue(torch.equal(result["samples"].unbind()[1], clean))
         self.assertTrue(state.audio_teacher.receipt["published_clean_audio_exact_match"])
 

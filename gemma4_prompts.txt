@@ -33,6 +33,8 @@
 #                         Literal global [Shot N] labels with chunk-local At
 #                         timecodes which must be copied exactly.
 # {{previous_context}}      Exact previous sampled/output ranges, or first-chunk notice.
+# {{previous_audio_transcription}} Independent ASR of the previous teacher-audio chunk.
+# {{prompt_stage}}         Whether this request writes teacher audio or video conditioning.
 # {{previous_shots}}        Complete source shots intersecting the previous chunk.
 # {{frame_manifest}}        Chronological attached-image number to exact global frame mapping.
 # {{previous_gemma_description}}
@@ -96,7 +98,8 @@ The complete original prompt is authoritative for characters, identities, refere
 
 The immutable character-name table contains only names explicitly mapped to existing `<Subject N>` labels in the original prompt. Preserve that table unchanged. Whenever one of those character names appears in ordinary H3-facing descriptive prose, write it as `Name (<Subject N>)` beside the name. Do this for every occurrence outside dialogue so H3 keeps the intended identity binding. A speaker clause is a strict exception: for a mapped character, use MiniMax's direct speaker form `<Subject N> (Sx) says: <d>[Language] exact words</d>` (or `shouts:`/`replies:`), with `<Subject N>` immediately followed by `(Sx)`. Never write `Name (<Subject N>) (Sx)` as the speaker clause. You may establish the human name in a preceding non-dialogue sentence. Never add a subject label inside `<d>...</d>`, because dialogue words are immutable spoken content.
 
-When a planned dialogue interval crosses retained physical chunk ownership, its immutable preproduction `dialogue_segments` divide the original speech at natural word or clause boundaries. Include only the exact segment assigned to this retained slice in detailed_description. Never restore the complete source utterance, repeat words assigned to a previous chunk, or borrow words assigned to a later chunk. For a later segment, use the exact phrase `continues uninterrupted` outside `<d>`, then use the assigned partial `<d>...</d>` line. The synchronized continuation audio, when available, carries the prior delivery across the boundary. Every segment repeats the original language tag, but the spoken words across all segments concatenate to the original utterance exactly once.
+When a planned dialogue interval crosses retained physical chunk ownership, its preproduction `dialogue_segments` divide the original speech at natural word or clause boundaries. Use the exact segment assigned to this retained slice by default; adjust its boundary only when the independent transcription clearly establishes that prior audio spoke extra scripted words or omitted assigned scripted words. Never restore the complete source utterance, repeat words already spoken, or invent words. For a later segment, use the exact phrase `continues uninterrupted` outside `<d>`, then use the appropriate partial `<d>...</d>` line. The synchronized continuation audio, when available, carries the prior delivery across the boundary. Every segment repeats the original language tag, and the spoken words across all segments must follow the original utterance in order.
+When an independent transcription of the previous generated audio is supplied, use it as the evidence of which scripted words were actually spoken. Compare it with the scripted words at that boundary. If it clearly shows that H3 already spoke words assigned to this slice, omit those words here; if it clearly shows that assigned words were not spoken, carry only those exact source words forward. This audio evidence overrides the planned dialogue boundary in mandatory coverage, but does not change the source utterance or non-dialogue beats. Transcription can mishear speech, so leave uncertain boundaries unchanged and describe the uncertainty in analysis. When previous audio is attached, listen to its delivery, emotion, pitch, and cadence for continuity; do not use it to replace the transcript's words. Never invent or paraphrase source dialogue.
 
 The immutable global production bible contains one `voice_profile` for every stable `(Sx)` speaker. Repeat that profile verbatim outside `<d>` at every actual vocal event, including every continuation segment, so independent H3 chunks receive the same pitch, timbre, cadence, speaking rate, and accent instructions. Inside `<d>`, keep only the language tag and exact spoken content. Never attach an `At MM:SS.mmm,` cue to dialogue: MiniMax documents `At` only inside a supplied `[Shot N] At ...` real-cut marker.
 
@@ -135,6 +138,7 @@ Return exactly one JSON object:
 When the mandatory coverage block supplies IDs, return exactly one coverage object for each listed ID and no others. Its status must be `begins`, `continues`, or `completes`; never use `deferred` for a current-slice ID. Evidence must be a short exact phrase from detailed_description. If there are no mandatory IDs, return `"coverage": []`.
 
 [OBSERVATION]
+Prompt stage: {{prompt_stage}}. An audio request writes the next spoken words from the source plan and previous audio evidence. A video request also uses any attached previous stills.
 Prepare physical chunk {{chunk_number}} of {{chunk_count}} at {{fps}} fps.
 
 Current physical chunk:
@@ -159,6 +163,9 @@ H3 marker contract:
 
 Previous generated evidence:
 {{previous_context}}
+
+Previous generated audio transcription (independent ASR; spoken-word evidence; attached audio, when present, supplies delivery and emotion):
+{{previous_audio_transcription}}
 
 Source-shot coverage in that previous chunk:
 {{previous_shots}}
@@ -226,6 +233,7 @@ Complete unchanged user prompt:
 Reply with exactly `{"status":"preproduction memory loaded"}`. Do not write an H3 detailed_description yet.
 
 [CACHED_OBSERVATION]
+Prompt stage: {{prompt_stage}}. An audio request writes the next spoken words from the source plan and previous audio evidence. A video request also uses any attached previous stills.
 Prepare physical chunk {{chunk_number}} of {{chunk_count}} at {{fps}} fps using the immutable preproduction memory already established above.
 
 Current physical chunk:
@@ -250,6 +258,9 @@ H3 marker contract:
 
 Previous generated evidence:
 {{previous_context}}
+
+Previous generated audio transcription (independent ASR; spoken-word evidence; attached audio, when present, supplies delivery and emotion):
+{{previous_audio_transcription}}
 
 Source-shot coverage in that previous chunk:
 {{previous_shots}}

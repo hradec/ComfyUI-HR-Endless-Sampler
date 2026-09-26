@@ -1,0 +1,24 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const source = fs.readFileSync(`${__dirname}/../web/finished_video_player.js`, 'utf8');
+const start = source.indexOf('function renderSubtitles() {');
+const end = source.indexOf('\n            subtitleButton.addEventListener', start);
+assert.ok(start >= 0 && end > start);
+const render = new Function('currentFrame', 'containing', 'timeline', 'isCompareNode', 'state', 'compareState', 'compareSourceFps', 'media', 'subtitlesEnabled', 'subtitleLabels', 'subtitleButton', `${source.slice(start, end)}\nrenderSubtitles();`);
+const label = () => ({textContent: '', title: '', style: {}});
+const labels = [label(), label()];
+const button = {style: {}, setAttribute(name, value) { this[name] = value; }};
+const timeline = {chunks: [{start: 0, end: 9, subtitle: 'Primary line'}]};
+const compare = {chunks: [{start: 0, end: 9, subtitle: 'Compared line'}]};
+const containing = (chunks, frame) => chunks.find(chunk => frame >= chunk.start && frame <= chunk.end);
+const draw = (enabled, compareActive) => render(() => 4, containing, timeline, true, {compare_media_url: compareActive ? '/compare.mp4' : '', compare_timeline: compare}, null, 24, {currentTime: 4 / 24}, enabled, labels, button);
+
+draw(true, true);
+assert.equal(labels[0].textContent, 'Primary line');
+assert.equal(labels[1].textContent, 'Compared line');
+assert.equal(labels[1].style.display, 'block');
+draw(false, true);
+assert.equal(labels[0].textContent, '');
+assert.equal(labels[1].style.display, 'none');
+assert.equal(button['aria-pressed'], 'false');
+console.log('Finished-video subtitle checks passed.');

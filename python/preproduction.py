@@ -5,6 +5,7 @@ plan_timing(request, progress_callback), direct(request, frames, progress_callba
 and materialize_preproduction_cache(request, plan, progress_callback), using the
 existing structured plan/prompt results. Runtime tensors stay in render_context,
 never in the JSON request sent to a disposable inference worker.
+The direct request names its ``prompt_stage`` as ``audio`` or ``video``.
 """
 
 from comfy_api.latest import io
@@ -83,8 +84,10 @@ class LegacyChunkPrompts:
             result.append(parts[index + 1].strip())
         return result
 
-    def get_chunk_prompt(self, number):
-        """Return the full user-authored prompt without its separator."""
+    def get_chunk_prompt(self, number, previous_audio_transcription=None, prompt_stage="video"):
+        """Return authored text for either stage without editing it."""
+        if prompt_stage not in ("audio", "video"):
+            raise ValueError("Chunk prompt stage must be audio or video")
         prompts = self.prompts()
         if number < 1 or number > len(prompts):
             raise ValueError("No manual prompt for Chunk %d; regenerate prompts for the current duration." % number)
@@ -148,7 +151,7 @@ class HREndlessLegacyPromptBake(io.ComfyNode):
         picture_number = 1 + sum(ref["kind"] == "image" for ref in refs)
         video_ref = duration > 0 and not masked and not taomate and nodes.INCLUDE_VIDEO1_REFERENCE
         audio_ref = duration > 0 and not masked and not taomate
-        planned = nodes._planned_chunk_prompts(prompt, plan, plan, fps, duration if physical else 0, video_ref, audio_ref, bool(refs), video_number, audio_number, legacy=True, taomate=taomate)
+        planned = nodes._planned_chunk_prompts(prompt, plan, plan, fps, duration if physical else 0, video_ref, audio_ref, bool(refs), video_number, audio_number, legacy=True)
         prompts = []
         for index, (local, _) in enumerate(planned):
             continuation = index > 0

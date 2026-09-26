@@ -236,11 +236,17 @@ def normalize_timeline(timeline, *, fps: float, total_frames: int) -> dict:
         h3_prompt = item.get("h3_prompt")
         if isinstance(h3_prompt, str) and h3_prompt.strip():
             chunk["h3_prompt"] = h3_prompt.strip()
+        teacher_prompt = item.get("audio_teacher_prompt")
+        if isinstance(teacher_prompt, str) and teacher_prompt.strip():
+            chunk["audio_teacher_prompt"] = teacher_prompt.strip()
         if isinstance(description, str) and description.strip():
             chunk["gemma_detailed_description"] = description.strip()
         retention_analysis = item.get("gemma_retention_analysis")
         if isinstance(retention_analysis, str) and retention_analysis.strip():
             chunk["gemma_retention_analysis"] = retention_analysis.strip()
+        subtitle = item.get("subtitle")
+        if isinstance(subtitle, str) and subtitle.strip():
+            chunk["subtitle"] = " ".join(subtitle.splitlines()).strip()
         for key in (
             "h3_render_seconds",
             "gemma_seconds",

@@ -1,5 +1,13 @@
 # External dependencies and update checks
 
+- 2026-09-25 (dialogue-cut commit check): rechecked [llama.cpp #27439](https://github.com/ggml-org/llama.cpp/issues/27439) through the GitHub API; it is still `open` with labels `bug-unconfirmed` and `stale`, zero comments, last updated 2026-09-20. PyPI's JSON API still reports `0.3.35` (uploaded 2026-08-17) as the newest `llama-cpp-python`, so no new package exists to inspect for the MTP fix and the recorded 0.3.35 vendoring is unchanged. The disposable MTP worker and the operation-local non-MTP retry are preserved unchanged. The only new runtime package in this commit is `openai-whisper`, used to transcribe generated teacher audio locally; it vendors no llama.cpp.
+
+- 2026-09-25 (Gemma audio input follow-up): [llama.cpp #27439](https://github.com/ggml-org/llama.cpp/issues/27439) is still open, and the [latest upstream llama-cpp-python release](https://github.com/abetlen/llama-cpp-python/releases) remains `v0.3.35-hip-radeon`; preserve the disposable worker and operation-local non-MTP retry. The installed JamePeng Gemma4 MTMD handler accepts `audio_url`, and the local 12B mmproj declares an audio encoder; the current project wrapper previously supplied only images and text. Direct WAV audio input is now wired for decoded teacher-audio observations, pending live-render validation.
+
+- 2026-09-25 (Gemma audio-transcript request check): [llama.cpp #27439](https://github.com/ggml-org/llama.cpp/issues/27439) remains open; [llama-cpp-python releases](https://github.com/abetlen/llama-cpp-python/releases) still list `v0.3.35-hip-radeon` as latest, with the previously recorded `v0.3.35` vendored llama.cpp commit `4df29be4f4c3673f428170fda944a5b19f743bb8`. Preserve the operation-local non-MTP retry and disposable worker.
+
+- 2026-09-24 (Gemma prompt path check): [llama.cpp #27439](https://github.com/ggml-org/llama.cpp/issues/27439) remains open; the [latest abetlen llama-cpp-python release](https://github.com/abetlen/llama-cpp-python/releases) remains `v0.3.35-hip-radeon`, with the previously recorded `v0.3.35` vendored llama.cpp commit `4df29be4f4c3673f428170fda944a5b19f743bb8`. No fixed runtime is available. Preserve the disposable-worker, operation-local non-MTP retry.
+
 - 2026-09-20 (TaoMate KV cache codecs): added sampler-selected `none`, `zstd lossless`, `int8`, and `turboquant` cache representations without a new runtime package. `turboquant` uses the 128-wide 4-bit MSE TurboQuant rotation/codebook method described in arXiv:2504.19874 and cross-checked against MIT-licensed `jorgebmann/pyturboquant` at its then-current main branch. It quantizes on GPU before CPU transfer and reconstructs one current H3 attention layer on GPU. The current SDPA path consumes reconstructed K/V, so it deliberately does not store TurboQuant's QJL residual: that residual only helps a fused approximate-inner-product attention implementation. This mode is lossy and experimental; retain `zstd lossless` for exact continuity comparisons.
 
 - 2026-09-19 (TaoMate audio/publication audit): fetched upstream main; it remains
@@ -501,6 +509,14 @@ decoder. Preserve the typed early handoff until upstream MTP is reliable.
   pass target-only and MTP multimodal capture replays, full worker teardown,
   32K-context memory checks, correction turns, and captured Chunk 2 before it
   can replace the existing path or its fallback.
+- 2026-09-23 (chunk-prompt allocation revert session): rechecked issue #27439
+  through the GitHub API; it remains `open`, labeled `bug-unconfirmed` and
+  `stale`, with zero comments and last updated 2026-09-20. PyPI's JSON API still
+  reports `0.3.35` (uploaded 2026-08-17) as the newest `llama-cpp-python`
+  release, so no new package exists to inspect for a fix and the previously
+  recorded 0.3.35 vendoring (llama.cpp `4df29be4f`/`adb55e514`) is unchanged.
+  Nothing to update; the disposable MTP worker and the operation-local non-MTP
+  retry are preserved unchanged.
 
 ## TaoMate-H3 streaming core (2026-09-18)
 
@@ -534,6 +550,16 @@ and throughput still need validation.
   preserving request-level text/reference positions while target AV advances.
   Manual prompt generation and dialogue timing share this request plan. Output
   decoding occurs after assembling the request, with its transport halo.
+
+- Prompt-allocation revert (2026-09-23): the one-sentence-per-chunk dialogue
+  allocator that used `sentence_word_owners` in the now-deleted
+  `python/dialogue_timing.py` is gone. `_legacy_dialogue_for_range` is back to
+  splitting the utterance proportionally across the chunk clock, so a seam may
+  fall inside a sentence again, for every continuation method including TaoMate;
+  the `sentence_chunks`/`taomate=` plumbing was removed rather than defaulted
+  off, so no per-method fork remains. This is planner-local: no vendored
+  TaoMate file, request-plan geometry, or upstream revision changes, and no
+  upstream update is needed.
 
 - TaoMate audio-teacher integration: copied upstream model/architecture.py and
   model/packed_sequence.py unchanged, and model/denoise.py with only its

@@ -60,6 +60,8 @@ def _cache_payload(payload):
                 "complete": None,
                 "phase": None,
                 "chunks": {},
+                "audio_first": None,
+                "audio_chunks": [],
                 "deltas": [],
                 "step_times": [],
             }
@@ -87,7 +89,7 @@ def _cache_payload(payload):
                     values[step - 1] = payload.get(source)
         elif action == "phase":
             state["phase"] = payload.copy()
-        elif action in ("chunk", "chunk_final"):
+        elif action in ("chunk", "chunk_final", "chunk_audio_first"):
             chunk_index = int(payload["chunk"])
             cached_chunk = state["chunks"].get(chunk_index)
             # Full-VAE frames and their decoded audio are authoritative for a
@@ -98,7 +100,20 @@ def _cache_payload(payload):
             if action == "chunk" and cached_chunk is not None \
                     and cached_chunk.get("action") == "chunk_final":
                 return
+            if action == "chunk_audio_first" and cached_chunk is not None \
+                    and cached_chunk.get("action") in ("chunk", "chunk_final"):
+                if cached_chunk.get("action") == "chunk":
+                    for key in ("audio", "audio_mime", "audio_sample_rate"):
+                        if key in payload:
+                            cached_chunk[key] = payload[key]
+                return
             state["chunks"][chunk_index] = payload.copy()
+        elif action == "audio_first":
+            state["audio_first"] = payload.copy()
+        elif action == "audio_chunk_complete":
+            chunk_index = int(payload["chunk"])
+            if chunk_index not in state["audio_chunks"]:
+                state["audio_chunks"].append(chunk_index)
         elif action == "chunk_audio_update":
             chunk_index = int(payload["chunk"])
             cached_chunk = state["chunks"].get(chunk_index)
@@ -132,7 +147,15 @@ def _cache_payload(payload):
                 h3_prompt = payload.get("h3_prompt")
                 if isinstance(h3_prompt, str) and h3_prompt.strip():
                     chunk_ranges[chunk_index]["h3_prompt"] = h3_prompt.strip()
+                audio_prompt = payload.get("audio_teacher_prompt")
+                if isinstance(audio_prompt, str) and audio_prompt.strip():
+                    chunk_ranges[chunk_index]["audio_teacher_prompt"] = audio_prompt.strip()
+                subtitle = payload.get("subtitle")
+                if isinstance(subtitle, str):
+                    chunk_ranges[chunk_index]["subtitle"] = subtitle
                 for key in (
+                    "audio_retry_start_ms",
+                    "audio_retry_end_ms",
                     "taomate_completed_frames",
                     "taomate_completed_phases",
                     "h3_render_seconds",
@@ -166,6 +189,8 @@ def _cached_snapshot(node_id):
             "complete": None if state["complete"] is None else state["complete"].copy(),
             "phase": None if state["phase"] is None else state["phase"].copy(),
             "chunks": [state["chunks"][index].copy() for index in sorted(state["chunks"])],
+            "audio_first": None if state.get("audio_first") is None else state["audio_first"].copy(),
+            "audio_chunks": list(state.get("audio_chunks", [])),
             "deltas": list(state["deltas"]),
             "step_times": list(state["step_times"]),
         }
@@ -538,9 +563,14 @@ class _PreviewExecution:
                 h3_prompt,
             )
 
-    def set_phase(self, phase, *, chunk=None):
+    def set_phase(self, phase, *, chunk=None, audio_step_ms=None):
         for wrapper, execution_id in self.items:
-            wrapper.set_phase(execution_id, phase, chunk=chunk)
+            wrapper.set_phase(execution_id, phase, chunk=chunk, audio_step_ms=audio_step_ms)
+
+    def set_audio_prompt(self, chunk, prompt, subtitle):
+        """Publish the prompt actually used by a teacher chunk before video exists."""
+        for wrapper, execution_id in self.items:
+            _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk, "h3_prompt": prompt, "audio_teacher_prompt": prompt, "subtitle": subtitle})
 
     def set_subchunk(self, index, start, end, temporal_offset, subchunk_number):
         """Set the current TaoMate phase without resetting its five-second group."""
@@ -552,6 +582,17 @@ class _PreviewExecution:
         """Publish frame-exact TaoMate completion through restorable metadata."""
         for wrapper, execution_id in self.items:
             _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk, "taomate_completed_frames": completed_frames, "taomate_completed_phases": completed_phases})
+
+    def set_audio_chunk_complete(self, chunk):
+        """Mark teacher audio ready for one timeline chunk, including reconnect state."""
+        for wrapper, execution_id in self.items:
+            _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "audio_chunk_complete", "chunk": int(chunk)})
+
+    def set_audio_retry(self, chunk, finished=False):
+        """Persist retry wall-clock boundaries so ETA can exclude them after reload."""
+        for wrapper, execution_id in self.items:
+            key = "audio_retry_end_ms" if finished else "audio_retry_start_ms"
+            _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": int(chunk), key: wrapper._elapsed_ms()})
 
     def restore_chunks(self, chunks, latent_format):
         """Rebuild completed replay chunks before new sampling resumes."""
@@ -605,6 +646,16 @@ class _PreviewExecution:
         """Publish slices of the final continuous audio decode to existing chunks."""
         for wrapper, execution_id in self.items:
             wrapper.replace_audio_timeline(execution_id, waveform, sample_rate, ranges, fps)
+
+    def publish_audio_first(self, waveform, sample_rate):
+        """Make the complete audio timeline playable while the preview is black."""
+        for wrapper, execution_id in self.items:
+            wrapper.publish_audio_first(execution_id, waveform, sample_rate)
+
+    def publish_chunk_audio_first(self, index, waveform, sample_rate, output_start, output_end):
+        """Publish a teacher audio segment before its video chunk starts."""
+        for wrapper, execution_id in self.items:
+            wrapper.publish_chunk_audio_first(execution_id, index, waveform, sample_rate, output_start, output_end)
 
     def replace_video_tail(self, index, frames, output_start, output_end, *,
                            gemma_detailed_description=None, gemma_retention_analysis=None):
@@ -710,7 +761,7 @@ class _AccumulatedPreviewWrapper:
         })
         return self.execution_id
 
-    def set_phase(self, execution_id, phase, *, chunk=None):
+    def set_phase(self, execution_id, phase, *, chunk=None, audio_step_ms=None):
         if execution_id != self.execution_id:
             return
         payload = {
@@ -722,6 +773,8 @@ class _AccumulatedPreviewWrapper:
         }
         if chunk is not None:
             payload["chunk"] = int(chunk)
+        if audio_step_ms is not None:
+            payload["audio_step_ms"] = float(audio_step_ms)
         _send(payload)
 
     def set_chunk(self, execution_id, index, sampled_start, sampled_end, output_start, output_end, trim_steps,
@@ -968,6 +1021,39 @@ class _AccumulatedPreviewWrapper:
                 "audio_mime": "audio/wav",
                 "audio_sample_rate": int(sample_rate),
             })
+
+    def publish_audio_first(self, execution_id, waveform, sample_rate):
+        """Publish the complete decoded teacher audio before any video frames."""
+        if execution_id != self.execution_id:
+            return
+        _send({
+            "node_id": self.node_id,
+            "action": "audio_first",
+            "execution": execution_id,
+            "audio": _encode_audio_wav(waveform, sample_rate),
+            "audio_mime": "audio/wav",
+            "audio_sample_rate": int(sample_rate),
+            "fps": self.fps,
+            "elapsed_ms": self._elapsed_ms(),
+        })
+
+    def publish_chunk_audio_first(self, execution_id, index, waveform, sample_rate, output_start, output_end):
+        """Publish one decoded teacher segment before its video chunk starts."""
+        if execution_id != self.execution_id:
+            return
+        _send({
+            "node_id": self.node_id,
+            "action": "chunk_audio_first",
+            "execution": execution_id,
+            "chunk": int(index),
+            "output_start": int(output_start),
+            "output_end": int(output_end),
+            "fps": self.fps,
+            "audio": _encode_audio_wav(waveform, sample_rate),
+            "audio_mime": "audio/wav",
+            "audio_sample_rate": int(sample_rate),
+            "elapsed_ms": self._elapsed_ms(),
+        })
 
     def replace_audio_tail(self, execution_id, index, waveform, sample_rate):
         """Replace finalized preview audio immediately before one chunk.

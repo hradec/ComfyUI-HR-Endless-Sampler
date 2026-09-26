@@ -443,12 +443,14 @@ plus peak RAM and VRAM use.
 
 - The released backend currently supports MiniMax H3 only.
 - Multi-chunk H3 rendering needs the H3 video VAE.
+- TaoMate dialogue feedback needs the H3 audio VAE to decode and transcribe each teacher chunk.
 - Chunked denoise masks are not supported.
 - The sampler can reconstruct image and audio Ref2VA inputs. It cannot turn an
   image input back into an original video Ref2VA source.
-- Gemma observes generated video frames, not generated audio. It preserves
-  dialogue and sound instructions from the source prompt, but does not judge
-  the resulting soundtrack.
+- TaoMate requests separate `audio` and `video` prompts. In full audio-first
+  mode, audio requests receive prior decoded teacher audio and its transcript;
+  video requests also receive previous rendered stills. In per-chunk mode,
+  both requests can receive prior audio, transcript, and rendered stills.
 
 ## TIPS TO RENDER 1080p with 16GB of VRAM:  
  - These tips are from my workflow using ref2va with 5 images at 720p resolution as reference. 

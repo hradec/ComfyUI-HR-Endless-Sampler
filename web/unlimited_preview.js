@@ -137,7 +137,7 @@ function createColoredChunkTooltip() {
     }
 
     return {
-        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, showFullPrompt, shotRanges, colors, waitingText }) {
+        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, teacherAudioPrompt, showFullPrompt, shotRanges, colors, waitingText }) {
             tooltip.replaceChildren();
             line(help, "color:#999;margin-bottom:6px;");
             const chunkNumber = Number(chunk.chunk) || 1;
@@ -152,9 +152,17 @@ function createColoredChunkTooltip() {
                 line("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
                 line(retentionAnalysis, "color:#d8c7a0;");
             }
-            line(showFullPrompt ? "Full prompt sent to H3:" : "chunk detailed_description:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
-            const text = showFullPrompt ? fullPrompt : description;
-            if (text) {
+            const prompts = showFullPrompt
+                ? teacherAudioPrompt && teacherAudioPrompt !== fullPrompt
+                    ? [["Audio prompt:", teacherAudioPrompt], ["Video prompt:", fullPrompt]]
+                    : [[teacherAudioPrompt ? "Chunk prompt (audio and video):" : "Chunk prompt:", fullPrompt || teacherAudioPrompt]]
+                : [["chunk detailed_description:", description]];
+            for (const [label, text] of prompts) {
+                line(label, "color:#bbb;margin-top:7px;margin-bottom:2px;");
+                if (!text) {
+                    line(waitingText, "color:#888;");
+                    continue;
+                }
                 const prompt = document.createElement("div");
                 for (const segment of coloredShotPromptSegments(text, chunk, shotRanges, colors)) {
                     // H3 dialogue tags remain literal text; only their presentation changes.
@@ -170,8 +178,6 @@ function createColoredChunkTooltip() {
                     }
                 }
                 tooltip.appendChild(prompt);
-            } else {
-                line(waitingText, "color:#888;");
             }
             tooltip.style.display = "block";
             position(event);
@@ -297,11 +303,11 @@ function formatEta(seconds) {
 }
 
 
-function projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaSeconds=NaN) {
+function projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaSeconds=NaN, rateElapsedSeconds=elapsedSeconds) {
     // Estimate remaining and total wall time from completed planned work units.
     const fraction = workTotal > 0 ? Math.max(0, Math.min(1, workDone / workTotal)) : NaN;
-    const etaSeconds = Number.isFinite(elapsedSeconds) && fraction > 0
-        ? elapsedSeconds * (1 - fraction) / fraction
+    const etaSeconds = Number.isFinite(rateElapsedSeconds) && fraction > 0
+        ? Math.max(0, rateElapsedSeconds) * (1 - fraction) / fraction
         : fallbackEtaSeconds;
     return {
         etaSeconds,
@@ -483,6 +489,42 @@ app.registerExtension({
             linearDisplayButton.style.cssText = "position:absolute;right:8px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#aaa;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:2;";
             viewport.appendChild(linearDisplayButton);
 
+            const subtitleButton = document.createElement("button");
+            subtitleButton.type = "button";
+            subtitleButton.textContent = "S";
+            subtitleButton.title = "Turn dialogue subtitles on or off";
+            subtitleButton.setAttribute("aria-label", subtitleButton.title);
+            subtitleButton.style.cssText = "position:absolute;right:34px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#eee;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:2;";
+            viewport.appendChild(subtitleButton);
+            const subtitleLabel = document.createElement("div");
+            subtitleLabel.style.cssText = "position:absolute;left:7%;right:7%;bottom:27px;z-index:3;text-align:center;color:#fff;font:bold 18px/1.25 sans-serif;-webkit-text-stroke:1px #000;text-shadow:1px 1px 0 #000,-1px -1px 0 #000,1px 1px 0 #000,-1px 1px 0 #000,0 2px 4px #000;pointer-events:none;user-select:none;display:none;";
+            viewport.appendChild(subtitleLabel);
+
+            const fullscreenButton = document.createElement("button");
+            fullscreenButton.type = "button";
+            fullscreenButton.textContent = "⛶";
+            fullscreenButton.title = "Enter fullscreen";
+            fullscreenButton.setAttribute("aria-label", "Enter fullscreen");
+            fullscreenButton.style.cssText = "position:absolute;right:60px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#ddd;font:bold 15px/18px sans-serif;cursor:pointer;z-index:2;";
+            viewport.appendChild(fullscreenButton);
+
+            function updateFullscreenButton() {
+                const active = document.fullscreenElement === root;
+                fullscreenButton.textContent = active ? "×" : "⛶";
+                fullscreenButton.title = active ? "Exit fullscreen (Esc)" : "Enter fullscreen";
+                fullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
+            }
+
+            const fullscreenChanged = () => updateFullscreenButton();
+            document.addEventListener("fullscreenchange", fullscreenChanged);
+            fullscreenButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (document.fullscreenElement === root) document.exitFullscreen?.();
+                else if (root.requestFullscreen) root.requestFullscreen().catch(error => console.warn("HR Endless Sampler fullscreen failed", error));
+                root.focus({ preventScroll: true });
+            });
+
             const transport = document.createElement("div");
             transport.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;height:43px;padding:4px 8px;background:#181818;border-top:1px solid #242424;";
             root.appendChild(transport);
@@ -494,6 +536,12 @@ app.registerExtension({
             playButton.title = "Play/pause (Space). Use Left/Right arrows for one preview frame.";
             transport.appendChild(playButton);
 
+            const muteButton = document.createElement("button");
+            muteButton.type = "button";
+            muteButton.style.cssText = "display:flex;flex:0 0 auto;align-items:center;justify-content:center;width:23px;height:19px;padding:0;border:1px solid #555;border-radius:3px;background:#252525;color:#f4f4f4;font:13px/1 sans-serif;cursor:pointer;";
+            muteButton.title = "Mute/unmute finalized preview audio (M)";
+            transport.appendChild(muteButton);
+
             const timelineHelp = "Click or drag to seek; colors identify chunks. Hold Shift to show the full prompt sent to H3.";
             const timelineShell = document.createElement("div");
             timelineShell.style.cssText = "position:relative;flex:1;height:33px;cursor:pointer;touch-action:none;";
@@ -503,6 +551,10 @@ app.registerExtension({
             const timelineTrack = document.createElement("div");
             timelineTrack.style.cssText = "position:absolute;left:0;right:0;top:3px;height:5px;border-radius:3px;background:#333;box-shadow:0 0 0 1px #080808,0 1px 2px #000;overflow:hidden;";
             timelineShell.appendChild(timelineTrack);
+
+            const audioCompletedOutlines = document.createElement("div");
+            audioCompletedOutlines.style.cssText = "position:absolute;left:0;right:0;top:1px;height:9px;z-index:2;pointer-events:none;";
+            timelineShell.appendChild(audioCompletedOutlines);
 
             const cachedChunkUnderlines = document.createElement("div");
             cachedChunkUnderlines.style.cssText = "position:absolute;left:0;right:0;top:10px;height:2px;z-index:2;pointer-events:none;";
@@ -519,12 +571,6 @@ app.registerExtension({
             const shotBrackets = document.createElement("div");
             shotBrackets.style.cssText = "position:absolute;left:0;right:0;top:13px;height:19px;pointer-events:none;overflow:hidden;";
             timelineShell.appendChild(shotBrackets);
-
-            const muteButton = document.createElement("button");
-            muteButton.type = "button";
-            muteButton.style.cssText = "display:flex;flex:0 0 auto;align-items:center;justify-content:center;width:23px;height:19px;padding:0;border:1px solid #555;border-radius:3px;background:#252525;color:#f4f4f4;font:13px/1 sans-serif;cursor:pointer;";
-            muteButton.title = "Mute/unmute finalized preview audio (M)";
-            transport.appendChild(muteButton);
 
             const transportFrame = document.createElement("div");
             transportFrame.style.cssText = "min-width:62px;text-align:right;color:#aaa;font:10px/1 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;";
@@ -814,6 +860,7 @@ app.registerExtension({
             let activeSubchunk = null;
             let chunks = [];
             let chunkRanges = [];
+            let audioCompletedChunks = new Set();
             let shotRanges = [];
             let timelineTotalFrames = 0;
             let shotBracketKey = null;
@@ -822,6 +869,7 @@ app.registerExtension({
             let timer = null;
             let playbackSerial = 0;
             let framePending = false;
+            let waitingAfterChunk = null;
             let paused = false;
             let timelineDragging = false;
             let sigmas = [];
@@ -843,6 +891,8 @@ app.registerExtension({
             let fpsWidget = null;
             let startedAt = null;
             let completedElapsed = null;
+            let audioFirstSeconds = null;
+            let audioStepMs = null;
             let elapsedTimer = null;
             let complete = false;
             let statusProgressAnimation = null;
@@ -860,6 +910,7 @@ app.registerExtension({
             let standbyAudioGroup = null;
             let audioMuted = Boolean(savedPlayerState.muted);
             let inverseGammaDisplay = Boolean(savedPlayerState.inverseGammaDisplay);
+            let subtitlesEnabled = savedPlayerState.subtitlesEnabled !== false;
             let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame)
                 ? savedPlayerState.frame : null;
             let pendingAudioSources = new Map();
@@ -913,15 +964,19 @@ app.registerExtension({
                     const buffer = decodedAudio.get(next.audioSource);
                     if (!buffer) break;
                     const rate = Math.max(0.0625, Math.min(16, currentPlaybackFps() / (validFps(next.sourceFps) || validFps(sourceFps) || 24)));
-                    const offset = next === group ? audioOffset(group, frameIndex) : 0;
+                    const offset = next === group ? audioOffset(group, frameIndex) : audioOffset(next, 0);
                     if (offset >= buffer.duration) break;
                     const source = continuousAudioContext.createBufferSource();
                     source.buffer = buffer;
                     source.playbackRate.value = rate;
                     source.connect(continuousAudioGain);
                     start = Math.max(start, continuousAudioContext.currentTime);
-                    const end = start + (buffer.duration - offset) / rate;
-                    source.start(start, offset);
+                    const segmentEnd = Number(next.audioEndSeconds);
+                    const playableEnd = Number.isFinite(segmentEnd) ? Math.min(buffer.duration, segmentEnd) : buffer.duration;
+                    if (playableEnd <= offset) break;
+                    const duration = (playableEnd - offset) / rate;
+                    const end = start + duration;
+                    source.start(start, offset, duration);
                     continuousAudio.push({ group: next, url: next.audioSource, source, start, end, offset, rate });
                     start = end;
                 }
@@ -933,6 +988,7 @@ app.registerExtension({
                 if (timer != null) clearTimeout(timer);
                 timer = null;
                 framePending = false;
+                waitingAfterChunk = null;
                 playbackSerial++;
                 audioPlayer.pause();
                 stopContinuousAudio();
@@ -969,12 +1025,13 @@ app.registerExtension({
 
             function audioOffset(group, frameIndex) {
                 const source = validFps(group?.sourceFps) || validFps(sourceFps) || 24;
+                const timelineOffset = Number(group?.audioStartSeconds) || 0;
                 const first = Number(group?.frameNumbers?.[0]);
                 const current = Number(group?.frameNumbers?.[frameIndex]);
                 if (Number.isFinite(first) && Number.isFinite(current)) {
-                    return Math.max(0, (current - first) / source);
+                    return Math.max(0, timelineOffset + (current - first) / source);
                 }
-                return Math.max(0, Number(frameIndex) || 0) / source;
+                return Math.max(0, timelineOffset + (Number(frameIndex) || 0) / source);
             }
 
             function syncAudio(group, frameIndex, shouldPlay, serial, forceSeek=false) {
@@ -987,7 +1044,7 @@ app.registerExtension({
                     return;
                 }
                 let sourceChanged = false;
-                if (audioGroup !== group) {
+                if (audioGroup !== group || audioPlayer.getAttribute("src") !== source) {
                     audioPlayer.pause();
                     if (standbyAudioGroup === group && audioStandbyPlayer.readyState >= 1) {
                         const previousPlayer = audioPlayer;
@@ -1054,7 +1111,7 @@ app.registerExtension({
                 // Retain a restored target until its chunk arrives from the server.
                 if (Number.isFinite(pendingFrame) && frame !== pendingFrame) return;
                 node.properties = node.properties || {};
-                node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay };
+                node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled };
             }
 
             function restorePersistedFrame() {
@@ -1067,7 +1124,7 @@ app.registerExtension({
                         const frame = pendingFrame;
                         pendingFrame = null;
                         show(chunkIndex, frameIndex);
-                        node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay };
+                        node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled };
                         return true;
                     }
                 }
@@ -1083,6 +1140,25 @@ app.registerExtension({
                 muteButton.style.color = audioMuted ? "#999" : "#f4f4f4";
                 muteButton.style.background = audioMuted ? "#1d1d1d" : "#252525";
             }
+
+            function renderSubtitles() {
+                const text = subtitlesEnabled ? String(chunkRanges[playing]?.subtitle || "").trim() : "";
+                subtitleLabel.textContent = text;
+                subtitleLabel.style.display = text ? "block" : "none";
+                subtitleButton.style.color = subtitlesEnabled ? "#ffe600" : "#888";
+                subtitleButton.style.background = subtitlesEnabled ? "rgba(70,58,12,.95)" : "rgba(28,28,28,.9)";
+                subtitleButton.setAttribute("aria-pressed", String(subtitlesEnabled));
+            }
+
+            subtitleButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                subtitlesEnabled = !subtitlesEnabled;
+                renderSubtitles();
+                persistPlayerState();
+                root.focus({ preventScroll: true });
+            });
+            renderSubtitles();
 
             function setAudioMuted(value) {
                 audioMuted = Boolean(value);
@@ -1227,9 +1303,10 @@ app.registerExtension({
                 const description = chunkPromptDescription(range);
                 const retentionAnalysis = String(range.gemma_retention_analysis || "").trim();
                 const fullPrompt = String(range.h3_prompt || "").trim();
+                const teacherAudioPrompt = String(range.audio_teacher_prompt || "").trim();
                 const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);
                 const timing = chunkTimingLines(range);
-                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, showFullPrompt, timing, shotRanges]);
+                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, teacherAudioPrompt, showFullPrompt, timing, shotRanges]);
                 if (tooltipChunkIndex === index && tooltipSignature === signature) {
                     chunkTooltip.move(event);
                     return;
@@ -1243,6 +1320,7 @@ app.registerExtension({
                     description,
                     retentionAnalysis,
                     fullPrompt,
+                    teacherAudioPrompt,
                     showFullPrompt,
                     shotRanges,
                     colors: chunkColors,
@@ -1323,6 +1401,7 @@ app.registerExtension({
             }
 
             function renderTransport() {
+                renderSubtitles();
                 const entries = flatFrames();
                 const showPlay = paused || !entries.length;
                 playButton.textContent = showPlay ? "▶" : "❚❚";
@@ -1336,6 +1415,20 @@ app.registerExtension({
                 const { spans, total } = timelineLayout();
                 let offset = 0;
                 const stops = [];
+                audioCompletedOutlines.replaceChildren();
+                let audioCompletedSpan = 0;
+                let audioCompletedCount = 0;
+                while (audioCompletedChunks.has(audioCompletedCount) && audioCompletedCount < spans.length) {
+                    audioCompletedSpan += spans[audioCompletedCount];
+                    audioCompletedCount++;
+                }
+                if (audioCompletedCount > 0) {
+                    const outline = document.createElement("div");
+                    outline.title = `Audio teacher complete · chunks 1–${audioCompletedCount}`;
+                    outline.style.cssText = `position:absolute;left:0;width:${audioCompletedSpan / total * 100}%;top:0;height:9px;box-sizing:border-box;border:1px solid #42c8ff;border-radius:2px;`;
+                    if (audioCompletedCount < spans.length) outline.style.cssText += "border-right:0;border-top-right-radius:0;border-bottom-right-radius:0;";
+                    audioCompletedOutlines.appendChild(outline);
+                }
                 for (let index = 0; index < spans.length; index++) {
                     const start = offset / total * 100;
                     offset += spans[index];
@@ -1344,7 +1437,7 @@ app.registerExtension({
                     const completedFrames = chunkRanges[index]?.taomate_completed_frames;
                     if (Number.isFinite(completedFrames)) {
                         // A live latent preview makes its current sub-chunk available before completion.
-                        const previewFrames = available(index)
+                        const previewFrames = available(index) && !chunks[index].audioOnlyPlaceholder
                             ? Math.max(0, (Number(chunks[index].outputEnd) + 1) - Number(chunkRanges[index]?.start)) || 0
                             : 0;
                         const fraction = Math.max(0, Math.min(1, Math.max(completedFrames, previewFrames) / spans[index]));
@@ -1354,7 +1447,7 @@ app.registerExtension({
                         if (fraction < 1) stops.push(`${pendingColor} ${boundary}%`, `${pendingColor} ${end}%`);
                         continue;
                     }
-                    const alpha = available(index) ? "e8" : "35";
+                    const alpha = available(index) && !chunks[index].audioOnlyPlaceholder ? "e8" : "35";
                     stops.push(`${color}${alpha} ${start}%`, `${color}${alpha} ${end}%`);
                 }
                 timelineTrack.style.background = stops.length
@@ -1424,8 +1517,16 @@ app.registerExtension({
                 const continuousTime = continuousAudioTime(group);
                 if (continuousTime != null || (group.audioSource && audioGroup === group && !audioPlayer.paused && audioPlayer.readyState >= 1)) {
                     const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
-                    const nextMediaTime = (boundedFrame + 1) / sourceRate;
-                    const wallDelay = (nextMediaTime - (continuousTime ?? audioPlayer.currentTime)) * 1000 / Math.max(0.0625, currentPlaybackFps() / sourceRate);
+                    const firstFrame = Number(group.outputStart);
+                    const currentFrame = Number(group.frameNumbers?.[boundedFrame]);
+                    const nextFrame = Number(group.frameNumbers?.[boundedFrame + 1]);
+                    const nextMediaTime = Number.isFinite(firstFrame) && Number.isFinite(nextFrame)
+                        ? (nextFrame - firstFrame) / sourceRate
+                        : Number.isFinite(firstFrame) && Number.isFinite(currentFrame)
+                            ? (currentFrame - firstFrame) / sourceRate + (Number(group.durations?.[boundedFrame]) || 1000 / sourceRate) / 1000
+                            : (boundedFrame + 1) / sourceRate;
+                    const localAudioTime = (continuousTime ?? audioPlayer.currentTime) - (Number(group.audioStartSeconds) || 0);
+                    const wallDelay = (nextMediaTime - localAudioTime) * 1000 / Math.max(0.0625, currentPlaybackFps() / sourceRate);
                     if (Number.isFinite(wallDelay)) duration = Math.max(1, wallDelay);
                 }
                 framePending = true;
@@ -1446,9 +1547,18 @@ app.registerExtension({
                                 const audioTime = continuousAudioTime(group);
                                 if (audioTime != null || (group.audioSource && audioGroup === group && !audioPlayer.paused)) {
                                     const sourceRate = validFps(group.sourceFps) || validFps(sourceFps) || 24;
+                                    const localAudioTime = (audioTime ?? audioPlayer.currentTime) - (Number(group.audioStartSeconds) || 0);
+                                    const firstFrame = Number(group.outputStart);
+                                    const targetFrame = (Number.isFinite(firstFrame) ? firstFrame : 0) + localAudioTime * sourceRate;
+                                    let audioFrame = 0;
+                                    if (group.frameNumbers?.length === group.frames.length) {
+                                        for (let candidate = 1; candidate < group.frameNumbers.length && Number(group.frameNumbers[candidate]) <= targetFrame; candidate++) audioFrame = candidate;
+                                    } else {
+                                        audioFrame = Math.floor(localAudioTime * sourceRate + 1e-4);
+                                    }
                                     nextFrame = Math.max(
                                         nextFrame,
-                                        Math.floor((audioTime ?? audioPlayer.currentTime) * sourceRate + 1e-4),
+                                        audioFrame,
                                     );
                                 }
                                 if (nextFrame < group.frames.length) {
@@ -1457,9 +1567,17 @@ app.registerExtension({
                                 }
                             }
                             if (boundedFrame + 1 >= group.frames.length || group.audioSource) {
-                                const next = nextAvailable(index);
-                                if (next === index + 1) playFrameGroup(next, chunks[next], 0, serial, false);
-                                else if (next >= 0) show(next);
+                                if (available(index + 1)) playFrameGroup(index + 1, chunks[index + 1], 0, serial, false);
+                                else if (!complete && index + 1 < chunkCount) {
+                                    // Wait for the next rendered chunk instead of replaying
+                                    // chunk 1 or jumping over a missing audio segment.
+                                    stop();
+                                    waitingAfterChunk = index;
+                                    renderTransport();
+                                } else if (complete || index + 1 >= chunkCount) {
+                                    const next = nextAvailable(index);
+                                    if (next >= 0) show(next);
+                                }
                                 return;
                             }
                         }, duration);
@@ -1637,7 +1755,9 @@ app.registerExtension({
                 if (restoringCache) return;
                 const resolution = previewWidth && previewHeight ? `${previewWidth}×${previewHeight}` : "resolution —";
                 const fps = Number.isFinite(currentPlaybackFps()) ? `${Number(currentPlaybackFps().toFixed(3))} fps` : "fps —";
-                const secondsPerStep = Number.isFinite(averageStepMs) ? `${(averageStepMs / 1000).toFixed(2)}s/step` : "—s/step";
+                const audioStep = /audio teacher\s+(\d+)\s*\/\s*(\d+).*?step\s+(\d+)\s*\/\s*(\d+)/i.exec(phase || "");
+                const displayedStepMs = audioStep ? audioStepMs : averageStepMs;
+                const secondsPerStep = Number.isFinite(displayedStepMs) ? `${(displayedStepMs / 1000).toFixed(2)}s/step` : "—s/step";
                 const elapsedSeconds = completedElapsed ?? (startedAt == null ? NaN : (performance.now() - startedAt) / 1000);
                 const elapsed = formatEta(elapsedSeconds);
                 const activePhaseCount = Math.max(1, Number(chunkRanges[activeChunk]?.taomate_phase_count) || 1);
@@ -1645,11 +1765,20 @@ app.registerExtension({
                     ? `C${activeChunk + 1}.${activeSubchunk}/${chunkCount}.${activePhaseCount}`
                     : `C${activeChunk + 1}/${chunkCount}`
                     : "C—/—";
-                const displayStep = hoverStep ?? currentStep;
+                const displayStep = audioStep ? Number(audioStep[3]) : (hoverStep ?? currentStep);
+                const displayTotalSteps = audioStep ? Number(audioStep[4]) : totalSteps;
                 const inspecting = hoverStep == null ? "" : "Inspect · ";
                 const statePrefix = `${complete ? "Complete · " : ""}${paused ? "Paused · " : ""}`;
-                const phaseLine = `${statePrefix}${phase || "Preparing sampler"}`;
+                const phaseLine = `${statePrefix}${(phase || "Preparing sampler").replace(/\s*·\s*step\s+\d+\s*\/\s*\d+/i, "")}`;
                 const h3Active = !complete && /h3\s+(?:sampling|inference)/i.test(phase || "");
+                const audioProgress = audioStep ? Math.max(0, Math.min(1, (Number(audioStep[1]) - 1 + Number(audioStep[3]) / Math.max(1, Number(audioStep[4]))) / Math.max(1, Number(audioStep[2])))) : 0;
+                const audioFirstMode = chunkRanges.some(range => range.taomate_audio_first === true) || audioFirstSeconds != null;
+                const audioPrepass = audioFirstMode && audioFirstSeconds == null && !complete;
+                const retrySeconds = chunkRanges.reduce((sum, range) => {
+                    if (!Number.isFinite(range.audio_retry_start_ms)) return sum;
+                    const end = Number.isFinite(range.audio_retry_end_ms) ? range.audio_retry_end_ms / 1000 : elapsedSeconds;
+                    return sum + Math.max(0, end - range.audio_retry_start_ms / 1000);
+                }, 0);
                 // ETA is deliberately unit based. A TaoMate phase is one unit;
                 // otherwise a sampler chunk is one unit. The current unit counts
                 // in the elapsed average even before it has completed.
@@ -1666,7 +1795,12 @@ app.registerExtension({
                     const phaseCount = phaseCountFor(range);
                     const chunkUnits = hasSubchunks ? phaseCount : 1;
                     workTotal += chunkUnits;
-                    if (index === activeChunk) {
+                    if (audioFirstMode) {
+                        // The audio cursor cannot mark earlier video groups complete.
+                        const reported = Math.min(chunkUnits, Number(range.taomate_completed_phases) || 0);
+                        const active = index === activeChunk && activeSubchunk != null ? Math.max(0, Number(activeSubchunk) - 1) : 0;
+                        completedUnits += cachedChunkIndices.has(index) || chunks[index]?.finalized ? chunkUnits : Math.min(chunkUnits, Math.max(reported, active));
+                    } else if (index === activeChunk) {
                         const reportedPhases = Number(range.taomate_completed_phases) || 0;
                         const activePhases = activeSubchunk == null ? 0 : Number(activeSubchunk) - 1;
                         const completedPhases = Math.max(0, Math.min(phaseCount, reportedPhases));
@@ -1677,13 +1811,21 @@ app.registerExtension({
                         completedUnits += chunkUnits;
                     }
                 }
-                const observedUnits = complete ? workTotal : Math.min(workTotal, completedUnits + 1);
+                let observedUnits = complete ? workTotal : Math.min(workTotal, completedUnits + (!audioFirstMode || activeSubchunk != null ? 1 : 0));
                 const fallbackRemainingSteps = Math.max(0, totalSteps - currentStep) + Math.max(0, chunkCount - activeChunk - 1) * totalSteps;
                 const fallbackEtaSeconds = Number.isFinite(averageStepMs) ? fallbackRemainingSteps * averageStepMs / 1000 : NaN;
-                const timingEstimate = projectedRenderTiming(elapsedSeconds, observedUnits, workTotal, fallbackEtaSeconds);
+                let rateElapsedSeconds = Math.max(0, elapsedSeconds - retrySeconds);
+                if (audioPrepass) {
+                    workTotal = chunkCount;
+                    const attemptedAudio = chunkRanges.reduce((count, range, index) => Number.isFinite(range.audio_retry_start_ms) ? Math.max(count, index + 1) : count, 0);
+                    observedUnits = Math.max(audioCompletedChunks.size, audioProgress * chunkCount, attemptedAudio);
+                } else if (audioFirstMode && audioFirstSeconds != null) {
+                    rateElapsedSeconds = Math.max(0, elapsedSeconds - audioFirstSeconds);
+                }
+                const timingEstimate = projectedRenderTiming(elapsedSeconds, observedUnits, workTotal, audioFirstMode ? NaN : fallbackEtaSeconds, rateElapsedSeconds);
                 const eta = formatEta(timingEstimate.etaSeconds);
-                const projected = formatEta(timingEstimate.totalSeconds);
-                const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${totalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ETA ${eta} · Est. total ${projected}`;
+                const projected = audioPrepass ? "—" : formatEta(timingEstimate.totalSeconds);
+                const metricsLine = `${chunk} · ${resolution} · ${fps} · ${inspecting}S ${displayStep}/${displayTotalSteps || "—"} · ${secondsPerStep} · E ${elapsed} · ${audioPrepass ? "ETA audio" : "ETA"} ${eta} · Est. total ${projected}`;
                 statusPhase.textContent = phaseLine;
                 statusMetrics.textContent = metricsLine;
                 const gemmaActive = !complete && /gemma\s*4/i.test(phase || "");
@@ -1707,10 +1849,12 @@ app.registerExtension({
                     statusProgressAnimation = null;
                     statusProgressFill.style.transform = "translateX(0)";
                     statusProgressFill.style.transition = "width .15s linear";
-                    statusProgressFill.style.background = complete ? "#63d38a" : "#65b9ff";
+                    statusProgressFill.style.background = complete ? "#63d38a" : audioStep ? "#e5b94f" : "#65b9ff";
                     const samplingProgress = totalSteps > 0 ? Math.max(0, Math.min(1, currentStep / totalSteps)) : 0;
-                    statusProgressFill.style.width = `${complete ? 100 : h3Active ? samplingProgress * 100 : 0}%`;
-                    progressHelp = h3Active
+                    statusProgressFill.style.width = `${complete ? 100 : audioStep ? audioProgress * 100 : h3Active ? samplingProgress * 100 : 0}%`;
+                    progressHelp = audioStep
+                        ? `Audio teacher chunk ${audioStep[1]}/${audioStep[2]}, step ${audioStep[3]}/${audioStep[4]}.`
+                        : h3Active
                         ? `H3 sampling step ${currentStep}/${totalSteps || "—"}.`
                         : complete ? "Render complete." : "Waiting for H3 or Gemma progress.";
                 }
@@ -1735,6 +1879,7 @@ app.registerExtension({
                 activeSubchunk = null;
                 chunks = new Array(chunkCount);
                 chunkRanges = Array.isArray(data.chunk_ranges) ? data.chunk_ranges.map(range => ({ ...range })) : [];
+                audioCompletedChunks = new Set();
                 previewAnnotation = String(data.annotation || "").replace(/[\r\n]+/g, " ").slice(0, 256);
                 if (node.properties) delete node.properties.hr_endless_sampler_annotation;
                 renderAnnotation();
@@ -1777,6 +1922,8 @@ app.registerExtension({
                     : 0;
                 startedAt = performance.now() - Math.max(elapsedMs, elapsedFromStart);
                 completedElapsed = null;
+                audioFirstSeconds = null;
+                audioStepMs = null;
                 complete = false;
                 audioPlayer.pause();
                 audioPlayer.removeAttribute("src");
@@ -1837,6 +1984,12 @@ app.registerExtension({
                     if (range && typeof data.h3_prompt === "string") {
                         range.h3_prompt = data.h3_prompt;
                     }
+                    if (range && typeof data.audio_teacher_prompt === "string") {
+                        range.audio_teacher_prompt = data.audio_teacher_prompt;
+                    }
+                    if (range && typeof data.subtitle === "string") {
+                        range.subtitle = data.subtitle;
+                    }
                     if (range) {
                         if (Number.isFinite(data.taomate_completed_frames) && data.taomate_completed_frames >= 0) {
                             range.taomate_completed_frames = data.taomate_completed_frames;
@@ -1845,21 +1998,114 @@ app.registerExtension({
                         if (Number.isFinite(data.taomate_completed_phases) && data.taomate_completed_phases >= 0) {
                             range.taomate_completed_phases = data.taomate_completed_phases;
                         }
-                        for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds"]) {
+                        for (const key of ["h3_render_seconds", "gemma_seconds", "gemma_preproduction_seconds", "chunk_total_seconds", "audio_retry_start_ms", "audio_retry_end_ms"]) {
                             const value = Number(data[key]);
                             if (Number.isFinite(value) && value >= 0) range[key] = value;
                         }
+                        if (tooltipChunkIndex === index && tooltipPointer) setChunkTooltip(index, { ...tooltipPointer, shiftKey: shiftPromptVisible });
                     }
                     return;
                 }
                 if (data.action === "phase") {
                     if (typeof data.phase === "string") phase = data.phase;
+                    if (Number.isFinite(data.audio_step_ms)) audioStepMs = data.audio_step_ms;
+                    else if (!/audio teacher.*step/i.test(phase || "")) audioStepMs = null;
                     if (data.chunk != null) {
                         if (data.chunk !== activeChunk) activeSubchunk = null;
                         activeChunk = data.chunk;
                     }
                     renderStatus();
                     renderTransport();
+                    return;
+                }
+                if (data.action === "audio_chunk_complete") {
+                    const index = Number(data.chunk);
+                    if (Number.isInteger(index) && index >= 0 && index < chunkCount) {
+                        audioCompletedChunks.add(index);
+                        renderTransport();
+                    }
+                    return;
+                }
+                if (data.action === "audio_first") {
+                    if (typeof data.audio !== "string" || !data.audio) return;
+                    audioFirstSeconds = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms / 1000 : (startedAt == null ? 0 : (performance.now() - startedAt) / 1000);
+                    const source = `data:${data.audio_mime || "audio/wav"};base64,${data.audio}`;
+                    const fps = validFps(data.fps) || currentPlaybackFps();
+                    const black = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E";
+                    let firstPlaceholder = -1;
+                    for (let index = 0; index < chunkCount; index++) {
+                        const range = chunkRanges[index] || {};
+                        const start = Math.max(0, Math.round(Number(range.start) || 0));
+                        const end = Math.max(start, Math.round(Number(range.end) || start));
+                        const numbers = Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
+                        chunks[index] = {
+                            frames: numbers.map(() => black),
+                            durations: numbers.map(() => 1000 / fps),
+                            frameNumbers: numbers,
+                            outputStart: start,
+                            outputEnd: end,
+                            sourceFps: fps,
+                            finalized: false,
+                            audioOnlyPlaceholder: true,
+                            audioSource: source,
+                            audioStartSeconds: start / fps,
+                            audioEndSeconds: (end + 1) / fps,
+                        };
+                        if (firstPlaceholder < 0 && numbers.length) firstPlaceholder = index;
+                    }
+                    setSourceFps(fps);
+                    renderTransport();
+                    if (waitingAfterChunk != null && available(waitingAfterChunk + 1) && !paused) {
+                        const next = waitingAfterChunk + 1;
+                        waitingAfterChunk = null;
+                        playFrameGroup(next, chunks[next], 0, playbackSerial, true);
+                    } else if (firstPlaceholder >= 0 && timer == null && !framePending) show(firstPlaceholder, 0);
+                    return;
+                }
+                if (data.action === "chunk_audio_first") {
+                    if (typeof data.audio !== "string" || !data.audio) return;
+                    const index = Number(data.chunk);
+                    if (!Number.isInteger(index) || index < 0 || index >= chunkCount) return;
+                    const oldGroup = chunks[index];
+                    const source = `data:${data.audio_mime || "audio/wav"};base64,${data.audio}`;
+                    if (oldGroup?.frames?.length && !oldGroup.audioOnlyPlaceholder) {
+                        const fps = validFps(data.fps) || currentPlaybackFps();
+                        const start = Math.max(0, Math.round(Number(data.output_start) || 0));
+                        const end = Math.max(start, Math.round(Number(data.output_end) || start));
+                        oldGroup.audioSource = source;
+                        oldGroup.audioStartSeconds = 0;
+                        oldGroup.audioEndSeconds = (end - start + 1) / fps;
+                        prepareContinuousAudio(oldGroup);
+                        if (waitingAfterChunk === index - 1 && !paused) {
+                            waitingAfterChunk = null;
+                            playFrameGroup(index, oldGroup, 0, playbackSerial, true);
+                        }
+                        return;
+                    }
+                    const fps = validFps(data.fps) || currentPlaybackFps();
+                    const start = Math.max(0, Math.round(Number(data.output_start) || 0));
+                    const end = Math.max(start, Math.round(Number(data.output_end) || start));
+                    const numbers = Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
+                    const black = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E";
+                    chunks[index] = {
+                        frames: numbers.map(() => black),
+                        durations: numbers.map(() => 1000 / fps),
+                        frameNumbers: numbers,
+                        outputStart: start,
+                        outputEnd: end,
+                        sourceFps: fps,
+                        finalized: false,
+                        audioOnlyPlaceholder: true,
+                        audioSource: source,
+                        audioStartSeconds: 0,
+                        audioEndSeconds: (end - start + 1) / fps,
+                    };
+                    prepareContinuousAudio(chunks[index]);
+                    renderTransport();
+                    if (waitingAfterChunk === index - 1 && !paused) {
+                        waitingAfterChunk = null;
+                        playFrameGroup(index, chunks[index], 0, playbackSerial, true);
+                    } else if (playing < 0 && timer == null && !framePending) show(index, 0);
                     return;
                 }
                 if (data.action === "sample_start") {
@@ -1942,7 +2188,8 @@ app.registerExtension({
                 // restores server state while websocket events are still in
                 // flight, so their arrival order is not guaranteed.
                 if (!finalized && chunks[index]?.finalized) return;
-                const replacingPlayingChunk = finalized && index === playing;
+                const wasAudioPlaceholder = Boolean(chunks[index]?.audioOnlyPlaceholder);
+                const replacingPlayingChunk = (finalized || wasAudioPlaceholder) && index === playing;
                 const displayedBeforeReplacement = replacingPlayingChunk ? displayedFrameNumber() : null;
                 activeChunk = index;
                 activeSubchunk = finalized ? null : (data.subchunk ?? null);
@@ -1956,11 +2203,18 @@ app.registerExtension({
                 let restoredAudioSource = typeof data.audio === "string" && data.audio
                     ? `data:${data.audio_mime || "audio/wav"};base64,${data.audio}`
                     : null;
+                const oldGroup = chunks[index];
                 if (finalized && pendingAudioSources.has(index)) {
                     restoredAudioSource = pendingAudioSources.get(index);
                     pendingAudioSources.delete(index);
                 }
-                const group = {
+                // The full teacher timeline must survive both placeholder →
+                // latent and latent → decoded-video replacements.
+                const keptTimelineAudio = !restoredAudioSource && Boolean(oldGroup?.audioSource);
+                if (keptTimelineAudio) restoredAudioSource = oldGroup.audioSource;
+                // Audio scheduling and the running frame callback retain this
+                // object. Update it in place as live video frames arrive.
+                const group = Object.assign(oldGroup || {}, {
                     frames: encodedFrames.map(frame => `data:image/webp;base64,${frame}`),
                     durations: frameDurations,
                     frameNumbers: Array.isArray(data.frame_numbers) ? data.frame_numbers : [],
@@ -1970,7 +2224,10 @@ app.registerExtension({
                     step: currentStep,
                     finalized,
                     audioSource: restoredAudioSource,
-                };
+                    audioStartSeconds: keptTimelineAudio ? oldGroup.audioStartSeconds : 0,
+                    audioEndSeconds: keptTimelineAudio ? oldGroup.audioEndSeconds : undefined,
+                    audioOnlyPlaceholder: false,
+                });
                 if (typeof data.gemma_detailed_description === "string" && chunkRanges[index]) {
                     chunkRanges[index].gemma_detailed_description = data.gemma_detailed_description;
                 }
@@ -1988,7 +2245,7 @@ app.registerExtension({
                 }
                 chunks[index] = group;
                 prepareContinuousAudio(group);
-                if (!finalized) stepPreviews[currentStep] = group;
+                if (!finalized) stepPreviews[currentStep] = { ...group };
                 previewWidth = data.width;
                 previewHeight = data.height;
                 setSourceFps(data.fps);
@@ -1996,6 +2253,11 @@ app.registerExtension({
                 renderTransport();
                 redrawGraphs();
                 if (restorePersistedFrame()) return;
+                if (waitingAfterChunk === index - 1 && !paused) {
+                    waitingAfterChunk = null;
+                    playFrameGroup(index, group, 0, playbackSerial, true);
+                    return;
+                }
                 if (replacingPlayingChunk && hoverStep == null) {
                     let replacementFrame = 0;
                     if (Number.isFinite(displayedBeforeReplacement) && group.frameNumbers.length) {
@@ -2052,6 +2314,8 @@ app.registerExtension({
                     if (force) resetExecution(snapshot.reset);
                     else node._hrEndlessSamplerPreview(snapshot.reset);
                     if (snapshot.phase) node._hrEndlessSamplerPreview(snapshot.phase);
+                    for (const chunk of snapshot.audio_chunks || []) node._hrEndlessSamplerPreview({ action: "audio_chunk_complete", execution: snapshot.execution, node_id: node.id, chunk });
+                    if (snapshot.audio_first) node._hrEndlessSamplerPreview(snapshot.audio_first);
                     if (snapshot.sample_start) node._hrEndlessSamplerPreview(snapshot.sample_start);
                     if (snapshot.progress) node._hrEndlessSamplerPreview(snapshot.progress);
                     for (const chunk of snapshot.chunks || []) {
@@ -2187,6 +2451,7 @@ app.registerExtension({
                 document.removeEventListener("pointerdown", dismissPreviewContextMenu, true);
                 document.removeEventListener("keydown", updateShiftPrompt);
                 document.removeEventListener("keyup", updateShiftPrompt);
+                document.removeEventListener("fullscreenchange", fullscreenChanged);
                 closePreviewContextMenu();
                 resizeObserver.disconnect();
                 chunkTooltip.remove();

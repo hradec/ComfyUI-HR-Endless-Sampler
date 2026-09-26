@@ -1,6 +1,7 @@
 """ComfyUI base-H3 audio adapter for the copied TaoMate Base10 denoising loop."""
 
 import logging
+import time
 from types import SimpleNamespace
 
 import torch
@@ -14,7 +15,7 @@ from .taomate_upstream.packed_sequence import minimax_h3_audio_only_packed_seque
 from .taomate_upstream.attention_hook import HookMode
 
 # Experiment: anchor clean teacher-audio feature statistics to its first chunk.
-TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO = True
+TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO = False
 
 
 class Base10AudioTeacher:
@@ -159,11 +160,15 @@ class Base10AudioTeacher:
         return rows.new_empty((0, 96)), output
 
     @torch.inference_mode()
-    def generate(self, conditioning, noise, height, width, sigmas=None, video_shift=12.0, audio_shift=3.0, audio_time_start=0):
+    def generate(self, conditioning, noise, height, width, sigmas=None, video_shift=12.0, audio_shift=3.0, audio_time_start=0, progress_callback=None):
         """Capture exact student sigma endpoints using persistent clean audio KV."""
         video_sigmas, audio_sigmas, capture_steps = self.guidance_schedule(sigmas, video_shift, audio_shift)
         device = self.patcher.load_device
         logging.info("TaoMate audio teacher: %d audio-only forwards, %d guidance states, shifts video=%g audio=%g; supplied model and LoRA.", len(video_sigmas) - 1, len(capture_steps), video_shift, audio_shift)
+        # The previous video phase can leave dynamic H3 weights resident on
+        # the shared patcher. Drop those clones before loading the teacher so
+        # its temporary dequantized weight buffers have maximum headroom.
+        comfy.model_management.unload_model_and_clones(self.patcher)
         comfy.model_management.load_models_gpu([self.patcher])
         self.patcher.pre_run()
         originals = []
@@ -188,11 +193,15 @@ class Base10AudioTeacher:
                 packed["token_tags"][packed["text_pos"]] = tags.detach().cpu().view(-1)
             self.branch = MiniMaxH3DenoiseBranch(packed=packed, text_embeddings=context, token_tags=packed["token_tags"], device=device, parallel_context=SimpleNamespace(ulysses_world_size=1, ulysses_rank=0))
             captured = {}
+            inference_started = time.perf_counter()
 
             def capture(step, video, audio):
                 """Retain teacher states at the requested student step endpoints."""
                 if step + 1 in capture_steps:
                     captured[step + 1] = h3.unpack_audio(audio[self.branch.audio_target_slice]).detach().float().cpu().clone()
+                if progress_callback is not None:
+                    self.average_step_ms = (time.perf_counter() - inference_started) * 1000.0 / (step + 1)
+                    progress_callback(step + 1, len(video_sigmas) - 1)
 
             _, clean_audio_rows = minimax_h3_denoise_loop(model=self.forward, positive=self.branch, initial_video_rows=torch.empty(0, 96), initial_audio_rows=initial, sigmas_video=video_sigmas, sigmas_audio=audio_sigmas, device=device, on_step=capture)
             # Correct clean targets before both KV capture and clean guidance publication.
@@ -217,19 +226,19 @@ class Base10AudioTeacher:
 
     @staticmethod
     def guidance_schedule(sigmas, video_shift, audio_shift):
-        """Add requested endpoints to the upstream teacher grid without interpolation."""
-        video = select_time_shift_sigmas(num_steps=10, shift_scale=video_shift)
-        base_audio = select_time_shift_sigmas(num_steps=10, shift_scale=audio_shift)
+        """Follow the video sampler step count using the matching audio shift."""
         if sigmas is None:
+            video = select_time_shift_sigmas(num_steps=10, shift_scale=video_shift)
+            base_audio = select_time_shift_sigmas(num_steps=10, shift_scale=audio_shift)
             return video, base_audio, [3, 6, 9]
         requested = sigmas.detach().float().cpu().tolist()
         if len(requested) < 2 or requested[0] != 1.0 or requested[-1] != 0.0 or any(not (a > b >= 0.0) for a, b in zip(requested, requested[1:])):
             raise ValueError("TaoMate audio guidance requires descending finite sigmas from 1 to 0 for noise initialization and clean KV capture.")
-        # Keep the teacher's finer grid and insert exact student endpoints.
-        video = sorted(set(video + requested), reverse=True)
+        # Reuse each video sigma exactly; only map its value to audio's shift.
+        video = requested
         ratio = audio_shift / video_shift
         audio = [ratio * sigma / (1.0 + (ratio - 1.0) * sigma) for sigma in video]
-        return video, audio, [video.index(sigma) for sigma in requested[1:]]
+        return video, audio, list(range(1, len(video)))
 
     def close(self):
         """Release request-local teacher KV."""

@@ -16,6 +16,8 @@ huggingface-hub>=0.34.0
 # Deterministic dialogue pacing uses espeak phoneme counts; the host must also
 # provide the phonemizer-supported espeak backend.
 phonemizer>=3.3.0
+# Transcribe generated teacher audio before directing the next chunk.
+openai-whisper>=20250625
 # ColorMatchV2-compatible output-only MKL seam correction.
 color-matcher
 

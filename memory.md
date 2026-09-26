@@ -3713,3 +3713,94 @@ set is unchanged by this work: the same six failures and one error that the
 uncommitted tree already had (the four camera-sentence tests, the one-based seed
 multiples, the schema ordering, and the compute-precision error), with both curve
 tests green.
+
+## 2026-09-23 — Chunk dialogue splits at the clock again, not at the sentence
+
+The owner asked for the one-sentence-per-chunk dialogue allocation to be
+reverted: "in fact the code tries to put one sentence per chunk. I think we need
+to revert that and split the sentence as we used to do before." The
+sentence-preserving allocator was TaoMate-only plumbing — `sentence_word_owners`
+in `python/dialogue_timing.py`, threaded through
+`_legacy_dialogue_for_range(sentence_chunks=...)`, `_legacy_shot_body_for_range`,
+`_legacy_opening_body_with_timed_dialogue`, `_planned_chunk_prompts(...,
+taomate=...)` and the sampler call site at `nodes.py:4825` (mirrored by
+`python/preproduction.py:151`) — and all of it is now removed rather than
+defaulted off, so no per-method fork survives.
+
+### Why the revert was warranted
+
+The evidence is the successful 68-minute run itself (history entry
+`671c6b35-a954-4972-ae71-79c0b77a5ad4`). Node `141 HREndlessSampler` has **no
+`pre_production` input wired**, so `legacy = pre_production is None` is `True`
+(`nodes.py:4836`) and the sampler plans its own prompts; node `2600
+HREndlessLegacyChunkPrompts` is not in that graph at all. Replaying the run's
+real prompt (`graph["138"]`), its real `TaoMateStreaming.request_plan(427, 2417,
+124, 39)` and its real `_planned_chunk_prompts` reproduces the 13 `h3_prompt`s
+the run recorded in `outputs["144"]...["timeline"]` exactly, so the planner under
+test is the planner that ran.
+
+That replay exposes two defects, both attributable to the sentence rule:
+
+1. The final chunk is a 17-frame stub (frames 1433–1449, a 0.708 s window) handed
+   1.510 s of speech — **slack −0.802 s**, the only negative slack in the run.
+2. It severed "…talk about death and | suffering and why light is bad for you…"
+   across a seam purely to keep sentences whole.
+
+One earlier in-session claim was wrong and is corrected here:
+`sentence_word_owners` compares *stretched* durations, so 4.630 s × 1.694 =
+7.843 s against the 7.750 s threshold (1.5 × the 5.167 s nominal). The sentence
+could legally have been moved into chunk 12 — a knife-edge split, not an
+impossibility, and not proof that the rule was working as intended.
+
+### The revert
+
+- `_legacy_dialogue_for_range` (`nodes.py` ~1335) lost its `sentence_chunks`
+  parameter and its `sentence_word_owners` branch; the proportional
+  `cumulative_weights`/`desired_weight` walk is back, with a comment recording
+  that sentence-preserving allocation was tried and reverted because it starved
+  the short tail chunk. The overflow `ValueError` (~1361) is unchanged.
+- `owns_prefix` no longer keys off `sentence_chunks`, so prefix carry-over
+  applies under TaoMate again.
+- `python/dialogue_timing.py` (2159 bytes) is deleted; `sentence_word_owners` was
+  its only symbol.
+- The two TaoMate sentence tests were rewritten rather than deleted, so both
+  behaviours stay pinned: `test_dialogue_boundary_splits_a_sentence_when_the_chunk_clock_requires_it`
+  and `test_short_final_chunk_receives_its_proportional_share`. Both pass
+  explicit `dialogue_ranges`, because without them each chunk still receives the
+  full utterance — which is what the neighbouring proportional tests rely on.
+
+### Verification
+
+`py_compile` is clean on `nodes.py`, `python/preproduction.py` and
+`tests/test_chunk_director_helpers.py`, and no occurrence of `sentence_chunks`,
+`sentence_word_owners`, `dialogue_timing`, `taomate=taomate` or
+`taomate=use_taomate` remains anywhere outside `vendor/`. The new tests pass. The
+module's failure set is byte-identical to the uncommitted tree's: 132 tests, the
+same six failures and one error (the four camera-sentence tests, the one-based
+seed multiples, the schema ordering, and the compute-precision error).
+`node tests/test_legacy_chunk_prompts.js` and
+`tests/test_global_prompt_sections.py` both pass.
+
+Replaying the reverted planner end to end at 1,450 frames (60.417 s; 13 chunks:
+124 then 119 × 11 then 17) gives **min slack +0.133 s**, up from −0.802 s. Chunk
+13 becomes a 0.708 s window carrying 0.575 s of speech, "about."; sentences now
+split at seams (chunk 1 ending "…whole minute. That's an", chunk 12 "This is
+torture. Finally! something worth talking", chunk 13 "about."), and the
+"dialogue already in progress" beat is emitted again. Adjacent durations behave
+sensibly too: 1,416 → 12 chunks / 102-frame tail / +0.328 s, 1,433 → 12 / 119 /
++0.978, 1,467 → 13 / 34 / −0.093, 1,484 → 13 / 51 / +0.615.
+
+What this does *not* establish is the GPU-visible result. Only the prompt text
+was replayed; `tests/test_taomate.py` and `tests/test_video_io.py` (slow CPU
+forwards) were not re-run, so the rendered effect of the revert is unverified.
+
+Per the standing Gemma/MTP rule, issue
+<https://github.com/ggml-org/llama.cpp/issues/27439> was rechecked before
+touching `python/preproduction.py`: it remains `open`, labeled `bug-unconfirmed`
+and `stale`, with zero comments and last updated 2026-09-20, and PyPI still
+reports `llama-cpp-python` 0.3.35 (2026-08-17) as the newest release. The
+disposable worker and the operation-local non-MTP retry are preserved unchanged;
+`dependency.md` records the recheck.
+
+Nothing here was committed or staged. The untracked `prompt.txt` and the owner's
+own dirty `python/taomate_audio_teacher.py` were left untouched.

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import io
+import base64
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import wave
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -288,10 +290,13 @@ class GemmaCaptureTest(unittest.TestCase):
                 return result
 
             with patch.object(gemma4, "_observe_in_worker", side_effect=fake_worker):
-                actual = director.direct(request, frames)
+                actual = director.direct(request, frames, audio=(torch.zeros((1, 1, 1600)), 16000))
 
             self.assertEqual(actual, result)
             self.assertEqual(captured_request["gemma4_seed"], 123456)
+            self.assertEqual(captured_request["audio_url"].split(",", 1)[0], "data:audio/wav;base64")
+            with wave.open(io.BytesIO(base64.b64decode(captured_request["audio_url"].split(",", 1)[1])), "rb") as audio_file:
+                self.assertEqual((audio_file.getnchannels(), audio_file.getframerate(), audio_file.getnframes()), (1, 16000, 1600))
             capture_dir = next(Path(temp_dir).glob("prompt_*"))
             saved_request = json.loads((capture_dir / "request.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_request, captured_request)
@@ -1997,6 +2002,7 @@ class GemmaCaptureTest(unittest.TestCase):
     def test_previous_gemma_description_is_explicitly_linked_to_prior_stills(self):
         request = self.request()
         request["character_name_table"] = "- Heman -> <Subject 1>"
+        request["previous_audio_transcription"] = "The previous voice said hello."
         request["previous_last_seen_character_state"] = [{
             "character_name": "Heman",
             "subject": "<Subject 1>",
@@ -2010,12 +2016,22 @@ class GemmaCaptureTest(unittest.TestCase):
         _system, observation = gemma4._render_observation_messages(request)
 
         self.assertIn(request["previous_gemma_description"], observation)
+        self.assertIn("The previous voice said hello.", observation)
         self.assertIn(request["previous_gemma_timing_plan"], observation)
         self.assertIn(request["previous_gemma_end_state"], observation)
         self.assertIn('"last_seen_global_frame": 208', observation)
         self.assertIn("Return exactly one entry for every immutable character", observation)
         self.assertIn("exact attached stills", observation)
         self.assertIn("latest rendered still is authoritative", gemma4._gemma_prompt_templates()["SYSTEM"])
+
+        audio_request = self.request()
+        audio_request["prompt_stage"] = "audio"
+        audio_request["observation_frame_numbers"] = []
+        audio_request["previous_audio_transcription"] = "We already spoke the next word."
+        _system, audio_observation = gemma4._render_observation_messages(audio_request)
+        self.assertIn("Only its teacher audio has been generated", audio_observation)
+        self.assertIn("Prompt stage: audio", audio_observation)
+        self.assertIn("We already spoke the next word.", audio_observation)
 
         first_chunk = self.request()
         first_chunk["previous_chunk"] = None

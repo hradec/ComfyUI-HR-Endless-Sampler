@@ -18,3 +18,6 @@
 - Preserve user diagnostics such as the untracked `prompt.txt`; never stage,
   overwrite, or delete them unless the user explicitly requests it.
 - Do not commit or push changes unless the user explicitly asks.
+- Do not add gates, guards, skips, fallbacks, or alter runtime behavior without
+  the user's explicit approval. State any proposed behavioral change first and
+  wait for approval; implement only the behavior the user requested.

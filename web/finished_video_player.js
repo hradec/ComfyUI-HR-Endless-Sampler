@@ -687,6 +687,39 @@ app.registerExtension({
             linearDisplayButton.style.cssText = "position:absolute;right:8px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#aaa;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:7;";
             viewport.appendChild(linearDisplayButton);
 
+            const fullscreenButton = document.createElement("button");
+            fullscreenButton.type = "button";
+            fullscreenButton.textContent = "⛶";
+            fullscreenButton.title = "Enter fullscreen";
+            fullscreenButton.setAttribute("aria-label", "Enter fullscreen");
+            fullscreenButton.style.cssText = "position:absolute;right:34px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#ddd;font:bold 15px/18px sans-serif;cursor:pointer;z-index:7;";
+            viewport.appendChild(fullscreenButton);
+
+            function updateFullscreenButton() {
+                const active = document.fullscreenElement === root;
+                fullscreenButton.textContent = active ? "×" : "⛶";
+                fullscreenButton.title = active ? "Exit fullscreen (Esc)" : "Enter fullscreen";
+                fullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
+            }
+
+            const fullscreenChanged = () => updateFullscreenButton();
+            document.addEventListener("fullscreenchange", fullscreenChanged);
+            fullscreenButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (document.fullscreenElement === root) document.exitFullscreen?.();
+                else if (root.requestFullscreen) root.requestFullscreen().catch(error => console.warn("HR Endless Sampler fullscreen failed", error));
+                root.focus({ preventScroll: true });
+            });
+
+            const subtitleButton = document.createElement("button");
+            subtitleButton.type = "button";
+            subtitleButton.textContent = "S";
+            subtitleButton.title = "Turn dialogue subtitles on or off";
+            subtitleButton.setAttribute("aria-label", subtitleButton.title);
+            subtitleButton.style.cssText = "position:absolute;right:60px;top:8px;width:20px;height:20px;padding:0;border:1px solid #666;border-radius:3px;background:rgba(28,28,28,.9);color:#ffe600;font:bold 12px/1 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;z-index:7;";
+            viewport.appendChild(subtitleButton);
+
             const compareMedia = document.createElement("video");
             compareMedia.style.cssText = "position:absolute;inset:0;display:none;width:100%;height:100%;object-fit:contain;background:#090909;pointer-events:none;clip-path:polygon(50% 0,100% 0,100% 100%,50% 100%);";
             compareMedia.preload = "metadata";
@@ -734,6 +767,13 @@ app.registerExtension({
                 return label;
             });
 
+            const subtitleLabels = [0, 1].map(index => {
+                const label = document.createElement("div");
+                label.style.cssText = `position:absolute;bottom:28px;z-index:6;overflow:hidden;color:#fff;font:bold 18px/1.25 sans-serif;-webkit-text-stroke:1px #000;text-shadow:1px 1px 0 #000,-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,0 2px 4px #000;pointer-events:none;user-select:none;display:none;text-align:center;${index === 0 ? "left:6%;right:6%;" : "left:52%;right:6%;"}`;
+                viewport.appendChild(label);
+                return label;
+            });
+
             function renderVideoAnnotations() {
                 const comparisonActive = Boolean(isCompareNode ? state?.compare_media_url : compareState?.media_url);
                 const values = [
@@ -753,6 +793,36 @@ app.registerExtension({
                     label.style.display = values[index] && (index === 0 || comparisonActive) ? "block" : "none";
                 }
             }
+
+            function renderSubtitles() {
+                const frame = currentFrame();
+                const primaryChunk = containing(timeline?.chunks || [], frame);
+                const secondTimeline = isCompareNode ? state?.compare_timeline : compareState?.timeline;
+                const secondFrame = Math.floor(Math.max(0, Number(media.currentTime) || 0) * compareSourceFps + 1e-6);
+                const secondChunk = containing(secondTimeline?.chunks || [], secondFrame);
+                const comparisonActive = Boolean(isCompareNode ? state?.compare_media_url : compareState?.media_url);
+                const values = [String(primaryChunk?.subtitle || "").trim(), String(secondChunk?.subtitle || "").trim()];
+                for (let index = 0; index < subtitleLabels.length; index++) {
+                    const label = subtitleLabels[index];
+                    label.textContent = subtitlesEnabled ? values[index] : "";
+                    label.title = label.textContent;
+                    label.style.left = comparisonActive ? (index === 0 ? "6%" : "52%") : "6%";
+                    label.style.right = comparisonActive ? "6%" : "6%";
+                    label.style.display = subtitlesEnabled && values[index] && (index === 0 || comparisonActive) ? "block" : "none";
+                }
+                subtitleButton.style.color = subtitlesEnabled ? "#ffe600" : "#888";
+                subtitleButton.style.background = subtitlesEnabled ? "rgba(70,58,12,.95)" : "rgba(28,28,28,.9)";
+                subtitleButton.setAttribute("aria-pressed", String(subtitlesEnabled));
+            }
+
+            subtitleButton.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                subtitlesEnabled = !subtitlesEnabled;
+                renderSubtitles();
+                persistPlayerState();
+                root.focus({ preventScroll: true });
+            });
 
             const frameLabel = document.createElement("div");
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
@@ -833,6 +903,7 @@ app.registerExtension({
             let compareSourceFps = 24;
             let audioMuted = Boolean(savedPlayerState.muted);
             let inverseGammaDisplay = Boolean(savedPlayerState.inverseGammaDisplay);
+            let subtitlesEnabled = savedPlayerState.subtitlesEnabled !== false;
             let pendingFrame = typeof savedPlayerState.frame === "number" && Number.isFinite(savedPlayerState.frame) ? savedPlayerState.frame : null;
             let wipePosition = 0.5;
             let wipeModeIndex = 0;
@@ -873,6 +944,7 @@ app.registerExtension({
                     frame: currentFrame(),
                     muted: audioMuted,
                     inverseGammaDisplay,
+                    subtitlesEnabled,
                 };
             }
 
@@ -1176,6 +1248,7 @@ app.registerExtension({
                 }
                 playButton.textContent = media.paused ? "▶" : "❚❚";
                 renderTransport();
+                renderSubtitles();
             }
 
             function tick() {
@@ -1373,6 +1446,7 @@ app.registerExtension({
                     comparePathLabel.textContent = path;
                     comparePathLabel.title = path;
                     renderVideoAnnotations();
+                    renderSubtitles();
                     renderComparisonWipe();
                     applyPlaybackRate();
                 } catch (error) {
@@ -1389,6 +1463,7 @@ app.registerExtension({
                 ++compareRequestSerial;
                 compareState = null;
                 renderVideoAnnotations();
+                renderSubtitles();
                 compareSourceFps = 24;
                 compareMedia.pause();
                 compareMedia.removeAttribute("src");
@@ -1674,6 +1749,7 @@ app.registerExtension({
             node.onRemoved = function () {
                 document.removeEventListener("keydown", updateShiftPrompt);
                 document.removeEventListener("keyup", updateShiftPrompt);
+                document.removeEventListener("fullscreenchange", fullscreenChanged);
                 if (animation != null) cancelAnimationFrame(animation);
                 media.pause();
                 media.removeAttribute("src");

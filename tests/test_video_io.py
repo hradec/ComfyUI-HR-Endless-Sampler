@@ -35,6 +35,7 @@ class FinishedVideoIOTest(unittest.TestCase):
                 paths.append(path)
             writer = object.__new__(video_io.IntermediateChunkVideoWriter)
             writer.destination = (directory, "render")
+            writer.fps = 24.0
             writer.completed_paths = {2: paths[1], 1: paths[0]}
             output = writer.save_preview()
             self.assertTrue(output.endswith("_saved_preview.mp4"))
@@ -115,7 +116,9 @@ class FinishedVideoIOTest(unittest.TestCase):
                         "end": 4,
                         "gemma_detailed_description": "  Continue the action.  ",
                         "h3_prompt": " summary: The target video continues.\ndetailed_description: Continue the action. ",
+                        "audio_teacher_prompt": " summary: Timed audio.\ndetailed_description: She speaks. ",
                         "gemma_retention_analysis": "  Preserve Tila's mounted pose.  ",
+                        "subtitle": "  Hello there.\nHow are you?  ",
                         "h3_render_seconds": 42.5,
                         "gemma_seconds": 3.25,
                         "gemma_preproduction_seconds": 2.0,
@@ -135,7 +138,9 @@ class FinishedVideoIOTest(unittest.TestCase):
             "end": 4,
             "gemma_detailed_description": "Continue the action.",
             "h3_prompt": "summary: The target video continues.\ndetailed_description: Continue the action.",
+            "audio_teacher_prompt": "summary: Timed audio.\ndetailed_description: She speaks.",
             "gemma_retention_analysis": "Preserve Tila's mounted pose.",
+            "subtitle": "Hello there. How are you?",
             "h3_render_seconds": 42.5,
             "gemma_seconds": 3.25,
             "gemma_preproduction_seconds": 2.0,

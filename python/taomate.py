@@ -38,6 +38,10 @@ TOGGLE_TAOMATE_DIVERGENCY_MOVE_PROMPT_REFERENCES = False
 # Experiment: use near-equal phases while never ending a phase on H3's
 # singleton temporal token. False keeps the upstream tail cadence.
 TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS = False
+# Generate all clean teacher audio before starting the video pass.
+TOGGLE_TAOMATE_DIVERGENCY_AUDIO_FIRST = True
+# Retry one teacher-audio take when its decoded speech misses the chunk dialogue.
+TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY = True
 # Deprecated test compatibility switch; node input selects the runtime codec.
 TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV = True
 # NVIDIA CUDA experiment: transfer compressed bytes, decode and unshuffle on GPU.
@@ -294,6 +298,15 @@ class TaoMateKVCache(CleanAVKVCache):
         finally:
             _profile_add(getattr(self, "profile", None), "KV restore", started)
 
+    def checkpoint(self):
+        """Keep references to committed rows so a rejected teacher take can roll back."""
+        return (self._history.copy(), self._commit_token_counts[:], self._commit_token_tags[:], self._block_index)
+
+    def restore_checkpoint(self, checkpoint):
+        """Discard one rejected clean commit without copying retained KV tensors."""
+        self._history, self._commit_token_counts, self._commit_token_tags, self._block_index = checkpoint
+        self._clear_staging()
+
     def stage(self, layer_name, key, value, token_tags, commit_mask):
         """Capture adapter-selected rows and persist them through the selected codec."""
         started = (time.perf_counter(), time.process_time())
@@ -303,7 +316,11 @@ class TaoMateKVCache(CleanAVKVCache):
             if self.compression_mode not in ("int8", "turboquant"):
                 pair = AVKV(pair.key.cpu(), pair.value.cpu())
                 _validate_av_pair(pair, self.contract, layer_name=layer_name)
-            self._staged[layer_name] = self.store_pair(pair)
+            # QuantizedKV has copied the compact codes to CPU RAM. Do not keep
+            # this layer's temporary full-BF16 device pair until the clean pass ends.
+            stored = self.store_pair(pair)
+            del pair
+            self._staged[layer_name] = stored
         finally:
             _profile_add(getattr(self, "profile", None), "KV stage/compress", started)
 
@@ -677,6 +694,9 @@ class TaoMateStreaming:
         self.video_shape = None
         self.audio_teacher = None
         self.teacher_milestones = None
+        self.audio_first_milestones = {}
+        self.audio_first_audio_latent = None
+        self.audio_first_ready = False
         self.phase_audio_start = 0
         self.phase_audio_end = 0
         self.audio_scale = 1.0
@@ -977,11 +997,98 @@ class TaoMateStreaming:
         """Mirror upstream publication: join clean latents, then decode once."""
         # No per-group waveform normalization or trimming: both create new seams.
         latent = torch.cat(segments, dim=-1)
+        latent = latent.to(device=getattr(getattr(audio_vae, "patcher", None), "load_device", latent.device))
         waveform = audio_vae.decode(latent).movedim(-1, 1)
         sample_rate = int(getattr(audio_vae, "audio_sample_rate_output", getattr(audio_vae, "audio_sample_rate", 32000)))
         return waveform.detach().to(device="cpu", dtype=torch.float32), sample_rate
 
-    def execute_chunk(self, execute_sampler, noise_factory, seed, noise, guider, sigmas, latent, chunk, on_subchunk=None, sampler=None, on_subchunk_start=None, on_status=None, debug_timing=False):
+    @staticmethod
+    def decode_audio_preview_segment(audio_vae, current_latent, previous_latent=None, context_ticks=0, latent_fps=40):
+        """Decode a segment with prior latent context, then discard that audio prefix."""
+        context_ticks = max(0, int(context_ticks))
+        if context_ticks and (previous_latent is None or previous_latent.shape[-1] < context_ticks):
+            raise ValueError("Audio preview is missing the preceding latent context")
+        context = previous_latent[..., -context_ticks:] if context_ticks else None
+        waveform, sample_rate = TaoMateStreaming.decode_audio_timeline(
+            audio_vae,
+            [context, current_latent] if context is not None else [current_latent],
+        )
+        trim_samples = round(context_ticks * sample_rate / float(latent_fps))
+        if trim_samples >= waveform.shape[-1] and trim_samples:
+            raise ValueError("Audio preview context consumes the decoded segment")
+        return waveform[..., trim_samples:], sample_rate
+
+    def prepare_audio_first(self, conditionings, noise, video, chunks, sigmas, video_shift, audio_shift, on_status=None, on_progress=None, on_chunk_complete=None, on_audio_candidate=None):
+        """Generate each request's audio from its own prompt on the global clock."""
+        if self.audio_teacher is None:
+            return None
+        clean_segments = []
+        self.audio_first_milestones = {}
+        total_chunks = len(chunks)
+        if not callable(conditionings) and len(conditionings) != total_chunks:
+            raise ValueError("TaoMate audio teacher needs one conditioning per chunk")
+        steps = max(0, len(self.audio_teacher.guidance_schedule(sigmas, video_shift, audio_shift)[0]) - 1)
+        with tqdm(total=total_chunks * steps, desc="TaoMate: audio teacher", unit="step", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
+            for index, chunk in enumerate(chunks):
+                self.current_chunk_number = index + 1
+                self.current_chunk_total = total_chunks
+                progress.set_postfix_str("chunk %d/%d" % (index + 1, total_chunks), refresh=False)
+                if on_status is not None:
+                    on_status("TaoMate: audio teacher %d/%d" % (index + 1, total_chunks))
+                if index and index % 12 == 0 and self.audio_teacher.cache is not None:
+                    self.audio_teacher.cache.drop_audio_history()
+                start = int(chunk["audio_start"])
+                end = int(chunk["audio_end"])
+                context = int(chunk["context_audio_t"])
+                if end <= start or start != (int(chunks[index - 1]["audio_end"]) if index else 0) or end > noise.shape[-1]:
+                    raise ValueError("TaoMate audio teacher chunks must cover contiguous global audio ticks")
+
+                def step_progress(completed, step_total):
+                    progress.update(1)
+                    if on_progress is not None:
+                        on_progress(index + 1, total_chunks, completed, step_total)
+
+                # Global noise has no synthetic prefix; context is used only
+                # when decoding this segment with its preceding latent tail.
+                conditioning = conditionings(index) if callable(conditionings) else conditionings[index]
+                previous_audio = torch.cat(clean_segments, dim=-1) if clean_segments and context else None
+                cache = self.audio_teacher.cache if on_audio_candidate is not None else None
+                checkpoint = cache.checkpoint() if cache is not None else None
+                anchor = self.audio_teacher.audio_anchor if on_audio_candidate is not None else None
+                time_origin = self.audio_teacher.audio_time_origin if on_audio_candidate is not None else None
+                milestones = self.audio_teacher.generate(conditioning, noise[..., start:end], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, start, progress_callback=step_progress)
+                if on_audio_candidate is not None:
+                    retry_conditioning = on_audio_candidate(index, milestones[-1], previous_audio, context)
+                    if retry_conditioning is not None:
+                        # ponytail: one retry only; accepting the second take keeps
+                        # inference bounded even when Whisper is uncertain.
+                        progress.total += steps
+                        progress.refresh()
+                        if checkpoint is None:
+                            self.audio_teacher.close()
+                        else:
+                            self.audio_teacher.cache.restore_checkpoint(checkpoint)
+                        self.audio_teacher.audio_anchor = anchor
+                        self.audio_teacher.audio_time_origin = time_origin
+                        # Keep the original realization: the shorter dialogue
+                        # is the correction, while a different sample can turn
+                        # an almost-correct take into a different performance.
+                        milestones = self.audio_teacher.generate(retry_conditioning, noise[..., start:end], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, start, progress_callback=step_progress)
+                self.audio_first_milestones[index] = milestones
+                current_audio = milestones[-1]
+                if current_audio.shape[-1] != end - start:
+                    raise ValueError("TaoMate audio teacher changed the segment's tick count")
+                if on_chunk_complete is not None:
+                    on_chunk_complete(index, current_audio, previous_audio, context)
+                clean_segments.append(current_audio)
+                self.record_audio_kv_memory()
+        self.audio_first_audio_latent = torch.cat(clean_segments, dim=-1) if clean_segments else None
+        self.audio_first_ready = True
+        # Only the captured states are needed by video sampling after this pass.
+        self.audio_teacher.close()
+        return self.audio_first_audio_latent
+
+    def execute_chunk(self, execute_sampler, noise_factory, seed, noise, guider, sigmas, latent, chunk, on_subchunk=None, sampler=None, on_subchunk_start=None, on_status=None, debug_timing=False, on_audio_teacher=None, on_audio_progress=None, audio_conditioning=None, on_audio_candidate=None):
         """Sample only new media; prepend historical tokens for VAE decoding only."""
         self.on_status = on_status
         self.debug_kv_table = bool(debug_timing)
@@ -989,20 +1096,48 @@ class TaoMateStreaming:
         vn, an = noise.unbind()
         vt, at = chunk["context_video_t"], chunk["context_audio_t"]
         self.request_video_start = chunk["video_start"]
-        if self.request_count and self.request_count % 12 == 0:
+        if not self.audio_first_ready and self.request_count and self.request_count % 12 == 0:
             for cache, hook in self.caches.values():
                 cache.drop_audio_history()
-        if self.audio_teacher is not None:
+        if self.audio_first_ready:
+            self.teacher_milestones = self.audio_first_milestones.pop(self.current_chunk_number - 1)
+            sampling = guider.model_patcher.get_model_object("model_sampling")
+            self.audio_scale = float(sampling.audio_scale)
+        elif self.audio_teacher is not None:
             self.report_status("TaoMate: generating teacher audio for this chunk")
-            positive = guider.original_conds["positive"][0]
+            positive = audio_conditioning if audio_conditioning is not None else guider.original_conds["positive"][0]
             sampling = guider.model_patcher.get_model_object("model_sampling")
             video_shift = float(sampling.shift)
-            audio_shift = float(sampling.audio_shift if sampling.audio_shift is not None else sampling.shift)
-            self.teacher_milestones = self.audio_teacher.generate(positive, an[..., at:], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, chunk["audio_start"])
+            audio_shift = float(sampling.audio_shift if sampling.audio_shift is not None else 3.0)
+            teacher_steps = max(0, len(self.audio_teacher.guidance_schedule(sigmas, video_shift, audio_shift)[0]) - 1)
+            with tqdm(total=teacher_steps, desc="TaoMate: audio teacher %d/%d" % (self.current_chunk_number, self.current_chunk_total), unit="step", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
+                def teacher_step_progress(completed, step_total):
+                    progress.update(1)
+                    if on_audio_progress is not None:
+                        on_audio_progress(completed, step_total)
+
+                cache = self.audio_teacher.cache if on_audio_candidate is not None else None
+                checkpoint = cache.checkpoint() if cache is not None else None
+                anchor = self.audio_teacher.audio_anchor if on_audio_candidate is not None else None
+                time_origin = self.audio_teacher.audio_time_origin if on_audio_candidate is not None else None
+                self.teacher_milestones = self.audio_teacher.generate(positive, an[..., at:], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, chunk["audio_start"], progress_callback=teacher_step_progress)
+                retry_conditioning = on_audio_candidate(self.current_chunk_number - 1, self.teacher_milestones[-1]) if on_audio_candidate is not None else None
+                if retry_conditioning is not None:
+                    progress.total += teacher_steps
+                    progress.refresh()
+                    if checkpoint is None:
+                        self.audio_teacher.close()
+                    else:
+                        self.audio_teacher.cache.restore_checkpoint(checkpoint)
+                    self.audio_teacher.audio_anchor = anchor
+                    self.audio_teacher.audio_time_origin = time_origin
+                    self.teacher_milestones = self.audio_teacher.generate(retry_conditioning, an[..., at:], video.shape[-2], video.shape[-1], sigmas, video_shift, audio_shift, chunk["audio_start"], progress_callback=teacher_step_progress)
             self.audio_scale = float(sampling.audio_scale)
             self.record_audio_kv_memory()
             if self.debug_kv_table:
                 logging.info("\n%s", self.audio_kv_cache_memory_table())
+            if on_audio_teacher is not None:
+                on_audio_teacher(self.current_chunk_number - 1, self.teacher_milestones[-1])
         self.prepared_model = None
         output_video, output_audio = [], []
         # All phases share the same guider conditioning, encoded once per request.
@@ -1097,6 +1232,9 @@ class TaoMateStreaming:
         self.caches.clear()
         self.prepared_model = None
         self.teacher_milestones = None
+        self.audio_first_milestones.clear()
+        self.audio_first_audio_latent = None
+        self.audio_first_ready = False
         if self.audio_teacher is not None:
             self.audio_teacher.close()
         self.anchor = None

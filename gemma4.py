@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1284,6 +1285,24 @@ def _image_data_url(frame: torch.Tensor) -> str:
     encoded = io.BytesIO()
     Image.fromarray(pixels).save(encoded, format="JPEG", quality=88, optimize=True)
     return "data:image/jpeg;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
+
+
+def _audio_data_url(waveform: torch.Tensor, sample_rate: int) -> str:
+    """Encode observed PCM as a WAV input for Gemma's existing MTMD handler."""
+    if sample_rate <= 0 or waveform.ndim not in (2, 3) or waveform.shape[-1] == 0:
+        raise Gemma4ObservationError("Gemma observation audio needs nonempty [batch, channels, samples] PCM and a positive sample rate")
+    samples = waveform.detach().to(device="cpu", dtype=torch.float32)
+    samples = samples.mean(dim=(0, 1)) if samples.ndim == 3 else samples.mean(dim=0)
+    if not bool(torch.isfinite(samples).all()):
+        raise Gemma4ObservationError("Gemma observation audio contains non-finite samples")
+    pcm = samples.clamp(-1, 1).mul(32767).round().to(torch.int16).numpy().tobytes()
+    encoded = io.BytesIO()
+    with wave.open(encoded, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(int(sample_rate))
+        output.writeframes(pcm)
+    return "data:audio/wav;base64," + base64.b64encode(encoded.getvalue()).decode("ascii")
 
 
 def _extract_json_object(content: str) -> tuple[dict[str, Any], str]:
@@ -3392,6 +3411,8 @@ def _render_observation_messages(
             f"{int(previous['sampled_start'])}-{int(previous['sampled_end']) - 1} and retained output frames "
             f"{int(previous['output_start'])}-{int(previous['output_end']) - 1}."
         )
+        if request.get("prompt_stage", "video") == "audio" and not frame_numbers:
+            previous_context += " Only its teacher audio has been generated so far; no previous-video stills exist for this audio prompt request. Use its independently transcribed speech as the audio evidence."
         previous_shots = _shot_context(request.get("previous_shots", ()), fps, include_target=False)
         frame_manifest = "\n".join(
             f"- attached image {index + 1}: exact global frame {frame_number}"
@@ -3407,6 +3428,10 @@ def _render_observation_messages(
         previous_gemma_end_state = str(request.get("previous_gemma_end_state") or (
             "The previous chunk has no recorded Gemma end state. Use the latest attached still as the current state."
         ))
+        if request.get("prompt_stage", "video") == "audio" and not frame_numbers:
+            previous_gemma_description = "No prior generated video exists during teacher-audio prompting."
+            previous_gemma_timing_plan = "Use the immutable preproduction timing plan and prior audio transcription."
+            previous_gemma_end_state = "No observed video end state exists yet."
     templates = _gemma_prompt_templates()
     use_preproduction_cache = bool(request.get("preproduction_cache"))
     template_name = "CACHED_OBSERVATION" if use_preproduction_cache else "OBSERVATION"
@@ -3422,6 +3447,7 @@ def _render_observation_messages(
         observation_template,
         {
             "chunk_number": str(int(request["chunk_number"])),
+            "prompt_stage": str(request.get("prompt_stage", "video")),
             "chunk_count": str(int(request["chunk_count"])),
             "fps": f"{fps:g}",
             "sampled_start": str(int(current["sampled_start"])),
@@ -3452,6 +3478,7 @@ def _render_observation_messages(
             )),
             "required_local_markers": _required_local_markers(target_shots),
             "previous_context": previous_context,
+            "previous_audio_transcription": str(request.get("previous_audio_transcription") or "none"),
             "previous_shots": previous_shots,
             "frame_manifest": frame_manifest,
             "previous_gemma_description": previous_gemma_description,
@@ -4179,6 +4206,8 @@ def _observe_in_process(
         {"type": "image_url", "image_url": {"url": image_url}}
         for image_url in image_urls
     ]
+    if request.get("audio_url"):
+        content.append({"type": "audio_url", "audio_url": {"url": request["audio_url"]}})
     content.append({"type": "text", "text": message})
 
     handler = None
@@ -5182,6 +5211,7 @@ class Gemma4ContinuityDirector:
         request: dict[str, Any],
         frames: torch.Tensor | None = None,
         progress_callback: Any = None,
+        audio: tuple[torch.Tensor, int] | None = None,
     ) -> GemmaChunkPrompt:
         request = json.loads(json.dumps(request, ensure_ascii=False))
         request["think_budget"] = self.chunk_think_budget
@@ -5203,6 +5233,8 @@ class Gemma4ContinuityDirector:
         if not request.get("target_shots"):
             raise Gemma4ObservationError("Gemma 4 needs at least one source shot for the current chunk")
         request["image_urls"] = image_urls
+        if audio is not None:
+            request["audio_url"] = _audio_data_url(audio[0], audio[1])
         request["debug"] = self.debug
         request["gemma4_mtp"] = self.gemma4_mtp
         request["gemma4_seed"] = self.seed
