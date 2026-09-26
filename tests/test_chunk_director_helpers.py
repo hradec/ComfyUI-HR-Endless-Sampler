@@ -436,6 +436,19 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertTrue(nodes._transcript_is_certain({"text": "one two", "words": [{"probability": 0.9}, {"probability": 0.7}]}))
         self.assertFalse(nodes._transcript_is_certain({"text": "one two three four", "words": [{"probability": 0.9}, {"probability": 0.1}, {"probability": 0.2}, {"probability": 0.1}]}))
 
+    def test_captured_graph_pool_release_follows_its_toggle(self):
+        """The sampler drops ComfyUI's captured graph pools only when its toggle asks."""
+        calls = []
+        with patch.object(nodes, "TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS", False), \
+                patch.object(nodes.comfy.model_prefetch, "cleanup_prefetch_queues", side_effect=lambda: calls.append("pools")), \
+                patch.object(nodes.comfy.model_management, "soft_empty_cache", side_effect=lambda **kwargs: calls.append("cache")), \
+                patch.object(nodes.comfy.model_management, "get_free_memory", return_value=(1024.0, 512.0)):
+            nodes._release_captured_graph_pools(torch.device("cpu"), "unit test")
+            self.assertEqual(calls, [])
+            with patch.object(nodes, "TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS", True):
+                nodes._release_captured_graph_pools(torch.device("cpu"), "unit test")
+        self.assertEqual(calls, ["pools", "cache"])
+
     def test_audio_transcript_approves_a_case_and_punctuation_insensitive_tail_omission(self):
         """A complete recognized prefix is retained without sampling another take."""
         prompt = "detailed_description: <Subject 1> (S1) says: <d>[English] Friendships fade. Birds die. There's</d>"
@@ -1364,7 +1377,11 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 patch.object(nodes.tempfile, "gettempdir", return_value=temp_root):
             cache = nodes._LastRunReplayCache()
             original_enabled = nodes.REPLAY_CACHE_ENABLED
+            stored_audio_state = dict(nodes._TEACHER_AUDIO_CACHE_STATE)
             nodes.REPLAY_CACHE_ENABLED = True
+            # The teacher-audio decision is a module global, so this test states
+            # the value it is pinning instead of depending on test order.
+            nodes._set_teacher_audio_cache_state("idle")
             self.assertEqual(
                 nodes._replay_cache_ui_status(),
                 {
@@ -1374,6 +1391,17 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                     "status": "",
                     "completed_chunks": 0,
                     "cached_chunks": [],
+                    # TaoMate has no video chunk cache, so the same endpoint
+                    # reports its teacher-audio entry beside the replay state.
+                    "audio_cache": {
+                        "has_cache": False,
+                        "chunks": 0,
+                        "bytes": 0,
+                        "created": "",
+                        "reused_chunks": 0,
+                        "run_reason": "",
+                        "run_state": "idle",
+                    },
                 },
             )
 
@@ -1409,6 +1437,7 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertFalse(nodes._replay_cache_ui_status()["enabled"])
             self.assertFalse(nodes._replay_cache_enabled())
             nodes.REPLAY_CACHE_ENABLED = original_enabled
+            nodes._set_teacher_audio_cache_state(stored_audio_state["run_state"], stored_audio_state["run_reason"], stored_audio_state["reused_chunks"])
             cache.clear()
             self.assertFalse(nodes._replay_cache_ui_status()["has_cache"])
 

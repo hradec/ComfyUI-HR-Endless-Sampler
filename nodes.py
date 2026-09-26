@@ -123,6 +123,12 @@ VRAM_DEBUG_WRAPPER_KEY = "hr_endless_sampler_vram_debug"
 # remains implemented below so the experiment can be restored by changing this
 # single flag after its startup cost is useful again.
 ENABLE_DEBUG_MEMORY_PREFLIGHT = True
+# ComfyUI's model compiler keeps captured CUDA graphs whose device pools
+# torch.cuda.empty_cache() cannot reclaim. Dropping them at every chunk start
+# and before the video VAE decode gives each chunk the same clean baseline as
+# the first one, at the cost of one re-capture per chunk. False keeps the graphs
+# warm and restores the previous behavior.
+TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS = True
 # Experimental A/B switch. False regenerates complete AV noise for every
 # chunk with seed * chunk_number; True preserves one sliced full-sequence noise.
 TOGGLE_SINGLE_NOISE = True
@@ -147,8 +153,16 @@ GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
 REPLAY_CACHE_FORMAT = 10
+# TaoMate has no video replay checkpoint, but its audio-first teacher pass is
+# the expensive part that a re-render with the same prompt and seed does not
+# need to repeat; it therefore keeps its own disposable entry in the same
+# temporary root and is governed by the same preview cache button.
+TEACHER_AUDIO_CACHE_DIRNAME = "teacher_audio"
+TEACHER_AUDIO_CACHE_FORMAT = 1
 _REPLAY_CACHE_ACTIVITY_LOCK = threading.Lock()
 _REPLAY_CACHE_ACTIVE_RUNS = 0
+# The last render's teacher-audio decision, published to the preview button.
+_TEACHER_AUDIO_CACHE_STATE = {"run_state": "idle", "run_reason": "", "reused_chunks": 0}
 # Preview's cache button controls whether future sampler executions use or
 # record the disposable replay checkpoint. It deliberately starts enabled to
 # preserve the established automatic interrupted-render recovery behavior.
@@ -344,6 +358,38 @@ def _remove_replay_cache():
         logging.warning("HR Endless Sampler could not clear replay cache %s: %s", path, error)
 
 
+def _teacher_audio_cache_root():
+    """Return the bounded, disposable cache for one finished teacher-audio pass."""
+    return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / TEACHER_AUDIO_CACHE_DIRNAME
+
+
+def _remove_cache_directory(path):
+    """Remove one disposable cache directory without following symlinks."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except OSError as error:
+        logging.warning("HR Endless Sampler could not clear %s: %s", path, error)
+
+
+def _remove_teacher_audio_cache():
+    """Remove only the sampler's fixed temporary teacher-audio cache."""
+    _remove_cache_directory(_teacher_audio_cache_root())
+
+
+def _set_teacher_audio_cache_state(state, reason="", reused_chunks=0):
+    """Record this render's teacher-audio cache decision for the preview button."""
+    with _REPLAY_CACHE_ACTIVITY_LOCK:
+        _TEACHER_AUDIO_CACHE_STATE.update({"run_state": str(state), "run_reason": str(reason), "reused_chunks": max(0, int(reused_chunks))})
+
+
+def _teacher_audio_cache_state_snapshot():
+    """Copy the decision state while the caller owns the activity lock."""
+    return dict(_TEACHER_AUDIO_CACHE_STATE)
+
+
 def _replay_cache_activity(active):
     """Track sampler executions so the UI cannot erase an in-use checkpoint."""
     global _REPLAY_CACHE_ACTIVE_RUNS
@@ -408,7 +454,32 @@ def _replay_cache_ui_status_unlocked():
         "status": status,
         "completed_chunks": completed_chunks,
         "cached_chunks": cached_chunks,
+        "audio_cache": _teacher_audio_cache_ui_status_unlocked(),
     }
+
+
+def _teacher_audio_cache_ui_status_unlocked():
+    """Describe the stored teacher-audio pass while the caller owns the lock."""
+    root = _teacher_audio_cache_root()
+    manifest = {}
+    try:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, NotADirectoryError, OSError, json.JSONDecodeError):
+        pass
+    payload = root / "teacher_audio.pt"
+    has_cache = bool(manifest) and payload.is_file()
+    try:
+        byte_count = payload.stat().st_size if payload.is_file() else 0
+    except OSError:
+        byte_count = 0
+    status = _teacher_audio_cache_state_snapshot()
+    status.update({
+        "has_cache": has_cache,
+        "chunks": max(0, int(manifest.get("chunks", 0) or 0)),
+        "bytes": byte_count,
+        "created": str(manifest.get("created", "")),
+    })
+    return status
 
 
 def _replay_cache_ui_status():
@@ -604,6 +675,173 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
         "ref2va": bool(ref2va),
         "plan": _replay_plan_signature(plan),
     }
+
+
+def _teacher_audio_patch_digest(patch):
+    """Hash one applied patch's key names and a bounded sample of its values."""
+    hasher = hashlib.sha256()
+    if not isinstance(patch, dict):
+        hasher.update(repr(patch).encode("utf-8"))
+        return hasher.hexdigest()
+    for key in sorted(patch.keys(), key=str):
+        hasher.update(str(key).encode("utf-8"))
+        values = patch[key] if isinstance(patch[key], (list, tuple)) else (patch[key],)
+        for value in values:
+            if not isinstance(value, torch.Tensor):
+                hasher.update(repr(value).encode("utf-8"))
+                continue
+            hasher.update(f"{tuple(value.shape)}{value.dtype}".encode("utf-8"))
+            # Only a prefix of each patch tensor is sampled: enough to separate
+            # two different LoRAs without reading a whole adapter per render.
+            flat = value.detach().reshape(-1)[:256].cpu()
+            if torch.is_floating_point(flat):
+                hasher.update(flat.to(torch.float32).numpy().tobytes())
+            else:
+                hasher.update(repr(flat.tolist()).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _teacher_audio_model_signature(model_patcher):
+    """Identify the patched weights that produced one teacher-audio pass.
+
+    ComfyUI assigns every applied patch a random identifier, so the digest is
+    built from the patch contents instead: strengths, key names and sampled
+    values. Replacing the base H3 weights while keeping the same LoRA, prompt
+    and seed is not covered here, exactly as the video replay cache does not
+    cover it; the cache button remains the manual escape hatch.
+    """
+    entries = []
+    for _identifier, entry in dict(getattr(model_patcher, "patches", None) or {}).items():
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        strength, patch = entry
+        try:
+            rounded = round(float(strength), 6)
+        except (TypeError, ValueError):
+            rounded = repr(strength)
+        entries.append([rounded, _teacher_audio_patch_digest(patch)])
+    return {"class": type(getattr(model_patcher, "model", None)).__qualname__, "patches": sorted(entries, key=repr)}
+
+
+def _teacher_audio_fingerprint(replay_fingerprint, *, prompt, noise_seed, sigmas, kv_cache_compression, model_patcher, toggles):
+    """Describe every input that changes one audio-first teacher-audio pass.
+
+    The owner's key is the source prompt plus the render seed, but the teacher
+    audio also depends on the chunk layout, the shifts, the compute precision,
+    the KV codec, the pre-production provider, the applied LoRA and the
+    TaoMate divergence toggles. ``replay_fingerprint`` already carries the
+    layout, the latent shapes and the audio-affecting flags, so it is the base
+    of this key rather than a second layout description.
+    """
+    fingerprint = dict(replay_fingerprint)
+    fingerprint["source_prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    fingerprint["noise_seed"] = int(noise_seed)
+    fingerprint["sigmas"] = [float(value) for value in sigmas.detach().float().cpu().tolist()] if sigmas is not None else []
+    fingerprint["kv_cache_compression"] = str(kv_cache_compression)
+    fingerprint["model"] = _teacher_audio_model_signature(model_patcher)
+    fingerprint["toggles"] = dict(toggles)
+    return fingerprint
+
+
+def _teacher_audio_toggle_signature():
+    """Name the TaoMate switches whose state changes the generated audio.
+
+    Imported lazily because the backend is imported the same way inside the
+    sampler, which keeps this module loadable without the TaoMate runtime.
+    """
+    from .python import taomate, taomate_audio_teacher
+    return {
+        "audio_first": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_AUDIO_FIRST),
+        "transcript_retry": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY),
+        "condition_attends_current_av": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_CONDITION_ATTENDS_CURRENT_AV),
+        "move_prompt_references": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_MOVE_PROMPT_REFERENCES),
+        "equal_sub_chunks": bool(taomate.TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS),
+        "compress_kv": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV),
+        "gpu_decompress_kv": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV),
+        "renorm_teacher_audio": bool(taomate_audio_teacher.TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO),
+    }
+
+
+def _teacher_audio_payload_problem(payload, chunk_count):
+    """Reject a truncated or mismatched payload before it can guide sampling."""
+    if not isinstance(payload, dict):
+        return "teacher audio cache payload is not a mapping"
+    for key in ("milestones", "prompts", "transcripts", "observations"):
+        if not isinstance(payload.get(key), list):
+            return f"teacher audio cache payload is missing {key}"
+    if not isinstance(payload.get("audio_latent"), torch.Tensor):
+        return "teacher audio cache payload is missing the clean teacher latent"
+    counts = {len(payload["milestones"]), len(payload["prompts"]), len(payload["transcripts"]), len(payload["observations"]), int(chunk_count)}
+    if len(counts) != 1:
+        return "teacher audio cache chunk count does not match this render"
+    for index, milestones in enumerate(payload["milestones"]):
+        if not isinstance(milestones, list) or not milestones or not all(isinstance(value, torch.Tensor) for value in milestones):
+            return f"teacher audio cache Chunk {index + 1} is missing its guidance states"
+    for index, observation in enumerate(payload["observations"]):
+        if not isinstance(observation, tuple) or len(observation) != 2 or not isinstance(observation[0], torch.Tensor):
+            return f"teacher audio cache Chunk {index + 1} is missing its decoded observation"
+    return None
+
+
+class _TeacherAudioCache:
+    """Persistent-on-disk copy of one complete audio-first teacher pass.
+
+    Only the sampler's own finished products are stored: the captured guidance
+    milestones, the clean teacher latent, the per-chunk teacher prompts, the
+    Whisper transcripts and the decoded observation waveforms. Nothing here
+    replaces a model or sampler input, so a reused pass is exactly the pass the
+    cached render already recorded.
+    """
+
+    def __init__(self):
+        """Bind the cache to the sampler's fixed temporary location."""
+        self.root = _teacher_audio_cache_root()
+
+    @property
+    def manifest_path(self):
+        return self.root / "manifest.json"
+
+    @property
+    def payload_path(self):
+        return self.root / "teacher_audio.pt"
+
+    def clear(self):
+        """Remove this entry from whichever root the cache is bound to."""
+        _remove_cache_directory(self.root)
+
+    def save(self, fingerprint, source_prompt, payload):
+        """Replace the stored pass with this render's finished products."""
+        self.clear()
+        self.root.mkdir(parents=True, exist_ok=True)
+        # The payload is written before its manifest: a manifest without a
+        # payload would claim a reusable pass that cannot be loaded.
+        _replay_write_tensor_file(self.payload_path, payload)
+        _replay_write_json(self.manifest_path, {
+            "format": TEACHER_AUDIO_CACHE_FORMAT,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "fingerprint": fingerprint,
+            "source_prompt_sha256": hashlib.sha256(source_prompt.encode("utf-8")).hexdigest(),
+            "chunks": len(payload["prompts"]),
+        })
+        logging.info("HR Endless Sampler recorded %d chunks of reusable teacher audio in %s", len(payload["prompts"]), self.root)
+
+    def load_if_compatible(self, fingerprint, chunk_count):
+        """Return the stored pass only when it matches this render exactly."""
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("format") != TEACHER_AUDIO_CACHE_FORMAT:
+                return None, "teacher audio cache format is obsolete"
+            if dict(manifest.get("fingerprint") or {}) != fingerprint:
+                return None, "prompt, seed, or a teacher-audio setting changed"
+            payload = _replay_load_tensor_file(self.payload_path)
+        except FileNotFoundError:
+            return None, "no teacher audio cache exists"
+        except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as error:
+            return None, f"could not load teacher audio cache: {error}"
+        problem = _teacher_audio_payload_problem(payload, chunk_count)
+        if problem is not None:
+            return None, problem
+        return payload, None
 
 
 class _LastRunReplayCache:
@@ -3895,6 +4133,31 @@ def _allocator_active_reserved(device):
     )
 
 
+def _release_captured_graph_pools(device, stage):
+    """Hand back ComfyUI's captured CUDA-graph pools, which a cache flush cannot.
+
+    `torch.cuda.empty_cache()` only returns the caching allocator's own blocks.
+    The model compiler's captured graphs keep private device pools that never
+    appear there, so they are dropped explicitly before a stage that needs the
+    card to itself. The next DiT evaluation re-captures what it needs.
+    """
+    if not TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS:
+        return
+    before = comfy.model_management.get_free_memory(device, torch_free_too=True)[0]
+    prefetch = getattr(comfy, "model_prefetch", None)
+    if prefetch is not None:
+        prefetch.cleanup_prefetch_queues()
+    comfy.model_management.soft_empty_cache(force=True)
+    after = comfy.model_management.get_free_memory(device, torch_free_too=True)[0]
+    logging.info(
+        "HR Endless Sampler released captured graph pools for %s on %s: free memory %.2f GiB -> %.2f GiB",
+        stage,
+        device,
+        before / (1024 ** 3),
+        after / (1024 ** 3),
+    )
+
+
 def _release_debug_preflight(device, *patchers):
     """Drop every disposable preflight owner and flush reclaimable VRAM."""
     for patcher in patchers:
@@ -4982,6 +5245,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 audio_sr=False,
                 **_deprecated_inputs):
         use_taomate = video_continuation_method == VIDEO_CONTINUATION_METHOD_TAOMATE
+        # This render has not chosen its teacher-audio policy yet; the preview
+        # button reads that decision while the render runs.
+        _set_teacher_audio_cache_state("idle")
         taomate_backend = None
         taomate_kv_cache = None
         audio_first_enabled = False
@@ -6176,7 +6442,81 @@ class HREndlessSampler(SamplerCustomAdvanced):
             if use_taomate and audio_vae is not None:
                 from .python.audio_transcription import ChunkAudioTranscriber
                 audio_transcriber = ChunkAudioTranscriber()
+
+            def decode_full_teacher_audio(full_teacher_audio):
+                """Decode one complete teacher audio timeline and publish it."""
+                nonlocal decoded_output_audio, decoded_audio_complete, audio_first_decoded, decoded_audio_sample_rate
+                decode_started = time.perf_counter()
+                try:
+                    comfy.model_management.unload_model_and_clones(guider.model_patcher)
+                    comfy.model_management.unload_model_and_clones(clip.patcher)
+                    full_audio, decoded_audio_sample_rate = taomate_backend.decode_audio_timeline(audio_vae, [full_teacher_audio])
+                    decoded_output_audio = [full_audio]
+                    decoded_audio_complete = True
+                    audio_first_decoded = True
+                    if preview_execution is not None:
+                        preview_execution.publish_audio_first(full_audio, decoded_audio_sample_rate)
+                except Exception as error:
+                    if not audio_first_decoded:
+                        decoded_audio_complete = False
+                    logging.warning("HR Endless Sampler could not decode the audio-first teacher preview; it will retry audio decode after video sampling: %s", error)
+                finally:
+                    comfy.model_management.unload_model_and_clones(audio_vae.patcher)
+                    timing.add("vae_audio_preview", decode_started)
+
+            # One audio-first pass is keyed by the source prompt, the render seed
+            # and every other setting that changes the teacher's audio. The
+            # preview cache button governs reuse: disabling it resets the stored
+            # pass as this render starts, and the run below then records a fresh
+            # replacement for the following one.
+            teacher_audio_reused = False
+            cached_teacher_audio = None
+            teacher_audio_cache = None
             if use_taomate and audio_first_enabled and replay_start_index == 0 and replay_sample_end:
+                teacher_audio_cache = _TeacherAudioCache()
+                teacher_audio_fingerprint = _teacher_audio_fingerprint(replay_fingerprint, prompt=prompt, noise_seed=replay_noise_seed, sigmas=sigmas, kv_cache_compression=kv_cache_compression, model_patcher=guider.model_patcher, toggles=_teacher_audio_toggle_signature())
+                if not _replay_cache_enabled():
+                    teacher_audio_cache.clear()
+                    _set_teacher_audio_cache_state("disabled", "the cache button is off, so this render recomputes and replaces the teacher audio")
+                    logging.info("HR Endless Sampler cache button is off; cleared the teacher audio cache so this TaoMate render regenerates and replaces it.")
+                else:
+                    cached_teacher_audio, teacher_audio_reason = teacher_audio_cache.load_if_compatible(teacher_audio_fingerprint, replay_sample_end)
+                    if cached_teacher_audio is None:
+                        _set_teacher_audio_cache_state("miss", teacher_audio_reason)
+                        logging.info("HR Endless Sampler has no reusable teacher audio: %s.", teacher_audio_reason)
+                    else:
+                        teacher_audio_reused = True
+                        _set_teacher_audio_cache_state("reused", "reused the stored teacher audio for this render", replay_sample_end)
+
+            if teacher_audio_reused:
+                first_started = time.perf_counter()
+                # The restored pass is exactly what the cached render recorded,
+                # so its prompts, transcripts, decoded observations and guidance
+                # states keep the video pass byte-identical to that render.
+                taomate_backend.audio_first_milestones = {index: milestones for index, milestones in enumerate(cached_teacher_audio["milestones"])}
+                taomate_backend.audio_first_ready = True
+                audio_requested_prompts.extend(cached_teacher_audio["prompts"])
+                audio_transcripts.extend(cached_teacher_audio["transcripts"])
+                audio_observations.extend(cached_teacher_audio["observations"])
+                for audio_index, cached_prompt in enumerate(audio_requested_prompts):
+                    preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = cached_prompt.strip()
+                    preview_chunk_ranges[audio_index]["h3_prompt"] = cached_prompt.strip()
+                    preview_chunk_ranges[audio_index]["subtitle"] = _preview_subtitle(cached_prompt)
+                    if preview_execution is not None:
+                        preview_execution.set_audio_prompt(audio_index, cached_prompt.strip(), preview_chunk_ranges[audio_index]["subtitle"])
+                        cached_waveform, cached_rate = audio_observations[audio_index]
+                        cached_range = preview_chunk_ranges[audio_index]
+                        preview_execution.publish_chunk_audio_first(audio_index, cached_waveform, cached_rate, cached_range["start"], cached_range["end"])
+                        preview_execution.set_audio_chunk_complete(audio_index)
+                decode_full_teacher_audio(cached_teacher_audio["audio_latent"])
+                timing.add("taomate_audio_first", first_started)
+                logging.info("TaoMate audio-first: reused the cached teacher audio for %d chunks; skipped teacher inference, its Gemma audio requests, VAE decode and transcription.", replay_sample_end)
+                if vram_monitor is not None:
+                    vram_monitor.report("after reusing the cached TaoMate teacher audio")
+                if debug:
+                    logging.info("TaoMate teacher audio cache reused from %s.", teacher_audio_cache.root)
+
+            if use_taomate and audio_first_enabled and replay_start_index == 0 and replay_sample_end and not teacher_audio_reused:
                 first_started = time.perf_counter()
                 sampling = guider.model_patcher.get_model_object("model_sampling")
                 video_shift = float(sampling.shift)
@@ -6349,24 +6689,24 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 full_teacher_audio = taomate_backend.prepare_audio_first(audio_teacher_conditioning, audio_noise, video, active_plan[:replay_sample_end], sigmas, video_shift, audio_shift, on_status=(lambda message: preview_execution.set_phase(message)) if preview_execution is not None else None, on_progress=(lambda chunk_number, chunk_total, step, steps: preview_execution.set_phase("TaoMate: audio teacher %d/%d · step %d/%d" % (chunk_number, chunk_total, step, steps), chunk=chunk_number - 1, audio_step_ms=taomate_backend.audio_teacher.average_step_ms)) if preview_execution is not None else None, on_chunk_complete=publish_audio_first_chunk, on_audio_candidate=retry_audio_first_candidate if TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY and audio_vae is not None else None)
                 del audio_transcriber
                 timing.add("taomate_audio_first", first_started)
-                if full_teacher_audio is not None and audio_vae is not None:
-                    decode_started = time.perf_counter()
+                if full_teacher_audio is not None:
+                    # The finished pass is recorded before it is decoded: the
+                    # pass is the reusable part, and a preview decode failure
+                    # must not cost the next render the whole teacher inference.
                     try:
-                        comfy.model_management.unload_model_and_clones(guider.model_patcher)
-                        comfy.model_management.unload_model_and_clones(clip.patcher)
-                        full_audio, decoded_audio_sample_rate = taomate_backend.decode_audio_timeline(audio_vae, [full_teacher_audio])
-                        decoded_output_audio = [full_audio]
-                        decoded_audio_complete = True
-                        audio_first_decoded = True
-                        if preview_execution is not None:
-                            preview_execution.publish_audio_first(full_audio, decoded_audio_sample_rate)
-                    except Exception as error:
-                        if not audio_first_decoded:
-                            decoded_audio_complete = False
-                        logging.warning("HR Endless Sampler could not decode the audio-first teacher preview; it will retry audio decode after video sampling: %s", error)
-                    finally:
-                        comfy.model_management.unload_model_and_clones(audio_vae.patcher)
-                        timing.add("vae_audio_preview", decode_started)
+                        teacher_audio_cache.save(teacher_audio_fingerprint, prompt, {
+                            "milestones": list(taomate_backend.audio_first_milestones.values()),
+                            "audio_latent": full_teacher_audio,
+                            "prompts": list(audio_requested_prompts),
+                            "transcripts": list(audio_transcripts),
+                            "observations": list(audio_observations),
+                        })
+                        _set_teacher_audio_cache_state("recorded", "recorded this render's teacher audio for reuse", replay_sample_end)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        _set_teacher_audio_cache_state("failed", str(error))
+                        logging.warning("HR Endless Sampler could not record reusable teacher audio; this render continues without a stored copy: %s", error)
+                if full_teacher_audio is not None and audio_vae is not None:
+                    decode_full_teacher_audio(full_teacher_audio)
                 taomate_backend.audio_first_audio_latent = None
                 full_teacher_audio = None
                 if vram_monitor is not None:
@@ -6390,6 +6730,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         "previous chunk": (previous_video, previous_audio),
                     },
                 )
+                _release_captured_graph_pools(vram_monitor.device, f"chunk {index + 1}/{len(active_plan)} start")
                 continuation = index > 0
                 continuation_picture_label = f"<Picture {picture_number}>" if continuation and include_video1_reference else None
                 content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
@@ -7400,6 +7741,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     logging.info("HR Endless Sampler: %s.", finalization_message)
                     if preview_execution is not None:
                         preview_execution.set_phase(finalization_message, chunk=index)
+                    _release_captured_graph_pools(vram_monitor.device, f"Chunk {index + 1}/{len(active_plan)} video VAE decode")
                     comfy.model_management.unload_model_and_clones(guider.model_patcher)
                     comfy.model_management.unload_model_and_clones(clip.patcher)
                     if use_taomate:

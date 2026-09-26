@@ -620,6 +620,7 @@ app.registerExtension({
             let lastCacheStatus = null;
 
             const cacheHelp = "Enable or disable replay-cache reuse for the next HR Endless Sampler run. Disabled ignores the existing cache, but the sampler still saves a fresh cache and overwrites the previous one.";
+            const teacherAudioCacheHelp = "Enable or disable teacher-audio reuse for the next TaoMate run. TaoMate records no video replay cache, so this button governs its audio-first teacher pass instead: the same prompt and seed reuse the stored teacher audio instead of sampling, decoding and transcribing it again. Disabled clears the stored audio as the render starts, and the run still records a fresh replacement.";
             let replayCacheEnabled = true;
             let reusingCachedChunks = false;
             let reusedChunkNumbers = [];
@@ -628,6 +629,15 @@ app.registerExtension({
             let cachedChunkCount = 0;
             let cachedChunkIndices = new Set();
             function renderCacheReuseLabel() {
+                // TaoMate has no cached video chunks; its only reusable state is
+                // the teacher audio stored by the last audio-first pass.
+                if (taomateMode) {
+                    const audio = lastCacheStatus?.audio_cache || null;
+                    const reused = audio?.run_state === "reused" && Number(audio.reused_chunks) > 0;
+                    cacheReuseLabel.textContent = `reusing cached teacher audio (${Number(audio?.reused_chunks) || 0} chunks)`;
+                    cacheReuseLabel.style.display = reused ? "block" : "none";
+                    return;
+                }
                 const labels = reusedChunkNumbers.map(number => `#${number}`);
                 const chunks = labels.length < 2
                     ? labels.join("")
@@ -635,7 +645,14 @@ app.registerExtension({
                         ? `${labels[0]} and ${labels[1]}`
                         : `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`;
                 cacheReuseLabel.textContent = `reusing cached chunks ${chunks}`;
-                cacheReuseLabel.style.display = !taomateMode && reusingCachedChunks && labels.length ? "block" : "none";
+                cacheReuseLabel.style.display = reusingCachedChunks && labels.length ? "block" : "none";
+            }
+            function teacherAudioCacheNote(audioStatus) {
+                const chunks = Math.max(0, Number(audioStatus?.chunks) || 0);
+                const bytes = Math.max(0, Number(audioStatus?.bytes) || 0);
+                const size = bytes ? ` (${(bytes / 1048576).toFixed(1)} MiB)` : "";
+                if (!chunks) return "No teacher audio is stored yet.";
+                return `${chunks} chunks of teacher audio are stored${size}${audioStatus?.created ? `, recorded ${audioStatus.created}` : ""}.`;
             }
             function applyReplayCacheStatus(cacheStatus) {
                 lastCacheStatus = cacheStatus;
@@ -657,17 +674,16 @@ app.registerExtension({
                     cachedChunkCount = 0;
                     cachedChunkIndices.clear();
                 }
-                cacheButton.disabled = taomateMode || Boolean(cacheStatus?.active);
+                cacheButton.disabled = Boolean(cacheStatus?.active);
                 cacheButton.style.background = replayCacheEnabled ? "#28662d" : "#202020";
                 cacheButton.style.borderColor = replayCacheEnabled ? "#69b76f" : "#444";
                 cacheButton.style.color = replayCacheEnabled ? "#e5ffe6" : "#888";
                 cacheButton.style.cursor = cacheButton.disabled ? "not-allowed" : "pointer";
                 renderCacheReuseLabel();
                 if (taomateMode) {
-                    cacheButton.title = "Replay cache is unavailable in TaoMate mode.";
-                    cacheButton.style.background = "#202020";
-                    cacheButton.style.color = "#888";
-                    cacheButton.style.borderColor = "#444";
+                    cacheButton.title = replayCacheEnabled
+                        ? `${teacherAudioCacheHelp}\nEnabled. ${teacherAudioCacheNote(cacheStatus?.audio_cache)}`
+                        : `${teacherAudioCacheHelp}\nDisabled. The stored teacher audio is cleared when the next render starts.`;
                 } else if (cacheStatus?.active) {
                     cacheButton.title = `${cacheHelp}\nThe current render already chose its cache policy.`;
                 } else {

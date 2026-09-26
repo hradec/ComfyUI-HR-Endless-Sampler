@@ -3804,3 +3804,125 @@ disposable worker and the operation-local non-MTP retry are preserved unchanged;
 
 Nothing here was committed or staged. The untracked `prompt.txt` and the owner's
 own dirty `python/taomate_audio_teacher.py` were left untouched.
+
+## 2026-09-26 — TaoMate reuses its teacher audio when prompt and seed are unchanged
+
+The owner asked for an audio cache: "implement an audio cache for the teacher
+audio, when the prompt and seed doesn't change, so the sampler can re-use the
+audio. We also need to reset the cache when the cache button is disable and the
+render starts. With taomate mode we have no video cache, but we still can make
+use of a global teacher audio cache, can't we?" Four decisions were put to the
+owner and all four recommended options were chosen: (1) the key covers the
+source prompt, the seed **and** every other audio-affecting setting, (2) the
+whole audio-first pass is restored, not just the latents, (3) the entry lives on
+disk in the existing temp root, (4) the existing preview cache button becomes
+TaoMate's teacher-audio switch.
+
+### Why the owner's key is coherent
+
+`gemma_director` is created with `seed=replay_noise_seed` (`nodes.py:5840`), so
+the entire audio-first chain — Gemma's per-chunk prompts → teacher audio →
+Whisper transcript → the next prompt — is reproducible from the source prompt
+plus the noise seed. That is what makes reuse of a recorded pass legitimate
+rather than a guess. The unavoidable caveat is the same one that already applies
+to every Gemma path: the documented MTP instability can make a *fresh* run
+diverge. A cache hit therefore freezes the direction the cached render recorded,
+which is the requested behaviour, not an accident.
+
+### What was built
+
+- `nodes.py` gained `TEACHER_AUDIO_CACHE_DIRNAME` (`teacher_audio`) beside
+  `last_run_replay`, a shared `_remove_cache_directory`, the
+  `_TeacherAudioCache` class (manifest plus one `teacher_audio.pt` payload), the
+  state global `_TEACHER_AUDIO_CACHE_STATE`, and `audio_cache` in
+  `_replay_cache_ui_status_unlocked()` so the button can report it.
+- The key is `_teacher_audio_fingerprint(replay_fingerprint, ...)`: the existing
+  replay fingerprint (layout, latent shapes, fps, continuation flags, compute
+  dtype, audio-affecting flags, preproduction fingerprint, ref2va) plus
+  `source_prompt_sha256`, `noise_seed`, the full `sigmas` list,
+  `kv_cache_compression`, `_teacher_audio_model_signature(...)` and
+  `_teacher_audio_toggle_signature()`. Note that the replay fingerprint
+  deliberately excludes the source prompt, which is why the prompt hash is added
+  explicitly.
+- `_teacher_audio_model_signature` hashes the applied patches by content
+  (strengths, patched key names, a 256-value prefix per tensor) and sorts the
+  per-entry digests, because ComfyUI gives each applied patch a *random*
+  identifier. Two renders with the same LoRA therefore share a signature; the
+  patch UUID never enters the key.
+- The payload holds only the sampler's own finished products: per-chunk
+  guidance milestones, the clean teacher latent, the per-chunk teacher prompts,
+  the Whisper transcripts and the decoded observation waveforms. Nothing there
+  replaces a model or sampler input. The manifest is written *after* the payload
+  so a manifest can never claim a pass that cannot be loaded.
+- Reuse restores `audio_first_milestones` (list → int-keyed dict),
+  `audio_first_ready`, `audio_requested_prompts`, `audio_transcripts` and
+  `audio_observations`, republishes each chunk's prompt/subtitle/audio to the
+  preview, and decodes the cached clean latent through the same
+  `decode_audio_timeline` call the fresh path uses. Teacher inference, its Gemma
+  audio requests, the per-chunk decodes and the transcripts are all skipped.
+- The fresh path now saves the pass *before* decoding it, so a preview decode
+  failure cannot cost the next render the whole teacher pass, and a storage
+  failure is logged and the render continues rather than dying.
+- Reset semantics match the replay cache contract: with the button off, the
+  stored pass is cleared as the render starts and the run records a fresh
+  replacement. `web/unlimited_preview.js` no longer disables the button in
+  TaoMate, its tooltip explains that it now governs the teacher audio, and
+  `cacheReuseLabel` shows "reusing cached teacher audio (N chunks)" from the new
+  `audio_cache.run_state`.
+
+### Trap that had to be checked
+
+`execute_chunk` pops `self.audio_first_milestones.pop(self.current_chunk_number - 1)`
+(`python/taomate.py:1103`) and `current_chunk_number` is *also* set inside
+`prepare_audio_first`, which a cache hit skips. Had the video loop not set it
+per chunk (`nodes.py:7537`), every reuse would have popped the wrong key. It
+does, so the reuse path is safe; keep that in mind before moving either line.
+Similarly, `audio_observations` must round-trip as *tuples* — the payload
+validator rejects anything else, so `weights_only=True` load behaviour is now
+pinned by a test.
+
+### Verified, and not verified
+
+`tests/test_teacher_audio_cache.py` (new, 11 tests) pins the round trip, the
+JSON-serializability of the key, key sensitivity per input, identifier-independent
+model signatures, rejection of changed keys / obsolete formats / truncated
+payloads / mismatched chunk counts, missing and corrupt entries reporting instead
+of raising, and the sampler wiring (including "a storage failure never stops the
+render"). `tests/test_chunk_director_helpers.py` needed one update: it asserts the
+exact status payload, so the new `audio_cache` block was added to that
+expectation, and it now states the audio state it pins instead of depending on
+test order. Full sweep is green: chunk-director helpers 147, TaoMate 41,
+teacher-audio cache 11, every other python test exits 0, all eight JS tests pass.
+
+**Not verified:** no live GPU render was run in this session. The fresh path's
+new save call and the reuse path only execute inside a real TaoMate render, so
+the first real render is the actual acceptance test. Reuse is also unmeasured —
+only the code path was proven, not the wall-clock saving.
+
+### Deliberate limits
+
+- Only the audio-first path is cached. With
+  `TOGGLE_TAOMATE_DIVERGENCY_AUDIO_FIRST` disabled, the per-chunk teacher audio
+  is interleaved into the video loop in `execute_chunk` and is not cached.
+- Replacing the base H3 weights while keeping the same LoRA, prompt and seed is
+  not detected. The video replay cache has the same hole, so the cache button
+  remains the manual escape hatch; adding a base-weight digest was rejected as
+  an expensive scan of a lazily loaded model.
+- A non-TaoMate render with the button off does *not* clear this entry; only a
+  TaoMate audio-first render does. That scoping was chosen so an unrelated video
+  render cannot destroy a good pass.
+- Which chunks were retried for transcript quality (`audio_retried_chunks`) is
+  not restored, because it only colours preview bands.
+
+Per the standing Gemma/MTP rule, issue
+<https://github.com/ggml-org/llama.cpp/issues/27439> was rechecked before
+touching these Gemma-dependent paths: still `open`, labeled `bug-unconfirmed`
+and `stale`, zero comments, last updated 2026-09-20, unsafely documented
+`LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` restore path with no linked fix, and PyPI still
+reports `llama-cpp-python` 0.3.35 (2026-08-17) as the newest release. The
+disposable worker and the operation-local non-MTP retry are preserved unchanged;
+`dependency.md` records the recheck.
+
+Nothing here was committed or staged. The untracked `prompt.txt` was left
+untouched, and the owner's own pre-existing uncommitted `nodes.py` work (the two
+`_release_captured_graph_pools` calls and their helper) was preserved as found.
