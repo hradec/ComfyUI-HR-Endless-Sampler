@@ -35,6 +35,12 @@ class Base10AudioTeacher:
         self.options = None
         self.receipt = None
         self.audio_anchor = None
+        # Set by the caller to receive each chunk's stored rows before commit
+        # consumes them, so one pass can keep a per-chunk KV record on disk.
+        self.on_kv_commit = None
+        # Stored rows for the chunks before a resume point. They are committed as
+        # soon as the cache exists, which happens on the first attention forward.
+        self.pending_prime = []
 
     def _renorm_clean_audio_rows(self, rows):
         """Match packed audio feature statistics to the first teacher chunk."""
@@ -68,6 +74,14 @@ class Base10AudioTeacher:
                     raise RuntimeError("teacher audio KV cache requires cache and attention-hook factories")
                 self.cache = self.cache_factory(attention.heads, attention.head_dim, k.dtype)
                 self.hook = self.hook_factory(self.cache)
+                if self.pending_prime:
+                    # A resumed pass rebuilds the skipped chunks' attention state
+                    # before this chunk attends, so the continuation sees the same
+                    # history the original pass had at that point.
+                    for record in self.pending_prime:
+                        self.cache.prime_staged(record["pairs"], record["block"], record["tags"])
+                    logging.info("TaoMate audio teacher primed %d stored audio KV chunks before resuming.", len(self.pending_prime))
+                    self.pending_prime = []
             self.cache.on_status = None
             if self.clean_cache_pass and not self.cache.clean_commit_active:
                 self.cache.begin_clean_commit(self.cache.committed_blocks)
@@ -107,7 +121,10 @@ class Base10AudioTeacher:
         try:
             self.forward(**self.branch.forward_kwargs(video_rows=torch.empty(0, 96, device=audio_rows.device), audio_rows=audio_rows, step_timesteps=clean_timestep))
             if self.cache.clean_commit_active:
+                snapshot = self.cache.staged_snapshot() if self.on_kv_commit is not None else None
                 self.cache.commit()
+                if snapshot is not None:
+                    self.on_kv_commit(snapshot)
         finally:
             self.clean_cache_pass = False
             if self.cache.clean_commit_active:

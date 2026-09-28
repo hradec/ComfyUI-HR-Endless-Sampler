@@ -150,6 +150,29 @@ def _cache_payload(payload):
                 audio_prompt = payload.get("audio_teacher_prompt")
                 if isinstance(audio_prompt, str) and audio_prompt.strip():
                     chunk_ranges[chunk_index]["audio_teacher_prompt"] = audio_prompt.strip()
+                # The attempt sequence outlives the prompt-of-record, so a refresh
+                # mid-render keeps the first take next to every retry.
+                attempts = payload.get("audio_teacher_attempts")
+                if isinstance(attempts, list):
+                    listed = [str(item).strip() for item in attempts if isinstance(item, str) and item.strip()]
+                    if listed:
+                        chunk_ranges[chunk_index]["audio_teacher_attempts"] = listed
+                # Empty slots are kept, because a retry is identified by its
+                # position: dropping one would move a hearing onto another retry.
+                # Empty slots are kept, because an attempt is identified by its position:
+                # dropping one would move a hearing onto another attempt.
+                heard = payload.get("audio_teacher_attempt_transcripts")
+                if isinstance(heard, list) and any(isinstance(item, str) and item.strip() for item in heard):
+                    chunk_ranges[chunk_index]["audio_teacher_attempt_transcripts"] = [str(item or "").strip() for item in heard]
+                silent_numbers = payload.get("subchunk_silent_numbers")
+                if isinstance(silent_numbers, list) and silent_numbers:
+                    chunk_ranges[chunk_index]["subchunk_silent_numbers"] = [int(number) for number in silent_numbers]
+                    chunk_ranges[chunk_index]["subchunk_silent_prompt"] = str(payload.get("subchunk_silent_prompt") or "")
+                # Empty slots are kept, because a sub-chunk is identified by its position:
+                # dropping one would move a transcript onto another sub-chunk.
+                subchunk_transcripts = payload.get("subchunk_transcripts")
+                if isinstance(subchunk_transcripts, list) and any(isinstance(item, str) and item.strip() for item in subchunk_transcripts):
+                    chunk_ranges[chunk_index]["subchunk_transcripts"] = [str(item or "").strip() for item in subchunk_transcripts]
                 subtitle = payload.get("subtitle")
                 if isinstance(subtitle, str):
                     chunk_ranges[chunk_index]["subtitle"] = subtitle
@@ -398,17 +421,19 @@ def _build_tiny_decoder(state_dict):
 
 
 class _TinyDecoder:
-    def __init__(self, name):
+    def __init__(self, name, device=None):
         path = folder_paths.get_full_path("vae_approx", name)
         if path is None:
             raise ValueError(f"tiny VAE '{name}' was not found in models/vae_approx")
         state_dict = comfy.utils.load_torch_file(path, safe_load=True)
         self.model = _build_tiny_decoder(state_dict)
         self.latent_channels = self.model[1].weight.shape[1]
-        self.device = comfy.model_management.vae_device()
-        self.dtype = comfy.model_management.vae_dtype(self.device, [torch.float16, torch.bfloat16])
+        # The CPU fallback asks for a second, host-side copy of the same decoder.
+        self.device = device if device is not None else comfy.model_management.vae_device()
+        on_cpu = torch.device(self.device).type == "cpu"
+        self.dtype = torch.float32 if on_cpu else comfy.model_management.vae_dtype(self.device, [torch.float16, torch.bfloat16])
         self.model = self.model.eval().to(device=self.device, dtype=self.dtype)
-        if torch.device(self.device).type == "cuda":
+        if not on_cpu and torch.device(self.device).type == "cuda":
             self.model.to(memory_format=torch.channels_last)
 
     def decode_frame(self, latent):
@@ -459,6 +484,12 @@ def _latent_rgb_frames(video, latent_format, indices, max_resolution):
     return [_tensor_image(frame, max_resolution) for frame in rgb]
 
 
+# The host-side fallback decodes a quarter as many frames and keeps to a couple
+# of threads, so it cannot starve the sampler's own CPU work while it runs.
+CPU_FALLBACK_FRAME_STRIDE = 4
+CPU_FALLBACK_THREADS = 2
+
+
 def _tiny_frames(video, decoder, indices, max_resolution):
     if decoder.latent_channels != video.shape[1]:
         raise ValueError(f"tiny VAE expects {decoder.latent_channels} latent channels, but the active video latent uses {video.shape[1]}")
@@ -480,10 +511,15 @@ def _frame_selection(video_t, trim_steps, stride, fps, output_start=0, temporal_
 
 
 def _encode_frame_group(frames, durations, quality):
+    # WebP's quality 100 is the finest *lossy* setting, not a lossless one, so
+    # 100 selects Pillow's lossless encoder by name. With it, quality becomes
+    # the compression effort. Lossless frames are bit-exact and, on smooth video
+    # content, smaller than lossy quality 100.
+    lossless = int(quality) >= 100
     encoded = []
     for frame in frames:
         buffer = pyio.BytesIO()
-        frame.save(buffer, format="WEBP", quality=quality, method=3)
+        frame.save(buffer, format="WEBP", quality=quality, method=3, lossless=lossless)
         encoded.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
     return encoded, list(durations)
 
@@ -567,10 +603,46 @@ class _PreviewExecution:
         for wrapper, execution_id in self.items:
             wrapper.set_phase(execution_id, phase, chunk=chunk, audio_step_ms=audio_step_ms)
 
-    def set_audio_prompt(self, chunk, prompt, subtitle):
-        """Publish the prompt actually used by a teacher chunk before video exists."""
+    def set_subchunk_prompts(self, chunk, numbers, prompt, transcripts=None):
+        """Publish what each sub-chunk of one chunk is prompted with, and what it heard.
+
+        Every phase of a chunk shares one conditioning, so only a sub-chunk whose audio
+        window holds no speech deviates: its prompt drops the dialogue so H3 is not told to
+        speak where the take was silent. ``transcripts`` holds the words the take spoke
+        inside each phase's own window, one entry per phase, empty where it said nothing.
+        The preview's Ctrl+Shift view shows both for the sub-chunk under the pointer.
+        """
+        listed = sorted(int(number) for number in numbers)
+        heard = [str(item or "").strip() for item in (transcripts or ())]
+        if not listed and not heard:
+            return
         for wrapper, execution_id in self.items:
-            _send({"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk, "h3_prompt": prompt, "audio_teacher_prompt": prompt, "subtitle": subtitle})
+            payload = {"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk}
+            if listed:
+                payload["subchunk_silent_numbers"] = listed
+                payload["subchunk_silent_prompt"] = str(prompt)
+            if heard:
+                payload["subchunk_transcripts"] = heard
+            _send(payload)
+
+    def set_audio_prompt(self, chunk, prompt, subtitle, attempts=None, attempt_transcripts=None):
+        """Publish the prompt actually used by a teacher chunk before video exists.
+
+        ``attempts`` is the whole prompt sequence this chunk's teacher audio was
+        sampled with, in order, so Ctrl-hover can show the first take next to
+        every retry that rejected one. ``attempt_transcripts`` holds what each take
+        heard, one entry per attempt, empty where the take said nothing or was never
+        transcribed, so the tooltip can show it under that attempt's prompt.
+        """
+        listed = [str(item).strip() for item in (attempts or ()) if str(item).strip()]
+        heard = [str(item or "").strip() for item in (attempt_transcripts or ())]
+        for wrapper, execution_id in self.items:
+            payload = {"node_id": wrapper.node_id, "execution": execution_id, "action": "chunk_metadata", "chunk": chunk, "h3_prompt": prompt, "audio_teacher_prompt": prompt, "subtitle": subtitle}
+            if listed:
+                payload["audio_teacher_attempts"] = listed
+            if any(heard):
+                payload["audio_teacher_attempt_transcripts"] = heard
+            _send(payload)
 
     def set_subchunk(self, index, start, end, temporal_offset, subchunk_number):
         """Set the current TaoMate phase without resetting its five-second group."""
@@ -702,6 +774,14 @@ class _AccumulatedPreviewWrapper:
         self.current_chunk = None
         self.decoder = None
         self.decoder_failed = False
+        self.decoder_oom = False
+        # Host-side fallback: one decoder copy, one decode at a time, and one
+        # finished result waiting to be shown by a later step.
+        self.cpu_decoder = None
+        self.cpu_decoder_failed = False
+        self.cpu_job = None
+        self.cpu_result = None
+        self.cpu_lock = threading.Lock()
         self.started_at = None
         self.started_at_ms = None
         self.final_audio = {}
@@ -1138,6 +1218,11 @@ class _AccumulatedPreviewWrapper:
     def _decoder(self):
         if self.tiny_vae_name == "none" or self.decoder_failed:
             return None
+        if self.decoder_oom:
+            # An allocation failure is not a permanent verdict: every sub-chunk
+            # starts from the sampler's released baseline, so try the card again.
+            self.decoder_oom = False
+            self.decoder = None
         if self.decoder is None:
             try:
                 self.decoder = _TinyDecoder(self.tiny_vae_name)
@@ -1146,6 +1231,56 @@ class _AccumulatedPreviewWrapper:
                 logging.warning(f"HR Endless Sampler preview could not load '{self.tiny_vae_name}', using Latent2RGB: {error}")
                 self.decoder_failed = True
         return self.decoder
+
+    def _cpu_decoder(self):
+        """Load the host-side copy the fallback uses, at most once per render."""
+        if self.cpu_decoder is not None or self.cpu_decoder_failed:
+            return self.cpu_decoder
+        try:
+            self.cpu_decoder = _TinyDecoder(self.tiny_vae_name, device="cpu")
+        except Exception as error:
+            logging.warning(f"HR Endless Sampler CPU tiny VAE fallback could not load '{self.tiny_vae_name}': {error}")
+            self.cpu_decoder_failed = True
+        return self.cpu_decoder
+
+    def _take_cpu_frames(self, key):
+        """Collect one finished background decode, if it belongs to this step."""
+        with self.cpu_lock:
+            result = self.cpu_result
+            self.cpu_result = None
+        if result is None or result[0] != key:
+            return None
+        return result[1], result[2], result[3]
+
+    def _queue_cpu_frames(self, video, indices, durations, frame_numbers, key):
+        """Decode one tight step's frames on the host, so the render never waits."""
+        with self.cpu_lock:
+            if self.cpu_job or self.cpu_decoder_failed:
+                return
+            latents = [video[0, :, index].detach().to(device="cpu", dtype=torch.float32, copy=True) for index in indices]
+            job = threading.Thread(target=self._cpu_decode_job, args=(latents, durations, frame_numbers, key), daemon=True)
+            self.cpu_job = job
+        job.start()
+
+    def _cpu_decode_job(self, latents, durations, frame_numbers, key):
+        """Decode frames off the sampler's critical path and publish them for a later step."""
+        frames = []
+        decoder = self._cpu_decoder()
+        if decoder is not None:
+            # Keep the fallback from competing with the sampler's own CPU work.
+            previous_threads = torch.get_num_threads()
+            torch.set_num_threads(CPU_FALLBACK_THREADS)
+            try:
+                for latent in latents:
+                    frames.append(_tensor_image(decoder.decode_frame(latent.unsqueeze(0)), self.max_resolution))
+            except Exception as error:
+                logging.warning(f"HR Endless Sampler CPU tiny VAE fallback failed: {error}")
+                frames = []
+            finally:
+                torch.set_num_threads(previous_threads)
+        with self.cpu_lock:
+            self.cpu_result = (key, frames, durations, frame_numbers) if frames else None
+            self.cpu_job = None
 
     def merge_subchunk_preview(self, payload):
         """Replace only the current phase's frames and retain earlier phase previews."""
@@ -1256,18 +1391,37 @@ class _AccumulatedPreviewWrapper:
                         chunk.get("subchunk_start", chunk["output_start"]),
                         chunk.get("temporal_offset", 0),
                     )
-                    if decoder is not None:
+                    cpu_frames = self._take_cpu_frames(chunk_index) if decoder is None else None
+                    if cpu_frames is not None:
+                        frames, durations, frame_numbers = cpu_frames
+                        previewer_name = "Tiny VAE (CPU fallback)"
+                    elif decoder is not None:
                         try:
                             frames = _tiny_frames(video, decoder, indices, self.max_resolution)
                         except Exception as error:
                             logging.warning(f"HR Endless Sampler tiny VAE preview failed, using Latent2RGB: {error}")
+                            # An allocation failure lasts until the next sub-chunk
+                            # releases the card again; it is not a verdict on the run.
                             self.decoder = None
-                            self.decoder_failed = True
+                            self.decoder_oom = True
                             decoder = None
                             previewer_name = "Latent2RGB (tiny VAE failed)"
                             frames = _latent_rgb_frames(video, latent_format, indices, self.max_resolution)
                     else:
                         frames = _latent_rgb_frames(video, latent_format, indices, self.max_resolution)
+                    # While the card is too full for the device decode, spend one
+                    # host-side decode per sub-chunk: on its last step, so the work
+                    # has the rest of the phase to finish without blocking anything.
+                    if decoder is None and not self.cpu_decoder_failed and step + 1 >= callback_total:
+                        cpu_indices, cpu_durations, cpu_numbers = _frame_selection(
+                            video.shape[2],
+                            chunk["trim_steps"],
+                            self.frame_stride * CPU_FALLBACK_FRAME_STRIDE,
+                            self.fps,
+                            chunk.get("subchunk_start", chunk["output_start"]),
+                            chunk.get("temporal_offset", 0),
+                        )
+                        self._queue_cpu_frames(video, cpu_indices, cpu_durations, cpu_numbers, chunk_index)
                     if frames:
                         payload = {
                             "node_id": self.node_id,
@@ -1329,7 +1483,8 @@ class HREndlessSamplerPreview(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Int.Input("max_resolution", default=0, min=0, max=8192, step=8,
                              tooltip="Maximum preview side in pixels. 0 keeps the decoder's native output resolution."),
-                io.Int.Input("quality", default=75, min=30, max=100, step=1),
+                io.Int.Input("quality", default=75, min=30, max=100, step=1,
+                             tooltip="WebP quality for each preview still. 100 switches to lossless WebP (bit-exact, and usually smaller than lossy 100 on smooth video)."),
                 io.Float.Input("fps", default=24.0, min=1.0, step=1.0,
                                tooltip="Preview playback FPS. The browser applies changes immediately while a preview is playing."),
                 io.Int.Input("frame_stride", default=1, min=1, max=16, step=1,
@@ -1351,3 +1506,95 @@ class HREndlessSamplerPreview(io.ComfyNode):
             _AccumulatedPreviewWrapper(cls.hidden.unique_id, max_resolution, quality, fps, frame_stride, tiny_vae),
         )
         return io.NodeOutput(patched)
+
+
+def build_teacher_audio_preview_snapshot(node_id, payload, *, fps):
+    """Rebuild a dormant player from the last TaoMate render's stored audio.
+
+    A TaoMate render keeps no video frames by design, so the restored groups carry
+    each chunk's prompt, subtitle and decoded audio and no frames. The sequence of
+    cached actions mirrors what the live audio-first pass publishes, which is what
+    the player already knows how to consume after a reconnect.
+    """
+    preview = payload.get("preview") if isinstance(payload, dict) else None
+    chunks = preview.get("chunks") if isinstance(preview, dict) else None
+    observations = payload.get("observations") if isinstance(payload, dict) else None
+    if not isinstance(chunks, list) or not chunks or not isinstance(observations, list):
+        return None
+    # The plan is longer than the settled prefix, and only the settled chunks have
+    # decoded audio to publish.
+    settled_count = sum(1 for chunk in chunks if chunk.get("settled") is not False)
+    if len(observations) < settled_count:
+        return None
+    resolved_fps = max(0.001, float(fps))
+    ranges = []
+    for chunk in chunks:
+        start = int(chunk.get("start", 0))
+        end = int(chunk.get("end", start))
+        range_item = {
+            "start": start,
+            "end": end,
+            "subtitle": str(chunk.get("subtitle") or ""),
+            "h3_prompt": str(chunk.get("prompt") or ""),
+            "audio_teacher_prompt": str(chunk.get("prompt") or ""),
+        }
+        # Every prompt this chunk's teacher audio was sampled with, so Ctrl-hover
+        # still names the retries after a refresh or a restart.
+        attempts = [str(item).strip() for item in (chunk.get("attempts") or ()) if str(item).strip()]
+        if attempts:
+            range_item["audio_teacher_attempts"] = attempts
+        heard = [str(item or "").strip() for item in (chunk.get("attempt_transcripts") or ())]
+        if any(heard):
+            range_item["audio_teacher_attempt_transcripts"] = heard
+        # The sub-chunks prompted without the dialogue, for the Ctrl+Shift view.
+        silent_numbers = [int(number) for number in (chunk.get("subchunk_silent_numbers") or ())]
+        if silent_numbers:
+            range_item["subchunk_silent_numbers"] = silent_numbers
+            range_item["subchunk_silent_prompt"] = str(chunk.get("subchunk_silent_prompt") or "")
+        # What each sub-chunk's slice of the take heard, for the Ctrl+Shift view.
+        subchunk_transcripts = [str(item or "").strip() for item in (chunk.get("subchunk_transcripts") or ())]
+        if any(subchunk_transcripts):
+            range_item["subchunk_transcripts"] = subchunk_transcripts
+        ranges.append(range_item)
+    total_frames = max((item["end"] for item in ranges), default=-1) + 1
+    _cache_payload({
+        "node_id": str(node_id),
+        "action": "reset",
+        "execution": 0,
+        "chunk_count": len(ranges),
+        "chunk_ranges": ranges,
+        "shot_ranges": [],
+        "reusing_cached_chunks": settled_count > 0,
+        "cached_chunk_count": settled_count,
+        "reused_chunk_numbers": list(range(1, settled_count + 1)),
+        "total_frames": total_frames,
+        "fps": resolved_fps,
+        "elapsed_ms": 0.0,
+        "phase": "Restored the last TaoMate render audio",
+    })
+    for index, chunk in enumerate(chunks):
+        # A chunk the pass has not reached yet keeps its slot in the timeline but
+        # has no audio to publish, exactly as it looks during the live pass.
+        if chunk.get("settled") is False:
+            continue
+        if index >= len(observations):
+            continue
+        waveform, sample_rate = observations[index]
+        if not isinstance(waveform, torch.Tensor) or sample_rate is None:
+            continue
+        _cache_payload({
+            "node_id": str(node_id),
+            "action": "chunk_audio_first",
+            "execution": 0,
+            "chunk": int(index),
+            "output_start": ranges[index]["start"],
+            "output_end": ranges[index]["end"],
+            "fps": resolved_fps,
+            "audio": _encode_audio_wav(waveform, int(sample_rate)),
+            "audio_mime": "audio/wav",
+            "audio_sample_rate": int(sample_rate),
+            "elapsed_ms": 0.0,
+        })
+        _cache_payload({"node_id": str(node_id), "action": "audio_chunk_complete", "execution": 0, "chunk": int(index)})
+    _cache_payload({"node_id": str(node_id), "action": "complete", "execution": 0, "elapsed_ms": 0.0})
+    return _cached_snapshot(node_id)

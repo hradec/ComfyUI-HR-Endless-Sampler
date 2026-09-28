@@ -3836,19 +3836,50 @@ which is the requested behaviour, not an accident.
   `_TeacherAudioCache` class (manifest plus one `teacher_audio.pt` payload), the
   state global `_TEACHER_AUDIO_CACHE_STATE`, and `audio_cache` in
   `_replay_cache_ui_status_unlocked()` so the button can report it.
-- The key is `_teacher_audio_fingerprint(replay_fingerprint, ...)`: the existing
-  replay fingerprint (layout, latent shapes, fps, continuation flags, compute
-  dtype, audio-affecting flags, preproduction fingerprint, ref2va) plus
-  `source_prompt_sha256`, `noise_seed`, the full `sigmas` list,
-  `kv_cache_compression`, `_teacher_audio_model_signature(...)` and
-  `_teacher_audio_toggle_signature()`. Note that the replay fingerprint
-  deliberately excludes the source prompt, which is why the prompt hash is added
-  explicitly.
-- `_teacher_audio_model_signature` hashes the applied patches by content
-  (strengths, patched key names, a 256-value prefix per tensor) and sorts the
-  per-entry digests, because ComfyUI gives each applied patch a *random*
-  identifier. Two renders with the same LoRA therefore share a signature; the
-  patch UUID never enters the key.
+- The key is `_teacher_audio_key(chunk_prompts, chunk_ticks)`: the ordered
+  per-chunk prompts the render will use (the "legacy chunk prompts" provider's
+  editable table when one is connected, otherwise the legacy planner's output from
+  `planned_prompts`), plus each chunk's audio length in ticks. Both lists exist
+  before the pass starts. `_teacher_audio_key_difference` therefore reports
+  "Chunk 4's prompt changed" — the unit the owner asked for. Cache format 3.
+- **Why the first version of this key was wrong, and dangerous.** It hashed the
+  source prompt only. The owner edits individual chunks in the
+  `HREndlessLegacyChunkPrompts` node, which reaches the sampler as
+  `pre_production` (the provider's 5.8 KB table at node 2600), not as `prompt`.
+  Under the source-prompt key that edit would not have invalidated anything: the
+  next render would have silently served the old chunk-4 audio. The key now
+  includes the provider table, so an edited chunk always redraws.
+- The key was `source prompt hash + chunk ticks` for one revision, which also
+  ignored `video_continuation` (73 vs 56 produce identical request plans and thus
+  identical audio windows). **This replaced a much stricter key**
+  (the whole replay fingerprint, seed, sigmas, codec, model digest and toggles).
+  The owner's rule: "drop everything but the chunk prompt" — users iterate on
+  video parameters far more than on dialogue, and an audio they like should
+  survive those changes. The per-chunk prompts themselves cannot be part of the
+  key, because in the audio-first pass chunk N's prompt is authored from chunk
+  N-1's transcript and so only exists while the pass runs; on a hit the cached
+  prompts are restored, which is what the rule asks for. Changing `chunk_frames`
+  still redraws the audio, because it changes the chunk count and their tick
+  lengths. The cache button remains the way to force a fresh pass.
+- **Why the strict key had to go.** On 2026-09-26 the 18:00 render missed with
+  "prompt, seed, or a teacher-audio setting changed" although the Cached pass was
+  exactly reusable: the source prompt hash read from the in-flight run's graph was
+  identical (`989243807b5743e5`), as were the seed, sigmas, codec, model digest
+  and toggles. The only difference was `video_continuation` 73 → 56, and
+  `TaoMateStreaming.request_plan` produces byte-identical plans for both: same six
+  requests, same frame windows, same audio ticks `[0, 433, 858, 1283, 1708, 2133, 2417]`,
+  differing only in the video sub-chunk `phases`, which the teacher never reads.
+  The render paid the full ~15-minute teacher pass for a parameter the audio pass
+  does not consume. The miss now names what changed
+  (`_teacher_audio_key_difference`), and the cache format is 2, so an old entry
+  reports "format is obsolete" instead of pretending a prompt changed.
+- Deliberate consequences of the looser key, so nobody rediscovers them as bugs: a
+  changed seed, sigma schedule, KV codec, LoRA/model, resolution or compute
+  precision now reuses the stored audio rather than regenerating it. That is the
+  requested behaviour ("if they have an audio they like, they can stick to it"),
+  and the button is the escape hatch. The payload is still validated for shape —
+  chunk count and each chunk's tick length — because a restored milestone whose
+  width differs from its chunk window would silently misalign the video pass.
 - The payload holds only the sampler's own finished products: per-chunk
   guidance milestones, the clean teacher latent, the per-chunk teacher prompts,
   the Whisper transcripts and the decoded observation waveforms. Nothing there
@@ -3926,3 +3957,1966 @@ disposable worker and the operation-local non-MTP retry are preserved unchanged;
 Nothing here was committed or staged. The untracked `prompt.txt` was left
 untouched, and the owner's own pre-existing uncommitted `nodes.py` work (the two
 `_release_captured_graph_pools` calls and their helper) was preserved as found.
+
+## 2026-09-26 — Source prose is owned by one chunk, and speech rate is directed
+
+The owner reported that chunk 2 of a render was correct (camera line plus its own
+dialogue) while chunk 3 "introduced back the state of subject 1 as described in
+the global prompt", and asked whether a per-chunk table of the prompt's actions
+could decide where each action goes. They then added two requirements: detect
+parallel versus sequential actions ("Tila smiles, as the camera zooms in" versus
+"The camera zooms to tilas face, and she smiles"), and stop treating speech rate
+as fixed, because H3 can be told how fast a subject speaks. They supplied a new
+`prompt.txt` (single-shot monologue) and moved the old seven-shot prompt to
+`prompt-heman.txt` so both could serve as fixtures.
+
+### Why the repetition happened
+
+`_legacy_shot_body_for_range` selected a sentence for **every** chunk whose
+proportional word window overlapped it (`offset < end_weight and offset + weight
+> start_weight`), and `_legacy_opening_body_with_timed_dialogue` handed the chunk
+where a shot opens the shot's **entire** visual prose. A long description
+sentence therefore reached the opening chunk and then every later chunk whose
+window reached it, while a shorter one in the middle could be skipped by the
+chunk in between. Reproduced exactly, with the shot opening at chunk 3: the state
+sentence appeared in chunk 3 and every chunk after it, and not in chunk 2. There
+was no ownership anywhere in the visual path; the dialogue path already had it in
+`_dialogue_owner_spans`.
+
+### What was built
+
+- `_action_clauses` splits a sentence into clauses and keeps each clause's raw
+  connector, so rejoining reproduces the source punctuation byte for byte. The
+  split group must **capture**: without the capture `re.split` returns no
+  separators and the pairing silently drops half the text, which is how the first
+  version lost the middle of a sentence.
+- `_action_units` classifies each clause: `camera_state`, `camera_cut`,
+  `camera_move`, `subject`, `other`. The camera vocabulary follows the vendored
+  guides and shares `CAMERA_MOTION` with `_legacy_static_camera_prompt` instead
+  of keeping a second copy of the regex.
+- `_action_relation` decides parallel or sequential: sequential markers win over
+  parallel ones, a camera cut is always a sequential boundary, a participial
+  clause and a continuous camera move are parallel unless the text sequenced
+  them, and an unmarked pair defaults to sequential (ordering two beats is
+  recoverable, merging them into one time window is not).
+- `_action_groups` returns the ownable parallel groups, the repeating camera
+  states, and the opening setup clauses. A setup clause (`<Picture N>`,
+  "starts with", "in silence for", "exact first frame") is neither repeated nor
+  splittable, so it is pinned to the shot's opening chunk; this is what keeps
+  `test_continuation_drops_complete_opening_picture_instruction_before_slicing`
+  meaningful.
+- A parallel group's weight is the **max** of its members, and sequential groups
+  chain by sum, so a camera move running alongside its subject no longer charges
+  the shot twice. That inflated estimate was a second cause of prose bleeding
+  into later chunks.
+- `_action_owner_index` is the dialogue walk applied to groups: whole groups, cut
+  at the boundary nearest the output clock, at least one group per planned chunk
+  while groups remain, never split and never dropped. `_legacy_action_plan`
+  builds the table per shot across every planned chunk and returns
+  window → prose; `_legacy_shot_body_for_range` and the opening wrapper now emit
+  only their owned text. `_planned_chunk_prompts` builds the tables once and
+  passes them in; `python/preproduction.py:154` inherits this because it calls
+  that function directly.
+- `_action_plan_rows` feeds the debug chunk prompt with shot, category,
+  relation and owning window per unit.
+
+### Three refusals replaced
+
+1. **Speech rate.** `base-en.txt` §4.4 documents a speaking rate as a supported
+   delivery attribute and requires delivery to sit **outside** `<d>`.
+   `_dialogue_word_schedule` already stretches words into their window
+   (`scale = available / total_weight`), so only the guard assumed a fixed rate.
+   The guard is now a factor: 1.0–1.10 "speaking a little faster than usual",
+   1.10–1.25 "speaking quickly", 1.25–1.40 "speaking very quickly, rushing the
+   words", past 1.40 the render still stops with the shot named. The owner's
+   Shot 3 case is 2.98 s in 2.75 s = **1.08×**, comfortably inside the first
+   band. Slack between 0.60 and 1.0 asks for "speaking slowly, with pauses";
+   below 0.60 the shot simply has sparse dialogue and no instruction is emitted,
+   because telling H3 to drag each word out would make that worse.
+2. **Fewer words than chunks.** The old guard raised when a shot had fewer words
+   than output chunks. `_dialogue_owner_spans` is documented to leave the
+   trailing ranges silent, which is exactly a long shot with one line, so the
+   guard became a log line. Without this the seven-shot prompt could not plan at
+   all: its Shot 7 is 43 s with 8 words.
+3. **Delivery verbs.** `LEGACY_DIALOGUE_PATTERN` required the literal word
+   "says", so `Heman (S1) shout:` and `Tila (S2) shouts:` made the prompt
+   unparseable. The header now accepts the delivery wording the guides allow
+   between the speaker ID and `<d>`.
+
+### Product change to watch
+
+The first video no longer receives the shot's complete description: ownership
+gives every chunk its own units, including the first one. The previous behaviour
+was deliberate ("the first H3 video establishes the shot from the user's complete
+source description") and its test was rewritten to the ownership contract rather
+than deleted. For both fixtures the change is invisible, because each opening
+shot fits inside its first chunk, but a long first shot now spreads its prose
+progressively. Reverting just that rule is a one-line change in
+`_legacy_action_plan`.
+
+### Verified, and not verified
+
+`tests/test_chunk_director_helpers.py` is 159 tests, all passing, including five
+rewritten pinned tests and five new ones: no action unit announced by two chunks,
+parallel group unsplit, sequential order and connector preserved, camera cut as a
+sequential boundary, still-camera state repeating while actions do not, setup
+pinned to its opener, and the rate bands. `test_taomate.py` 41, teacher-audio
+cache 11, every other python test exits 0, all eight JS tests pass. Across both
+real prompts the ownership table reports **32 action groups with 0 announced
+twice**, and the seven-shot prompt now plans at both geometries (14 and 17
+chunks) instead of stopping.
+
+**Not verified:** no live GPU render. The prompts were planned, not sampled, so
+the rendered result of the new distribution and of the delivery instructions is
+unmeasured. Known remaining weakness: `_dialogue_word_schedule` spreads a shot's
+words across the whole shot, so a long shot with one line still gives each chunk
+a word or two (Shot 7 of the seven-shot prompt), and the fix for that is to clip
+the utterance span rather than stretch it — not attempted here.
+
+Nothing was committed or staged. Both prompt files were read as fixtures and left
+untouched. The Gemma/MTP upstream check recorded earlier in this same session
+still applies; this change touches prompt construction only and no llama.cpp,
+worker, cache or retry behaviour.
+
+## 2026-09-26 — Dialogue cuts land on phrase terminals, and retries change the rate
+
+The owner watched chunk 3 lose the word "silence" on every take and asked for
+three things: never split a phrase between chunks so a chunk always ends with
+punctuation, make a retry raise the speaking-rate instruction instead of changing
+the text, and use "speaking much faster than before" for that retry because the
+take's own audio is in the retained KV cache, so the model can measure "before".
+
+### The live log evidence
+
+`/NVME/comfyui/ComfyUI/user/comfyui.log` and its two predecessors, render of
+17:12-17:19, six chunks, `chunk_frames=260`, `video_continuation=73` (geometry
+recovered by matching `TaoMateStreaming.request_plan` against the teacher's
+logged audio ticks). Every chunk whose slice opened with a carried seam word lost
+exactly that word, before and after the retry:
+
+| chunk | expected head | heard | lost |
+|---|---|---|---|
+| 2 | `and why light is bad…` | `why light is bad…` | "and" |
+| 3 | `silence comforting…` | `comforting…` | "silence" |
+| 4 | `is shining. The birds are singing. Disturbing…` | `Disturbing…` | "is shining." **and** the new sentence "The birds are singing." |
+
+Chunk 3 take 1 was scheduled cleanly — "silence" at 21.458s-22.039s in a window
+ending 32.083s — so it was never a timing slip. The slice opened mid-phrase and
+the prose said "The dialogue is already in progress at this video opening."; H3
+obeyed by starting at the next complete unit. `_recut_dialogue_prompts` rebuilt
+the slice from `leftover[span_start:span_end + 1]` with `span_start = 0`, so the
+same head word came back and the retry could never fix it — chunk 3's retried
+take dropped "silence" again, chunk 4's dropped two sentences again.
+
+### Changes
+
+- `_dialogue_owner_spans` now cuts only on a phrase terminal: it picks the
+  terminal nearest the output clock instead of the nearest word. `_dialogue_phrase_ids`
+  already marks a phrase end at `. ! ? …`, so every slice finishes on punctuation.
+  A phrase that cannot fit its window overruns it rather than being split, which
+  is what the speaking-rate delivery now covers. `_seam_orphans_a_phrase_word`
+  became unnecessary and was deleted.
+- `_escalate_speech_rate(prompt)` replaces whichever band the prompt carries with
+  "Speaking much faster than before", outside `<d>`, or attaches it to the
+  speaker header when no band was emitted. The spoken words are untouched.
+- Both retry paths (`retry_audio_first_candidate` for audio-first, and
+  `retry_chunk_teacher_audio` for the per-chunk teacher) now keep the dialogue and
+  escalate the delivery. The "approved spoken prefix" branch and its text
+  re-authoring are gone: a retry means the take lost or garbled words, not that
+  the words were wrong, so the words stay.
+- Deleted as dead once the retry stopped rewriting text: `_recut_dialogue_prompts`,
+  `_retry_take_prompts`, `_publish_revised_dialogue`, `_audio_transcript_approved_tail_prompt`
+  (124 lines). They remain in git history if the prefix-acceptance idea returns.
+
+### Verification
+
+On the live monologue prompt every chunk slice now ends on a phrase terminal —
+"chunks ending mid-phrase: 0" — and chunk 2 ends with the whole phrase
+`...Personally, I find silence comforting.` while chunk 3 starts on a fresh
+sentence instead of a borrowed fragment. Escalation on chunk 3 turns "Speaking
+slowly" into "Speaking much faster than before" with the spoken words byte-identical.
+`tests/test_chunk_director_helpers.py` is 158 tests passing: five obsolete
+re-cut tests were replaced by three escalation tests and a
+phrase-terminal test, and six tests that pinned mid-phrase splits were rewritten
+to the phrase-aligned contract, including the property that a phrase which
+overruns its window may only be restated with words its own chunk already spoke.
+TaoMate 41, teacher-audio cache 11, every other python test exits 0, all eight JS
+tests pass.
+
+**Not verified:** no live GPU render of these changes yet; the cuts and the
+escalation were verified by planning, not by sampling.
+
+### Per-chunk teacher audio KV records and a resumable pass
+
+The owner asked "aren't we caching each chunk kv? audio only kv-cache is not that
+big", and they were right that no KV was cached anywhere. **The size estimate in
+the first draft of this note was wrong by 10x**: measured from a real record, the
+audio attention has **56 heads** and the teacher's commit captured **866 tokens for
+a 433-tick chunk** (two per tick) across 50 layers, so a chunk's rows are ~250 MB
+at `turboquant3` (3 bits, codes shape (tokens, 56, 48)) and a 60-second video is
+**~1.4 GB** — a three-minute video ~5-6 GB. That is the real price of exact prefix
+reuse, and it needs a disk budget decision rather than a cheerful assumption. It is
+still ~10x smaller than the video KV, but not "not that big".
+
+### Why a browser refresh shows a week-old cache
+
+Driving the owner's report "when I refresh the browser it loads a really old cache
+(which apparently is never getting deleted) and doesn't show the last rendered
+cache (the audio?)":
+
+- On load the widget asks `/hr_endless_sampler_preview/state?node_id=…` and, when
+  ComfyUI no longer has that in-memory snapshot, falls back to
+  `/hr_endless_sampler_preview/cached_preview` (`web/unlimited_preview.js:2319-2327`,
+  route at `nodes.py:559`).
+- That route rebuilds the player from the **finalized replay checkpoint** —
+  `_LastRunReplayCache()` at `nodes.py:1257` → `build_cached_final_preview_snapshot`
+  in `preview.py`, which publishes each cached chunk's frames *and* audio.
+- TaoMate renders never write that checkpoint
+  (`replay_cache_enabled = _replay_cache_enabled() and not use_taomate`), so the
+  one on disk is frozen at **2026-09-19 16:32**, and its manifest says
+  `status="interrupted"` with one completed chunk: a refresh therefore plays a
+  week-old half-finished run, audio included.
+- The last render's teacher audio lives in `teacher_audio/`, which that path never
+  reads, so the newest audio cannot appear. When the entry is also incomplete (only
+  `kv/` records, as while a pass is still running) there is nothing recent to show
+  at all.
+
+- `serialize_stored_kv` / `deserialize_stored_kv` (`python/taomate.py`) describe
+  the three storage forms: quantized (codes + scales), compressed (codec frames
+  as bytes) and raw. `tests/test_taomate_kv_records.py` proves a save/load round
+  trip is bit-identical for turboquant, int8, zstd-lossless and none, codec bytes
+  included, through the sampler's own `weights_only=True` loader.
+- `TaoMateKVCache.staged_snapshot()` and `prime_staged()` snapshot one chunk's
+  rows before `commit()` consumes them and later accept them as if that chunk had
+  just been generated; priming two chunks reproduces a two-chunk history exactly.
+- `Base10AudioTeacher.on_kv_commit` hands each chunk's rows to the caller before
+  the commit, and `pending_prime` commits stored rows the moment the cache exists,
+  which is the first attention forward of the resumed chunk.
+- `prepare_audio_first(..., start_index, prefix_segments, prefix_origin,
+  prime_records, on_kv_commit)` resumes a pass: chunks before `start_index` keep
+  their clean rows as the teacher's context, and `_TeacherAudioCache` stores one
+  record per chunk beside the payload.
+- Per-pass state that a resume must restore, or the continuation lands on
+  different coordinates: `audio_time_origin` (the rope origin, set once from the
+  first chunk's text length) and `audio_anchor` (the renorm mean/std). Both are in
+  the payload now.
+- `_teacher_audio_resume_index` returns the first chunk whose prompt hash differs,
+  and only when the chunk tick lengths are unchanged and every earlier record
+  exists. Otherwise the render falls back to a full pass, which is always safe.
+- **A trap worth remembering:** `save()` used to start with `self.clear()`, which
+  would have deleted the KV records written during that same pass. It now replaces
+  only the manifest and the payload, and a fresh pass clears the records
+  explicitly through `clear_kv_records()`.
+- Past twelve chunks the pass calls `drop_audio_history`, so records from before
+  the last drop boundary no longer describe the KV: the save path discards them,
+  and the gap rule then refuses a resume that would need them.
+
+**Not verified:** a live resumed render. The serializer, priming, decision and
+prefix validation are tested offline; only a render can confirm that the resumed
+pass produces the same audio for the settled chunks. What to look for in the log:
+`keeping Chunks 1-3 from the stored pass and resuming the teacher at Chunk 4 of 6`,
+`primed 3 stored audio KV chunks before resuming`, and a teacher progress bar with
+fewer steps than the chunk count.
+
+### One last cache, newest source on refresh
+
+The owner's rule after the diagnosis: "only one last cache stays. If a render that
+doesn't use cache starts, that last is deleted since the new non-cached render will
+create a new one." Implemented as three changes.
+
+- **Refresh shows the newest cache.** `_newest_cached_preview_source()` compares the
+  teacher-audio manifest against the replay checkpoint and
+  `/hr_endless_sampler_preview/cached_preview` builds from the winner, falling back
+  to the checkpoint if the audio snapshot cannot be built. The teacher-audio payload
+  now carries a `preview` block (fps plus per-chunk start/end/prompt/subtitle), and
+  `build_teacher_audio_preview_snapshot` in `preview.py` replays the live
+  audio-first sequence (`reset` → `chunk_audio_first` → `audio_chunk_complete` →
+  `complete`) so a refreshed player shows the last TaoMate render's chunks, prompts
+  and audio. No frames, by design: a TaoMate render keeps none.
+- **Button off deletes every last cache as the render starts.** The rule lives once,
+  next to where the button is read: `_remove_replay_cache()` +
+  `_remove_teacher_audio_cache()`. The audio-first block no longer clears anything
+  itself, so there is a single place that decides this.
+- **An incompatible cache warns instead of failing silently.** When the button is on
+  and a stored entry exists but cannot be used, the state is `incompatible` and the
+  preview shows a yellow line naming the reason and saying the render overwrites it.
+  A missing entry stays a plain `miss`.
+- KV records stay inside the cache folder (`teacher_audio/kv/`) and are removed with
+  it, as asked; no separate pruning.
+
+### Follow-up worth doing
+
+The delivery band is still computed per **shot** (`total_weight / available_seconds`
+over the shot's dialogue window), while the cut is now per phrase. A chunk can
+therefore own more speech than its own window while the shot-level rate stays
+under 1.0, and nothing asks that chunk to speak faster until the retry does.
+Computing the band per chunk from the words it owns would prevent the drop
+instead of repairing it. The owner also noted that the monologue's chunks all
+carry "speaking slowly, with pauses"; that band came from the shot-level slack,
+and a per-chunk rate would change it.
+
+## 2026-09-26 — Add 3-bit and 2-bit TurboQuant KV modes
+
+The owner asked to expose 4-, 3-, and 2-bit TurboQuant choices, rename the
+existing `turboquant` choice to `turboquant4`, and make `turboquant3` the
+sampler default.
+
+- Added the fixed Gaussian Lloyd-Max centroids used by the upstream
+  `pyturboquant` codebook for 2 and 3 bits, reusing the existing 4-bit table.
+  The 3-bit packer writes each 8-index group into three bytes; 2- and 4-bit
+  packers use 4- and 2-index groups respectively. All three unpack back to the
+  128-wide H3 attention head.
+- The sampler menu and execution default are now `turboquant3`; `none`,
+  `zstd lossless`, and `int8` remain. Saved quantized records using the former
+  name `turboquant` deserialize as `turboquant4`.
+- A resumed audio cache can contain an older TurboQuant width than the newly
+  selected mode. At that boundary, the old and new rows are reconstructed on
+  CPU and re-encoded in the active mode; same-width rows continue to append
+  packed data directly.
+- Expected retained K/V storage, including two FP32 norms per vector pair, is
+  26.6% for 4 bits, 20.3% for 3 bits, and 14.1% for 2 bits relative to BF16.
+- The first full TaoMate suite run found three tiny-head test fixtures inheriting
+  the new 3-bit default. The user-facing sampler default is the requested 3-bit
+  mode; the no-argument backend fallback was restored to its prior setting so
+  these internal fixtures keep their old behavior.
+
+Validation: `tests/test_taomate_kv_records.py` (10 tests) and
+`tests/test_taomate.py` (41 tests) pass. The record tests verify exact packed
+index round trips, stored byte counts, legacy 4-bit records, mixed-width cache
+continuation, and save/load. `py_compile` and `git diff --check` pass. No live
+render comparison has been run for the new lower-precision modes.
+
+## 2026-09-26 — Why a stopped render kept losing its cache, and the fixes
+
+The owner stopped an audio render, restarted ComfyUI, started a new one and watched
+it recompute everything, not delete the old video checkpoint, and then saw a
+refreshed browser restore that week-old checkpoint instead of the audio render.
+Three separate mechanisms produced that, in this order.
+
+- **The cache button lived in the process only.** `REPLAY_CACHE_ENABLED` is a module
+  global set at import, so a ComfyUI restart silently flipped it back to *enabled*:
+  the delete branch (`if not _replay_cache_enabled()` → `_remove_replay_cache()` and
+  `_remove_teacher_audio_cache()`) never ran, and the banner the owner saw said
+  cache reuse was on. The endpoint also refuses a change while a render is active
+  (`409`, "Cache policy can change only between sampler renders"), so clicking it
+  mid-render bounced back. Fix: the choice is written to
+  `<temp>/comfyui-hr-endless-sampler/cache_policy.json` by
+  `_save_cache_policy` and restored by `_load_cache_policy()` at import.
+- **A stopped pass had no identity.** KV records were written per chunk during the
+  pass, but the manifest and payload only appeared in `save()`, which runs after the
+  whole teacher pass. Stopping at Chunk 6 of 6 therefore left 1.4 GB of records with
+  no manifest: invisible to the status, invisible to
+  `_newest_cached_preview_source()` (so the refresh fell back to the Sep 19 replay
+  checkpoint), and a miss for the next render, which then called
+  `clear_kv_records()` and deleted them.
+- **A resume could not have worked anyway.** Two defects: the resume index needed an
+  *edited* prompt (an identical key returned 0, so a stopped pass restarted at Chunk
+  1), and `prepare_audio_first` reset `audio_first_milestones = {}` after the caller
+  had restored the prefix, while `execute_chunk` pops one entry per chunk with
+  `audio_first_milestones.pop(...)` — a resumed render would have raised `KeyError`
+  on its first video chunk.
+
+Implemented, in the order the plan table listed them:
+
+- **Pass identity from the first chunk.** `_TeacherAudioCache.begin_pass(key,
+  chunk_count, resume_index)` writes `manifest.json` with
+  `{key, chunks, recorded, status: "recording", deleted}` before sampling. A fresh
+  pass (`resume_index == 0`) drops the previous payload and records first, exactly as
+  the old `clear_kv_records()` call did; a resumed pass keeps the prefix and drops
+  the records after the resume point, because those rows describe the take this
+  render is replacing. `save()` finally writes `status: "complete"`.
+- **The settled prefix is written as it grows.** `save_chunk_state(index, payload)`
+  rewrites the payload (same mapping as `save()`, without `audio_latent`) at the end
+  of every chunk, from the `teacher_audio_payload()` closure both writers share. The
+  write is deliberately not atomic: a process killed inside it leaves a payload the
+  loaders reject, which costs one reuse, while a temp file plus rename would cost a
+  second copy of every tensor.
+- **Resume index semantics.** `_teacher_audio_resume_index` now keeps
+  `min(settled, edited, first deleted)` chunks: an identical key on an unfinished
+  pass continues at its stop point, an edited prompt still resumes at the first
+  changed chunk, and a chunk deleted from the timeline forces that chunk (and every
+  chunk after it) to be generated again. A *finished* pass whose key is identical
+  still returns 0 — that case is the whole-pass reuse `load_if_compatible` already
+  handles, and returning 0 there avoids resuming from a payload the loader rejected.
+  `load_if_compatible` refuses a payload whose manifest lists deleted chunks, naming
+  the chunk.
+- **Prefix milestones survive the resume.** `prepare_audio_first` keeps the caller's
+  restored entries (`index < start_index`) instead of clearing the dict.
+- **A cache a render cannot use is deleted at render start, never left behind.** The
+  owner's rule, stated twice and now enforced in both places: *a cache is either
+  reused or deleted*. TaoMate renders carry no video cache and cannot continue one,
+  so the replay checkpoint goes at render start even with the button on (it is the
+  checkpoint a refresh kept restoring). A non-TaoMate render with the button on whose
+  checkpoint fails `load_if_compatible` (fingerprint mismatch, or missing prior
+  chunks) now clears it instead of leaving it for the refresh and overwriting it at
+  the end. The teacher-audio side already follows the rule through
+  `begin_pass(..., resume_index=0)`: a miss or an incompatible pass drops the stored
+  payload and records before sampling, then records under the new key. (Approved as
+  row 7 of the plan table plus this follow-up.)
+- **Per-chunk delete from the timeline.** `POST
+  /hr_endless_sampler_preview/teacher_audio_chunk?chunk=<0-based index>`, backed by
+  `_TeacherAudioCache.delete_chunk` (rows plus the manifest's `deleted` list), and a
+  right-click item "Delete teacher audio cached chunk" in the preview menu, shown
+  when `taomateMode` and the chunk has stored audio. The status now reports
+  `recorded`, `kv_chunks` and `interrupted`, and the button tooltip says
+  "N of M chunks are stored so far (the render was stopped)".
+
+Known ceiling, named in the code: a pass past twelve chunks drops its earliest audio
+history and their records with it, so `_teacher_audio_resume_index` still restarts
+those long passes at Chunk 1. Priming from the live twelve-chunk window is the
+upgrade path.
+
+Validation: `tests/test_teacher_audio_cache.py` (22 tests, five new: stopped-pass
+identity and refresh, fresh-pass replacement, resume prefix, button persistence,
+unusable-cache deletion), `tests/test_taomate_kv_records.py` (12 tests, two new:
+interrupted-pass resume at the stop point, delete forcing a new take),
+`tests/test_chunk_director_helpers.py` (158), `tests/test_taomate.py` (41), all JS
+suites. No live render has exercised the new resume path yet: the next stopped render
+is the first real check. The owner's week-old Sep 19 replay checkpoint was removed by
+hand after the rule was implemented, since no render had run in between.
+
+## 2026-09-26 — The resume path's arity crash, and what the first live pass proved
+The first render that exercised the new resume logic died with
+`_TeacherAudioCache.load_prefix() missing 1 required positional argument:
+'chunk_ticks'` at 22:03. The call site still passed one argument, so the *decision*
+had worked (it wanted to keep a prefix) and the restore crashed on the very next
+line. Fixes:
+
+- The per-chunk ticks list is now built once as `teacher_audio_chunk_ticks` and feeds
+  both `_teacher_audio_key(...)` and `load_prefix(resume_index,
+  teacher_audio_chunk_ticks)`; the duplication that let the two drift apart is gone.
+- `_write_manifest` gained `created=`, so the manifest's creation time names the pass
+  instead of the last rewrite. `save_chunk_state`, `save` and `delete_chunk` pass the
+  stored value through.
+- Regression test `test_every_cache_call_matches_its_method_signature`: it walks
+  `nodes.py` with `ast`, collects every `.method(...)` call whose name belongs to the
+  cache module classes, and asserts the positional count matches one of the arities
+  that name has in this module (two classes share `load_if_compatible` and
+  `delete_chunk`, hence the set). This is the check that would have caught the crash.
+
+What the 21:56–22:01 pass left on disk, read back with the real loader
+(`/tmp/codex/verify_resume.py`): manifest `status="recording"`, `chunks=6`,
+`recorded=4`, `deleted=[]`, key with six prompts and ticks
+`[433, 425, 425, 425, 425, 284]`; five KV records on disk but only four settled
+chunks, because the render stopped between Chunk 5's KV commit and its completion —
+which is exactly the case `settled = min(recorded, available records)` exists for.
+The resume index for an identical key is 4, with 4 prime records and 4 prefix
+milestones whose widths match the first four ticks, `audio_time_origin = 654`, and 4
+preview chunks at 24 fps. So the next render with the same prompt keeps chunks 1-4 and
+generates only 5 and 6.
+
+Note for later: `audio_anchor` is always `None` in practice because
+`TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO` is hard-coded `False`. If that
+constant is ever enabled, a resumed pass would re-anchor on its own first generated
+chunk instead of the original Chunk 1, and the prefix's packed rows are no longer
+available to recompute it from.
+
+## 2026-09-26 — Preview button states survive a refresh
+
+The owner reported that every preview button resets on a browser refresh. The cause:
+`persistPlayerState()` only wrote `node.properties.hr_endless_sampler_preview_player`
+(the `L` gamma display, subtitles, mute and the frame position), and LiteGraph
+serializes node properties only when the *workflow is saved*, so an unsaved refresh
+or a ComfyUI restart started from the defaults.
+
+- The same mapping is now mirrored into `localStorage` under
+  `hr_endless_sampler_preview_player` by `writeStoredPlayerState()`, and read back by
+  `readStoredPlayerState()` when the node is created, merged *over* the workflow
+  copy: every press writes storage, so storage is the newer authority.
+  `rememberPlayerState(state)` is the single writer, used by `persistPlayerState()`
+  and by the restored-frame path in `restorePersistedFrame()`.
+- Both copies keep the same shape, so a workflow saved by an older build keeps
+  working, and a browser that blocks or corrupts storage falls back to the defaults
+  with one warning instead of throwing inside node creation.
+- The play button is part of the same mapping now: `paused` is stored by
+  `persistPlayerState()`, `setPaused()` stores it the moment it is pressed (so a
+  press is remembered even before a frame is displayed), and
+  `restorePersistedFrame()` honors it — an explicit `paused: false` resumes playing
+  from the stored frame, while a state written before this key existed (or by an
+  older build) still restores paused at the frame, exactly as it did then. Only the
+  *soundtrack* still needs one click after a refresh, because browsers grant audio
+  playback only from a user gesture; the frames resume on their own.
+- The cache button was already server-side (`cache_policy.json`), so it needed no
+  change. Fullscreen is deliberately not restored: the browser grants it only from a
+  user gesture. The playback-fps widget is a node widget, so it keeps following the
+  workflow rather than browser storage.
+
+Validation: `tests/test_preview_player_state.js` (new) executes both helpers in a
+`vm` context against a fake `localStorage` and checks the round trip, the exact
+storage key, the failure fallbacks and the wiring; all nine JS suites and
+`tests/test_teacher_audio_cache.py` (22) pass.
+
+## 2026-09-27 — The delete-chunk item was invisible, and its route was stale
+
+The owner reported the timeline's "delete audio chunk" item as missing. Two causes:
+
+- The item only appeared when *that* chunk had a stored record, so right-clicking any other
+  chunk showed nothing at all. It is now offered for **every** TaoMate chunk while the cache
+  button is on; when the chunk has no stored audio it is disabled and its tooltip names the
+  chunks that do have it. It is a state the owner can see, not a hidden condition.
+- The server route behind it (`POST /hr_endless_sampler_preview/teacher_audio_chunk`) answered
+  **404** on the live process: the running module predates the route again. Python changes need
+  a restart; the JS is served `no-store`, so that half was already current.
+
+Evidence worth keeping: `GET` on that POST-only route is the cheapest liveness probe (405 =
+present, `404 = missing`), and the live status showed `kv_chunks: [0]` for a Chunk-1-only pass —
+the tail chunks legitimately have no rows because they were kept, not generated.
+
+`tests/test_taomate_timeline.js` now pins the always-offered item, the disabled state and its
+explanation; all nine JS suites are green.
+
+## 2026-09-27 — A table item is consumed the moment a chunk gets it
+
+Owner's own proposal, implemented: remove an item from the table as soon as it lands in a
+chunk prompt, so it can never reach another chunk.
+
+- `_planned_chunk_prompts` keeps one `emitted_units` ledger per render and threads it into
+  every chunk body (`emitted=`).
+- `_legacy_shot_body_for_range` claims each owned prose piece by `(slot, text)` and each
+  block's in-between prose by `(block, gap)`. A repeat is dropped and named in a warning
+  ("already went into an earlier chunk"), so a duplicated sentence is now impossible and
+  visible if some future path tries it.
+- Repeated *by design*, therefore not claimed: the still-camera state and the opening setup
+  (pieces with a negative slot — they are states, not items) and the dialogue words a chunk
+  restates to bridge a physical prefix.
+
+Verified directly (`/tmp/codex/verify_ledger.py`): with a shared ledger the second chunk
+carrying the same pieces emits the owned sentence once and keeps the camera state.
+`tests/test_chunk_director_helpers.py` (168, one new) plus `tests/test_teacher_audio_cache.py`
+(30), `tests/test_taomate_kv_records.py` (18), `tests/test_taomate.py` (41) and the global
+prompt section checks are green.
+
+Also added this session: `_log_chunk_prompts` writes every chunk's final prompt to the log and
+to `<temp>/comfyui-hr-endless-sampler/last_chunk_prompts.txt` (`CHUNK_PROMPT_LOG_FILENAME`),
+so the next render can be read instead of guessed at.
+
+## 2026-09-27 — The speaking-rate band only rides a cut delivery
+
+Owner rule, from a real miss: "Speaking slowly, with pauses" appeared in front of a delivery
+the chunk holds whole ("That's an act of agression"). The band exists for a delivery a chunk
+boundary *cut* — a phrase that continues here from the previous chunk — and a whole delivery
+must never gain one.
+
+The band was computed once per source shot (`speech_rate = total_weight / available_seconds`)
+and then stamped on **every** piece, which is why an unrelated delivery inherited it.
+`_legacy_dialogue_pieces` now tracks per piece whether any of its words arrived through the
+chunk's physical prefix (`piece_is_cut`) and only then prefixes the band (or when the slice
+starts inside a phrase, `carried_prefix`). The shot-level rate check still stops the render
+past a plausible human pace; it just no longer decorates deliveries that were not cut.
+
+Verified with the mocked weights the tests use (`/tmp/codex/verify_band2.py`,
+`/tmp/codex/verify_band3.py`): a 48s-in-40s shot asks for "speaking quickly" only on the
+continuing chunk, and the chunk holding the whole phrase carries no instruction at all.
+`tests/test_chunk_director_helpers.py` (167: one new test for the cut case, and the old
+"asks for a faster delivery" test now pins that a whole over-long line is spoken as written
+without any band) plus the other Python suites are green.
+
+## 2026-09-27 — The chunk prompt keeps the global prompt's line breaks
+
+Owner rule: the newlines and empty lines in the global prompt are there for a reason, so the
+cutter may not flatten them. It did: every piece was joined with a space and the sentence
+splitter consumed blank lines as separators.
+
+- `_legacy_prose_layout(body)` maps each prose sentence to `(slot, leading whitespace)`, the
+  whitespace being the run the source wrote before that sentence (its line breaks and empty
+  lines). `_legacy_prose_slots` is the same map stripped to the slot.
+- `_action_units` stamps both onto every unit; the plan's pieces carry the unit's
+  `separator` (leading whitespace + connector, so `, and then` keeps its own spacing) and the
+  joined `text` is assembled from those same pieces, so the text other callers read is
+  unchanged.
+- Each dialogue piece carries the whitespace *before* its header as its separator and keeps
+  everything the source wrote between the previous block and that header inside the piece
+  (the in-between prose plus the break before the header). The first block claims only the
+  break into its own header, never the leading prose — that belongs to the chunk's prose
+  piece, and claiming it twice duplicated the opening sentence.
+- The emission joins with those separators, collapsing runs longer than one empty line
+  (`\n{3,}` → `\n\n`) so a dropped piece cannot leave a wall of blank lines.
+
+Verified with a four-part prompt (`/tmp/codex/verify_newlines.py`): the chunk prompt keeps all
+four blank lines, has no tripled newline, emits the opening sentence once, and orders
+delivery / in-between prose / delivery / trailing prose as written.
+`tests/test_chunk_director_helpers.py` (166, one new) plus the other three Python suites are
+green.
+
+## 2026-09-27 — Dialogue is a unit in the action table
+
+Owner decision, implemented: dialogue belongs in the action table next to camera, action and
+direction, so the chunk body follows the sequence of events the global prompt writes instead
+of "all owned prose, then all dialogue".
+
+- `_legacy_prose_slots(body)` maps each prose sentence to its **slot**: how many spoken
+  blocks precede it (`0` before the first, `k` between block `k-1` and `k`, the trailing slot
+  after the last). It is built with the same `ACTION_SENTENCE_BREAK` the table unitizes with,
+  so the two can never disagree about what a sentence is.
+- `_action_units(..., sentence_slots)` stamps each unit with that slot; `_action_groups`
+  passes it through; the slot rides on the piece, not on the plan text, so ownership is
+  untouched.
+- `_legacy_action_outputs(...)` returns both the joined text (byte for byte what the other
+  callers read) and `[(slot, text, separator), ...]` per window. `_legacy_action_plan` is now
+  a thin wrapper over it.
+- `_legacy_dialogue_pieces(...)` is the index-carrying twin of `_legacy_dialogue_for_range`,
+  which stays the public two-value API, so the slicer's words, seams and delivery bands are
+  unchanged.
+- `_legacy_shot_body_for_range(..., action_pieces=, sentence_slots=)` merges prose pieces
+  (rank 0) and deliveries (rank 1, keyed by their block index) and sorts by slot, so the
+  emitted order is the prompt's order. Callers that still pass only the joined `action_plan`
+  get the old arrangement through `_legacy_plan_pieces`.
+
+Verified through the real builder (`/tmp/codex/verify_table_order.py`): with prose after the
+last delivery it now follows the delivery instead of being hoisted; leading prose stays
+before it; the between-deliveries case keeps its order. `tests/test_chunk_director_helpers.py`
+(165, three new ordering tests) plus `tests/test_teacher_audio_cache.py` (30),
+`tests/test_taomate_kv_records.py` (18), `tests/test_taomate.py` (41) and the global-prompt
+section checks are green. Not yet exercised by a live render.
+
+## 2026-09-27 — Prose between two deliveries now stays between them
+
+The owner's rule, from a real miss: in
+
+```
+… then <Subject 1> (S1) says: <d>[English]Someone asked me to keep talking for a whole minute.</d>
+
+after saying, she pauses and  makes a disaproving face moving her head side to side.
+
+<Subject 1> (S1) then says: <d>[English] That's an act of agression.</d>
+```
+
+the middle prose must stay between the two deliveries. It did not: `_legacy_visual_body`
+stripped only the `<d>` blocks, so that prose became an action-table unit that the chunk
+author emitted *before* both deliveries — and the delivery band ("speaking slowly, with
+pauses") then sat where the prose belonged.
+
+- `_legacy_dialogue_gaps(body)` returns the prose between each pair of spoken blocks, keyed
+  by the block it precedes.
+- `_legacy_visual_body` strips those gaps as well as the blocks, so the action table can
+  never claim them — one definition, used by the plan and by the direct callers.
+- `_legacy_dialogue_for_range` emits each gap immediately before the delivery it precedes
+  (`"<gap> <header><d>…</d>"`), so the gap lands between the two phrases in whichever chunk
+  speaks the second one, and exactly once.
+
+Verified with the owner's own text through the real chunk builder
+(`/tmp/codex/verify_gap2.py`): in the produced body phrase 1 < gap < phrase 2, and the gap
+appears once. `tests/test_chunk_director_helpers.py` (164, two new) plus
+`tests/test_teacher_audio_cache.py` (30), `tests/test_taomate_kv_records.py` (18),
+`tests/test_taomate.py` (41) are green.
+
+## 2026-09-27 — Cache warnings moved from the node to ComfyUI toasts
+
+The owner asked for the yellow text on the preview node to become a ComfyUI warning at the
+top of the UI, dismissed with its X. Both yellow sites used the same colour (`#e0c060`):
+the incompatible-cache notice in `renderCacheReuseLabel` and the reason for a refused cache
+policy change in the button handler.
+
+- `warnToast(summary, detail)` calls `app.extensionManager.toast.add({severity: "warn",
+  summary, detail, life: 8000})`. It skips a repeat of the *identical* message, because the
+  cache status is polled every three seconds and would otherwise raise a toast each time.
+- When the frontend has no toast API it writes `console.warn` and returns false, so a cache
+  problem is never silent; no yellow node text remains (`grep e0c060` is empty).
+- `tests/test_preview_player_state.js` runs the helper against a fake
+  `app.extensionManager.toast` and asserts the payload, the repeat suppression and the
+  missing-API path.
+
+## 2026-09-27 — The cursor could not come back on an audio-only preview
+
+`restorePersistedFrame()` matched the stored frame against each chunk's `frameNumbers`, and
+a TaoMate preview publishes audio with **no** frames (`frame_numbers: []`), so the search
+found nothing, the restore gave up and the timeline cursor stayed at the first chunk.
+
+The restore now falls back to the chunk whose **frame range** holds the stored position —
+`output_start`/`output_end` from the published chunk, else the range table — sets the cursor
+there and clears the pending target. It deliberately skips any group that *does* have frames,
+so a real frame match still wins when the frames arrive later.
+
+Verified by running the real function in a harness (`/tmp/codex/run_restore.cjs`): the
+audio-only shape restores with `playing=0` on the chunk spanning frames 260-514 for a stored
+frame of 261, and the frame shape still shows the exact frame. All nine JS suites green,
+`tests/test_preview_player_state.js` pins the fallback and its skip condition.
+
+## 2026-09-27 — A refresh always started playing
+
+`resetExecution()` unconditionally set `paused = false`, and every restore path runs a
+reset: the browser's restored snapshot arrives as a `reset` action, so a panel that was
+paused came back playing. `restorePersistedFrame()` could not fix it either — it applies
+the stored `paused` only when it finds the stored frame, and an audio-only preview has no
+frames to find.
+
+`resetExecution` now keeps the stored play state when the panel is restoring
+(`restoringCache` is true for exactly that window) and still forces `paused = false` for a
+live reset, which is a new run. The restore's `finally` also repaints the transport, so
+the restored play button is visible instead of waiting for the next event; the reconnect
+test harness needed the matching `renderTransport` stub for that.
+
+Validation: all nine JS suites green, including `tests/test_preview_player_state.js`
+(two new pins: the restore condition and the repaint) and `tests/test_preview_reconnect.js`.
+
+## 2026-09-27 — The key now hashes the owner's own chunk prompts
+
+Asked again, plainly: only the chunk prompts and the chunk count may rebuild the audio.
+Until now the key hashed `planned_prompts`, i.e. the *derived* prose (action ownership,
+dialogue windows, delivery bands), so anything that re-derived that text — the
+continuation's presence, a resolution change, an edited table entry — moved the hashes.
+
+`_teacher_audio_key(...)` is now called with `teacher_audio_key_prompts`: the owner's own
+chunk table (`manual_prompts.prompts()[:replay_sample_end]`, the legacy/manual chunk
+prompts node) when one exists, falling back to the planned prompts only for
+Gemma-authored layouts that have no table. The second argument stays
+`teacher_audio_chunk_ticks`, which already encodes how many chunks the layout has and how
+long each one is, i.e. what `chunk_frames` decides. Nothing else reaches the key — no
+model, LoRA, seed, sigmas, resolution, continuation or KV precision.
+
+Cost, stated before the run: stored passes keyed on the *derived* text no longer match, so
+the first render after this change rebuilds the audio once; every later render reuses it
+unless a chunk's own text changes.
+
+Validation: `tests/test_teacher_audio_cache.py` (29, the key test now pins the owner-table
+call and asserts `video_continuation` never appears at the call site),
+`tests/test_chunk_director_helpers.py` (162), `tests/test_taomate_kv_records.py` (16),
+`tests/test_taomate.py` (41).
+
+## 2026-09-27 — The audio key, the dialogue windows, and a decision line
+
+The owner stopped a video render, switched `kv_cache_compression` to `turboquant4` and
+saw the audio rebuild, and asked why the key is not "chunk prompt only". Findings, all
+evidence-based:
+
+- The precision is not in the key at all. The key line now printed by every render
+  (`teacher audio key: N chunks, ticks [...], prompt hashes [...], cache button on|off`)
+  shows only the six ticks and the six prompt hashes.
+- The dialogue assignment does **not** use the continuation's *value*: `dialogue_ranges`
+  is built from each request's output window (`frame_start + output_trim_frames`,
+  `frame_end`, nodes.py:2761) and each shot body is sliced against
+  `content_start … chunk["frame_end"]` (nodes.py:2789), all of which the planner keeps
+  identical for continuation 39, 56 and 73 (see the 2026-09-27 plan entry above). Only
+  `continuation > 0` matters, through the `<Video N>` reference label (nodes.py:2775).
+- The hashes for Chunks 1 and 4 in the 01:41 render differ from the pass stored at
+  22:40, but the pass immediately before it (00:46) had its key overwritten, so whether
+  the text changed between those two runs cannot be shown from the outside.
+- Why the owner could not see any of this: the running module predates the decision
+  logging, so a rebuild printed neither the branch nor the reason. Fixed by one
+  unconditional line after the branch chain —
+  `teacher audio cache decision: reused|resumed|miss|incompatible|disabled (<reason>)`,
+  with the reason naming the chunk whose prompt moved. The module must be restarted for
+  it to appear (the live one predates both log lines).
+
+Validation: `tests/test_teacher_audio_cache.py` (29, one new pinning the decision line),
+`tests/test_chunk_director_helpers.py` (162), `tests/test_taomate_kv_records.py` (16),
+`tests/test_taomate.py` (41).
+
+## 2026-09-27 — One <d> group per phrase, and the toggle for the first attempt
+
+The owner's own fix for a take that drops a phrase: give every phrase its own
+`<d>[language] …</d>` group, because MiniMax speaks one group as one delivery and a
+group holding several phrases can lose the ones it has no room for. Their example:
+`<d>[English] This is that. But that is not this.</d>` must become
+`<d>[English] This is that.</d> <d>[English] But that is not this.</d>`.
+
+- `_split_dialogue_phrases(prompt)` rewrites each `<d>` group into one group per phrase,
+  repeating the group's own language tag (a bare `<d>` stays bare) and leaving every
+  character outside the groups byte-identical. Phrases end where `_dialogue_phrase_ids`
+  ends them (`.`, `!`, `?`, `…`, `...`), so the split and the chunk cutter agree on what
+  a phrase is. A group that holds one phrase is returned untouched.
+- `_dialogue_retry_prompt(prompt)` = `_split_dialogue_phrases(_escalate_speech_rate(...))`,
+  so a retry re-groups the phrases *and* asks for the faster delivery; the words stay
+  identical either way. Both retries use it: `retry_audio_first_candidate` and
+  `retry_chunk_teacher_audio` (the log line now says "one group per phrase and a faster
+  delivery").
+- `TOGGLE_SPLIT_DIALOGUE_PHRASES = True` decides whether the *first* attempt is authored
+  split as well (answered as "make a toggle, default to 2"): True splits every chunk's
+  dialogue as it is authored, False keeps the owner's grouping and lets only a retry
+  split. The toggle does not enter the audio cache key — the key hashes `planned_prompts`,
+  not the authored prompt — so flipping it never invalidates a stored pass.
+
+Validation: the owner's example and the edge cases were checked with the real helper
+(`/tmp/codex/verify_split.py`, `/tmp/codex/verify_retry.py`: two languages in one chunk,
+a bare `<d>`, a lone phrase, ellipses, prose with no dialogue, and the retry keeping the
+dialogue words while replacing the delivery band). Tests: `tests/test_chunk_director_helpers.py`
+(162, five new), `tests/test_teacher_audio_cache.py` (28), `tests/test_taomate_kv_records.py`
+(16), `tests/test_taomate.py` (41), all nine JS suites green. Not yet exercised by a live
+retry.
+
+## 2026-09-27 — video_continuation 39 vs 56 vs 73: what actually changes
+
+The owner saw video artifacts at `video_continuation=56` and `73` that disappear at
+`39`, and asked how the chunk distribution differs. Measured with the plugin's own
+planner (`/tmp/codex/plan_table.py`, `/tmp/codex/plan_phases.py`; source 1450 frames at
+24 fps ⇒ 427 video tokens, 2417 audio ticks, `chunk_frames=260`):
+
+- **The request-level chunks are identical** for 39, 56 and 73: 6 chunks of
+  `[260, 260, 260, 260, 260, 175]` frames and `[433, 425, 425, 425, 425, 284]` audio
+  ticks. So the artifacts are *not* a chunking, prompt or audio-cache effect, and the
+  audio cache key is unaffected by the continuation setting.
+- **Only the internal streaming grid changes**, i.e. `TaoMateStreaming.plan`'s phases
+  inside each chunk: 49 phases at 39, 34 at 56, 26 at 73.
+- Chunk 1 specifically: 9 sub-chunks at 39, 6 at 56, 5 at 73; its opening sub-chunk grows
+  `12 → 17 → 22` new frames, i.e. a `17 → 22 → 27`-frame sampling window, and the video
+  steps derived from that window (`_video_steps`) jump `2 → 7 → 7`. At 39 every
+  sub-chunk in chunk 1 stays at the minimum (17-frame window, 2 steps); at 56 and 73 the
+  opening window crosses onto the next H3 grid step. With 73 three of chunk 1's five
+  sub-chunks need 7 steps (25 total) against 18 at 39.
+
+That is the one geometry that moves exactly where the owner reports artifacts, and it is
+why 39 is clean. No code was changed for this analysis; it is recorded so the next
+session starts from the numbers instead of re-deriving them.
+
+## 2026-09-26 — Why no button state ever reached storage
+
+The owner changed the buttons, refreshed, and got defaults again — twice. The mirror was
+never written, and the reason was inside `persistPlayerState()`:
+
+```js
+if (Number.isFinite(pendingFrame) && frame !== pendingFrame) return;
+```
+
+That guard exists so a restored frame survives until its chunk arrives, but it returned
+*before* `rememberPlayerState(...)`, and it returned for **every** button. In a TaoMate
+preview there are no video frames at all, so `displayedFrameNumber()` never becomes the
+stored target and the guard blocked forever: L, subtitles, mute and play were dropped
+no matter what the owner pressed, which is exactly the reported symptom.
+
+The guard now only protects the *frame field*: a pending target is kept as the stored
+frame, and the other four values are stored on every press. `tests/test_preview_player_state.js`
+runs the real function body in a `vm` with a fake closure and checks all three cases
+(dropped-then-fixed pending frame, no pending frame, arrived frame).
+
+Two operational notes for the next diagnosis: ComfyUI serves extension JS with
+`Cache-Control: no-store`, so a browser refresh alone picks up `web/*.js` changes and no
+ComfyUI restart is needed for them; Python changes still need a restart, and the restart
+must come *after* the edit (a restart at 22:50 misses an edit made at 22:52).
+
+## 2026-09-26 — Button states after the restart: what was really broken
+
+The owner restarted ComfyUI, refreshed, and every preview button looked reset. Two
+separate causes, neither of them a missing feature:
+
+- The browser had been running the *old* extension script until that refresh, so the
+  button presses that preceded it never reached `rememberPlayerState` and browser
+  storage was empty. The first refresh after the fix therefore shows defaults by
+  construction; every press from then on stores the state. ComfyUI serves extension
+  files with `Cache-Control: no-store`, verified with `curl -D`, so a plain refresh
+  does load the new script.
+- The cache button *was* persisting: `<temp>/comfyui-hr-endless-sampler/cache_policy.json`
+  was rewritten by the owner's click at 22:55:01 (`enabled: false`) and the endpoint
+  logged `replay cache is disabled for future sampler runs`. Earlier attempts did not
+  land because the endpoint refuses a policy change while a sampler render is active
+  and the widget used to log the refusal and flip the button back **silently**, which
+  reads exactly like "it did not save".
+
+That silent revert is fixed: the click handler keeps the reason and prints it in the
+cache label, so a refused change says why. Self-check for the owner, in the browser
+console: `localStorage.getItem("hr_endless_sampler_preview_player")` returns the stored
+state, or `null` when no press has reached the new handler yet.
+
+Also worth knowing when reading the preview after a restart: the on-disk audio cache
+was a one-chunk leftover from the render the restart killed (`status="recording"`,
+`recorded=1`), so a refresh legitimately restores only Chunk 1 until a render resumes
+it and records the rest.
+
+## 2026-09-26 — The audio cache key, and the stale process that hid it
+
+The owner changed the resolution (and later the attention backend, the LoRA source and
+the source prompt) and the audio rebuilt, which contradicts the agreed key: the audio
+cache is keyed by the per-chunk prompts plus each chunk's audio tick lengths, and by
+nothing upstream — no model, LoRA, seed, sigmas, guidance, resolution or attention
+backend. That rule is real: `_teacher_audio_key(chunk_prompts, chunk_ticks)` takes both
+lists as arguments, the single call site passes exactly
+`planned_prompts[:replay_sample_end]` and `teacher_audio_chunk_ticks`, and
+`test_the_key_is_the_chunk_prompts_and_the_chunk_structure` pins that call site. The
+22:12 and 22:20 renders prove the sensitivity is prompt-only: they resumed at Chunk 4
+*only* because the owner had edited Chunk 4's text.
+
+What actually happened is that the running ComfyUI served **stale code**. The process
+loaded the plugin at ~21:31 and never reloaded, so everything added after that was
+missing from it: the timeline delete route, the delete-an-unusable-cache rule, the
+full-plan timeline, the resume-reason label, the contiguous-row cap and the whole
+keep-the-tail feature. Evidence, gathered from the live server and log:
+
+- `GET /hr_endless_sampler_preview/teacher_audio_chunk` answered **404** while
+  `cached_preview`, `replay_cache` and `state` answered 200 — the route exists in the
+  file and in no loaded module.
+- The live `/replay_cache` status reported `audio_cache.run_state: "idle"` for the
+  22:40 render, and the log for that render contains no cache-decision line at all
+  (neither `reused`, `resumes`, `has no reusable`, `cannot reuse` nor `cache button is
+  off`), i.e. that process never evaluated the cache for the render.
+- Fetching `/object_info` does **not** reload custom nodes in this setup: the 404
+  survived it. Only restarting ComfyUI picks up an edited plugin.
+
+Lesson for the next session: before diagnosing the sampler's behaviour, check that the
+running process has the code. A route probe against a route added in the same edit
+batch is the cheapest test, and `comfyui.log`'s cache-decision lines are the second.
+
+Also added: every render now logs its teacher-audio key —
+`teacher audio key: N chunks, ticks [...], prompt hashes [...], cache button on|off` —
+so a rebuild either names its reason or shows that the prompts or the chunk lengths
+really moved. `tests/test_teacher_audio_cache.py` (28) stays green.
+
+## 2026-09-26 — An edited chunk now keeps the chunks after it
+
+Owner decision, taken knowingly against the seam argument: when an edited chunk's
+audio changes, the chunks *after* it keep the audio they already had, and only the
+edited chunk is generated again. Before this, a resume regenerated the whole suffix
+(every later chunk was generated attending over the edited chunk's clean audio) and
+the discarded rows went with it.
+
+- `_teacher_audio_kept_tail(cached_prefix, resume_index, chunk_count)` offers the tail
+  only when the stored pass settled **every** chunk and the edited chunk is not the
+  last one. An interrupted pass cannot offer a complete tail, and a hole inside it
+  would force a chunk to be generated whose stored rows are gone, so those passes
+  regenerate the suffix exactly as before.
+- `prepare_audio_first(..., generate_count=1)` generates just the edited chunk and
+  keeps `audio_first_milestones` for everything outside `[start_index,
+  generated_end)`, which is what lets the video pass pop one guidance state per chunk
+  while chunks after the edit are never sampled again.
+- The pass products stay in chunk order: the tail's prompts, transcripts,
+  observations and clean latents are appended after the pass returns, and
+  `full_teacher_audio` is extended with the kept latents, so the payload, the preview
+  and the video pass all read position i as chunk i. `teacher_audio_payload()` merges
+  the same tail as soon as the edited chunk settles — before that, the previous
+  payload is still untouched on disk, so a stop during the edited chunk loses nothing.
+- `_teacher_audio_resume_reason` composes the sentence the preview shows (a resume can
+  keep chunks on both sides of the one it regenerates), and the widget prints
+  `run_reason` verbatim instead of building its own wording.
+- The attention rows of the kept tail are deliberately dropped (`begin_pass` discards
+  records from the resume point on): they describe the take the edit replaced, and
+  nothing needs them because those chunks are not sampled again. A later edit inside
+  the tail therefore starts from the first chunk without rows, which is the chunk
+  after the last one this pass generated.
+
+Validation against the owner's real stored pass (finished, 6/6 chunks, all rows;
+`/tmp/codex/verify_tail.py`): editing Chunk 4 reports `resume at Chunk 4; kept teacher
+audio for Chunks 1-3 and Chunks 5-6; generating Chunk 4` with kept tail widths
+`[425, 284]`; editing Chunk 1 finds no resume and regenerates everything; editing
+Chunk 6 generates Chunk 5 and keeps Chunk 6, because the rows of a skipped chunk are
+never written and one chunk has to be regenerated to rebuild the history. Tests:
+`tests/test_taomate_kv_records.py` (16), `tests/test_teacher_audio_cache.py` (28),
+`tests/test_chunk_director_helpers.py` (158), `tests/test_taomate.py` (41), all nine JS
+suites. The mixed pass itself has not run live yet.
+
+## 2026-09-26 — A refresh mid-pass dropped the chunks the pass had not reached
+
+The owner edited Chunk 4's prompt, restarted the render and reported that chunks 5 and
+6 were gone. Reproduced with the real loader: the stored payload's `preview` block only
+described the *settled* chunks (`payload preview block chunks: 4`, `restored reset
+chunk_count: 4 (plan has 6)`, `total_frames 1025` instead of 1450), so a refresh showed
+a four-chunk timeline and the plan's last two chunks disappeared from it.
+
+- `teacher_audio_payload()` now describes the whole plan: every planned chunk up to
+  `replay_sample_end` keeps its `index`, frame range, prompt and subtitle, plus
+  `settled` telling whether its audio exists. `_teacher_audio_chunk_prompt` picks the
+  generated prompt when there is one and the plan's `audio_teacher_prompt`/`h3_prompt`
+  otherwise, so a pending chunk is still described.
+- `build_teacher_audio_preview_snapshot` publishes the plan's ranges for the reset and
+  only emits `chunk_audio_first`/`audio_chunk_complete` for chunks that are settled;
+  `cached_chunk_count`/`reused_chunk_numbers` count the settled prefix instead of every
+  range. Its guard now compares observations against the settled count, and a payload
+  without the `settled` key keeps the old meaning (every listed chunk has audio).
+- Consequence for the pass itself, unchanged and deliberate: an edited chunk k still
+  regenerates k..N, because the later chunks were generated attending over chunk k's
+  clean audio. The timeline keeps their slots and refills them as the pass reaches them.
+
+Validation: `/tmp/codex/verify_plan_timeline.py` (a four-chunk plan with two settled
+chunks restores `chunk_count=4`, `total_frames=96`, audio only for chunks 0-1, and the
+pending chunks keep their planned prompts; the finished variant publishes all four),
+`tests/test_teacher_audio_cache.py` (27, two new), `tests/test_taomate_kv_records.py`
+(13), `tests/test_chunk_director_helpers.py` (158), `tests/test_taomate.py` (41), all
+nine JS suites.
+
+## 2026-09-26 — First real resume, and the two things it exposed
+
+The 22:12 render logged `resumes teacher audio at Chunk 4 of 6, keeping 3 settled
+chunks because Chunk 4's prompt changed` and then continued the pass from there — the
+resume path works live. Two defects showed up next to it:
+
+- **The preview reported the plan's chunk count as the kept count.** The resumed
+  branch called `_set_teacher_audio_cache_state("resumed", reason, replay_sample_end)`
+  while the third argument is `reused_chunks`, so the label read "kept 6 settled
+  teacher audio chunks; the teacher audio continues at Chunk 7" on a six-chunk plan.
+  It now passes `teacher_audio_resume`, and the label names both sides of the work:
+  "kept teacher audio for Chunks 1-3; generating Chunks 4-6", with a separate wording
+  for the case where every planned chunk was kept.
+- **The rows can lag the payload by one chunk**, because a chunk's stored rows land
+  with the *next* chunk's forward while its payload entry is written when it settles.
+  The resume point is now `min(settled, contiguous rows)` instead of failing the whole
+  prefix when a row is missing: on the live cache that is 4 kept chunks out of a
+  5-chunk payload, where the old rule returned 0 and recomputed everything.
+
+Validation: `tests/test_taomate_kv_records.py` (13, new test for the lagging rows),
+`tests/test_teacher_audio_cache.py` (25, new test pinning the reported kept count),
+`tests/test_chunk_director_helpers.py` (158), `tests/test_taomate.py` (41), all nine JS
+suites. The real cache was read back with the real loader after the change:
+`settled=5`, rows `[0, 1, 2, 3]`, resume index 4, four prime records, five prefix
+milestones, `audio_time_origin=654`.
+
+## 2026-09-27 — A cached pass is audio and rows together, or it is nothing
+
+The owner refreshed the browser and reported the timeline's "Delete teacher audio cached
+chunk" item showing but greyed out, although a render had just reused the stored audio.
+The live status route explained it: `recorded: 6, chunks: 6` with `kv_chunks: [0]` — the
+payload held all six chunks of teacher audio while `kv/` held one single record, because
+the pass that wrote it regenerated Chunk 1 and `begin_pass(keep_payload=True)` had wiped
+*every* stored row before that. The menu enables the item (and the delete route guards it)
+on "this chunk has a KV record", so Chunks 2-6 were greyed, and the tooltip blamed "no
+stored teacher audio", which was false. An earlier note in this session that the running
+process was stale was wrong: ComfyUI answers 404 for a GET on a POST-only route, and
+`POST {}` returning the route's own validation error proves the route is live.
+
+The owner's rule settled it: the cache is one object, so audio and its attention rows are
+stored, kept and deleted together. Three changes:
+
+- `_TeacherAudioCache.begin_pass` drops only the rows of the chunks this pass samples
+  again. With `keep_payload` (the tail-keeping edit path) that is exactly `resume_index`;
+  a resume without a kept tail still drops everything from `resume_index` on.
+- `_teacher_audio_kept_tail(prefix, resume_index, chunk_count, available_rows)` refuses a
+  tail whose chunks have no stored rows, so audio is never kept without the rows that
+  describe it; both call sites pass `teacher_audio_cache.kv_chunk_indices()`.
+- The timeline wording: the greyed item says the audio and its rows are cached together
+  and this chunk has neither, and the enabled item promises "keeps every other chunk and
+  generates this one again" instead of the old "and every chunk after it".
+
+Consequences: a healthy pass keeps rows for every chunk through any single-chunk edit, so
+a later delete (which removes that chunk's row and resumes at it) still regenerates that
+chunk alone and keeps the rest — the pair invariant also makes the old silent ignore
+impossible, where a delete was capped below the deleted chunk and the kept tail copied its
+audio straight back. The route guard and the menu's enable test were left alone because
+under the pair rule a chunk's row implies the rows before it. The cache on disk right now
+is legacy (audio 6, rows 1): with the tail rule, editing Chunk 1 of it regenerates all six
+chunks instead of keeping Chunks 2-6, and one full teacher pass heals it.
+
+Validation: `tests/test_taomate_kv_records.py` (19; the kept-tail test rewritten to assert
+that only the generated chunk's row goes, plus a new test that a tail without rows is not
+kept), `tests/test_teacher_audio_cache.py` (30), `tests/test_taomate.py` (41),
+`tests/test_chunk_director_helpers.py` (168), and all nine JS suites. The running ComfyUI
+process predates these Python edits, so a restart is required before the new rule is live.
+
+## 2026-09-27 — First attempts keep the owner's <d> groups, and the pace is the chunk's own
+
+Two owner reports from the 03:31 render of `prompt.txt` (one 60.42s shot, one
+`<d>` group holding the whole 38s monologue, cut into six chunks): the per-phrase
+`<d>` split broke the dialogue generation, and no chunk prompt carried a
+speaking-speed instruction any more, "not even cut dialogues".
+
+The phrase split was the first attempt's own doing: `nodes.py` re-grouped every
+`<d>` block into one group per phrase before the teacher ever saw it. The owner
+wants the prompt's groups spoken as written, so that call is gone: the teacher
+prompt is appended untouched, and `_dialogue_retry_prompt` is now the only place
+that re-groups (still behind `TOGGLE_SPLIT_DIALOGUE_PHRASES`, still adding "Speaking
+much faster than before"), which is what a retry is for — phrases the take lost.
+
+The missing band was the cut test. `delivery` was computed per *shot* (the log
+showed `needs 0.63x` for all six chunks), inserted only when the chunk boundary cut
+a phrase, and the phrase-ownership rule now places every seam between phrases, so
+nothing counted as cut and no chunk received anything. Two fixes in
+`_legacy_dialogue_pieces`:
+
+- A piece that speaks only part of its source block is a cut delivery, whether the
+  seam fell inside a phrase or between two of them (`len(selected) <
+  len(weighted_words)`), so a sliced monologue is banded on every chunk it spans.
+- The band's value is the chunk's own: `_dialogue_delivery_instruction` now runs on
+  the words this chunk speaks divided by the time this chunk gives them
+  (`selected_weight / (current_range[1] - current_range[0]) / fps`), not on the
+  shot's ratio. On the owner's prompt that is 0.42x/0.56x for the sparse chunks
+  (below the 0.60 floor: sparse dialogue, no instruction), 0.89x, 0.70x and 0.61x
+  for the rest ("Speaking slowly, with pauses,"), and the log prints one line per
+  banded chunk with those numbers. The shot-level line now only reports the
+  estimate that can stop the render.
+
+Validation: the offline bake probe (`/tmp/codex/band_probe.py`) rebuilds the
+owner's six chunk prompts from `prompt.txt` and showed one whole group per chunk
+with no band before the change and bands on Chunks 2, 5 and 6 after it;
+`/tmp/codex/band_probe2.py` pins the per-chunk rule (2s of words in 20s gets
+nothing, 18s in 20s gets "Speaking slowly, with pauses,"), and
+`/tmp/codex/band_probe3.py` the cut case (24s of words in a 20s window gets
+"Speaking quickly,"). Tests: `tests/test_chunk_director_helpers.py` (169, the
+authoring-path test rewritten to prove the first attempt never re-groups and a new
+per-chunk pace test), `tests/test_teacher_audio_cache.py` (30),
+`tests/test_taomate_kv_records.py` (19), `tests/test_taomate.py` (41), nine JS
+suites. The running ComfyUI process predates all of it: a restart is required, and
+the chunk prompts in the node's editor have to be re-baked to gain the bands.
+
+## 2026-09-27 — The timeline cursor follows the mouse while a chunk is still filling
+
+The owner's complaint: while a chunk is being rendered, dragging the timeline
+"does not make it follow the mouse", the cursor stays behind it because the chunk
+has fewer sub-chunks than its span, and when the pointer leaves the last available
+sub-chunk the cursor jumps.
+
+The cause was in `seekTimeline`: the pointer's fraction was applied to the frames
+that *exist* (`Math.round(fraction * (group.frames.length - 1))`), so the cursor
+could never reach past the newest decoded frame of a half-filled chunk, and a
+pointer outside an available chunk made the code pick the nearest rendered chunk and
+snap the cursor to its edge — which is the jump the owner saw.
+
+- `seekTimeline` now records the pointer's own position as `timelineScrub = {chunk,
+  fraction}` after showing the closest available frame, and only calls `show` when
+  the pointed chunk has frames: a chunk the pass has not reached keeps the
+  displayed picture where it is instead of dragging it to the nearest rendered one.
+- The new `scrubPlayheadPosition(spans, total, scrub)` converts that position to a
+  percentage, and `renderTransport` draws the playhead from it when a drag owns the
+  cursor — even when nothing is rendered under the pointer.
+- The drag's position is cleared by `show`, by `playFrameGroup` (playback moves the
+  position itself) and by `resetExecution`, so the cursor returns to the displayed
+  frame as soon as anything else seeks.
+
+Validation: `tests/test_taomate_timeline.js` gained "Timeline scrub cursor checks"
+(positions for a half-filled second chunk, clamped fractions, out-of-range chunks,
+a zero span, and source assertions that the nearest-rendered-chunk jump is gone),
+and all nine JS suites pass.
+
+## 2026-09-27 — The cache-button-off render crashed on its own decision line
+
+After the restart the owner's first render died 29s in with
+`UnboundLocalError: cannot access local variable 'teacher_audio_reason'` at the
+unconditional `teacher audio cache decision` log line. The cache button was off, so
+the `if not _replay_cache_enabled():` branch ran — the branch that never loads the
+cache — and `teacher_audio_reason` was bound only in the `else`.
+
+The off branch now names its own reason (`the cache button is off, so this render
+records a fresh teacher audio pass`) before logging, which also makes the decision
+line read `disabled` with a cause instead of an empty reason. An AST sweep of the
+same function confirms `resume_index`, `stored_pass`, `prefix_records`,
+`cached_prefix`, `prefix_reason` and `kept_chunks` are read only inside the branch
+that binds them, so this was the only leaked name.
+
+Validation: `tests/test_teacher_audio_cache.py` (31; the new
+`test_the_decision_line_has_a_reason_whatever_branch_ran` asserts the off branch
+binds the reason before the cache load and before the decision line),
+`tests/test_chunk_director_helpers.py` (169), `tests/test_taomate.py` (41).
+
+## 2026-09-27 — A sub-chunk with no speech is no longer told the words
+
+The owner watched sub-chunks whose audio is silent still move the mouth in the video.
+The cause is in `python/taomate.py`: a request's phases all share one encoded
+conditioning ("encoded once per request", `execute_chunk`), so a phase with silence in
+its own window still read the chunk's whole `<d>` dialogue.
+
+Owner's rules for the fix: a sub-chunk that speaks keeps the chunk's dialogue exactly as
+it is; only a sub-chunk with no speech loses it; the removal adds no text of its own;
+and it applies to both flows, the audio-first pass (whose transcripts are already
+finished) and the in-chunk teacher path (whose transcript arrives during that chunk,
+before its sub-chunks).
+
+- `nodes.py` gained `_prompt_without_dialogue`, `_subchunk_speaks` and
+  `_silent_subchunk_prompts`. Speech is decided from the take's own word times (Whisper
+  seconds from the chunk's audio start, which matches `decode_audio_preview_segment`
+  because it discards the decoded context prefix) against the phase's own audio window
+  (`phase["audio_start"]..phase["audio_end"]`, 40 ticks per second). Any overlap counts
+  as speech, so only a certain silence loses the dialogue, and a transcript that never
+  arrived keeps today's prompt.
+- `DIALOGUE_LEAD` and `DIALOGUE_LEAD_BARE` remove the clause that hands a line to a
+  speaker together with the line. That is what keeps "starts the video in silence (no
+  mouth movent) for 00:01.00," and the prose around it intact while the delivery and its
+  words go. Prose that merely mentions speaking is left alone, line breaks survive, and
+  only `\n{3,}` collapses, as everywhere else in this plugin. The first pattern anchors
+  on the `<Subject N>` tag, the second on a clause standing alone at a line start or
+  after a finished sentence; a first attempt anchored nowhere ate the tail of the
+  preceding sentence.
+- The silent sub-chunks of a chunk share one dialogue-less text, so a single extra
+  encode inside the CLIP window the chunk already opens serves all of them, and each
+  one's conditioning comes from `_conditioning_for_chunk` with the same arguments as the
+  chunk's own (only the text differs).
+- `execute_chunk` takes `phase_conditionings`, remembers the caller's conditioning and
+  assigns `guider.original_conds` for every phase: a silent phase's own text where one
+  exists, the chunk's again for the others, so a silent phase cannot leak into the
+  sub-chunk that follows it.
+
+Validation: `tests/test_chunk_director_helpers.py` (171; the removal on the owner's own
+chunk 1, plus the per-sub-chunk decision including a word straddling a boundary, an
+empty take, a missing transcript and a prompt with nothing to remove),
+`tests/test_taomate.py` (42; a new test that phase 2 of a four-phase request is sampled
+with its own text and the rest with the chunk's, and that the guider still holds the
+chunk's conditioning afterwards), `tests/test_teacher_audio_cache.py` (31),
+`tests/test_taomate_kv_records.py` (19). Not verifiable offline: that H3 really closes
+the mouth once the dialogue is gone — that needs a render.
+
+## 2026-09-27 — A retry isolates only the phrase the take failed
+
+The owner tested by hand what the retry should do: chunk 2's three phrases in one
+`<d>` group, the take losing the opening phrase — splitting *only* that phrase away
+and leaving the other two grouped made MiniMax speak the whole dialogue, while the
+retry's "one group per phrase" produced a take that was worse than the first one.
+
+So the retry no longer re-groups everything:
+
+- `_dialogue_phrase_groups(spoken)` is the phrase walk `_split_dialogue_phrases` used,
+  extracted so both share one definition of a phrase (terminals and ellipses).
+- `_dialogue_phrase_was_spoken(phrase, heard_words)` judges a phrase word by word with
+  the existing tolerant `_dialogue_same_word`, so a stale take only fails a phrase when
+  a word of it is really missing, never for spelling or a number written as digits.
+- `_split_out_damaged_phrases(prompt, transcript)` rebuilds every `<d>` group as the
+  healthy runs the prompt already had, with each failed phrase on its own. A phrase
+  damaged in the middle separates its neighbours too, because a later phrase cannot be
+  moved in front of it.
+- `_dialogue_retry_prompt(prompt, transcript)` applies that behind
+  `TOGGLE_SPLIT_DIALOGUE_PHRASES` and then escalates the delivery, and it is the only
+  place that re-groups; both retry call sites now hand it their own `recognized`
+  transcript, and the log names the phrases it isolated. With no usable transcript, or
+  when every phrase was spoken, the grouping is left exactly as written — a take that
+  failed every phrase is the one case where the whole dialogue still goes one group per
+  phrase.
+
+Replayed on the real chunk 2 (heard `and why light is bad for you and love is a curse.
+People are strangely afraid of silence. Personally, I find silence comforting.`): the
+failed opening phrase stands alone and the other two stay one group, which is what the
+owner's manual test produced.
+
+Validation: `tests/test_chunk_director_helpers.py` (173; the failed-last-phrase case,
+a garbled middle phrase, the no-transcript / nothing-damaged / all-damaged cases, and
+source assertions for both call sites), `tests/test_taomate.py` (42),
+`tests/test_teacher_audio_cache.py` (31), `tests/test_taomate_kv_records.py` (19), nine
+JS suites.
+
+## 2026-09-27 — Ctrl-hover names every teacher-audio attempt, tinted per take
+
+The owner asked the preview tooltip for a second key: Shift already shows the full
+prompt of a chunk, and Ctrl must show every prompt the chunk's teacher audio was
+sampled with — the first take and each retry — cut to the `detailed_description`
+section only, each on a colored background so the first take and the retries are told
+apart at a glance.
+
+The prompt of record could not answer that: a retry overwrites `audio_teacher_prompt`
+(and `h3_prompt`) with the wording it is about to use, so the take it rejected was gone.
+The attempts are now a list beside it:
+
+- `nodes.py` gained `_remember_audio_teacher_attempt(range_item, retry_prompt)`, called
+  at the two retry sites (`retry_audio_first_candidate`, `retry_chunk_teacher_audio`)
+  *before* the prompt of record is overwritten. It seeds the list from that prompt when
+  the range has none yet, so the first entry is the rejected take and every later entry
+  is one retry, in sampling order. Nothing else writes the list, so a chunk that was
+  never retried carries none and the tooltip shows its own prompt as a single attempt.
+- `teacher_audio_payload()` writes `"attempts"` per preview chunk and
+  `preview.build_teacher_audio_preview_snapshot` maps it back to
+  `audio_teacher_attempts`, so the sequence survives a browser refresh and a process
+  restart through the teacher-audio disk payload. `preview.set_audio_prompt` now takes
+  an optional `attempts` and publishes `audio_teacher_attempts` on `chunk_metadata`,
+  and `preview._cache_payload` keeps that key, so a refresh mid-render keeps it too.
+- `web/unlimited_preview.js`: `chunkPromptDescription(chunk, fallback=true)` — the
+  attempt view passes `false` so it never falls back to Gemma's description, which would
+  make two attempts read identically; a prompt without that section shows its real text
+  instead of an empty block. `audioTeacherAttempts(range)` is the one reader of the list
+  (single prompt when the list is absent). Ctrl owns the prompt area and wins over
+  Shift; the keydown/keyup handler is now `updatePromptKeys` for both keys, the help line
+  names Ctrl, and the tooltip's signature carries the attempts so an open tooltip
+  refreshes when a retry lands.
+- Coloring: one tint per attempt index, cycled — blue `#45b7d1`, orange `#f4b942`,
+  purple `#b27ce8`, green `#78d078` — as a 3px left border plus a 14%-alpha background,
+  with `Take 1 (first take):` / `Retry N:` labels in the same hue. The prompt body is
+  built by the new shared `coloredPromptBody`, so the attempt blocks and the existing
+  description block keep the identical per-shot coloring and bold dialogue tags.
+
+Out of scope on purpose: the finished-video player's tooltip (`createFinishedChunkTooltip`)
+and the timeline sidecar (`video_io.normalize_timeline`) were left alone at the owner's
+choice. Known gap: a *resumed* pass republishes its kept chunks from the stored
+`prompts` list, which holds only each chunk's prompt of record, so a chunk kept across a
+resume shows one attempt until it is generated again.
+
+Validation: `tests/test_preview_prompt.js` (new `checkAttemptView`: attempt reading,
+blank filtering, the strict section extractor, one tinted block per attempt, the labels
+in order, the raw-text fallback, Ctrl over Shift, live delivery), `tests/test_chunk_director_helpers.py`
+(174; the tooltip source assertions updated and
+`test_a_retry_keeps_the_take_it_replaced_and_reaches_the_preview` added),
+`tests/test_teacher_audio_cache.py` (32; `test_a_refresh_keeps_every_teacher_audio_attempt`),
+`tests/test_taomate.py` (42), `tests/test_taomate_kv_records.py` (19),
+`tests/test_video_io.py` (25), `tests/test_audio_transcription.py` (2), all nine JS
+suites. The running ComfyUI process predates these edits, so a restart is required
+before Ctrl-hover is live.
+
+## 2026-09-27 — Each retry also shows the hearing that caused it
+
+Follow-up to the Ctrl-hover attempt view: a retry prompt only says what was asked for,
+not what went wrong, so the owner asked for the transcript that triggered each retry,
+on a darker shade of that retry's own background so the pair reads as one retry.
+
+- `_remember_audio_teacher_attempt(range_item, retry_prompt, transcript="")` now appends
+  the hearing to `audio_teacher_retry_transcripts` in the same call that appends the
+  retry, so the two lists stay aligned by construction: entry N belongs to retry N, and
+  the take itself owns no entry. An unavailable transcript keeps its slot as `""`, so a
+  hearing can never drift onto a different retry.
+- Both retry sites pass `recognized["text"]` — the transcript of the take being rejected,
+  which is exactly the mismatch the retry answers.
+- `teacher_audio_payload()` writes `retry_transcripts` beside `attempts`;
+  `preview.set_audio_prompt(..., retry_transcripts=None)` publishes
+  `audio_teacher_retry_transcripts` (only when at least one entry is non-empty),
+  `preview._cache_payload` keeps the list including its empty slots, and
+  `build_teacher_audio_preview_snapshot` restores it from the payload.
+- `web/unlimited_preview.js`: the new `audioTeacherRetryTranscripts(range)` reader, and
+  under each `Retry N:` block an extra
+  `Heard instead (caused this retry):` block holding the hearing, styled
+  `background:color-mix(in srgb, <that retry's accent> 32%, black)` with the same 3px
+  accent left border — a darker shade of the retry's tint, so the hearing and its prompt
+  are tied together and still told apart. The attempts signature carries the transcripts,
+  so an open tooltip refreshes when a retry lands.
+
+Validation: `tests/test_preview_prompt.js` (the reading, an empty slot suppressed, the
+hearing block's darker shade derived from the retry's own accent, and proof it never
+borrows the first take's tint), `tests/test_chunk_director_helpers.py` (174; the helper's
+alignment and empty-slot cases, the published key, and the payload source assertion),
+`tests/test_teacher_audio_cache.py` (32; the snapshot keeps `retry_transcripts`),
+`tests/test_taomate.py` (42), `tests/test_taomate_kv_records.py` (19),
+`tests/test_video_io.py` (25), all nine JS suites. Restart ComfyUI (Python changed) and
+hard-refresh the browser (JS changed).
+
+## 2026-09-27 — Every prompt view frames the prompt, and cascades its sections
+
+After liking the framed background of the Ctrl attempt blocks, the owner asked for the
+same treatment on the normal tooltip and the Shift one: the prompt on a really dark shade
+of its chunk color, and, cascaded inside, one block per prompt section named by the
+prompt's own field labels (summary, detailed_description, overall_soundscape, ...).
+
+- `web/unlimited_preview.js` gained `promptSections(text)`: it matches the authored field
+  headers (`^[ \t]*(subject_definitions|summary|retention_analysis|detailed_description|
+  integrated_multimodal_description|overall_soundscape|non_diegetic_music|
+  non_diegetic_audio)[ \t]*:`) and returns each section's range plus its header end, with
+  a leading section when text precedes the first header. Every section keeps its header
+  verbatim, so the prompt text is only ever grouped, never rewritten; when no header
+  exists (the normal view shows the description body alone) there is exactly one section.
+- `promptSectionBlock(text, chunk, shotRanges, colors, chunkColor)` draws the outer frame
+  on `color-mix(in srgb, <chunk color> 18%, black)` with a 3px chunk-color left border,
+  and one cascaded block per section on `color-mix(in srgb, <chunk color> 32%, black)`
+  with a 2px border and a bold label in `color-mix(in srgb, <chunk color> 55%, white)`.
+  The section header is emphasised where it stands rather than repeated above the text.
+- Coloring is not recomputed per section: `coloredShotPromptSegments` still maps the
+  markers over the whole prompt (so a marker keeps the shot it always had), and the new
+  `appendColoredRange(parent, segments, offsets, start, end)` renders a character range
+  of that mapping, including the literal `<d>` bolding. Sections are therefore frames
+  around one continuous color mapping, not a re-coloring of each piece.
+- The Ctrl attempt view is deliberately untouched: its per-attempt tint is what tells the
+  attempts apart, and each attempt is already shown as the description section alone.
+
+Validation: `tests/test_preview_prompt.js` — `collectPromptSpans` now walks the nests (and
+falls back to the finished player's flat tooltip), the literal-text invariant still holds
+in both views, and `checkPromptBlocks` pins the outer shade/border, one section block per
+label, the lighter section shade, the in-place bold headers, and that the sections cover
+the prompt exactly. All nine JS suites, `tests/test_chunk_director_helpers.py` (174),
+`tests/test_teacher_audio_cache.py` (32). The DOM was also dumped offline for both views
+(normal: frame + one unlabelled section; Shift: frame + subject_definitions, summary,
+detailed_description, overall_soundscape) before the scratch script was removed. JS only,
+so a hard browser refresh is enough.
+
+## 2026-09-27 — A drag shows the frame that is really at the pointed position
+
+The owner's report: while the sub-chunks of a chunk were rendering, dragging across the
+whole chunk swept the *rendered* sub-chunk through the drag, instead of placing it where it
+was rendered with black everywhere the later sub-chunks had not arrived yet. The cursor
+itself was correct; the picture it produced was not.
+
+The cause was one line in `seekTimeline`: the pointer's fraction of the chunk span was
+applied to the frames that exist
+(`show(targetChunk, Math.round(fraction * frames.length - 1))`), so a chunk holding 20 of
+its 80 frames stretched those 20 across the whole span.
+
+- `scrubFrameIndex(chunkIndex, fraction)` resolves the pointer's position instead of a
+  frame count: the position is `floor(fraction * span)` chunk-local, `span` is the chunk's
+  planned length, and the frame that answers it is the group's decoded frame whose
+  *absolute* `frameNumbers` entry equals the planned start plus that offset. Frame numbers
+  are the same coordinate as `chunkRanges[i].start/end` (the transport's own frame label
+  already matches them), so a group that starts later, that carries overlap-replacement
+  frames or that holds latent steps with gaps is located by its own numbers, not by
+  counting from zero. No entry means the pass has not rendered that position: `-1`.
+- `seekTimeline` shows that frame when one exists, and `showEmptyPosition(chunk)` when none
+  does. The empty position sets `playing = chunk`, `playingFrame = -1` (so the transport
+  reports `—/N` and no frame label), displays `EMPTY_FRAME_SOURCE` — the same black asset
+  the teacher-audio placeholder groups use, now one shared constant instead of two inline
+  copies — and leaves `timelineScrub` to keep the playhead under the pointer.
+- `restorePlayback()` keeps that black position across later redraws while paused, and
+  starts from the chunk's first frame if playback is asked for, so pressing play never
+  leaves a black picture behind.
+
+Owner's choice, applied everywhere: a chunk the pass has not reached at all is black now
+too, replacing the earlier "keep the last displayed picture" behaviour, so a position on
+the timeline always shows what exists there.
+
+Validation: `tests/test_taomate_timeline.js` — `scrubFrameIndex` is run through its own
+sources: a 20-of-80 chunk keeps frame 19 at position 19/80 and answers nothing at 20/80,
+0.5 and 1; a group numbered 8,9,12,13 is found by its numbers with its gap answering
+nothing; a later chunk is read at its own start with `chunkRanges[i].start`; a group with
+no frame numbers falls back to its own list; a missing chunk answers nothing; plus source
+assertions that the fraction-times-length mapping is gone, that a frame-less position goes
+black, that it reports no frame, that it survives a redraw and that play recovers it. All
+nine JS suites and `tests/test_chunk_director_helpers.py` (174) pass. JS only, so a hard
+browser refresh is enough.
+
+## 2026-09-27 — One chunk card from Chunk N, and a color per prompt section
+
+Two follow-ups on the tooltip framing, from the owner: the background must start at the
+`Chunk N` line rather than at the prompt heading, it must be much darker, and every prompt
+section needs its own distinct color with a darker shade of that color behind it.
+
+- `createColoredChunkTooltip`'s `line()` now takes its container, and `show()` builds one
+  **chunk card** immediately after the help line. The card holds the chunk number, the
+  timing lines, the retention analysis, the prompt heading and everything under it, on
+  `border-left:3px solid <chunk color>` over
+  `color-mix(in srgb, <chunk color> 7%, black)` — much darker than the previous 18% frame.
+  The help line deliberately stays outside, because it describes the tooltip, not the chunk.
+- The old chunk-colored prompt frame is gone: the card *is* that frame, one level up.
+  `promptSectionBlock` became `promptSectionBlocks`, returning one block per section
+  (`background:color-mix(in srgb, <section color> 14%, black)`, 2px border in the section
+  color, header in `color-mix(<section color> 55%, white)`).
+- New `PROMPT_SECTION_COLORS` gives every field its own stable color, so a section is
+  recognizable in any view and any prompt: `subject_definitions` #f08a4b, `summary`
+  #f4b942, `retention_analysis` #d6cf57, `detailed_description` and
+  `integrated_multimodal_description` #45b7d1, `overall_soundscape` #72c472,
+  `non_diegetic_music` #a98bea, `non_diegetic_audio` #ef6f91, and prose before the first
+  label keeps the neutral #b8b8d0.
+- The Ctrl attempt view keeps its per-attempt tints and its hearing blocks (still a 32%
+  shade of the retry's own color, deliberately darker than a section) and now sits inside
+  the same card, so every view starts its background at `Chunk N`.
+
+Validation: `tests/test_preview_prompt.js` — walkers now traverse the tree instead of one
+level (`elementTree`, `leavesOf`, `promptBlocks`, `contentBlocks`, `cardOf`, `boxAccent`),
+and the checks pin that the card starts at `Chunk 1` while the help line stays outside,
+that the timing lines and the heading are inside it, that the card is the 7% chunk shade
+with a 3px chunk-color border, that a section's background is derived from its *own*
+border color at 14%, and that the three Shift sections keep three distinct colors
+(#f4b942 / #45b7d1 / #72c472). All nine JS suites and
+`tests/test_chunk_director_helpers.py` (174) pass. The rendered tree was dumped offline for
+the normal, Shift and Ctrl views before the scratch script was removed. JS only, so a hard
+browser refresh is enough.
+
+## 2026-09-27 — A sub-chunk's frames are merged into its chunk, not thrown away
+
+Owner's report: dragging the timeline over a chunk that had finished sub-chunks *and* not
+yet rendered areas made the preview blink black; the arrow keys were fine. The scrub maths
+were not at fault — the finished sub-chunks were not in the client any more.
+
+A TaoMate phase reports only its own frames, numbered where they really sit
+(`preview.py`: `output_start = chunk.get("subchunk_start", chunk["output_start"])`, fed by
+`nodes.py` `set_subchunk(index, frames(phase["video_start"]), phase["frame_end"] - 1, ...)`),
+and the `chunk` handler **replaced** the chunk's group with them. So the moment sub-chunk 2
+landed, the group held only frames 17…38 of an 80-frame chunk: sub-chunk 1's frames were
+gone, the corrected scrub said "nothing rendered" for 0…16, and dragging across the chunk
+therefore alternated picture and black.
+
+- New module-level `mergeFrameGroup(oldGroup, frames, durations, numbers)` writes the
+  incoming frames into the chunk's group by frame number, keeping `frames`, `durations` and
+  `frameNumbers` parallel and sorted. Entries are written last so a phase's
+  replacement-overlap frames overwrite the earlier version, and a frame whose number is
+  missing from a payload cannot be placed, so that payload becomes the group (an unnumbered
+  event must not silently drop what is already rendered).
+- The `chunk` handler merges every non-finalized event and lets `chunk_final` replace the
+  group outright, since the full-VAE decode is authoritative for the whole chunk.
+  `outputStart`/`outputEnd` now follow the merged extremes, so the audio clock keeps a
+  correct frame-number base for a group that starts later in the chunk (the audio-first
+  placeholder covers the whole span already, so its black frames stay as the holes).
+- No clock or sampling change: playback already maps frames to the audio clock by frame
+  number, so a hole between two sub-chunks is simply skipped.
+
+Validation: `tests/test_preview_prompt.js` — `checkFrameMerge` covers the merge order, the
+replacement overlap taking the new version, durations staying parallel, an unordered event,
+an unrendered position staying unrendered, the first sub-chunk of a chunk, an unnumbered
+payload, plus source assertions that live events merge and the final one replaces.
+`tests/test_preview_audio.js` needed the helper inside its own function slice (its
+assertions are unchanged and still pass). An offline walk of a 4-sub-chunk, 80-frame chunk
+(scratch script, then removed) showed 21 → 39 → 60 → 80 frames with 0 empty positions at the
+end, each frame resolving at its own position. All nine JS suites,
+`tests/test_chunk_director_helpers.py` (175), `tests/test_teacher_audio_cache.py` (32),
+`tests/test_taomate.py` (42), `tests/test_taomate_kv_records.py` (19),
+`tests/test_video_io.py` (25). JS only, so a hard browser refresh is enough.
+
+## 2026-09-27 — A position shows the image that covers it, and the arrow keys stop seeing black
+
+Owner's follow-up: the arrow keys that were fine before showed black between frames, and the
+drag did too. Their diagnosis was right: the preview decodes one image per H3 temporal
+token, not per frame, so the image numbered 1 stands for frames 1…4 — and the scrub maths
+treated the frames a token covers as unrendered. The arrows regressed for a second reason:
+merging a live sub-chunk into the teacher-audio placeholder kept the placeholder's black
+images in the group, so stepping walked through them.
+
+- `scrubFrameIndex` now returns the image that *covers* the pointed position: the last
+  decoded frame whose number is at or before it (the numbers are ordered, so a scan keeps
+  the last one). "Nothing" is returned only when the position is past the chunk's rendered
+  end (`group.outputEnd`) or before its first decoded image, which is what keeps the
+  un-rendered tail black.
+- `outputEnd` now keeps the phase that finished: `max(data.output_end, last merged frame
+  number)`, because an image's own token frames are rendered too. Shrinking it to the last
+  image would have blacked out up to three frames of a phase that just completed.
+- The `chunk` handler passes `null` as the group to merge when the old group is an
+  audio-first placeholder: the placeholder is span coverage with a black picture, not
+  frames, so a real sub-chunk replaces it (its audio fields still carry over through
+  `Object.assign`). A chunk with teacher audio but no video yet keeps its placeholder and
+  its black picture exactly as before.
+
+Validation: `tests/test_taomate_timeline.js` — the scrub checks were rewritten for the
+covering rule (four token images covering 0-3/4-7/8-11/12-15: position 3 shows image 0,
+4 shows image 1, 15 shows image 3, 16 and beyond answer nothing; a later chunk read by its
+own numbers; a position before its first image black; a group without numbers unchanged),
+plus source assertions for the rendered end. `tests/test_preview_prompt.js` asserts the
+placeholder is replaced rather than merged into, and that `outputEnd` keeps the phase end.
+An offline walk (scratch, then removed) over a token-sparse 333-frame chunk rendered
+through frame 60 gave 61 pictured positions and the first black exactly at the rendered
+end. All nine JS suites, `tests/test_chunk_director_helpers.py` (175),
+`tests/test_teacher_audio_cache.py` (32). JS only, so a hard browser refresh is enough.
+
+## 2026-09-27 — The prompt tooltip scrolls when its text is taller than the panel
+
+The owner asked that a tooltip whose text is larger than its area scroll with the mouse
+wheel. It already capped at `max-height:min(70vh,640px)`, but with `overflow:hidden` and
+`pointer-events:none`, so anything past the cap was silently cut off and the wheel could
+not reach it.
+
+Owner's choice: the tooltip takes the mouse, so its scrollbar is draggable and its text is
+selectable, rather than forwarding the wheel from the document while staying transparent.
+
+- Tooltip style: `overflow-y:auto;overflow-x:hidden` with `scrollbar-width:thin` and
+  `scrollbar-color:#6a6a6a transparent`, `pointer-events:auto`, `user-select:text`.
+  Everything else about the look is unchanged.
+- Taking the mouse creates the problem the old `pointer-events:none` was hiding: the
+  timeline's `mouseleave` closed the tooltip the moment the pointer moved towards it, so
+  the scrollbar could never be reached. `createColoredChunkTooltip` now tracks its own
+  `hovered` state from `mouseenter`/`mouseleave` and reads a `leaveGuard`: the extension
+  registers `event => Boolean(event.relatedTarget && timelineShell.contains(event.relatedTarget))`,
+  so leaving for the timeline hands the hover back without closing, and leaving for
+  anything else closes it. `timelineShell`'s `mouseleave` returns early while
+  `chunkTooltip.isHovered()`. The tooltip also stops `pointerdown` from reaching the panel
+  or the canvas, so scrolling or selecting text can never start a node drag or a pan.
+- `hide()` clears `hovered` and resets `scrollTop`, so a tooltip that opens again starts at
+  the top, while a rebuild of the content it is already showing (a retry landing, a timing
+  update) keeps the reader where they scrolled to — the reset is deliberately in `hide()`
+  and not in `show()` for that reason.
+
+The finished-video player's tooltip (`createFinishedChunkTooltip`) is untouched, as the
+owner scoped this to the preview node.
+
+Validation: `tests/test_preview_prompt.js` — the element fake gained
+`addEventListener`/`dispatchEvent`, and `checkTooltipScroll` pins the style flags, that a
+shown tooltip is not hovered, that entering marks it hovered, that leaving for the timeline
+keeps it open (guard true) while leaving elsewhere closes it at scrollTop 0, and that a
+rebuild keeps scrollTop, plus source assertions for the guard, the timeline's early return
+and the press stop. All nine JS suites and `tests/test_chunk_director_helpers.py` (175)
+pass. JS only, so a hard browser refresh is enough.
+
+## 2026-09-27 — Ctrl+wheel over the timeline scrolls the prompt tooltip
+
+The owner reported the tooltip scroll doing nothing and Ctrl+wheel zooming the page instead.
+The cause is in the frontend, not in the tooltip: `document.body` carries
+`K(document.body, "wheel", …, { capture: true, passive: false })` which, whenever Ctrl or
+Meta is held, calls `preventDefault()` and `stopPropagation()` and then switches workflow
+tabs. The tooltip's own listener therefore never ran, its native scroll was cancelled, and
+the browser's ctrl+wheel page zoom took over.
+
+- `createColoredChunkTooltip` now takes the wheel from a `window` **capture** listener,
+  which runs before that `document.body` capture handler: while the tooltip is showing a
+  prompt taller than itself it calls `preventDefault()` + `stopImmediatePropagation()` and
+  scrolls `scrollTop` itself (line-mode deltas ×16, clamped to
+  `scrollHeight - clientHeight`), so the frontend's tab switch, the graph's zoom and the
+  browser's ctrl+zoom are all kept out of it.
+- The guard is deliberately *not* the pointer being on the tooltip: the tooltip only exists
+  while the pointer is on the timeline, and moving off the timeline hides it immediately, so
+  the pointer is never over it. What decides is that a tooltip is showing content that
+  overflows; a tooltip that fits, or none at all, leaves the wheel to the graph.
+- `remove()` detaches the window listener, so a deleted node leaves nothing behind.
+
+Validation: `tests/test_preview_prompt.js` — the fake harness gained a `window` with
+listeners, a `remove()` on elements and a `dispatchWindowEvent`, and `checkTooltipScroll`
+now pins the wheel: a tooltip that fits and a hidden tooltip let the event through
+untouched, while a showing, overflowing tooltip swallows it (`preventDefault` +
+`stopImmediatePropagation`) and moves the text by 120px, converts a 3-line delta to 48px
+and clamps at the end. All nine JS suites and `tests/test_chunk_director_helpers.py` (175)
+pass. JS only, so a hard browser refresh is enough.
+
+## 2026-09-27 — The retry splits a group in two, and the pace is the shot's own
+
+Two follow-ups from the owner's renders of the monologue prompt.
+
+**A retry never makes more than two groups.** The retry that isolates the failed phrase
+produced three groups when the *middle* phrase failed (18:44: `People are strangely afraid
+of silence.` and `Personally, I find silence comforting.` both failed), and the owner heard
+audio worse than the take it was meant to fix. So `_split_out_damaged_phrases` now splits
+each group at exactly one place: after the first phrase when the first phrase failed,
+otherwise before the last phrase. Words, order, language tags and the retry's faster
+delivery are untouched, a group with one phrase or nothing damaged is still left alone,
+and a take that failed everything still only becomes two groups.
+
+**The pace bands are relative to the shot.** The owner's objection: chunk 2 is the densest
+chunk of the shot and was told "speaking slowly, with pauses", while the sparsest chunks
+were told nothing — the absolute bands were backwards. `_dialogue_delivery_instruction(rate,
+pace)` now compares the chunk's own words-per-second with the shot's own pace (the
+`total_weight / available_seconds` the cutter already computed), with the owner's approved
+dead band:
+
+| ratio to the shot's pace | instruction |
+|---|---|
+| ≥ 1.50 | speaking very quickly, rushing the words |
+| 1.25 – 1.50 | speaking quickly |
+| 1.10 – 1.25 | speaking a little faster than usual |
+| 0.90 – 1.10 | nothing |
+| < 0.90 | speaking slowly, with pauses |
+
+On the owner's prompt (shot pace 0.63x) that is chunk 1 slowly, chunk 2 quickly, chunk 3
+nothing, chunk 4 slowly, chunk 5 a little faster, chunk 6 nothing. `ACTION_MAX_SPEECH_RATE`
+(1.40) is still the *absolute* pace no human reaches, and the render stops there; the band
+list now ends in `float("inf")` so a ratio past the last edge keeps the strongest phrase
+instead of falling through to nothing, which is what the first cut of this change did.
+
+Validation: `tests/test_chunk_director_helpers.py` (175; new relative band test, a
+whole-delivery test that proves the instruction rides only cut pieces, the cut-piece test
+with its two bands, and `test_a_retry_never_makes_more_than_two_groups`),
+`tests/test_taomate.py` (42), `tests/test_teacher_audio_cache.py` (32),
+`tests/test_taomate_kv_records.py` (19), nine JS suites.
+
+## 2026-09-27 — A word's tail no longer keeps the dialogue in a silent sub-chunk
+
+The owner watched the 19:58 render: sub-chunk 1.4 lost its dialogue and the video stayed
+silent ✔, but 1.3 still carried the dialogue and moved the mouth with no audio driving it.
+Reading the cached take's word times against the sub-chunk windows showed why: 1.3 covers
+4.42s-6.55s and the only word in it was the tail of `minute.` (4.10-4.70, 0.28s) followed by
+1.85s of silence, and `_subchunk_speaks` counted *any* overlap as speech.
+
+The owner's rule now: a word belongs to the sub-chunk it **starts** in — the voice begins
+there — and a word that started earlier only counts while its sound fills at least
+`ACTION_MIN_SPEECH_SHARE` (0.25) of this sub-chunk. On chunk 1 that leaves 1.1, 1.2, 1.5 and
+1.6 speaking and 1.3 and 1.4 dialogue-free, which is the render the owner asked for. A
+transcript that never arrived still keeps the prompt, and a take with no words at all is
+still silent everywhere.
+
+Validation: `tests/test_chunk_director_helpers.py` (175) — the sub-chunk test now pins a
+word starting inside a window, a word whose tail alone falls in the next one (removed), a
+word that really runs across the boundary (kept), an empty take and a missing transcript —
+plus `tests/test_taomate.py` (42), `tests/test_teacher_audio_cache.py` (32) and
+`tests/test_taomate_kv_records.py` (19).
+
+## 2026-09-27 — kv_remember: the plugin had been dropping one remembered sub-chunk
+
+The owner asked for a `kv_remember` widget after suspecting the camera jump at a chunk seam
+came from what the KV cache feeds a new sub-chunk, and they were right about the cause: the
+vendored upstream policy in `python/taomate_upstream/cache.py:211-219` is
+
+```python
+if block_count <= 2:
+    return
+recent_start = max(1, block_count - 2)
+selection = [(0, True)] + [(index, False) for index in range(recent_start, block_count)]
+```
+
+— the video-only sink plus the **last two** committed sub-chunk blocks — while
+`VideoSubchunkKVCache.prepare_commit` had been trimming to `[(0, True), (count - 1, False)]`,
+i.e. the sink plus **one** recent block. That deviation shipped with the TaoMate backend
+itself (`6939e1a`, `9e84be8`, both 2026-09-26), so it is not a recent regression; it also
+made the plugin evict earlier than upstream (at three blocks upstream keeps all three, the
+plugin already dropped the middle one).
+
+- `parse_kv_remember("1,-2,-1")` validates the new widget once per render and raises a clear
+  `ValueError` for `0`, words or an empty spec, so a typo stops the render instead of
+  quietly narrowing the window.
+- `kv_remember_selection(entries, block_count)` resolves positive entries from the start
+  (1 = the first sub-chunk) and negative ones from the newest (-1, -2, …), keeps the first
+  block video-only exactly as upstream ages it into a sink, skips blocks the render has not
+  reached and de-duplicates. For the default it reproduces upstream's selection exactly at
+  every block count.
+- `VideoSubchunkKVCache` now carries the parsed spec and trims to it; upstream's
+  `block_count <= 2` guard is kept, so the first sub-chunks stay unaged as before.
+- The widget sits above `kv_cache_compression`, and `kv_cache_compression` now defaults to
+  `turboquant4` in both the node schema and the legacy signature.
+
+Validation: `tests/test_taomate.py` (46) — the default equals upstream's formula at every
+block count, `"1,-1"` reproduces the old behaviour, `"-2,-1"` drops the sink,
+`"-3,-2,-1"` keeps three, malformed specs raise, and `prepare_commit` applies the spec
+through `_retain_commit_rows`; the existing cross-rollover comparison against the upstream
+cache now expects the sink plus two recents and drops its old identity check, because the
+plugin trims before each append while upstream trims after it (the retained bytes are what
+the test compares). `tests/test_chunk_director_helpers.py` (175),
+`tests/test_teacher_audio_cache.py` (32), `tests/test_taomate_kv_records.py` (19) pass too.
+
+## 2026-09-28 — No pace band on the head of a cut delivery, and it goes with the line
+
+Two corrections to the pace band.
+
+**The head of a delivery is not a cut delivery.** The owner: "it wasn't a cut dialogue that
+the cutter created, it was the start of the big dialogue that the cutter cuts — as a rule,
+no speech speed should be added before the start of a dialogue that has been cut." The
+condition I had added earlier (`len(selected) < len(weighted_words)`, i.e. "this piece
+holds only part of its block") fires on the *first* chunk of a monologue too, so chunk 1
+was told "speaking slowly, with pauses". It is now `bool(selected_index)` — a piece earns an
+instruction only when its first spoken word is not its block's first word, or it carries
+words from the previous chunk — so the head stays clean and the continuations keep theirs
+(on the owner's prompt: chunk 1 none, 2 quickly, 3 none, 4 slowly, 5 a little faster,
+6 none).
+
+**A removed dialogue takes its delivery band with it.** A silenced sub-chunk kept
+"Speaking slowly, with pauses, <Subject 1> (S1) then says:" in front of nothing, because
+the band sits *before* the clause `_prompt_without_dialogue` removes. `SPEECH_RATE_PREFIX`
+(`(?:speaking [^.\n]*?, )?`) is now part of both the `<Subject N>` and the bare lead
+patterns, so the band, the clause and the line go together.
+
+Validation: `tests/test_chunk_director_helpers.py` (175) — the cut-delivery test now
+asserts the head chunk gains no instruction while the continuation keeps "Speaking very
+quickly, rushing the words,", and the silent-prompt test asserts a banded prompt loses the
+band, the header and the line. `tests/test_taomate.py` (46),
+`tests/test_teacher_audio_cache.py` (32), `tests/test_taomate_kv_records.py` (19) pass.
+
+## 2026-09-27 — Fullscreen playback floats the chrome over the whole picture and fades it
+
+Owner's request for the preview node, then for every fullscreen player in the plugin: with
+the picture fullscreen, the timeslider, the info under it and the top buttons should fade out
+after three seconds of a still pointer and come back on movement, and the video should stay
+fullscreen with everything floating on top of it. The owner chose the whole transport bar
+with the status line and the top buttons, translucent bars, the graphs overlaid and fading
+with the rest, and chrome kept visible while playback is paused.
+
+Two panels have their own fullscreen: `web/unlimited_preview.js` (the preview node) and
+`web/finished_video_player.js` (the Save/Load Video nodes). They already duplicate their
+panel and tooltip code, so the helper is duplicated too rather than adding a shared module
+both would have to import.
+
+- New file-scope `createControlsAutohide(elements, { delayMs = 3000, isFullscreen,
+  isPlaying, doc = document })` in both files: `mousemove` and `fullscreenchange` show the
+  elements and arm a three second timer, which fades them to `opacity:0` +
+  `pointer-events:none` (a faded control must not answer a click) only while the player is
+  fullscreen *and* playing; `isVisible()` and `stop()` (clears the timer, detaches both
+  listeners, restores) are exposed, and `arm()` is what a state change calls.
+- The transport bar and the status line now live in a `controls` wrapper (`display:flex;
+  flex-direction:column`), which is invisible in the normal layout and is what fullscreen
+  floats; the finished player puts its comparison footer in it too. `root` gained
+  `position:relative`.
+- `applyFullscreenLayout()` runs on every `fullscreenchange` (from the existing handler,
+  alongside `updateFullscreenButton()`): the viewport becomes `position:absolute;inset:0`
+  so the picture is full-bleed and `object-fit:contain` keeps its shape, `controls` is
+  anchored to the bottom, and (preview only) `graphs` gets the `min(430px,44vw)` top-left
+  corner. Over that picture the bars turn translucent (`rgba(20,20,20,.72)` transport,
+  `rgba(24,24,24,.72)` status, `rgba(18,18,18,.72)` graphs) with `backdrop-filter:blur(3px)`
+  and are restored to their exact opaque colors on exit.
+- Play state re-arms from the player itself: the preview's `setPaused()` calls `arm()`
+  (`isPlaying: () => !paused`), and the finished player listens to its `media` element's
+  `play`/`pause`/`ended` events (`isPlaying: () => !media.paused && !media.ended`), so
+  pausing brings the chrome back and a paused fullscreen never hides it.
+
+Validation: new `tests/test_preview_controls_autohide.js` runs **both** copies of the helper
+for real under `vm` with fake timers and a fake document: nothing arms outside fullscreen,
+fullscreen arms exactly 3000ms and hides, movement restores and re-arms, a paused player
+arms nothing, leaving fullscreen restores and clears, `stop()` detaches both listeners, the
+transition is set, and source assertions cover the wiring of both panels (bottom-floated
+translucent chrome, the graphs floating with the rest in the preview, the comparison footer
+in the save node, each panel's own play state). All ten JS suites pass, plus
+`tests/test_chunk_director_helpers.py` (175). The change is JS only, so a hard browser
+refresh is enough.
+
+## 2026-09-27 — The sub-chunk view shows what that slice of the take heard
+
+Owner's follow-up on the Ctrl+Shift view: each sub-chunk should also show the teacher audio
+transcript belonging to its own time slice. The take's Whisper transcript is per chunk
+(`{"text", "words": [{word, start, end}]}`, seconds from the chunk's audio start) and was
+never published to the preview, so there was nothing to show.
+
+- New `_subchunk_transcript(phase, chunk, transcript)` in `nodes.py` cuts those words to one
+  phase's own window — `(audio_start - chunk_audio_start) / AUDIO_LATENT_FPS` (**40**, not
+  25: the first test expectation was wrong about this) to `(audio_end - chunk_audio_start) /
+  AUDIO_LATENT_FPS`, with the same overlap rule as `_subchunk_speaks`, so a word straddling
+  a boundary belongs to both windows. Words are joined in order.
+- `_publish_subchunk_prompts(..., chunk, transcript)` now publishes `subchunk_transcripts`
+  (one entry per phase, `""` where the slice holds no word) beside the silent-sub-chunk
+  keys, and is called for every chunk rather than only for chunks with a silent sub-chunk.
+  Both call sites pass the transcript they already have: `audio_transcripts[index]` in the
+  video pass, `recognized` in the audio-first pass. A transcript that never arrived or holds
+  no words publishes **nothing**, so the tooltip never claims a silence it cannot know.
+- `preview.set_subchunk_prompts(chunk, numbers, prompt, transcripts=None)` publishes it (and
+  publishes transcripts alone for a chunk that speaks throughout), `_cache_payload` keeps
+  the empty slots so a transcript cannot drift onto another sub-chunk,
+  `build_teacher_audio_preview_snapshot` restores it, and `teacher_audio_payload()` carries
+  `subchunk_transcripts` so a reload keeps it.
+- `web/unlimited_preview.js`: the Ctrl+Shift branch adds
+  `Teacher audio transcript (this sub-chunk's window):` and, under it, the words in their
+  own plain block (grey border, no shot colours — it is speech, not prompt text); an empty
+  entry reads `nothing heard in this window`, which is exactly why that sub-chunk's prompt
+  dropped the dialogue. A chunk without a transcript list shows no line at all. The
+  transcript joins the tooltip signature and the `chunk_metadata` handler, so a late
+  transcript refreshes an open tooltip.
+
+Validation: `tests/test_chunk_director_helpers.py` (175; the window cutting with one word
+per window, a straddling word in both, a silent window, an absent/wordless transcript
+publishing nothing, the transport publishing both keys and transcripts alone, the cache
+keeping the empty slot), `tests/test_teacher_audio_cache.py` (32; a reload keeps
+`subchunk_transcripts` with its empty slot), `tests/test_preview_prompt.js` (the label, the
+plain block, the empty-window note, no line without a list), plus all ten JS suites and
+`tests/test_taomate.py` (42), `tests/test_global_prompt_sections.py`. Python changed, so
+this one needs a ComfyUI restart and a hard browser refresh.
+
+## 2026-09-27 — The timeline shows where each chunk's sub-chunks are, in luminance only
+
+Owner's request: represent the sub-chunks inside a chunk on the timeline as a variation of
+the chunk color's luminance, positioned by the frames each sub-chunk really owns (their
+choice: the real `taomate_phase_work` counts, with the pending part of a filling chunk
+showing the same treatment).
+
+**Second cut, after the owner saw it.** The first version ran a sawtooth — the chunk color
+brightening towards each sub-chunk's middle and back at its boundaries — and the owner
+rejected it twice: the transitions should not be smooth, and the split should be *odd
+sub-chunks in the chunk's own color, even sub-chunks a step brighter*, each band flat with a
+**sharp** step at every boundary. That is what ships.
+
+The timeline paints every chunk into one `linear-gradient` on `timelineTrack`, so the
+structure arrives as extra stops, not as elements:
+
+- New file-scope helpers in `web/unlimited_preview.js`: `mixHex(from, to, amount)`,
+  `subchunkEdges(work)` (each sub-chunk's end as a fraction of the chunk; `null` when the
+  chunk has one sub-chunk or none of the counts is known) and `subchunkTimelineStops(stops,
+  { color, start, end, work, alpha, renderedFraction })`. Bands are `edges` (or one band for
+  the whole chunk), the odd ones keep `color`, the even ones take
+  `mixHex(color, "#ffffff", 0.3)`, and each segment emits its color at both ends — so a
+  boundary carries both colors at the same percentage, which is what makes the step sharp.
+  Percentages are rounded to a thousandth so a long timeline keeps a readable string.
+- The loop in `renderTransport` calls it for both halves of a filling chunk (the rendered
+  part keeps its `e8` alpha, the pending part its `color-mix(… 50%, black)` recipe, in the
+  same bands), and for a chunk with no progress (`e8`, or `35` while it has no frames). A
+  band the render has half filled is split a hundredth of a percent before the boundary, so
+  the rendered/pending step stays sharp and inside its own band. A chunk without known
+  sub-chunk frames produces exactly the two flat stops it always did.
+- Nothing else changed: the chunk colors, the completed/pending split, the cached and
+  overlap overlays, the shot brackets and the playhead are untouched.
+
+Validation: `tests/test_taomate_timeline.js` runs the real stop-building loop, so the
+sub-chunk cases go through the panel code: `mixHex` positions, edges for equal and unequal
+work (`[31, 93]` of 124 frames puts the boundary at the quarter mark), `null` edges for a
+single-sub-chunk or unknown chunk, the two-band stop list of a pair, the four alternating
+bands of a 4-sub-chunk chunk (its starts and ends back in the chunk color), a filling chunk
+whose dimmed part keeps the alternation with the render step inside the band, and the
+finished-sub-chunk case below. An offline dump of a real four-sub-chunk chunk (`[21, 22, 22,
+21]`, 8 stops, boundaries at 24.419/50/75.581%) confirmed the sharp steps before the scratch
+script was removed. All ten JS suites and `tests/test_chunk_director_helpers.py` (175) pass.
+JS only, so a hard browser refresh is enough — no ComfyUI restart for this one.
+
+**Third cut: a finished sub-chunk still ramped.** The owner: "there's still a gradient when
+a subchunk is showing images". The split of rendered from pending was `renderedFraction < to`
+(exclusive), but a sub-chunk that finishes puts the render boundary *exactly* on the band
+edge — so that band took the rendered color from its start and the dimmed one at its end and
+the gradient ramped across the whole sub-chunk. Reproduced offline for
+`work: [31,31,31,31], renderedFraction: 0.25`, which printed `#45b7d1e8 0%` straight to
+`color-mix(… 50%, black) 25%`. `subchunkTimelineStops` now splits when
+`renderedFraction <= to`, keeps the band rendered up to `max(from, renderedFraction - 1e-4)`,
+starts the pending color at the boundary and only paints the band's pending tail when the
+boundary is strictly inside it (the clamped edge also stops a non-monotonic stop list when a
+boundary sits a hair above a band edge). Same dump now: `#45b7d1e8 0%`, `#45b7d1e8 24.99%`,
+`color-mix(… 50%, black) 25%`, then the pending bands — flat everywhere.
+`tests/test_taomate_timeline.js` carries that state as a regression case
+(`draw(62, …, [62, 62])`).
+
+## 2026-09-28 — The tooltip follows the sub-chunk, so the chord is gone
+
+The owner's conclusion: the Ctrl+Shift chord is unnecessary. A chunk with sub-chunks should
+read sub-chunk by sub-chunk in the ordinary tooltip — no key for that sub-chunk's
+`detailed_description`, Shift for its whole prompt — and the chord is removed. Their two
+extra answers: holding Ctrl+Shift does **nothing** (the prompt text is cleared, the card keeps
+its numbers), and the sub-chunk's teacher-audio transcript belongs in **every** view, below
+the prompt text that view showed.
+
+- `setChunkTooltip` now resolves the pointed sub-chunk *before* anything else and builds the
+  tooltip's text from it: `fullPrompt = subchunkBody?.prompt || range.h3_prompt` and
+  `description = chunkPromptDescription({ h3_prompt: fullPrompt, gemma_detailed_description:
+  range.gemma_detailed_description })` — the object form keeps the Gemma fallback that the
+  range form used to give. Everything downstream (`showFullPrompt`, the prompts list, the
+  signature) then uses those, so a silent sub-chunk shows its dialogue-less body with no
+  further branching, and a chunk without sub-chunks is byte-for-byte today's behaviour
+  (`subchunkAt` returns `{number: 1, count: 1}`).
+- Views: `showAttempts = ctrl` (Ctrl+Shift included, as the owner asked — Ctrl still owns the
+  attempts), `showFullPrompt = !showAttempts && shift`, `showNothing = ctrl && shift`, which
+  prints `Prompt text hidden.` where the prompt would be. `showSubchunk` is gone from the
+  code and from both test suites.
+- `Chunk N.M of N: …` heading stays, now shown by default whenever the pointed chunk has more
+  than one sub-chunk, and the transcript line (`Teacher audio transcript (this sub-chunk's
+  window):`, its own plain block, `nothing heard in this window` when empty) moved out of the
+  removed branch to the end of the card, so it lands under the detailed_description of every
+  view, including the Ctrl attempts one.
+- The local holding the named sub-chunk is called `pointed`, not `position`: inside `show()`
+  a `const position` shadowed the tooltip's own `position(event)` and broke the final
+  placement call. The test harness caught it before the browser did.
+
+Validation: `tests/test_preview_prompt.js` — `checkSubchunkView` now covers `subchunkAt`
+boundaries and `subchunkPrompt` (unchanged), the plain view showing the pointed sub-chunk's
+description with the heading and transcript, the Shift view adding its sections up to the
+sub-chunk's whole prompt, the empty-window note, no transcript line without a transcript,
+the cleared Ctrl+Shift view (no prompt block, numbers kept, transcript still there), a chunk
+without sub-chunks showing no sub-chunk line, and source assertions that the chord is gone
+and the prompt comes from the sub-chunk.
+`tests/test_chunk_director_helpers.py` (175) asserts the same on the source.
+All ten JS suites, `tests/test_taomate.py` (46) pass. JS only, so a hard browser refresh is
+enough.
+
+## 2026-09-28 — The plain tooltip is a Shift section, not a grey block
+
+Owner: "make the normal tooltip the same style as the shift version… it's currently
+different." It was: the plain view drew the description as one neutral-grey block
+(`PROMPT_SECTION_NEUTRAL`) with a `chunk detailed_description:` heading above it, while Shift
+framed every section in its own palette colour with a bold in-place header. The owner also
+settled what each view carries: **Shift shows everything including the retention_analysis**,
+the plain view shows the detailed_description and the transcript.
+
+- New file-scope `promptSectionField(label)` (the label without its colon, lowercased, now
+  shared with `promptSectionColor`) and `PROMPT_DESCRIPTION_FIELDS`
+  (`detailed_description`, `integrated_multimodal_description`); `promptSectionBlocks(text,
+  chunk, shotRanges, colors, fields=null)` keeps only the sections a caller asks for.
+- The plain view renders that one section of the *same* prompt the Shift view uses, so it
+  now carries the section's own colour (`#45b7d1`), its bold `detailed_description:` header
+  and the same 14% background. Its grey heading line is gone, because the section names
+  itself. A prompt with no such field (a legacy chunk, or Gemma's own description) falls
+  back to the unframed body exactly as before, and an empty one still shows the waiting
+  line. The plain branch no longer trims the section's trailing newline — that is the
+  literal prompt text, as in Shift.
+- The retention analysis moved out of the plain view: it is shown when `showFullPrompt`
+  (Shift's everything) or `showAttempts` (Ctrl's teacher takes), and never in the plain or
+  cleared views.
+
+Validation: `tests/test_preview_prompt.js` — the plain view now asserts one framed section
+in `#45b7d1` named by its own header with no grey heading left, its literal text is
+`detailed_description: <body>\n`, the retention analysis appears only with Shift, and a
+description without the field still shows its body. The finished player's own tooltip keeps
+its flat description (its expectations are scoped to the preview). An offline dump of both
+trees confirmed the plain and Shift framings match. All ten JS suites,
+`tests/test_chunk_director_helpers.py` (175). JS only, so a hard browser refresh is enough.
+
+## 2026-09-28 — The sub-chunk number rides on the chunk title, in every view
+
+Owner: drop the `Chunk 1.N of T: the chunk prompt` line and put `1.N / T` on the `Chunk 1`
+colored title instead — in all views. Done by moving the resolution of the pointed sub-chunk
+above the title: `setChunkTooltip` already computes it for the prompt text, and `show()`
+draws `Chunk ${chunkNumber}.${pointed.number} / ${pointed.count}` (or the plain
+`Chunk ${chunkNumber}` for a chunk with one sub-chunk, `pointed` being `subchunk.count > 1`)
+before any view branch, so the plain, Shift, Ctrl and cleared views all carry it. The
+heading's "no speech in its window, so the dialogue is dropped" hint went with the line —
+the missing dialogue in the section body is what shows it now.
+
+Validation: `tests/test_preview_prompt.js` pins the title as `Chunk 1.3 / 4` in the plain and
+Shift views, in the Ctrl attempts view, and (unchanged) `Chunk 1` for a chunk without
+sub-chunks; an offline dump of the four views printed `Chunk 1.3 / 4` as the second line of
+each. All ten JS suites and `tests/test_chunk_director_helpers.py` (175) pass.
+
+## 2026-09-28 — Each teacher take shows what it heard, and the retry's own is now published
+
+Owner's batch on the tooltip: drop the `Chunk prompt (audio and video):` line in the Shift
+view, call the first attempt `Teacher audio prompt:` (same tint), put a transcript below every
+teacher-audio prompt, remove the old block that sat under the retry (it held the *first*
+take's words) and show the retry's own words instead, and paint the hearing that *caused* a
+retry red. Follow-ups: no label at all when Shift has a single prompt, and each hearing is
+labelled `Teacher audio heard:`.
+
+The blocker was data: the preview only ever received the transcript that *caused* a retry
+(the rejected take's words), never the retry's own. Both flows do know it —
+`publish_audio_first_chunk` and `publish_chunk_teacher_audio` transcribe the committed take
+and know `audio_index in audio_retried_chunks`.
+
+- New `_remember_audio_teacher_transcript(range_item, attempt, transcript)` keeps a list
+  aligned with the prompt list (entry i = what take i heard, `""` for one not yet
+  transcribed), padding to one slot per attempt. `_remember_audio_teacher_attempt` records
+  the rejected take's hearing through it at `max(0, len(attempts) - 2)` — the take a retry
+  replaced — so a range whose first prompt is the retry still lands in slot 0.
+- The key is `audio_teacher_attempt_transcripts` (was `audio_teacher_retry_transcripts`),
+  and both transcription sites now record the committed take's own hearing at attempt `1`
+  when the chunk was retried, else `0`. The rename follows through `set_audio_prompt(…,
+  attempt_transcripts=)`, the `chunk_metadata` key, `_cache_payload`,
+  `teacher_audio_payload` (payload key `attempt_transcripts`) and
+  `build_teacher_audio_preview_snapshot`.
+- JS: the reader is `audioTeacherAttemptTranscripts`; the attempts view labels the first
+  attempt `Teacher audio prompt:`, and under **each** attempt's description prints
+  `Teacher audio heard:` with that take's own words — red (`#e05252` border, 26% red
+  background, `#ffe3e3` text) when the attempt is followed by another, i.e. when it caused
+  that retry, and in the attempt's own tint for the accepted one; an empty slot reads
+  `nothing heard in this window`. The old `Heard instead (caused this retry):` block is gone.
+  The Shift view prints no label line for a single prompt; two prompts keep `Audio prompt:` /
+  `Video prompt:`, since those are what tell them apart.
+
+Validation: `tests/test_chunk_director_helpers.py` (175) — the aligned slots, the retry's own
+slot filled afterwards, the padded list, the renamed keys and payload; the old
+`"Chunk prompt (audio and video):"` assertion became an absence plus the two-label case.
+`tests/test_preview_prompt.js` — the attempt labels, one hearing per attempt with the right
+words, red for the causing one, the tint for the accepted one, the empty-slot note, no
+leftover old block, and the Shift view carrying no label for one prompt.
+`tests/test_teacher_audio_cache.py` (32) keeps the renamed key through a reload. An offline
+dump of both views confirmed the layout. All ten JS suites, `tests/test_taomate.py` (46) and
+`tests/test_taomate_kv_records.py` (19) pass. Python changed, so this needs a ComfyUI restart
+and a hard browser refresh.

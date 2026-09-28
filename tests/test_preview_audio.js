@@ -92,9 +92,13 @@ const timelineClock = new Function("assert", `
 timelineClock(assert);
 const carryBegin = source.indexOf('                let restoredAudioSource = typeof data.audio');
 const carryEnd = source.indexOf('                if (typeof data.gemma_detailed_description', carryBegin);
+const mergeBegin = source.indexOf("function mergeFrameGroup(");
+const mergeEnd = source.indexOf("function audioTeacherAttempts(", mergeBegin);
+assert.ok(mergeBegin >= 0 && mergeEnd > mergeBegin, "the frame group merge must exist");
 const carryAudio = new Function('data', 'chunks', 'index', 'finalized', 'pendingAudioSources', 'currentStep', `
     const encodedFrames = ['image'];
     const frameDurations = [42];
+    ${source.slice(mergeBegin, mergeEnd)}
     ${source.slice(carryBegin, carryEnd)}
     return group;
 `);

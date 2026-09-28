@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io as pyio
 import importlib
 import inspect
 import json
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from PIL import Image
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -155,8 +157,8 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertNotIn("video continuation", summary)
         self.assertEqual(nodes._chunk_summary_prompt("detailed_description: Plain.", "detailed_description: Plain.", False), "detailed_description: Plain.")
 
-    def test_local_planner_keeps_the_complete_source_description_for_first_video(self):
-        """The first video keeps visual prose while later videos slice action."""
+    def test_local_planner_owns_each_source_action_once(self):
+        """Each action unit reaches exactly one chunk, never two and never none."""
         prompt = (
             "summary: original task\n\n"
             "detailed_description: [Shot 1] Initial source prose remains complete. "
@@ -167,14 +169,15 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             {"frame_start": 0, "frame_end": 48, "output_trim_frames": 0},
             {"frame_start": 48, "frame_end": 96, "output_trim_frames": 0},
         ]
-        with patch.object(nodes, "_legacy_shot_body_for_range", return_value="SLICED CONTINUATION") as slicer:
-            planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24.0, 0, False, False, True, 1, 1, legacy=True)
+        planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24.0, 0, False, False, True, 1, 1, legacy=True)
 
+        # Ownership replaced the old rule where the first video carried the whole
+        # description and later chunks sliced it again, which is what repeated a
+        # source sentence across chunks.
         self.assertIn("Initial source prose remains complete.", planned[0][0])
-        self.assertIn("A second source action remains present.", planned[0][0])
-        self.assertNotIn("SLICED CONTINUATION", planned[0][0])
-        self.assertIn("SLICED CONTINUATION", planned[1][0])
-        self.assertEqual(slicer.call_count, 1)
+        self.assertNotIn("A second source action remains present.", planned[0][0])
+        self.assertIn("A second source action remains present.", planned[1][0])
+        self.assertNotIn("Initial source prose remains complete.", planned[1][0])
 
     def test_local_opening_body_keeps_visual_prose_but_times_dialogue(self):
         """Chunk 1 cannot repeat dialogue that belongs to a later video."""
@@ -203,14 +206,17 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertIn("The camera stays fixed in the stablished frame.", planned[1][0])
 
     def test_continuation_drops_complete_opening_picture_instruction_before_slicing(self):
-        """An opening setup cannot be cut into a dangling dialogue prefix."""
+        """An opening setup stays with its own chunk and never dangles later."""
         setup = "Starts with <Picture 1> as the exact first frame for the target video, and the camera stays static at <Picture 1> stablished position for the entire duration of the shot."
         body = setup + " She smiles warmly."
-        first = nodes._legacy_opening_body_with_timed_dialogue(body, 0, 240, 0, 120)
-        later = nodes._legacy_shot_body_for_range(body, 0, 240, 120, 240)
-        self.assertIn(setup, first)
-        self.assertNotIn("<Picture 1>", later)
-        self.assertIn("She smiles warmly.", later)
+        # The setup configures the opening, so it is one-time prose rather than a
+        # camera state that repeats, and ownership gives it to the first window.
+        table = nodes._legacy_action_plan(nodes._legacy_visual_body(body), 0, 240, ((0, 120), (120, 240)), 24.0)
+        self.assertIn(setup, table[(0, 120)])
+        self.assertNotIn("<Picture 1>", table[(120, 240)])
+        # The action itself lands in exactly one chunk; which side of a seam it
+        # falls on is the clock's business, not the prompt's.
+        self.assertEqual(sum("She smiles warmly." in text for text in table.values()), 1)
         long_sentence = "The subject " + "very " * 40 + "slowly turns around."
         sliced = nodes._legacy_shot_body_for_range(long_sentence, 0, 240, 120, 240)
         self.assertEqual(sliced.strip(), long_sentence)
@@ -322,16 +328,69 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertNotIn("start the video in silence", speaking.lower())
 
     def test_phoneme_timed_dialogue_contract_is_word_exact_and_chunk_owned(self):
-        """The preproduction verifier receives the same deterministic split as legacy sampling."""
-        body = "<Subject 1> (S1) says: <d>[English] One two three four five six seven eight nine ten.</d>"
+        """The verifier receives the same split, and the split lands on a phrase end."""
+        body = "<Subject 1> (S1) says: <d>[English] One two three four. Five six seven eight nine ten.</d>"
         chunks = [{"output_start": 0, "output_end": 120}, {"output_start": 120, "output_end": 240}]
         segments = nodes._deterministic_dialogue_segments(body, 0, 240, chunks, 24)
         words = [match.group(1).split("]", 1)[1].strip() for segment in segments for match in nodes.DIALOGUE_BLOCK.finditer(segment["content"])]
-        self.assertEqual(" ".join(words).split(), "One two three four five six seven eight nine ten.".split())
+        self.assertEqual(" ".join(words).split(), "One two three four. Five six seven eight nine ten.".split())
         self.assertEqual([segment["chunk"] for segment in segments], [1, 2])
+        # Each slice finishes on the phrase terminal, so H3 always has a stop.
+        for segment in segments:
+            self.assertTrue(nodes._preview_subtitle(segment["content"]).endswith("."), segment["content"])
         source_shots, request = nodes._gemma_preproduction_request("detailed_description: " + body, [(0, 0, 240, body)], [{"frame_start": 0, "frame_end": 120, "output_trim_frames": 0}, {"frame_start": 120, "frame_end": 240, "output_trim_frames": 0}], 24, False)
         self.assertEqual(source_shots[0]["deterministic_dialogue_segments"], segments)
         self.assertEqual([(item["output_start"], item["output_end"]) for item in request["chunks"]], [(0, 120), (120, 240)])
+
+    def test_the_pace_bands_are_relative_to_the_shots_own_pace(self):
+        """A chunk is asked for the pace its own words need next to the shot's own."""
+        pace = 0.63
+        band = nodes._dialogue_delivery_instruction
+        self.assertIsNone(band(pace, pace))
+        self.assertIsNone(band(pace * 1.10, pace))
+        self.assertEqual(band(pace * 1.20, pace), "speaking a little faster than usual")
+        self.assertEqual(band(pace * 1.42, pace), "speaking quickly")
+        self.assertEqual(band(pace * 1.60, pace), "speaking very quickly, rushing the words")
+        self.assertEqual(band(pace * 1.10 + 0.01, pace), "speaking a little faster than usual")
+        self.assertEqual(band(pace * 0.89, pace), "speaking slowly, with pauses")
+        # The owner's own monologue: the densest chunk of the shot is asked to speed up
+        # and the sparsest to slow down, whatever their absolute rate is.
+        self.assertEqual(band(0.89, pace), "speaking quickly")
+        self.assertEqual(band(0.42, pace), "speaking slowly, with pauses")
+        self.assertEqual(band(0.70, pace), "speaking a little faster than usual")
+        self.assertIsNone(band(0.58, pace))
+
+    def test_a_whole_delivery_gains_no_instruction(self):
+        """The owner's rule: a delivery the chunk holds whole is never told a pace."""
+        # One group, two short words, all of it inside the first chunk: 0.1x where the
+        # shot's own pace is 0.05x, so a cut piece here would be asked for a fast
+        # delivery. A whole one is asked for nothing at all.
+        body = "<Subject 1> (S1) says: <d>[English] one two.</d>"
+        words = list(nodes.re.finditer(r"\S+", "one two."))
+        ranges = ((0, 20), (20, 40))
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple(zip(words, (1.0, 1.0)))):
+            _visual, first = nodes._legacy_dialogue_for_range(body, 0, 40, 0, 20, 1, ranges)
+            _visual, second = nodes._legacy_dialogue_for_range(body, 0, 40, 20, 40, 1, ranges, 20)
+        self.assertNotIn("Speaking", " ".join(first))
+        self.assertNotIn("Speaking", " ".join(second))
+        self.assertIn("<d>[English]one two.</d>", first[-1])
+
+    def test_a_cut_delivery_is_asked_for_its_own_pace_next_to_the_shot(self):
+        """A group cut across a boundary is the one that carries the instruction."""
+        # One group, 22s of words in a 40s shot: the first chunk holds 2s of them and
+        # the second the remaining 20s, so the shot's own pace is 0.55x.
+        body = "<Subject 1> (S1) says: <d>[English] one two. three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty.</d>"
+        words = list(nodes.re.finditer(r"\S+", "one two. three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty."))
+        ranges = ((0, 20), (20, 40))
+        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
+            _visual, first = nodes._legacy_dialogue_for_range(body, 0, 40, 0, 20, 1, ranges)
+            _visual, second = nodes._legacy_dialogue_for_range(body, 0, 40, 20, 40, 1, ranges, 20)
+        # The owner's rule: nothing is said about speed before the start of a dialogue the
+        # cutter cut, so the chunk that begins the delivery gets no instruction at all...
+        self.assertNotIn("Speaking", " ".join(first))
+        # ...while the chunk that continues it is dense next to the shot's pace and is
+        # asked to speed up.
+        self.assertIn("Speaking very quickly, rushing the words, <Subject 1> (S1) says: ", second[-1])
 
     def test_dialogue_word_crossing_a_boundary_belongs_to_its_end_chunk(self):
         """A word may start in a prefix, but its complete sound belongs later."""
@@ -343,17 +402,20 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertIn("one two.", second[-1])
 
-    def test_dialogue_prompt_includes_words_spoken_during_the_carried_prefix(self):
-        """The resampled boundary receives its prior chunk's tail dialogue."""
+    def test_a_phrase_longer_than_its_window_is_handed_over_whole(self):
+        """No chunk is told to continue a phrase an earlier chunk already finished."""
         body = "<Subject 1> (S1) says: <d>[English] one two three four.</d>"
         words = list(nodes.re.finditer(r"\S+", "one two three four."))
         ranges = ((0, 20), (20, 40))
         with patch.object(nodes, "_dialogue_word_weights", return_value=tuple(zip(words, (10.0, 10.0, 10.0, 10.0)))):
             _visual, first = nodes._legacy_dialogue_for_range(body, 0, 40, 0, 20, 1, ranges)
             _visual, second = nodes._legacy_dialogue_for_range(body, 0, 40, 20, 40, 1, ranges, 10)
-        self.assertIn("one two", first[-1])
-        self.assertEqual(second[0], "The dialogue is already in progress at this video opening.")
-        self.assertIn("two three four.", second[-1])
+        self.assertEqual(nodes._preview_subtitle(first[-1]), "one two three four.")
+        # A phrase that overruns its window may only be restated by the next
+        # chunk with words this chunk already spoke, so no word is ever lost.
+        for item in second:
+            if "<d>" in item:
+                self.assertIn(nodes._preview_subtitle(item).strip(), "one two three four.")
 
     def test_audio_teacher_prompts_do_not_repeat_video_prefix_words(self):
         """A teacher segment contains only words owned by its new audio ticks."""
@@ -362,7 +424,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         words = list(nodes.re.finditer(r"\S+", "one two three four."))
         with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 10.0) for word in words)):
             prompts = nodes._planned_chunk_prompts(prompt, plan, plan, 1, 0, False, False, False, 1, 1, legacy=True, include_dialogue_prefix=False)
-        self.assertEqual([nodes._preview_subtitle(item[0]) for item in prompts], ["one two", "three four."])
+        # The phrase cannot be cut, so the earlier chunk speaks all of it and
+        # the later chunk is silent rather than starting mid-phrase.
+        self.assertEqual([nodes._preview_subtitle(item[0]) for item in prompts], ["one two three four.", ""])
 
     def test_dialogue_slice_leaves_its_gap_after_the_last_word(self):
         """A carried dialogue seam keeps one space on each side of the split."""
@@ -374,18 +438,18 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         words = list(nodes.re.finditer(r"\S+", "one two three four."))
         with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
             _visual, dialogue = nodes._legacy_dialogue_for_range(body, 0, 4, 0, 2, 1, ((0, 2), (2, 4)))
-        self.assertIn("<d>[English]one two </d>", dialogue[0])
+        self.assertIn("<d>[English]one two three four.</d>", dialogue[0])
 
-    def test_a_split_phrase_keeps_one_space_on_each_side_of_the_seam(self):
-        """The chunk before a seam ends in a space and the chunk after starts in one."""
+    def test_a_phrase_is_never_cut_even_when_it_overruns_its_window(self):
+        """One chunk owns the whole phrase, and the next chunk starts fresh or silent."""
         body = "<Subject 1> (S1) says: <d>[English] one two three four.</d>"
         words = list(nodes.re.finditer(r"\S+", "one two three four."))
         ranges = ((0, 2), (2, 4))
         with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
             _visual, first = nodes._legacy_dialogue_for_range(body, 0, 4, 0, 2, 1, ranges)
             _visual, second = nodes._legacy_dialogue_for_range(body, 0, 4, 2, 4, 1, ranges, 2)
-        self.assertIn("<d>[English]one two </d>", first[0])
-        self.assertIn("<d>[English] three four.</d>", second[0])
+        self.assertEqual(nodes._preview_subtitle(first[0]), "one two three four.")
+        self.assertEqual([item for item in second if "<d>" in item], [])
 
     def test_native_audio_feedback_moves_only_exact_boundary_words(self):
         """Clear omissions/overshoots alter the next chunk; uncertain ASR does not."""
@@ -436,6 +500,59 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertTrue(nodes._transcript_is_certain({"text": "one two", "words": [{"probability": 0.9}, {"probability": 0.7}]}))
         self.assertFalse(nodes._transcript_is_certain({"text": "one two three four", "words": [{"probability": 0.9}, {"probability": 0.1}, {"probability": 0.2}, {"probability": 0.1}]}))
 
+    def test_tiny_preview_retries_after_an_allocation_failure(self):
+        """An OOM costs one sub-chunk of the tiny preview, not the whole render."""
+        session = preview._AccumulatedPreviewWrapper(1, 0, 75, 24, 1, "taeh3.safetensors")
+        with patch.object(preview, "_TinyDecoder", return_value=SimpleNamespace(latent_channels=24)):
+            session.decoder, session.decoder_oom = None, True
+            self.assertIsNotNone(session._decoder())
+            self.assertFalse(session.decoder_oom)
+        # A load or channel failure stays permanent.
+        session.decoder, session.decoder_failed = None, True
+        self.assertIsNone(session._decoder())
+
+    def test_cpu_tiny_fallback_samples_a_quarter_of_the_frames(self):
+        """The host-side fallback decodes four times fewer frames than the device path."""
+        self.assertEqual(preview.CPU_FALLBACK_FRAME_STRIDE, 4)
+        indices, durations, numbers = preview._frame_selection(40, 0, 1 * preview.CPU_FALLBACK_FRAME_STRIDE, 24)
+        self.assertEqual(indices, list(range(0, 40, 4)))
+        self.assertEqual(len(durations), len(indices))
+        self.assertEqual(len(numbers), len(indices))
+
+    def test_preview_quality_100_encodes_losslessly(self):
+        """Quality 100 is bit-exact WebP; the ordinary setting stays lossy."""
+        pixels = torch.zeros((24, 32, 3), dtype=torch.float32)
+        pixels[..., 0] = torch.arange(32, dtype=torch.float32) / 31.0
+        pixels[..., 1] = torch.arange(24, dtype=torch.float32).unsqueeze(1) / 23.0
+        pixels[..., 2] = 0.5
+        frame = preview._tensor_image(pixels, 0)
+        original = torch.frombuffer(bytearray(frame.convert("RGB").tobytes()), dtype=torch.uint8).to(torch.int16)
+        for quality in (100, 75):
+            encoded, durations = preview._encode_frame_group([frame], [40], quality)
+            decoded = Image.open(pyio.BytesIO(base64.b64decode(encoded[0]))).convert("RGB")
+            error = int((torch.frombuffer(bytearray(decoded.tobytes()), dtype=torch.uint8).to(torch.int16) - original).abs().max())
+            self.assertEqual(durations, [40])
+            if quality == 100:
+                self.assertEqual(error, 0)
+            else:
+                self.assertGreater(error, 0)
+
+    def test_pressure_release_only_fires_when_the_card_is_short(self):
+        """A roomy card keeps its graph pools; a short one hands them back."""
+        calls = []
+
+        def release(free_bytes):
+            with patch.object(nodes, "TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS", True), \
+                    patch.object(nodes.comfy.model_prefetch, "cleanup_prefetch_queues", side_effect=lambda: calls.append("pools")), \
+                    patch.object(nodes.comfy.model_management, "soft_empty_cache", side_effect=lambda **kwargs: calls.append("cache")), \
+                    patch.object(nodes.comfy.model_management, "get_free_memory", return_value=(free_bytes, 0)):
+                nodes._release_captured_graph_pools(torch.device("cpu"), "unit test", free_below_gib=1.5)
+
+        release(int(8.0 * 1024 ** 3))
+        self.assertEqual(calls, [])
+        release(int(0.5 * 1024 ** 3))
+        self.assertEqual(calls, ["pools", "cache"])
+
     def test_captured_graph_pool_release_follows_its_toggle(self):
         """The sampler drops ComfyUI's captured graph pools only when its toggle asks."""
         calls = []
@@ -449,56 +566,278 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                 nodes._release_captured_graph_pools(torch.device("cpu"), "unit test")
         self.assertEqual(calls, ["pools", "cache"])
 
-    def test_audio_transcript_approves_a_case_and_punctuation_insensitive_tail_omission(self):
-        """A complete recognized prefix is retained without sampling another take."""
-        prompt = "detailed_description: <Subject 1> (S1) says: <d>[English] Friendships fade. Birds die. There's</d>"
-        approved = nodes._audio_transcript_approved_tail_prompt(prompt, {"text": "friendships fade, birds die."})
-        self.assertEqual(nodes._preview_subtitle(approved), "Friendships fade. Birds die.")
+    def test_retry_escalates_the_speaking_rate_instead_of_changing_words(self):
+        """A mismatched take keeps its words and is asked to speak much faster."""
+        prompt = (
+            "detailed_description: [Shot 1] The camera stays fixed. "
+            "Speaking slowly, with pauses, <Subject 1> (S1) says: <d>[English] one two. three four.</d>"
+        )
+        escalated = nodes._escalate_speech_rate(prompt)
+        self.assertIn("Speaking much faster than before, <Subject 1> (S1) says: ", escalated)
+        self.assertNotIn("Speaking slowly", escalated)
+        # The spoken words and their punctuation survive byte for byte.
+        self.assertIn("<d>[English] one two. three four.</d>", escalated)
 
-    def test_audio_transcript_does_not_approve_a_non_tail_omission(self):
-        """Only a missing tail is safe to carry into following dialogue prompts."""
-        prompt = "detailed_description: <Subject 1> (S1) says: <d>[English] one two three.</d>"
-        self.assertIsNone(nodes._audio_transcript_approved_tail_prompt(prompt, {"text": "one three"}))
+    def test_the_chunk_keeps_the_global_prompt_line_structure(self):
+        """The owner's line breaks and empty lines are there for a reason."""
+        body = (
+            "[Shot 1] The camera stays fixed in the stablished frame.\n\n"
+            "<Subject 1> (S1) says: <d>[English] one two.</d>\n\n"
+            "after saying, she pauses and makes a face.\n\n"
+            "<Subject 1> (S1) then says: <d>[English] three four.</d>\n\n"
+            "The room stays quiet."
+        )
+        window = (0, 240)
+        layout = nodes._legacy_prose_layout(body)
+        slots = {sentence: pair[0] for sentence, pair in layout.items()}
+        separators = {sentence: pair[1] for sentence, pair in layout.items()}
+        _texts, pieces = nodes._legacy_action_outputs(nodes._legacy_visual_body(body), 0, 240, (window,), 24.0, slots, separators)
+        text = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 240, 24.0, (window,), 0, "Chunk 1", None, pieces, slots)
 
-    def test_audio_transcript_does_not_approve_a_complete_take(self):
-        """A take that spoke every word needs no re-cutting, dots or not."""
-        prompt = "detailed_description: <Subject 1> (S1) says: <d>[English] One two </d>"
-        self.assertIsNone(nodes._audio_transcript_approved_tail_prompt(prompt, {"text": "one two..."}))
+        # Every blank line the source wrote between the owned pieces survives.
+        self.assertEqual(text.count("\n\n"), 4)
+        self.assertNotIn("\n\n\n", text)
+        self.assertEqual(text.count("[Shot 1] The camera stays fixed"), 1)
+        self.assertLess(text.index("one two"), text.index("after saying"))
+        self.assertLess(text.index("after saying"), text.index("three four"))
+        self.assertLess(text.index("three four"), text.index("room stays quiet"))
 
-    def test_retry_recut_redistributes_the_leftover_dialogue_by_chunk_time(self):
-        """A diverged take is re-cut with the initial cut over the chunks left to sample."""
+    def test_a_table_item_cannot_land_in_two_chunks(self):
+        """The owner's rule: an item leaves the table as soon as a chunk has it."""
+        body = "[Shot 1] The camera stays fixed. She leans in and smiles. <Subject 1> (S1) says: <d>[English] one two.</d>"
+        window = (0, 120)
+        layout = nodes._legacy_prose_layout(body)
+        slots = {sentence: pair[0] for sentence, pair in layout.items()}
+        separators = {sentence: pair[1] for sentence, pair in layout.items()}
+        _texts, pieces = nodes._legacy_action_outputs(nodes._legacy_visual_body(body), 0, 120, (window,), 24.0, slots, separators)
+        ledger = set()
+        first = nodes._legacy_shot_body_for_range(body, 0, 120, 0, 120, 24.0, (window,), 0, "Chunk 1", None, pieces, slots, ledger)
+        second = nodes._legacy_shot_body_for_range(body, 0, 120, 0, 120, 24.0, (window,), 0, "Chunk 2", None, pieces, slots, ledger)
+
+        self.assertIn("leans in and smiles", first)
+        self.assertNotIn("leans in and smiles", second)
+        # A state still repeats: the table hands out items, not states.
+        self.assertIn("camera stays fixed", second)
+
+    def test_owned_prose_keeps_its_place_around_deliveries(self):
+        """Action and direction stay exactly where the global prompt puts them."""
+
+        def chunk_body(body):
+            window = (0, 240)
+            slots = nodes._legacy_prose_slots(body)
+            _texts, pieces = nodes._legacy_action_outputs(nodes._legacy_visual_body(body), 0, 240, (window,), 24.0, slots)
+            text = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 240, 24.0, (window,), 0, "Chunk 1", None, pieces, slots)
+            return " ".join(text.split())
+
+        trailing = chunk_body("[Shot 1] The camera stays fixed. <Subject 1> (S1) says: <d>[English] one two.</d> then she turns away and leaves.")
+        self.assertLess(trailing.index("one two"), trailing.index("turns away"))
+
+        leading = chunk_body("[Shot 1] The camera stays fixed. She leans into the frame. <Subject 1> (S1) says: <d>[English] one two.</d>")
+        self.assertLess(leading.index("leans into the frame"), leading.index("one two"))
+
+        middle = chunk_body("[Shot 1] The camera stays fixed. <Subject 1> (S1) says: <d>[English] one two.</d> after saying, she pauses. <Subject 1> (S1) then says: <d>[English] three four.</d>")
+        self.assertLess(middle.index("one two"), middle.index("after saying"))
+        self.assertLess(middle.index("after saying"), middle.index("three four"))
+
+    def test_prose_between_two_deliveries_stays_between_them(self):
+        """The owner's rule: in-between prose may be neither hoisted nor replaced."""
+        body = (
+            "[Shot 1] The camera stays fixed. <Subject 1> (S1) says: <d>[English] one two.</d> "
+            "after saying, she pauses and  makes a disaproving face moving her head side to side. "
+            "<Subject 1> (S1) then says: <d>[English] three four.</d>"
+        )
+        action_plan = nodes._legacy_action_plan(nodes._legacy_visual_body(body), 0, 240, ((0, 240),), 24.0)
+        text = nodes._legacy_shot_body_for_range(body, 0, 240, 0, 240, 24.0, ((0, 240),), 0, "Chunk 1", action_plan)
+        flat = " ".join(text.split())
+
+        self.assertLess(flat.index("one two"), flat.index("after saying"))
+        self.assertLess(flat.index("after saying"), flat.index("three four"))
+        # Emitted once, verbatim, and never replaced by a delivery band.
+        self.assertEqual(flat.count("after saying"), 1)
+        self.assertIn("after saying, she pauses and makes a disaproving face moving her head side to side.", flat)
+
+    def test_visual_prose_drops_the_prose_between_deliveries(self):
+        """The action table must not see it either, or it would reappear."""
+        body = (
+            "<Subject 1> (S1) says: <d>[English] one.</d> between the two. "
+            "<Subject 1> (S1) says: <d>[English] two.</d>"
+        )
+        self.assertEqual(nodes._legacy_dialogue_gaps(body), ["", "between the two."])
+        self.assertNotIn("between the two", nodes._legacy_visual_body(body))
+
+    def test_retry_attaches_the_rate_when_no_band_was_emitted(self):
+        """A prompt with no delivery band still gains the faster instruction."""
+        prompt = "detailed_description: [Shot 1] Wide shot. <Subject 1> (S1) says: <d>[English] hello there.</d>"
+        escalated = nodes._escalate_speech_rate(prompt)
+        self.assertIn("Speaking much faster than before, <Subject 1> (S1) says: ", escalated)
+        self.assertIn("<d>[English] hello there.</d>", escalated)
+
+    def test_retry_isolates_only_the_phrase_the_take_failed(self):
+        """The owner's rule: the phrases a take spoke keep the prompt's grouping."""
+        prompt = (
+            "detailed_description: [Shot 1] The camera stays fixed. "
+            "Speaking slowly, with pauses, <Subject 1> (S1) says: "
+            "<d>[English] This is that. But that is not this. Nor is that this.</d>"
+        )
+        # The take lost the last phrase, exactly as the owner's chunk 2 did.
+        heard = {"text": "This is that. But that is not this."}
+        retry = nodes._dialogue_retry_prompt(prompt, heard)
+        self.assertIn(
+            "<d>[English] This is that. But that is not this.</d> <d>[English] Nor is that this.</d>",
+            retry,
+        )
+        self.assertNotIn("<d>[English] This is that.</d>", retry)
+        self.assertIn("Speaking much faster than before, <Subject 1> (S1) says: ", retry)
+        # Only the grouping changes: the spoken script keeps every word.
+        self.assertEqual(nodes._preview_subtitle(retry), nodes._preview_subtitle(prompt))
+
+    def test_a_retry_never_makes_more_than_two_groups(self):
+        """Three groups measured worse audio than the take they were meant to fix."""
+        prompt = "He says: <d>[English] One two. Three four. Five six.</d>"
+        # The middle phrase was garbled, so the last phrase speaks on its own instead of
+        # cutting the group into three.
+        middle = nodes._dialogue_retry_prompt(prompt, {"text": "One two. Three... five six."})
+        self.assertIn("<d>[English] One two. Three four.</d> <d>[English] Five six.</d>", middle)
+        # The first phrase failed: it speaks alone and the other two stay together.
+        first = nodes._dialogue_retry_prompt(prompt, {"text": "Two. Three four. Five six."})
+        self.assertIn("<d>[English] One two.</d> <d>[English] Three four. Five six.</d>", first)
+        # Whichever phrase failed, a group never becomes more than two groups.
+        for transcript in ({"text": "One two."}, {"text": "Three four."}, {"text": "Five six."}, {"text": "Something else."}, {"text": "One two. Three four. Five six."}):
+            retry = nodes._dialogue_retry_prompt(prompt, transcript)
+            self.assertLessEqual(retry.count("<d>"), 2)
+
+    def test_retry_keeps_the_grouping_when_nothing_is_identifiably_missing(self):
+        """A retry may not re-group on a guess: no transcript, no re-grouping."""
+        prompt = "<Subject 1> (S1) says: <d>[English] One two. Three four.</d>"
+        for transcript in (None, {"text": ""}, {"text": "One two. Three four."}, {"text": "One two. Three four. Five six."}):
+            retry = nodes._dialogue_retry_prompt(prompt, transcript)
+            self.assertIn("<d>[English] One two. Three four.</d>", retry)
+            self.assertIn("Speaking much faster than before, ", retry)
+        # A word that differs by one letter is the same word, never damage.
+        self.assertIn("<d>[English] One two. Three four.</d>", nodes._dialogue_retry_prompt(prompt, {"text": "One two. Three fours."}))
+        # A take that failed every phrase isolates every phrase, which is the one case
+        # where the whole dialogue still gets its own group per phrase.
+        self.assertIn(
+            "<d>[English] One two.</d> <d>[English] Three four.</d>",
+            nodes._dialogue_retry_prompt(prompt, {"text": "Something else entirely."}),
+        )
+
+    def test_split_dialogue_phrases_repeats_each_language_and_terminal(self):
+        """Every terminal ends a phrase, and every group keeps its own language tag."""
+        self.assertEqual(
+            nodes._split_dialogue_phrases("<d>[English] One. Two? Three! Four…</d>"),
+            "<d>[English] One.</d> <d>[English] Two?</d> <d>[English] Three!</d> <d>[English] Four…</d>",
+        )
+        self.assertEqual(
+            nodes._split_dialogue_phrases("<d>[English] One. Two.</d> <d>[German] Eins. Zwei.</d>"),
+            "<d>[English] One.</d> <d>[English] Two.</d> <d>[German] Eins.</d> <d>[German] Zwei.</d>",
+        )
+        self.assertEqual(
+            nodes._split_dialogue_phrases("He pauses. <d>No tag here. Second phrase.</d> and waits."),
+            "He pauses. <d>No tag here.</d> <d>Second phrase.</d> and waits.",
+        )
+
+    def test_split_dialogue_leaves_single_phrases_and_prose_alone(self):
+        """A prompt with nothing to split must survive byte for byte."""
+        for prompt in ("<d>[English] Still one phrase</d>", "No dialogue at all, just prose."):
+            self.assertEqual(nodes._split_dialogue_phrases(prompt), prompt)
+        # An ellipsis is a phrase terminal, exactly as _dialogue_phrase_ids treats it.
+        self.assertEqual(
+            nodes._split_dialogue_phrases("<d>[English] Wait... What?</d>"),
+            "<d>[English] Wait...</d> <d>[English] What?</d>",
+        )
+
+    def test_a_silent_subchunk_prompt_drops_the_dialogue_and_its_header(self):
+        """A sub-chunk H3 must render silent is not handed the words at all."""
+        prompt = (
+            "<Subject 1> starts the video in silence (no mouth movent) for 00:01.00,\n"
+            "then <Subject 1> (S1) says really fast, irritated: <d>[English] One two three.</d>\n"
+            "\n"
+            "The camera stays fixed."
+        )
+        without = nodes._prompt_without_dialogue(prompt)
+        self.assertNotIn("<d>", without)
+        self.assertNotIn("says", without)
+        self.assertNotIn("One two three", without)
+        # The prose, the line breaks and the blank lines stay as the owner wrote them.
+        self.assertIn("<Subject 1> starts the video in silence (no mouth movent) for 00:01.00,", without)
+        self.assertIn("\n\nThe camera stays fixed.", without)
+        # A delivery band introduced that line, so it goes with it: a silenced sub-chunk
+        # must not keep "speaking slowly, with pauses" in front of nothing.
+        banded = nodes._prompt_without_dialogue(
+            "The camera stays fixed. Speaking very quickly, rushing the words, <Subject 1> (S1) says really fast: <d>[English] One two.</d>"
+        )
+        self.assertNotIn("Speaking", banded)
+        self.assertNotIn("<d>", banded)
+        self.assertEqual(banded, "The camera stays fixed. ")
+
+    def test_only_the_subchunks_without_speech_lose_the_dialogue(self):
+        """The take's word times, in the chunk's own audio clock, decide per sub-chunk."""
+        chunk = {
+            "audio_start": 400,
+            "audio_end": 800,
+            "phases": [
+                {"audio_start": 400, "audio_end": 600},
+                {"audio_start": 600, "audio_end": 800},
+            ],
+        }
+        prompt = "He says, flat: <d>[English] One two.</d>"
+        # 0.4s into the take is inside the first sub-chunk, which is 5s long.
+        spoken_early = {"words": [{"word": "one", "start": 0.4, "end": 0.9, "probability": 1.0}]}
+        self.assertEqual(sorted(nodes._silent_subchunk_prompts(chunk, spoken_early, prompt)), [2])
+        # A word belongs to the sub-chunk it starts in; its tail only counts when the sound
+        # fills a quarter of the next sub-chunk, so a tail alone leaves that sub-chunk
+        # silent (the owner's chunk 1.3: 0.28s of a word in a 2.1s sub-chunk).
+        tail_only = {"words": [{"word": "one", "start": 4.8, "end": 5.1, "probability": 1.0}]}
+        self.assertEqual(sorted(nodes._silent_subchunk_prompts(chunk, tail_only, prompt)), [2])
+        # A word that really runs into the next sub-chunk still keeps its dialogue there.
+        crossing = {"words": [{"word": "one", "start": 4.0, "end": 6.5, "probability": 1.0}]}
+        self.assertIsNone(nodes._silent_subchunk_prompts(chunk, crossing, prompt))
+        # A take that says nothing at all silences every sub-chunk...
+        self.assertEqual(sorted(nodes._silent_subchunk_prompts(chunk, {"words": []}, prompt)), [1, 2])
+        # ...while a transcript that never arrived keeps the prompt exactly as it is.
+        self.assertIsNone(nodes._silent_subchunk_prompts(chunk, None, prompt))
+        # A prompt with no dialogue has nothing to remove.
+        self.assertIsNone(nodes._silent_subchunk_prompts(chunk, {"words": []}, "No dialogue here."))
+
+    def test_only_a_retry_splits_the_owners_dialogue_groups(self):
+        """The first attempt speaks the prompt's own groups; a retry re-groups them."""
+        self.assertIs(nodes.TOGGLE_SPLIT_DIALOGUE_PHRASES, True)
+        source = (PLUGIN_ROOT / "nodes.py").read_text(encoding="utf-8")
+        # Two retry call sites: the audio teacher's candidate and the video pass, and
+        # each hands its own transcript to the re-grouping.
+        self.assertEqual(source.count("retry_prompt = _dialogue_retry_prompt(requested, recognized)"), 2)
+        # The first attempt appends the prompt untouched: nothing re-groups it.
+        self.assertIn("audio_requested_prompts.append(teacher_prompt)", source)
+        self.assertNotIn("teacher_prompt = _split_dialogue_phrases(teacher_prompt)", source)
+        self.assertIn("rebuilt = _split_out_damaged_phrases(prompt, transcript) if TOGGLE_SPLIT_DIALOGUE_PHRASES else prompt", source)
+        # The prompt's own multi-phrase group reaches the model byte-identical.
+        prompt = "<Subject 1> (S1) says: <d>[English] one two. three four.</d>"
+        plan = [{"frame_start": 0, "frame_end": 48, "output_trim_frames": 0}]
+        planned = nodes._planned_chunk_prompts("detailed_description: [Shot 1] " + prompt, plan, plan, 24.0, 0, 0, 0, False, 1, 1, legacy=True)
+        self.assertIn("<d>[English]one two. three four.</d>", planned[0][0])
+
+    def test_retry_escalation_replaces_a_faster_band_too(self):
+        """Any existing band is replaced, so the retry is always a step up."""
+        prompt = "Speaking very quickly, rushing the words, <Subject 1> (S1) says: <d>[English] go now.</d>"
+        escalated = nodes._escalate_speech_rate(prompt)
+        self.assertEqual(escalated.count("Speaking"), 1)
+        self.assertIn("Speaking much faster than before, <Subject 1> (S1) says: ", escalated)
+        self.assertIn("<d>[English] go now.</d>", escalated)
+
+    def test_every_dialogue_slice_ends_on_a_phrase_terminal(self):
+        """A chunk never ends inside a phrase, so its speech can always finish."""
         speech = "one two. three four five six. seven eight nine ten."
         body = "<Subject 1> (S1) says: <d>[English] " + speech + "</d>"
-        words = list(nodes.re.finditer(r"\S+", speech))
         ranges = ((0, 30), (30, 60), (60, 90))
-        plan = [{"frame_start": start, "frame_end": end, "output_trim_frames": 0} for start, end in ranges]
-        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
-            prompts = [nodes._legacy_dialogue_for_range(body, 0, 90, start, end, 1, ranges, start)[1][-1] for start, end in ranges]
-            revised, shrink_frames = nodes._retry_take_prompts(prompts, plan, 1.0, 0)
-        self.assertEqual([nodes._preview_subtitle(prompt) for prompt in prompts], ["one two. three four", "five six. seven eight", "nine ten."])
-        self.assertEqual([nodes._preview_subtitle(prompt) for prompt in revised], ["one two.", "three four five six.", "seven eight nine ten."])
-        self.assertEqual(shrink_frames, 10)
-
-    def test_approved_take_keeps_its_audio_and_recuts_only_the_later_chunks(self):
-        """A spoken prefix stays with its own chunk; the missing words move forward."""
-        prompts = [
-            "detailed_description: <Subject 1> (S1) says: <d>[English] one two.</d>",
-            "detailed_description: <Subject 1> (S1) says: <d>[English] three four.</d>",
-            "detailed_description: <Subject 1> (S1) says: <d>[English] five six.</d>",
-        ]
-        plan = [
-            {"frame_start": 0, "frame_end": 30, "output_trim_frames": 0},
-            {"frame_start": 30, "frame_end": 60, "output_trim_frames": 0},
-            {"frame_start": 60, "frame_end": 90, "output_trim_frames": 0},
-        ]
-        words = list(nodes.re.finditer(r"\S+", "three four. five six."))
-        with patch.object(nodes, "_dialogue_word_weights", return_value=tuple((word, 1.0) for word in words)):
-            revised = nodes._recut_dialogue_prompts(prompts, plan, 1.0, 1, 2, kept_words=1)
-        self.assertEqual(nodes._preview_subtitle(revised[0]), "one two.")
-        self.assertEqual(nodes._preview_subtitle(revised[1]), "three")
-        self.assertEqual(nodes._preview_subtitle(revised[2]), "four. five six.")
-        # The word the take did not say opens the next chunk as a continuation.
-        self.assertIn("<d>[English] four. five six.", revised[2])
+        slices = [nodes._legacy_dialogue_for_range(body, 0, 90, begin, end, 1, ranges, begin)[1][-1] for begin, end in ranges]
+        spoken = [nodes._preview_subtitle(prompt) for prompt in slices]
+        for index, subtitle in enumerate(spoken):
+            if not subtitle:
+                continue
+            self.assertTrue(subtitle.rstrip().endswith((".", "!", "?")), "chunk %d ends mid-phrase: %r" % (index + 1, subtitle))
+        # No word is lost and none is repeated: the phrases are handed over whole.
+        self.assertEqual(" ".join(spoken).split(), speech.split())
 
     def test_dialogue_cut_leaves_trailing_chunks_silent_when_words_run_out(self):
         """Fewer leftover words than chunks stay with the earlier chunks."""
@@ -532,15 +871,18 @@ class ChunkDirectorHelperTest(unittest.TestCase):
 
     def test_dialogue_uses_every_output_chunk_in_its_source_shot(self):
         """Shot duration controls speaking speed, and a short tail stays silent."""
-        body = "<Subject 1> (S1) says: <d>[English] one two three four five six.</d>"
+        body = "<Subject 1> (S1) says: <d>[English] one two three four. five six.</d>"
         chunks = [{"output_start": 0, "output_end": 80}, {"output_start": 80, "output_end": 160}, {"output_start": 160, "output_end": 240}]
         segments = nodes._deterministic_dialogue_segments(body, 0, 240, chunks, 24)
-        # The last chunk would own a single word of one phrase, so that phrase
-        # stays whole in the chunk before it and the tail speaks nothing.
+        # The cut lands on the sentence terminal, never inside either phrase.
         self.assertEqual([segment["chunk"] for segment in segments], [1, 2])
-        self.assertEqual(nodes._preview_subtitle(segments[-1]["content"]), "four five six.")
-        with self.assertRaisesRegex(ValueError, "every dialogue chunk"):
-            nodes._deterministic_dialogue_segments("<Subject 1> (S1) says: <d>[English] one two.</d>", 0, 240, chunks, 24)
+        self.assertEqual(nodes._preview_subtitle(segments[0]["content"]), "one two three four.")
+        self.assertEqual(nodes._preview_subtitle(segments[-1]["content"]), "five six.")
+        # Far fewer words than chunks is sparse dialogue inside a long shot, not
+        # an impossible prompt: the existing words stay contiguous and the
+        # trailing chunks stay silent instead of the render stopping.
+        sparse = nodes._deterministic_dialogue_segments("<Subject 1> (S1) says: <d>[English] one two.</d>", 0, 240, chunks, 24)
+        self.assertEqual([segment["chunk"] for segment in sparse], [1])
 
     def test_legacy_dialogue_rejects_malformed_or_impossible_speech(self):
         """Do not silently drop unparseable speech or overflow its shot."""
@@ -548,6 +890,60 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             nodes._legacy_shot_body_for_range("<Subject 1> (S1) says: <d>[English] Hello", 0, 240, 0, 24)
         with self.assertRaisesRegex(ValueError, "estimates"):
             nodes._legacy_shot_body_for_range("<Subject 1> (S1) says: <d>[English] This sentence cannot fit.</d>", 0, 5, 0, 5)
+
+    def test_legacy_dialogue_asks_for_a_faster_delivery_instead_of_failing(self):
+        """An over-long line is spoken as written, never rejected and never banded.
+
+        The owner's rule: the speaking-rate band is only for a *cut* delivery, so a
+        shot whose dialogue is whole inside its chunk gets no instruction at all.
+        """
+        prompt = (
+            "summary: A two shot test.\n\n"
+            "detailed_description: [Shot 1] Wide camera on a quiet street. "
+            "<Subject 1> (S1) says: <d>[English] Hello there.</d> "
+            "[Shot 2] At 00:04.000, The camera pushes in. "
+            "<Subject 1> (S1) says: <d>[English] This sentence cannot possibly fit inside the remaining time of this shot at all.</d>"
+        )
+        plan = [
+            {"frame_start": 0, "frame_end": 96, "output_trim_frames": 0},
+            {"frame_start": 96, "frame_end": 192, "output_trim_frames": 0},
+        ]
+        planned = nodes._planned_chunk_prompts(prompt, plan, plan, 24.0, 0, 0, 0, False, 1, 1, legacy=True)
+        spoken = planned[1][0]
+        self.assertNotIn("Speaking", spoken)
+        self.assertNotIn("Speaking", planned[0][0])
+        # The words survive byte for byte, and the overrun is not an error.
+        self.assertIn("<d>[English]This sentence cannot possibly fit inside the remaining time of this shot at all.</d>", spoken)
+
+    def test_legacy_dialogue_stops_only_past_the_plausible_speaking_rate(self):
+        """A stopped render must name the shot whose delivery would be absurd."""
+        prompt = (
+            "summary: A two shot test.\n\n"
+            "detailed_description: [Shot 1] Wide camera on a quiet street. "
+            "<Subject 1> (S1) says: <d>[English] Hello there.</d> "
+            "[Shot 2] At 00:04.000, The camera pushes in. "
+            "<Subject 1> (S1) says: <d>[English] one two three four five six seven eight nine ten eleven twelve thirteen fourteen.</d>"
+        )
+        plan = [
+            {"frame_start": 0, "frame_end": 96, "output_trim_frames": 0},
+            {"frame_start": 96, "frame_end": 120, "output_trim_frames": 0},
+        ]
+        with self.assertRaisesRegex(ValueError, "estimates") as raised:
+            nodes._planned_chunk_prompts(prompt, plan, plan, 24.0, 0, 0, 0, False, 1, 1, legacy=True)
+        message = str(raised.exception)
+        # The identity has to survive the whole planner path, not only a direct
+        # helper call, because that is the message the render log shows.
+        self.assertIn("source Shot 2 (frames 96-120 = 4.00s-5.00s at 24 fps)", message)
+        self.assertIn("output Chunk 2 (frames 96-120 = 4.00s-5.00s)", message)
+        self.assertIn("one two three four five six", message)
+        self.assertIn("a speaking rate of 4.16x", message)
+
+
+    def test_legacy_dialogue_malformed_block_also_names_its_shot(self):
+        """The sibling parse failure has the same locate-the-shot requirement."""
+        with self.assertRaisesRegex(ValueError, "complete") as raised:
+            nodes._legacy_shot_body_for_range("<Subject 1> (S1) says: <d>[English] Hello", 0, 240, 0, 24, 24.0, (), None, "source Shot 4 (frames 240-480)")
+        self.assertTrue(str(raised.exception).startswith("source Shot 4 (frames 240-480): "))
 
     def test_preproduction_node_is_lazy_and_creates_fresh_director_sessions(self):
         """Graph execution configures Gemma; only sampler calls create sessions."""
@@ -566,12 +962,64 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         self.assertNotEqual(provider.fingerprint(), module.GemmaPreProduction().fingerprint())
         self.assertEqual([item.id for item in module.HREndlessGemmaPreProduction.define_schema().inputs], ["cache_gemma_preproduction", "gemma4_mtp", "production_think_budget", "chunk_think_budget"])
 
-    def test_legacy_prompt_slicing_selects_the_proportional_action(self):
-        """Without a director, restore the old deterministic word-count method."""
+    def test_legacy_prompt_ownership_splits_action_by_the_chunk_clock(self):
+        """Without a director, the deterministic word-count table still decides."""
         body = "Tiger runs. Tiger stops."
-        self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 0, 50).strip(), "Tiger runs.")
-        self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 50, 100).strip(), "Tiger stops.")
+        table = nodes._legacy_action_plan(nodes._legacy_visual_body(body), 0, 100, ((0, 50), (50, 100)), 24.0)
+        self.assertEqual(table[(0, 50)].strip(), "Tiger runs.")
+        self.assertEqual(table[(50, 100)].strip(), "Tiger stops.")
+        # One window owns the whole shot, which is what a single-chunk shot is.
         self.assertEqual(nodes._legacy_shot_body_for_range(body, 0, 100, 0, 100), body)
+
+    def test_no_action_unit_is_announced_by_two_chunks(self):
+        """The reported defect: a description sentence must not survive into later chunks."""
+        body = (
+            "The camera arcs slowly around the clearing at shoulder height. "
+            "Our hero and his companion are mounted on the tiger, riding together as it runs through the jungle as fast as it can while the vines whip past them. "
+            "He pulls the harness and the tiger slows to a walk. "
+            "They stop in front of a stone gate."
+        )
+        windows = tuple((start, start + 192) for start in range(0, 1152, 192))
+        table = nodes._legacy_action_plan(nodes._legacy_visual_body(body), 0, 1152, windows, 24.0)
+        for sentence in [unit["text"] for unit in nodes._action_units(body)]:
+            announced = [window for window, text in table.items() if sentence in text]
+            self.assertEqual(len(announced), 1, sentence)
+
+    def test_parallel_group_and_sequential_pair_are_treated_differently(self):
+        """One time window for "as", two ordered beats for ", and"."""
+        parallel = nodes._action_units("Tila smiles, as the camera zooms in to tilas face.")
+        self.assertEqual(len(parallel), 2)
+        self.assertEqual(nodes._action_relation(parallel[0], parallel[1]), "parallel")
+        groups, carry, opening = nodes._action_groups("Tila smiles, as the camera zooms in to tilas face.")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(nodes._action_group_text(groups[0]), "Tila smiles, as the camera zooms in to tilas face.")
+
+        sequential = nodes._action_units("The camera zooms to tilas face, and she smiles.")
+        self.assertEqual(nodes._action_relation(sequential[0], sequential[1]), "sequential")
+        groups, carry, opening = nodes._action_groups("The camera zooms to tilas face, and she smiles.")
+        self.assertEqual(len(groups), 2)
+        # The connector survives when both beats land in the same chunk.
+        joined = nodes._action_group_text(groups[0]) + groups[1]["units"][0]["connector"] + nodes._action_group_text(groups[1])
+        self.assertEqual(joined, "The camera zooms to tilas face, and she smiles.")
+
+    def test_camera_cut_is_a_sequential_boundary_and_a_move_is_not(self):
+        """A cut starts a new beat; a continuous movement runs alongside it."""
+        cut = nodes._action_units("The camera cuts to a wide shot, then Heman sprints away.")
+        self.assertEqual(cut[0]["category"], "camera_cut")
+        self.assertEqual(nodes._action_relation(cut[0], cut[1]), "sequential")
+        move = nodes._action_units("Heman walks toward the gate while the camera tracks him from behind.")
+        self.assertEqual(nodes._action_relation(move[0], move[1]), "parallel")
+        self.assertEqual(len(nodes._action_groups("Heman walks toward the gate while the camera tracks him from behind.")[0]), 1)
+
+    def test_a_still_camera_state_repeats_in_every_chunk_of_its_shot(self):
+        """A state stays true; it is the one clause that is not owned by one chunk."""
+        body = "The camera stays fixed in the established frame. He sits down. He stands up."
+        windows = ((0, 96), (96, 192))
+        table = nodes._legacy_action_plan(nodes._legacy_visual_body(body), 0, 192, windows, 24.0)
+        self.assertIn("The camera stays fixed in the established frame.", table[(0, 96)])
+        self.assertIn("The camera stays fixed in the established frame.", table[(96, 192)])
+        self.assertEqual(sum("He sits down." in text for text in table.values()), 1)
+        self.assertEqual(sum("He stands up." in text for text in table.values()), 1)
 
     def test_sampler_compute_precision_is_local_and_default_is_unchanged(self):
         """FP32 reaches sampling through a clone without changing the upstream guider."""
@@ -1037,8 +1485,21 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         metadata = next(payload for payload in payloads if payload.get("action") == "chunk_metadata")
         self.assertEqual(metadata["h3_prompt"], "complete H3 prompt")
         source = (PLUGIN_ROOT / "web" / "unlimited_preview.js").read_text(encoding="utf-8")
-        self.assertIn('const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);', source)
-        self.assertIn('"Chunk prompt (audio and video):"', source)
+        # The sub-chunk under the pointer owns the prompt text, so no key shows that
+        # sub-chunk's detailed_description and Shift its whole prompt; Ctrl keeps the
+        # teacher-audio attempts, and Ctrl+Shift clears the prompt text.
+        self.assertIn('const fullPrompt = String(subchunkBody?.prompt || range.h3_prompt || "").trim();', source)
+        self.assertIn('const showAttempts = Boolean(event.ctrlKey || ctrlPromptVisible);', source)
+        self.assertIn('const showFullPrompt = Boolean(!showAttempts && (event.shiftKey || shiftPromptVisible));', source)
+        self.assertIn('const showNothing = Boolean((event.ctrlKey || ctrlPromptVisible) && (event.shiftKey || shiftPromptVisible));', source)
+        self.assertNotIn('showSubchunk', source)
+        self.assertIn('if (event.key !== "Shift" && event.key !== "Control") return;', source)
+        self.assertIn('range.audio_teacher_attempts = data.audio_teacher_attempts.map', source)
+        self.assertIn('range.subchunk_silent_numbers = data.subchunk_silent_numbers.map', source)
+        self.assertNotIn('"Chunk prompt (audio and video):"', source)
+        # A single prompt needs no label: its sections carry their own headers, and only the
+        # two prompts of a diverging teacher take keep their names.
+        self.assertIn('? [["Audio prompt:", teacherAudioPrompt], ["Video prompt:", fullPrompt]]', source)
         self.assertIn('["Audio prompt:", teacherAudioPrompt], ["Video prompt:", fullPrompt]', source)
 
         node_id = "preview-audio-prompt-cache-test"
@@ -1049,6 +1510,25 @@ class ChunkDirectorHelperTest(unittest.TestCase):
         preview._cache_payload({"node_id": node_id, "execution": 1, "action": "chunk_metadata", "chunk": 0, "h3_prompt": "revised video words"})
         stored = preview._cached_snapshot(node_id)["reset"]["chunk_ranges"][0]
         self.assertEqual((stored["audio_teacher_prompt"], stored["h3_prompt"], stored["subtitle"]), ("audio words", "revised video words", "audio words"))
+
+        node_id = "preview-audio-attempt-cache-test"
+        with preview._PREVIEW_CACHE_LOCK:
+            preview._PREVIEW_CACHE.pop(node_id, None)
+        preview._cache_payload({"node_id": node_id, "execution": 1, "action": "reset", "chunk_ranges": [{"chunk": 1, "start": 0, "end": 3}]})
+        preview._cache_payload({
+            "node_id": node_id,
+            "execution": 1,
+            "action": "chunk_metadata",
+            "chunk": 0,
+            "h3_prompt": "retry one",
+            "audio_teacher_prompt": "retry one",
+            "audio_teacher_attempts": ["take one", " retry one ", ""],
+            "audio_teacher_attempt_transcripts": [" heard one ", ""],
+        })
+        cached_range = preview._cached_snapshot(node_id)["reset"]["chunk_ranges"][0]
+        self.assertEqual(cached_range["audio_teacher_attempts"], ["take one", "retry one"])
+        # The empty second slot stays, so the first hearing cannot drift onto it.
+        self.assertEqual(cached_range["audio_teacher_attempt_transcripts"], ["heard one", ""])
 
         node_id = "preview-audio-update-cache-test"
         with preview._PREVIEW_CACHE_LOCK:
@@ -1080,6 +1560,141 @@ class ChunkDirectorHelperTest(unittest.TestCase):
             self.assertEqual(cached["frames"], ["frame0"])
             self.assertEqual(cached["audio"], "new-wav")
             self.assertEqual(cached["audio_sample_rate"], 8000)
+        finally:
+            with preview._PREVIEW_CACHE_LOCK:
+                preview._PREVIEW_CACHE.pop(node_id, None)
+
+    def test_a_retry_keeps_the_take_it_replaced_and_reaches_the_preview(self):
+        """Ctrl-hover shows the first take and every retry, in the order sampled."""
+        range_item = {"audio_teacher_prompt": "take one", "h3_prompt": "take one"}
+        self.assertEqual(nodes._remember_audio_teacher_attempt(range_item, "retry one", "heard one"), ["take one", "retry one"])
+        self.assertEqual(range_item["audio_teacher_attempt_transcripts"], ["heard one", ""])
+        # The prompt of record is overwritten by the retry, so the sequence survives it.
+        range_item["audio_teacher_prompt"] = "retry one"
+        self.assertEqual(nodes._remember_audio_teacher_attempt(range_item, "retry two", "heard two"), ["take one", "retry one", "retry two"])
+        # One hearing per attempt, aligned with the prompts: the take a retry replaced gets
+        # the transcript that caused it, and the newest retry has no hearing of its own yet.
+        self.assertEqual(range_item["audio_teacher_attempt_transcripts"], ["heard one", "heard two", ""])
+        self.assertEqual(nodes._remember_audio_teacher_attempt({"h3_prompt": "only"}, "retry"), ["only", "retry"])
+        bare = {}
+        nodes._remember_audio_teacher_attempt(bare, "retry with no hearing")
+        self.assertEqual((bare["audio_teacher_attempts"], bare["audio_teacher_attempt_transcripts"]), (["retry with no hearing"], [""]))
+        nodes._remember_audio_teacher_attempt(bare, "second retry", "heard now")
+        self.assertEqual(bare["audio_teacher_attempt_transcripts"], ["heard now", ""])
+        # A take transcribed after the retry fills the retry's own slot.
+        nodes._remember_audio_teacher_transcript(bare, 1, "the retry spoke")
+        self.assertEqual(bare["audio_teacher_attempt_transcripts"], ["heard now", "the retry spoke"])
+
+        wrapper = preview._AccumulatedPreviewWrapper(
+            node_id="preview-attempts-test",
+            max_resolution=0,
+            quality=80,
+            fps=24.0,
+            frame_stride=1,
+            tiny_vae="none",
+        )
+        payloads = []
+        with patch.object(preview, "_send", side_effect=lambda payload: payloads.append(payload)):
+            execution = preview._PreviewExecution([wrapper], [{"chunk": 1, "start": 0, "end": 4}, {"chunk": 2, "start": 5, "end": 9}], [])
+            execution.set_audio_prompt(0, "retry one", "spoken words", ["take one", "retry one"], ["heard one"])
+            execution.set_audio_prompt(1, "plain prompt", "spoken words")
+
+        retried = next(payload for payload in payloads if payload.get("chunk") == 0 and payload.get("action") == "chunk_metadata")
+        plain = next(payload for payload in payloads if payload.get("chunk") == 1 and payload.get("action") == "chunk_metadata")
+        self.assertEqual(retried["audio_teacher_attempts"], ["take one", "retry one"])
+        self.assertEqual(retried["audio_teacher_attempt_transcripts"], ["heard one"])
+        self.assertEqual(retried["audio_teacher_prompt"], "retry one")
+        # A chunk that was never retried publishes no attempt list at all.
+        self.assertNotIn("audio_teacher_attempts", plain)
+        self.assertNotIn("audio_teacher_attempt_transcripts", plain)
+
+        # The stored pass is what a refresh restores, so it carries the sequence.
+        nodes_source = (PLUGIN_ROOT / "nodes.py").read_text(encoding="utf-8")
+        self.assertIn('"attempts": [str(item) for item in (preview_chunk_ranges[audio_index].get("audio_teacher_attempts") or [])]', nodes_source)
+        self.assertIn('"attempt_transcripts": [str(item or "") for item in (preview_chunk_ranges[audio_index].get("audio_teacher_attempt_transcripts") or [])]', nodes_source)
+
+    def test_a_silent_sub_chunk_publishes_the_prompt_it_is_sampled_with(self):
+        """Ctrl+Shift names the sub-chunk under the pointer, so its prompt must be known."""
+        range_item = {}
+        # A chunk whose every sub-chunk speaks has nothing to publish: the base prompt is
+        # the chunk's own.
+        nodes._publish_subchunk_prompts(None, range_item, 0, None, {}, None)
+        self.assertEqual(range_item, {})
+        nodes._publish_subchunk_prompts(None, range_item, 0, {3: " no dialogue here ", 1: "no dialogue here"}, {}, None)
+        self.assertEqual(range_item["subchunk_silent_numbers"], [1, 3])
+        self.assertEqual(range_item["subchunk_silent_prompt"], "no dialogue here")
+
+        # The teacher audio transcript is cut to each sub-chunk's own audio window. Audio
+        # runs at AUDIO_LATENT_FPS (40) frames per second, so two phases of forty frames
+        # own one second each and every word lands in the window it was spoken in.
+        chunk = {
+            "audio_start": 0,
+            "phases": [
+                {"audio_start": 0, "audio_end": 40},
+                {"audio_start": 40, "audio_end": 80},
+            ],
+        }
+        transcript = {"text": "one two three four", "words": [
+            {"word": "one", "start": 0.1, "end": 0.4},
+            {"word": "two", "start": 0.6, "end": 0.9},
+            {"word": "three", "start": 1.1, "end": 1.4},
+            {"word": "four", "start": 1.6, "end": 1.9},
+        ]}
+        heard = {}
+        nodes._publish_subchunk_prompts(None, heard, 0, None, chunk, transcript)
+        self.assertEqual(heard["subchunk_transcripts"], ["one two", "three four"])
+        self.assertNotIn("subchunk_silent_numbers", heard)
+        # A word straddling a boundary belongs to both windows, exactly as it does for the
+        # speech test, and a window with no word reports nothing.
+        straddling = {"words": [{"word": "bridge", "start": 0.9, "end": 1.1}]}
+        nodes._publish_subchunk_prompts(None, heard, 0, None, chunk, straddling)
+        self.assertEqual(heard["subchunk_transcripts"], ["bridge", "bridge"])
+        silent = {"words": [{"word": "later", "start": 1.6, "end": 1.9}]}
+        nodes._publish_subchunk_prompts(None, heard, 0, None, chunk, silent)
+        self.assertEqual(heard["subchunk_transcripts"], ["", "later"])
+        # A transcript that never arrived, or holds no words, publishes none at all: the
+        # tooltip must not claim a silence it cannot know about.
+        for absent in (None, {}, {"text": "nothing"}):
+            bare = {}
+            nodes._publish_subchunk_prompts(None, bare, 0, None, chunk, absent)
+            self.assertNotIn("subchunk_transcripts", bare)
+            self.assertEqual(bare, {})
+
+        wrapper = preview._AccumulatedPreviewWrapper(
+            node_id="preview-subchunks-test",
+            max_resolution=0,
+            quality=80,
+            fps=24.0,
+            frame_stride=1,
+            tiny_vae="none",
+        )
+        payloads = []
+        with patch.object(preview, "_send", side_effect=lambda payload: payloads.append(payload)):
+            execution = preview._PreviewExecution([wrapper], [{"chunk": 1, "start": 0, "end": 4}], [])
+            execution.set_subchunk_prompts(0, [3, 1], "no dialogue here", ["", "heard two"])
+            execution.set_subchunk_prompts(0, [], "never published")
+            # A chunk that speaks throughout still has transcripts worth reading.
+            execution.set_subchunk_prompts(1, [], "", ["only words"])
+
+        published = [payload for payload in payloads if payload.get("action") == "chunk_metadata"]
+        self.assertEqual(len(published), 2)
+        self.assertEqual(published[0]["subchunk_silent_numbers"], [1, 3])
+        self.assertEqual(published[0]["subchunk_silent_prompt"], "no dialogue here")
+        self.assertEqual(published[0]["subchunk_transcripts"], ["", "heard two"])
+        self.assertEqual(published[1]["subchunk_transcripts"], ["only words"])
+        self.assertNotIn("subchunk_silent_numbers", published[1])
+
+        # The preview cache is what a refresh replays, so it keeps the same answer.
+        node_id = "preview-subchunk-cache-test"
+        with preview._PREVIEW_CACHE_LOCK:
+            preview._PREVIEW_CACHE.pop(node_id, None)
+        try:
+            preview._cache_payload({"node_id": node_id, "execution": 1, "action": "reset", "chunk_ranges": [{"chunk": 1, "start": 0, "end": 4}]})
+            preview._cache_payload({"node_id": node_id, "execution": 1, "action": "chunk_metadata", "chunk": 0, "subchunk_silent_numbers": [2], "subchunk_silent_prompt": "no dialogue here", "subchunk_transcripts": ["heard one", ""]})
+            cached = preview._cached_snapshot(node_id)["reset"]["chunk_ranges"][0]
+            self.assertEqual((cached["subchunk_silent_numbers"], cached["subchunk_silent_prompt"]), ([2], "no dialogue here"))
+            # The empty second slot stays, so the first transcript cannot drift onto it.
+            self.assertEqual(cached["subchunk_transcripts"], ["heard one", ""])
         finally:
             with preview._PREVIEW_CACHE_LOCK:
                 preview._PREVIEW_CACHE.pop(node_id, None)
@@ -1398,6 +2013,9 @@ class ChunkDirectorHelperTest(unittest.TestCase):
                         "chunks": 0,
                         "bytes": 0,
                         "created": "",
+                        "recorded": 0,
+                        "kv_chunks": [],
+                        "interrupted": False,
                         "reused_chunks": 0,
                         "run_reason": "",
                         "run_state": "idle",

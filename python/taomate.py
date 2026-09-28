@@ -11,6 +11,7 @@ import copy
 import math
 import logging
 import os
+import re
 import time
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
@@ -48,8 +49,62 @@ TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV = True
 TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV = True
 # Use all allowed CPU cores, respecting process affinity; 1 restores serial work.
 TAOMATE_KV_CPU_WORKERS = max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1))
-KV_CACHE_COMPRESSION_MODES = ("none", "zstd lossless", "int8", "turboquant")
-TURBOQUANT_4BIT_CENTROIDS = (-2.7326368225, -2.0690571770, -1.6180378132, -1.2561836443, -0.9423401764, -0.6567588956, -0.3880170670, -0.1284042432, 0.1284042432, 0.3880170670, 0.6567588956, 0.9423401764, 1.2561836443, 1.6180378132, 2.0690571770, 2.7326368225)
+KV_CACHE_COMPRESSION_MODES = ("none", "zstd lossless", "int8", "turboquant4", "turboquant3", "turboquant2")
+TURBOQUANT_BITS_BY_MODE = {"turboquant4": 4, "turboquant3": 3, "turboquant2": 2}
+TURBOQUANT_LEGACY_MODE = "turboquant"
+TURBOQUANT_GAUSSIAN_CENTROIDS = {
+    2: (-1.5104176088, -0.4527800398, 0.4527800398, 1.5104176088),
+    3: (-2.1519742685, -1.3439092613, -0.7560052489, -0.2451209529, 0.2451209529, 0.7560052489, 1.3439092613, 2.1519742685),
+    4: (-2.7326368225, -2.0690571770, -1.6180378132, -1.2561836443, -0.9423401764, -0.6567588956, -0.3880170670, -0.1284042432, 0.1284042432, 0.3880170670, 0.6567588956, 0.9423401764, 1.2561836443, 1.6180378132, 2.0690571770, 2.7326368225),
+}
+
+
+def _canonical_kv_compression_mode(mode):
+    """Map the former menu name to its explicit 4-bit codec name."""
+    return "turboquant4" if mode == TURBOQUANT_LEGACY_MODE else mode
+
+
+def parse_kv_remember(spec):
+    """Turn "1,-2,-1" into the sub-chunk blocks a new sub-chunk attends to.
+
+    Each entry names one committed video sub-chunk block: a positive number counts from
+    the first block (1 is the very first sub-chunk, which upstream ages into a video-only
+    sink), a negative one from the newest (-1 is the block just committed). Upstream's
+    policy is "1,-2,-1": the sink plus the last two sub-chunks.
+    """
+    text = str(spec if spec is not None else "").replace(" ", "")
+    entries = []
+    for raw in text.split(","):
+        if not raw:
+            continue
+        if not re.fullmatch(r"-?\d+", raw):
+            raise ValueError(f"kv_remember entries must be whole numbers such as 1,-2,-1; got {raw!r}")
+        index = int(raw)
+        if index == 0:
+            raise ValueError("kv_remember cannot use 0: 1 is the first sub-chunk, -1 the newest, -2 the one before it")
+        entries.append(index)
+    if not entries:
+        raise ValueError("kv_remember needs at least one sub-chunk block, such as the upstream 1,-2,-1")
+    return tuple(entries)
+
+
+def kv_remember_selection(entries, block_count):
+    """Return the upstream row selection [(block, video_only)] for this many blocks.
+
+    The first block keeps its video rows only, exactly as upstream ages it into a sink,
+    and every other remembered block keeps its complete AV rows. Entries that name a
+    block the render has not reached yet are skipped, which is what makes the default
+    usable from the very first sub-chunk.
+    """
+    selection = []
+    seen = set()
+    for entry in entries:
+        index = entry - 1 if entry > 0 else block_count + entry
+        if index < 0 or index >= block_count or index in seen:
+            continue
+        seen.add(index)
+        selection.append((index, index == 0))
+    return selection
 
 
 def _profile_add(profile, name, started):
@@ -74,9 +129,50 @@ def _turboquant_rotation(device):
     return cache[key]
 
 
-def _turboquant_centroids(device):
-    """Build TurboQuant's fixed Gaussian 4-bit codebook for 128-wide heads."""
-    return torch.tensor(TURBOQUANT_4BIT_CENTROIDS, device=device, dtype=torch.float32).div(math.sqrt(128.0))
+def _turboquant_centroids(device, bits):
+    """Build the fixed Gaussian Lloyd-Max codebook for one bit width."""
+    return torch.tensor(TURBOQUANT_GAUSSIAN_CENTROIDS[bits], device=device, dtype=torch.float32).div(math.sqrt(128.0))
+
+
+def _pack_turboquant_indices(indices, bits):
+    """Pack 2, 3 or 4-bit indices along H3's 128-value attention head."""
+    if indices.shape[-1] != 128 or bits not in (2, 3, 4):
+        raise ValueError("TurboQuant packing requires a 128-value vector and 2, 3 or 4 bits")
+    values = indices.to(torch.int32)
+    if bits == 4:
+        return (values[..., 0::2] | (values[..., 1::2] << 4)).to(torch.uint8)
+    if bits == 2:
+        groups = values.reshape(*values.shape[:-1], 32, 4)
+        packed = groups[..., 0] | (groups[..., 1] << 2) | (groups[..., 2] << 4) | (groups[..., 3] << 6)
+        return packed.to(torch.uint8)
+    groups = values.reshape(*values.shape[:-1], 16, 8)
+    c0, c1, c2, c3, c4, c5, c6, c7 = groups.unbind(-1)
+    # Each 8-code group fills three bytes; the crossing fields are split explicitly.
+    first = c0 | (c1 << 3) | ((c2 & 3) << 6)
+    second = (c2 >> 2) | (c3 << 1) | (c4 << 4) | ((c5 & 1) << 7)
+    third = (c5 >> 1) | (c6 << 2) | (c7 << 5)
+    return torch.stack((first, second, third), dim=-1).reshape(*values.shape[:-1], 48).to(torch.uint8)
+
+
+def _unpack_turboquant_indices(codes, bits, shape):
+    """Restore packed indices for one 128-value attention head."""
+    if tuple(shape)[-1] != 128 or bits not in (2, 3, 4):
+        raise ValueError("TurboQuant unpacking requires a 128-value vector and 2, 3 or 4 bits")
+    prefix = tuple(shape)[:-1]
+    values = codes.long()
+    if bits == 4:
+        indices = torch.empty(shape, dtype=torch.long, device=codes.device)
+        indices[..., 0::2] = values & 15
+        indices[..., 1::2] = values >> 4
+        return indices
+    if bits == 2:
+        groups = values.reshape(*prefix, 32)
+        unpacked = torch.stack((groups & 3, (groups >> 2) & 3, (groups >> 4) & 3, (groups >> 6) & 3), dim=-1)
+        return unpacked.reshape(shape)
+    groups = values.reshape(*prefix, 16, 3)
+    first, second, third = groups.unbind(-1)
+    unpacked = torch.stack((first & 7, (first >> 3) & 7, ((first >> 6) & 3) | ((second & 1) << 2), (second >> 1) & 7, (second >> 4) & 7, ((second >> 7) & 1) | ((third & 3) << 1), (third >> 2) & 7, (third >> 5) & 7), dim=-1)
+    return unpacked.reshape(shape)
 
 
 class CompressedKV:
@@ -177,7 +273,8 @@ class QuantizedKV:
 
     def __init__(self, pair, mode):
         """Quantize BF16 keys and values before transferring their compact form to CPU."""
-        if mode not in ("int8", "turboquant"):
+        mode = _canonical_kv_compression_mode(mode)
+        if mode != "int8" and mode not in TURBOQUANT_BITS_BY_MODE:
             raise ValueError("unknown quantized KV mode %r" % mode)
         if pair.key.shape[-1] != 128:
             raise ValueError("%s KV quantization requires H3's 128-wide attention heads" % mode)
@@ -198,17 +295,24 @@ class QuantizedKV:
             return codes.cpu(), scales.to(torch.float16).cpu()
         norms = torch.linalg.vector_norm(values, dim=-1, keepdim=True).clamp_min(1e-12)
         rotated = values.div(norms).matmul(_turboquant_rotation(values.device).T)
-        centroids = _turboquant_centroids(values.device)
+        bits = TURBOQUANT_BITS_BY_MODE[self.mode]
+        centroids = _turboquant_centroids(values.device, bits)
         boundaries = (centroids[:-1] + centroids[1:]).mul(0.5)
         indices = torch.bucketize(rotated, boundaries).to(torch.uint8)
-        codes = indices[..., 0::2] | (indices[..., 1::2] << 4)
-        return codes.cpu(), norms.cpu()
+        return _pack_turboquant_indices(indices, bits).cpu(), norms.cpu()
 
     @classmethod
     def concat(cls, first, second):
         """Join same-codec token rows without reconstructing their BF16 values."""
-        if first.mode != second.mode or first.dtype != second.dtype or first.shape[1:] != second.shape[1:]:
+        if first.dtype != second.dtype or first.shape[1:] != second.shape[1:]:
             raise ValueError("cannot concatenate incompatible quantized KV entries")
+        if first.mode != second.mode:
+            # A resumed audio pass can carry an older codec into a newly selected
+            # codec; convert only that mixed-mode boundary on CPU, then keep the
+            # active selection for future rows.
+            key = torch.cat((first.tensor(0, "cpu"), second.tensor(0, "cpu")), dim=0)
+            value = torch.cat((first.tensor(1, "cpu"), second.tensor(1, "cpu")), dim=0)
+            return cls(AVKV(key, value), second.mode)
         result = object.__new__(cls)
         result.shape = (first.shape[0] + second.shape[0],) + first.shape[1:]
         result.dtype = first.dtype
@@ -241,12 +345,98 @@ class QuantizedKV:
         scales = (self.key_scales, self.value_scales)[index].to(device, non_blocking=True)
         if self.mode == "int8":
             return codes.float().mul(scales.float()).to(self.dtype)
-        indices = torch.empty(self.shape, dtype=torch.long, device=device)
-        indices[..., 0::2] = codes.bitwise_and(15).long()
-        indices[..., 1::2] = codes.bitwise_right_shift(4).long()
-        centroids = _turboquant_centroids(device)
+        bits = TURBOQUANT_BITS_BY_MODE[self.mode]
+        indices = _unpack_turboquant_indices(codes, bits, self.shape)
+        centroids = _turboquant_centroids(device, bits)
         restored = centroids[indices].matmul(_turboquant_rotation(device)).mul(scales.float())
         return restored.to(self.dtype)
+
+
+TEACHER_KV_RECORD_FORMAT = 1
+
+
+def _kv_dtype(name):
+    """Return the torch dtype a stored record names."""
+    if not str(name).startswith("torch."):
+        raise ValueError("unexpected KV dtype name %r" % name)
+    dtype = getattr(torch, str(name).split(".", 1)[1], None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError("unknown KV dtype %r" % name)
+    return dtype
+
+
+def serialize_stored_kv(stored):
+    """Describe one stored KV layer so it can be written and restored exactly.
+
+    The three storage forms keep different state: quantized rows hold integer
+    codes plus scales, compressed rows hold codec frames as bytes, and an
+    uncompressed row is the pair itself. Writing the description rather than the
+    object keeps the payload inside the ``torch.load(weights_only=True)``
+    allowlist, the same discipline the teacher-audio payload follows.
+    """
+    if isinstance(stored, QuantizedKV):
+        return {
+            "kind": "quantized",
+            "shape": list(stored.shape),
+            "dtype": str(stored.dtype),
+            "mode": stored.mode,
+            "raw_bytes": int(stored.raw_bytes),
+            "stored_bytes": int(stored.stored_bytes),
+            "key_codes": stored.key_codes,
+            "key_scales": stored.key_scales,
+            "value_codes": stored.value_codes,
+            "value_scales": stored.value_scales,
+        }
+    if isinstance(stored, CompressedKV):
+        return {
+            "kind": "compressed",
+            "shape": list(stored.shape),
+            "dtype": str(stored.dtype),
+            "raw_zstd": bool(stored.raw_zstd),
+            "raw_bytes": int(stored.raw_bytes),
+            "stored_bytes": int(stored.stored_bytes),
+            "blocks": [list(frames) for frames in stored.blocks],
+        }
+    return {"kind": "raw", "key": stored.key.detach().cpu().contiguous(), "value": stored.value.detach().cpu().contiguous()}
+
+
+def deserialize_stored_kv(payload):
+    """Rebuild one stored KV layer from its written description."""
+    kind = payload.get("kind")
+    if kind == "quantized":
+        stored = object.__new__(QuantizedKV)
+        stored.shape = tuple(payload["shape"])
+        stored.dtype = _kv_dtype(payload["dtype"])
+        stored.mode = _canonical_kv_compression_mode(str(payload["mode"]))
+        stored.raw_bytes = int(payload["raw_bytes"])
+        stored.stored_bytes = int(payload["stored_bytes"])
+        stored.key_codes = payload["key_codes"]
+        stored.key_scales = payload["key_scales"]
+        stored.value_codes = payload["value_codes"]
+        stored.value_scales = payload["value_scales"]
+        return stored
+    if kind == "compressed":
+        stored = object.__new__(CompressedKV)
+        stored.shape = tuple(payload["shape"])
+        stored.dtype = _kv_dtype(payload["dtype"])
+        stored.raw_zstd = bool(payload["raw_zstd"])
+        stored.raw_bytes = int(payload["raw_bytes"])
+        stored.stored_bytes = int(payload["stored_bytes"])
+        stored.blocks = [list(frames) for frames in payload["blocks"]]
+        return stored
+    if kind == "raw":
+        return AVKV(payload["key"], payload["value"])
+    raise ValueError("unknown stored KV record kind %r" % kind)
+
+
+def serialize_stored_kv_chunk(pairs):
+    """Describe one chunk's stored rows for every layer."""
+    return {layer: serialize_stored_kv(pair) for layer, pair in pairs.items()}
+
+
+def deserialize_stored_kv_chunk(payload):
+    """Rebuild one chunk's stored rows for every layer."""
+    return {layer: deserialize_stored_kv(entry) for layer, entry in payload.items()}
 
 
 class TaoMateKVCache(CleanAVKVCache):
@@ -255,7 +445,7 @@ class TaoMateKVCache(CleanAVKVCache):
     def __init__(self, contract, compression_mode=None):
         """Keep one render's selected KV representation; TurboQuant is the base default."""
         super().__init__(contract)
-        self.compression_mode = compression_mode or "turboquant"
+        self.compression_mode = _canonical_kv_compression_mode(compression_mode or "turboquant3")
         if self.compression_mode not in KV_CACHE_COMPRESSION_MODES:
             raise ValueError("unknown KV cache compression mode %r" % self.compression_mode)
 
@@ -268,7 +458,7 @@ class TaoMateKVCache(CleanAVKVCache):
         """Use the selected storage format for both staged and retained layers."""
         if self.compression_mode == "zstd lossless":
             return CompressedKV(pair)
-        if self.compression_mode in ("int8", "turboquant"):
+        if self.compression_mode == "int8" or self.compression_mode in TURBOQUANT_BITS_BY_MODE:
             return QuantizedKV(pair, self.compression_mode)
         return pair
 
@@ -313,7 +503,7 @@ class TaoMateKVCache(CleanAVKVCache):
         try:
             indices = self.capture_rows(layer_name, key, value, token_tags, commit_mask)
             pair = AVKV(key.index_select(0, indices).detach(), value.index_select(0, indices).detach())
-            if self.compression_mode not in ("int8", "turboquant"):
+            if self.compression_mode != "int8" and self.compression_mode not in TURBOQUANT_BITS_BY_MODE:
                 pair = AVKV(pair.key.cpu(), pair.value.cpu())
                 _validate_av_pair(pair, self.contract, layer_name=layer_name)
             # QuantizedKV has copied the compact codes to CPU RAM. Do not keep
@@ -392,6 +582,27 @@ class TaoMateKVCache(CleanAVKVCache):
         self._block_index += 1
         self._clear_staging()
 
+    def staged_snapshot(self):
+        """Return this chunk's staged rows before commit consumes them.
+
+        Snapshotting the mapping is enough: commit() pops the entries it keeps,
+        so the snapshot holds the same objects alive while the history is built.
+        """
+        return dict(self._staged), self._staged_block, self._staged_tags
+
+    def prime_staged(self, pairs, block_index, tags):
+        """Accept stored rows for one chunk as if they had just been generated."""
+        if self.clean_commit_active:
+            raise RuntimeError("cannot prime the KV cache during an active clean commit")
+        self._staged = dict(pairs)
+        self._staged_block = int(block_index)
+        self._staged_indices = None
+        self._staged_tags = tuple(int(tag) for tag in tags)
+        missing = [name for name in MAIN_LAYER_NAMES if name not in self._staged]
+        if missing:
+            raise RuntimeError("primed KV chunk is missing %d transformer layers" % len(missing))
+        self.commit()
+
     def prepare_commit(self):
         """Evict stale rows before append; subclasses own their retention policy."""
         return None
@@ -469,6 +680,12 @@ class TaoMateKVCache(CleanAVKVCache):
 class VideoSubchunkKVCache(TaoMateKVCache):
     """Capture complete AV rows for TaoMate's video sub-chunk attention stream."""
 
+    def __init__(self, contract, compression_mode=None, remember=None):
+        super().__init__(contract, compression_mode)
+        # Which committed sub-chunk blocks the next sub-chunk attends to. The upstream
+        # policy is the sink plus the last two blocks.
+        self.remember = tuple(remember) if remember else parse_kv_remember("1,-2,-1")
+
     def capture_rows(self, layer_name, key, value, token_tags, commit_mask):
         """Keep the current clean video and audio rows for every H3 layer."""
         return self._capture_indices(layer_name, key, value, token_tags, commit_mask, (VIDEO_TOKEN_TAG, 2))
@@ -478,11 +695,23 @@ class VideoSubchunkKVCache(TaoMateKVCache):
         return pair
 
     def prepare_commit(self):
-        """Keep the video sink and one recent AV block before appending a new block."""
-        count = len(self._commit_token_counts)
-        if count >= 2:
+        """Age the committed sub-chunk blocks down to the ones kv_remember names.
+
+        Upstream waits until three clean sub-chunks exist before it ages the first block
+        into a video-only sink and drops everything the window does not name, which is
+        what keeps the very first sub-chunks unaged.
+        """
+        block_count = len(self._commit_token_counts)
+        if block_count <= 2:
+            return
+        selection = kv_remember_selection(self.remember, block_count)
+        if not selection:
+            return
+        # The block being appended is part of the window too, so anything the remembered
+        # blocks do not cover is what this trim drops.
+        if len(selection) < block_count + 1:
             self.report_status("KV cache: evicting outgoing history")
-            self._retain_commit_rows([(0, True), (count - 1, False)])
+        self._retain_commit_rows(selection)
 
 
 class TeacherAudioKVCache(TaoMateKVCache):
@@ -676,10 +905,13 @@ class TaoMateStreaming:
             start = end
         return requests
 
-    def __init__(self, kv_cache_compression=None):
+    def __init__(self, kv_cache_compression=None, kv_remember=None):
         """Start with no retained model or render state."""
         self.cache = None
         self.caches = {}
+        # Validated once, so a typo stops the render instead of quietly narrowing the
+        # attention window.
+        self.kv_remember = parse_kv_remember(kv_remember if kv_remember is not None else "1,-2,-1")
         self.branch = ()
         self.hook = None
         self.anchor = None
@@ -714,7 +946,7 @@ class TaoMateStreaming:
         self.current_phase_total = 0
         self.current_chunk_number = 0
         self.current_chunk_total = 0
-        self.kv_cache_compression = kv_cache_compression or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none")
+        self.kv_cache_compression = _canonical_kv_compression_mode(kv_cache_compression or ("zstd lossless" if TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV else "none"))
         if self.kv_cache_compression not in KV_CACHE_COMPRESSION_MODES:
             raise ValueError("unknown KV cache compression mode %r" % self.kv_cache_compression)
 
@@ -884,7 +1116,7 @@ class TaoMateStreaming:
                 k = attention.k_norm(k.reshape(count, attention.heads, attention.head_dim))
             # CFG branches need independent history and clean commits.
             if self.branch not in self.caches:
-                cache = VideoSubchunkKVCache(KVContract(local_heads=attention.heads, head_dim=attention.head_dim, dtype=k.dtype, device_type="cpu"), self.kv_cache_compression)
+                cache = VideoSubchunkKVCache(KVContract(local_heads=attention.heads, head_dim=attention.head_dim, dtype=k.dtype, device_type="cpu"), self.kv_cache_compression, self.kv_remember)
                 self.caches[self.branch] = (cache, ComfyStreamingHook(cache))
             self.cache, self.hook = self.caches[self.branch]
             self.cache.on_status = self.report_status
@@ -1018,18 +1250,45 @@ class TaoMateStreaming:
             raise ValueError("Audio preview context consumes the decoded segment")
         return waveform[..., trim_samples:], sample_rate
 
-    def prepare_audio_first(self, conditionings, noise, video, chunks, sigmas, video_shift, audio_shift, on_status=None, on_progress=None, on_chunk_complete=None, on_audio_candidate=None):
-        """Generate each request's audio from its own prompt on the global clock."""
+    def prepare_audio_first(self, conditionings, noise, video, chunks, sigmas, video_shift, audio_shift, on_status=None, on_progress=None, on_chunk_complete=None, on_audio_candidate=None, start_index=0, prefix_segments=None, prefix_origin=None, prime_records=None, on_kv_commit=None, generate_count=None):
+        """Generate each request's audio from its own prompt on the global clock.
+
+        ``start_index`` resumes a pass whose earlier chunks are already settled:
+        their clean rows arrive as ``prefix_segments``, their attention state as
+        ``prime_records``, and ``prefix_origin`` restores the rope origin the
+        original pass used so the continuation lands on the same coordinates.
+        """
         if self.audio_teacher is None:
             return None
-        clean_segments = []
-        self.audio_first_milestones = {}
-        total_chunks = len(chunks)
-        if not callable(conditionings) and len(conditionings) != total_chunks:
+        start_index = int(start_index)
+        if start_index < 0 or start_index > len(chunks):
+            raise ValueError("TaoMate audio teacher resume point is out of range")
+        if not callable(conditionings) and len(conditionings) != len(chunks):
             raise ValueError("TaoMate audio teacher needs one conditioning per chunk")
+        clean_segments = list(prefix_segments or [])
+        if len(clean_segments) != start_index:
+            raise ValueError("a resumed TaoMate teacher pass needs one clean segment per skipped chunk")
+        if prefix_origin is not None:
+            self.audio_teacher.audio_time_origin = int(prefix_origin)
+        if prime_records:
+            self.audio_teacher.pending_prime = list(prime_records)
+        if on_kv_commit is not None:
+            self.audio_teacher.on_kv_commit = on_kv_commit
+        # A resumed pass starts from the caller's restored prefix states: the video
+        # pass pops one per chunk, including the chunks this pass is not sampling.
+        # The caller may also leave states for the chunks after the ones generated
+        # here, which is how an edit before them keeps their approved audio.
+        generated_end = len(chunks) if generate_count is None else min(len(chunks), start_index + max(0, int(generate_count)))
+        self.audio_first_milestones = {
+            index: milestones for index, milestones in self.audio_first_milestones.items()
+            if index < start_index or index >= generated_end
+        }
+        total_chunks = len(chunks)
         steps = max(0, len(self.audio_teacher.guidance_schedule(sigmas, video_shift, audio_shift)[0]) - 1)
-        with tqdm(total=total_chunks * steps, desc="TaoMate: audio teacher", unit="step", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
+        with tqdm(total=(generated_end - start_index) * steps, desc="TaoMate: audio teacher", unit="step", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
             for index, chunk in enumerate(chunks):
+                if index < start_index or index >= generated_end:
+                    continue
                 self.current_chunk_number = index + 1
                 self.current_chunk_total = total_chunks
                 progress.set_postfix_str("chunk %d/%d" % (index + 1, total_chunks), refresh=False)
@@ -1088,7 +1347,7 @@ class TaoMateStreaming:
         self.audio_teacher.close()
         return self.audio_first_audio_latent
 
-    def execute_chunk(self, execute_sampler, noise_factory, seed, noise, guider, sigmas, latent, chunk, on_subchunk=None, sampler=None, on_subchunk_start=None, on_status=None, debug_timing=False, on_audio_teacher=None, on_audio_progress=None, audio_conditioning=None, on_audio_candidate=None):
+    def execute_chunk(self, execute_sampler, noise_factory, seed, noise, guider, sigmas, latent, chunk, on_subchunk=None, sampler=None, on_subchunk_start=None, on_status=None, debug_timing=False, on_audio_teacher=None, on_audio_progress=None, audio_conditioning=None, on_audio_candidate=None, phase_conditionings=None):
         """Sample only new media; prepend historical tokens for VAE decoding only."""
         self.on_status = on_status
         self.debug_kv_table = bool(debug_timing)
@@ -1140,8 +1399,12 @@ class TaoMateStreaming:
                 on_audio_teacher(self.current_chunk_number - 1, self.teacher_milestones[-1])
         self.prepared_model = None
         output_video, output_audio = [], []
-        # All phases share the same guider conditioning, encoded once per request.
+        # All phases share the same guider conditioning, encoded once per request,
+        # unless the caller gave a sub-chunk its own: a sub-chunk whose audio is silent
+        # has no business being told the chunk's dialogue, and one that speaks keeps it.
         phases = chunk.get("phases", (chunk,))
+        phase_conditionings = phase_conditionings or {}
+        chunk_conds = getattr(guider, "original_conds", None)
         with tqdm(total=len(phases), desc="TaoMate group %d: video sub-chunks" % (self.request_count + 1), unit="sub-chunk", leave=True, disable=not comfy.utils.PROGRESS_BAR_ENABLED) as progress:
             for phase_number, phase in enumerate(phases, 1):
                 logging.info("TaoMate group %d: video sub-chunk %d/%d", self.request_count + 1, phase_number, len(phases))
@@ -1165,6 +1428,10 @@ class TaoMateStreaming:
                 # Guidance splits packed AV before the first model forward; set each phase's shape now.
                 self.video_shape = tuple(video[:, :, v0:v1].shape)
                 target_noise = comfy.nested_tensor.NestedTensor((vn[:, :, v0:v1], an[..., a0:a1]))
+                # A silent sub-chunk's own text, or the chunk's conditioning again for
+                # every other sub-chunk, so one silent phase never leaks into the next.
+                if phase_conditionings:
+                    guider.original_conds = phase_conditionings.get(phase_number, chunk_conds)
                 selected = self.wrap_sampler(sampler) if sampler is not None else comfy.samplers.KSAMPLER(self.sample)
                 sampler_started = (time.perf_counter(), time.process_time())
                 result, _ = execute_sampler(noise_factory(seed, target_noise), guider, selected, sigmas, target)

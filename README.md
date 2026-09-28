@@ -544,7 +544,9 @@ on the actual cache values.
 | `none` | 100% | Exact | Raw BF16 K/V in CPU RAM. |
 | `zstd lossless` | about 69% | Exact | Prior local cache measurement saved about 31%; content-dependent. |
 | `int8` | 50.8% | Lossy | One signed 8-bit value plus a FP16 scale per 128-value vector. |
-| `turboquant` | 26.6% | Lossy | Packed 4-bit rotated values plus one FP32 norm per vector; quantized on GPU before CPU transfer. |
+| `turboquant4` | 26.6% | Lossy | Packed 4-bit rotated values plus one FP32 norm per vector; quantized on GPU before CPU transfer. |
+| `turboquant3` | 20.3% | Lossy | Packed 3-bit rotated values plus one FP32 norm per vector; quantized on GPU before CPU transfer. This is the default. |
+| `turboquant2` | 14.1% | Lossy | Packed 2-bit rotated values plus one FP32 norm per vector; quantized on GPU before CPU transfer. |
 
 TurboQuant reconstructs the active K/V layer on GPU for the existing SDPA
 attention path. In the latest local comparison, its render matched the

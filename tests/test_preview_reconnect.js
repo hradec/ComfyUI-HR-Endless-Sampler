@@ -13,7 +13,7 @@ async function check(force, liveReset, expected) {
     const snapshot = { execution: 1, reset: { execution: 1, action: 'reset' }, chunks: [{ execution: 1, action: 'chunk' }] };
     const context = {
         execution: 7, restoringCache: false, statusPhase: {}, statusProgressFill: { style: {} },
-        fpsWidget: null, setPlaybackFps() {}, renderStatus() {}, redrawGraphs() {},
+        fpsWidget: null, setPlaybackFps() {}, renderStatus() {}, redrawGraphs() {}, renderTransport() {},
         hoverStep: null, timer: null, framePending: false, restorePlayback() {},
         setTimeout, console,
         node: { id: 1, _hrEndlessSamplerPreview(data) {

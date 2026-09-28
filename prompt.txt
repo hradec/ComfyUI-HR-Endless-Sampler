@@ -1,0 +1,52 @@
+
+
+subject_definitions: 
+<Subject 1> is the character shown in <Picture 1>.
+<Subject 1> is Jenna Ortega.  
+
+
+summary: [ keyframe completion + reference generation] - <Picture 1> serves as the exact first frame for the target video. <Subject 1> just sits in front of the camera and talks her dialog in a monotone and creepy speech that lasts the whole video. The camera stays complete fixed thoughout the target video, ending at the exact same framing it started. 
+
+retention_analysis: 
+Keep the identity, face, hair, clothing and overall appearance of <Subject 1>. Maintain the camera fixed throughout at <Picture 1> framing. Keep the environment from <Picture 1>. 
+r34l1sm
+Enhance this video with sharp, crisp details while preserving a natural photorealistic appearance.
+
+
+detailed_description: 
+[Shot 1]  The camera stays fixed in the stablished frame from start to the end of the shot.
+
+<Subject 1> starts the video in silence (no mouth movent) for 00:01.00, then <Subject 1> (S1) says: <d>[English] Someone asked me to keep talking for a whole minute. That's an act of agression.
+
+Well, I could talk about death and suffering and why light is bad for you and love is a curse.
+
+People are strangely afraid of silence. Personally, I find silence comforting. Nothing disappointing has happened yet.
+
+Then someone speaks.
+
+Usually about the weather.
+
+The sun is shining. The birds are singing. 
+
+Disturbing.
+
+Eventually everything ends anyway. Friendships fade. Birds die. The sun will consume the Earth.
+
+There's really no reason to worry about anything.
+
+Which is strangely comforting.
+
+How long has it been?
+
+Forty seconds?
+
+This is torture.
+
+Finally! something worth talking about.
+</d>
+
+
+overall_soundscape: Clear dry English speech in a quiet room.
+
+non_diegetic_music: N/A
+non_diegetic_audio: N/A

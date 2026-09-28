@@ -145,6 +145,57 @@ function finishedColoredShotSegments(description, chunk, shotRanges) {
 }
 
 
+function createControlsAutohide(elements, { delayMs = 3000, isFullscreen, isPlaying, doc = document } = {}) {
+    // Fullscreen playback hides the chrome the way a video player does: after the pointer
+    // has been quiet for the delay the transport bar, the status line and the viewport
+    // buttons fade away, and any movement brings them back at once. A paused player keeps
+    // them, because there is no picture to watch behind them.
+    let timer = null;
+
+    function setVisible(visible) {
+        for (const element of elements) {
+            element.style.opacity = visible ? "1" : "0";
+            // A faded control must not answer a click either.
+            element.style.pointerEvents = visible ? "" : "none";
+        }
+    }
+
+    function shouldHide() {
+        return Boolean(isFullscreen() && isPlaying());
+    }
+
+    function arm() {
+        if (timer != null) clearTimeout(timer);
+        timer = null;
+        setVisible(true);
+        if (!shouldHide()) return;
+        timer = setTimeout(() => {
+            timer = null;
+            if (shouldHide()) setVisible(false);
+        }, delayMs);
+    }
+
+    const onMove = () => arm();
+    const onFullscreen = () => arm();
+    doc.addEventListener("mousemove", onMove);
+    doc.addEventListener("fullscreenchange", onFullscreen);
+    for (const element of elements) element.style.transition = "opacity .3s ease";
+
+    return {
+        arm,
+        isVisible: () => elements.every(element => element.style.opacity !== "0"),
+        stop() {
+            if (timer != null) clearTimeout(timer);
+            timer = null;
+            doc.removeEventListener("mousemove", onMove);
+            doc.removeEventListener("fullscreenchange", onFullscreen);
+            setVisible(true);
+        },
+    };
+}
+
+
+
 function createFinishedChunkTooltip() {
     const tooltip = document.createElement("div");
     tooltip.style.cssText = "position:fixed;z-index:100001;display:none;box-sizing:border-box;max-width:min(760px,calc(100vw - 24px));max-height:min(70vh,640px);overflow:hidden;padding:9px 11px;border:1px solid #555;border-radius:5px;background:rgba(18,18,18,.97);color:#ddd;box-shadow:0 7px 24px rgba(0,0,0,.75);font:11px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;pointer-events:none;user-select:none;";
@@ -576,7 +627,7 @@ app.registerExtension({
             // LiteGraph serializes node properties with the workflow, so this survives refresh and execution.
             const savedPlayerState = node.properties?.hr_endless_sampler_player || {};
             const root = document.createElement("div");
-            root.style.cssText = "display:flex;flex-direction:column;width:100%;height:100%;min-height:355px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
+            root.style.cssText = "position:relative;display:flex;flex-direction:column;width:100%;height:100%;min-height:355px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
             root.tabIndex = 0;
 
             let selectedPathLabel = null;
@@ -702,7 +753,11 @@ app.registerExtension({
                 fullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
             }
 
-            const fullscreenChanged = () => updateFullscreenButton();
+            const fullscreenChanged = () => {
+                updateFullscreenButton();
+                applyFullscreenLayout();
+                controlsAutohide.arm();
+            };
             document.addEventListener("fullscreenchange", fullscreenChanged);
             fullscreenButton.addEventListener("click", event => {
                 event.preventDefault();
@@ -828,9 +883,15 @@ app.registerExtension({
             frameLabel.style.cssText = "position:absolute;right:8px;bottom:6px;color:#ffe600;font:bold 13px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.2px;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 2px #000;pointer-events:none;user-select:none;display:none;";
             viewport.appendChild(frameLabel);
 
+            // The transport bar, the status line and the comparison footer share one block,
+            // so fullscreen can float them over the whole picture as a single panel.
+            const controls = document.createElement("div");
+            controls.style.cssText = "display:flex;flex-direction:column;flex:0 0 auto;";
+            root.appendChild(controls);
+
             const transport = document.createElement("div");
             transport.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;height:43px;padding:4px 8px;background:#181818;border-top:1px solid #242424;";
-            root.appendChild(transport);
+            controls.appendChild(transport);
 
             const playButton = document.createElement("button");
             playButton.type = "button";
@@ -870,12 +931,12 @@ app.registerExtension({
             const status = document.createElement("div");
             status.style.cssText = "box-sizing:border-box;padding:7px 9px;background:#1b1b1b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
             status.textContent = isCompareNode ? "Waiting for two IMAGE videos…" : "Waiting for a saved HR Endless Sampler render…";
-            root.appendChild(status);
+            controls.appendChild(status);
 
             if (isSaveNode) {
                 const compareFooter = document.createElement("div");
                 compareFooter.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;min-height:31px;padding:4px 8px;border-top:1px solid #292929;background:#171717;";
-                root.appendChild(compareFooter);
+                controls.appendChild(compareFooter);
                 compareButton = document.createElement("button");
                 compareButton.type = "button";
                 compareButton.textContent = "Compare with ▴";
@@ -888,6 +949,40 @@ app.registerExtension({
                 compareFooter.appendChild(comparePathLabel);
                 compareFooter.appendChild(compareButton);
             }
+
+            // In fullscreen the video owns the whole screen and the chrome floats on top of it,
+            // translucent, so the transport, the status line and the comparison footer never
+            // resize the picture. Leaving fullscreen puts every one of them back in the column.
+            function applyFullscreenLayout() {
+                const active = document.fullscreenElement === root;
+                const blur = active ? "blur(3px)" : "";
+                viewport.style.position = active ? "absolute" : "relative";
+                viewport.style.inset = active ? "0" : "";
+                controls.style.position = active ? "absolute" : "";
+                controls.style.left = active ? "0" : "";
+                controls.style.right = active ? "0" : "";
+                controls.style.bottom = active ? "0" : "";
+                controls.style.zIndex = active ? "6" : "";
+                transport.style.background = active ? "rgba(20,20,20,.72)" : "#181818";
+                transport.style.backdropFilter = blur;
+                status.style.background = active ? "rgba(24,24,24,.72)" : "#1b1b1b";
+                status.style.backdropFilter = blur;
+            }
+
+            // Fullscreen playback hides that chrome once the pointer has been quiet for three
+            // seconds; a paused video keeps it, and any movement brings it back.
+            const controlsAutohide = createControlsAutohide(
+                [controls, linearDisplayButton, subtitleButton, fullscreenButton],
+                {
+                    isFullscreen: () => document.fullscreenElement === root,
+                    isPlaying: () => !media.paused && !media.ended,
+                },
+            );
+            // The video's own state decides: pressing play hides the chrome after the delay,
+            // pressing pause brings it back at once.
+            media.addEventListener("play", () => controlsAutohide.arm());
+            media.addEventListener("pause", () => controlsAutohide.arm());
+            media.addEventListener("ended", () => controlsAutohide.arm());
 
             let state = null;
             let timeline = null;
@@ -1750,6 +1845,7 @@ app.registerExtension({
                 document.removeEventListener("keydown", updateShiftPrompt);
                 document.removeEventListener("keyup", updateShiftPrompt);
                 document.removeEventListener("fullscreenchange", fullscreenChanged);
+                controlsAutohide.stop();
                 if (animation != null) cancelAnimationFrame(animation);
                 media.pause();
                 media.removeAttribute("src");

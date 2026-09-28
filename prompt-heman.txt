@@ -1,0 +1,55 @@
+integrated_multimodal_description: Caravaggio chiaroscuro, Kodak 35mm grain, cinematic, live action, Shoot in a ancient temple environment in the middle of a jungle. Light rays coming from the ceiling, particles are visibly floating in the light.
+
+
+subject_definitions: 
+<Subject 1> is the character shown in <Picture 1>.
+<Subject 2> is the character shown in <Picture 2> (hair style is a reddish hair pulled into a neat, high updo/bun held by a golden tiara).
+<Subject 3> is the character shown in <Picture 3>.
+<Subject 4> is the character shown in <Picture 4> (green fur tiger named tiger).
+
+
+<Subject 1> is a young Arnold Schwarzenegger.  
+
+Heman is <Subject 1>.
+Tila is <Subject 2>.
+Tiamat is <Subject 3>. 
+tiger is <Subject 4>.
+"our heroes" are  Heman, Tila and the tiger together.
+
+retention_analysis: 
+Keep the identity, face, hair, clothing and overall appearance of <Subject 1>, <Subject 2>, <Subject 3>, <Subject 4> consistent across every shot. 
+<Picture 1> must be used for <Subject 1> face, hair, body, clothing and overall appearance.
+<Picture 2> for <Subject 2> face, hair, body, clothing and overall appearance.
+
+Heman is <Subject 1>.
+Tila is <Subject 2>.
+Tiamat is <Subject 3>. 
+tiger is <Subject 4>.
+"our heroes" are  Heman, Tila and the tiger together.
+
+detailed_description: 
+[Shot 1] Cinematic, live-action.
+the camera is a side view shot, tracking our heroes: heman (<Subject 1>) and tila (<Subject 2>) are mounted on tiger (<Subject 4>), riding together as tiger runs through in the middle of a jungle as fast as he can. Tila is sitting behind heman on the saddle.
+The floor is wild jungle floor, no pavement or man made floor. In a continuous movement, the camera arcs to a shoulder view with small amplitude at slow speed: tiger still running fast, we can see they are getting closer to an ancient maya like pyramid(<Picture 5>) in the middle of the jungle. It's old and the jungle has grown all over the pyramid... its really old. 
+
+[Shot 2] At 00:02.833, camera cuts to a side view, tracking Tiger with Heman and Tila still mounted on tigers back: They cross from the jungle into a temple room, heman and tila still mounted on tigers back, and tiger is still running, real fast. Heman pulls the harness, and tiger stops suddenly, roars as he lower his back close to the floor, almost like sitting, and skids trying to stop, very "cartoony" like, with smoke, tracks on the floor, it slides on the floor for a long while before stopping. 
+
+[Shot 3] At 00:06.208, camera cut to a face closeup shot of Tila as she points to the right. Tila (S2) says: <d>[English] I heard something coming from that direction, he-man!</d> 
+
+[Shot 4] At 00:08.958, continuing from the last frame of the previous shot, the camera zooms out with small amplitude at slow speed: Heman dismounts the tiger and starts walking to the right. Tila stays mounted and leans forward. 
+
+[Shot 5] At 00:10.792, the camera cuts to a frontal closeup of heman: Heman (S1) says: <d>[English] There's a weird and evil dark energy in this place.</d> at the same time the camera starts to Shake Strongly, and the room starts to crumble. While he talks, Heman looks up, a little worried. Heman (S1) says: <d>[English] I don't like this!</d> 
+
+[Shot 6] At 00:14.958, cut to a closeup of Tilas face, front camera: Tila make a scared face, close her eyes, cover her head with her hands, protecting herself from the debris. 
+The whole room crumbles around her as a big loud dragon roar is heard. Tila (S2) says: <d>[English] What a fuck was that?</d> 
+
+[Shot 7] At 00:17.250, cut to wide low shot behind our heroes: We can see the temple room crumbling around then.
+there's a huge ancient gate in front of him (about 100 feet high) that is crumbling down, and it's really dark passing the gate, with a dark fog hiding anything that is inside there. Another loud dragon roar sound... a moment pass and a huge red dragon head starts to come out of the fog (Tiamat central head), slowly, followed by the other heads, they   break the gate and walls as they come out... 
+The camera zooms out to show Tiamat, all heads drooling in hunger, in all its huge size and glory, showing our tiny heroes at the bottom of the frame. Tiamat red head looks up roars. The other heads starts to move and roar randomly. The red head moves down really close to our heroes, and saliva start to drool as he looks at then... tiamat is hungry and wants to it our heroes. 
+Heman (S1) shout: <d>[English] Fuck this! </d> 
+Heman just sprints away from the dragon, towards the camera slightly to the left, leaving Tila and tiger confused. Tila and tiger look at each other for a moment, and Tila and Tiger start sprint after Heman while Tila (S2) shouts: <d>[English] Wait for us you jack ass!!</d>
+
+
+overall_soundscape: florest sounds
+
+non_diegetic_music: N/A

@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import pathlib
 import sys
 import tempfile
 import unittest
@@ -250,7 +251,7 @@ class TaoMateTest(unittest.TestCase):
             self._run_native_phases(True)
 
     def test_commit_evicts_before_append_and_matches_upstream(self):
-        """Across rollovers, append sees only anchor plus one old recent."""
+        """Across rollovers, append sees the anchor plus the last two recents."""
         contract = module.KVContract(local_heads=1, head_dim=2, dtype=torch.float32, device_type="cpu")
         actual = module.CPUStreamingCache(contract)
         expected = module.CleanAVKVCache(contract)
@@ -261,8 +262,9 @@ class TaoMateTest(unittest.TestCase):
         def inspect_append(cache):
             """Verify eviction happened before upstream builds combined tensors."""
             if cache is actual:
-                self.assertLessEqual(len(cache._commit_token_counts), 2)
-                if cache.committed_blocks >= 2:
+                # Upstream's kv_remember window: the video sink plus two sub-chunks.
+                self.assertLessEqual(len(cache._commit_token_counts), 3)
+                if cache.committed_blocks >= 3:
                     self.assertEqual(set(cache._commit_token_tags[0]), {0})
             original_commit(cache)
 
@@ -275,10 +277,11 @@ class TaoMateTest(unittest.TestCase):
                     cache.stage(name, values, values + 1, tags, torch.ones_like(tags, dtype=torch.bool))
                 with patch.object(module.CleanAVKVCache, "commit", inspect_append):
                     cache.commit()
-                before = cache._history["blocks.0.attn"]
+                # Applying upstream's post-commit trim on top of the plugin's pre-append
+                # trim always rebuilds the sink once more, because the append just added a
+                # block the plugin has not seen yet. The bytes compared below are what
+                # proves the retained contract, so no identity check is claimed here.
                 cache.retain_sink_and_recent_commits()
-                if cache is actual:
-                    self.assertIs(before, cache._history["blocks.0.attn"])
             self.assertEqual(actual._commit_token_tags, expected._commit_token_tags)
             for name in module.MAIN_LAYER_NAMES:
                 self.assertTrue(torch.equal(actual._history[name].key, expected._history[name].key))
@@ -949,7 +952,7 @@ class TaoMateTest(unittest.TestCase):
     def test_gpu_lossy_kv_codecs_restore_h3_shapes(self):
         """INT8 and TurboQuant keep compact CPU rows and reconstruct finite H3 KV."""
         pair = module.AVKV(torch.randn(11, 2, 128, device="cuda", dtype=torch.bfloat16), torch.randn(11, 2, 128, device="cuda", dtype=torch.bfloat16))
-        for mode in ("int8", "turboquant"):
+        for mode in ("int8", "turboquant4", "turboquant3", "turboquant2"):
             compressed = module.QuantizedKV(pair, mode)
             self.assertLess(compressed.stored_bytes, compressed.raw_bytes)
             restored_key = compressed.tensor(0, "cuda")
@@ -959,9 +962,84 @@ class TaoMateTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(restored_key).all())
             self.assertTrue(torch.isfinite(restored_value).all())
             similarity = torch.nn.functional.cosine_similarity(restored_key.float().reshape(-1, 128), pair.key.float().reshape(-1, 128), dim=-1).mean()
-            self.assertGreater(similarity, 0.95)
+            self.assertGreater(similarity, 0.9 if mode == "turboquant2" else 0.95)
             self.assertEqual(module.QuantizedKV.concat(compressed, compressed).shape[0], 22)
             self.assertEqual(compressed.select(torch.tensor([1, 7])).shape[0], 2)
+
+
+    def test_a_silent_subchunk_swaps_in_its_own_conditioning(self):
+        """A sub-chunk without speech gets its own text, and the next one gets the chunk's."""
+        state = module.TaoMateStreaming()
+        request = state.request_plan(72, 405)[0]
+        self.assertGreaterEqual(len(request["phases"]), 3)
+        chunk_conds = {"positive": [{"cross_attn": "chunk dialogue"}]}
+        silent_conds = {"positive": [{"cross_attn": "no dialogue"}]}
+        guider = SimpleNamespace(original_conds=chunk_conds)
+        seen = []
+
+        def sample(noise, current_guider, sampler, sigmas, target):
+            """Record which text each sub-chunk was sampled with."""
+            seen.append(current_guider.original_conds["positive"][0]["cross_attn"])
+            return target, target
+
+        vt, at = request["context_video_t"], request["context_audio_t"]
+        video = torch.zeros(1, 24, vt + request["video_end"] - request["video_start"], 2, 2)
+        audio = torch.zeros(1, 32, 2, at + request["audio_end"] - request["audio_start"])
+        latent = {"samples": module.comfy.nested_tensor.NestedTensor((video, audio))}
+        state.execute_chunk(sample, lambda seed, value: value, 1, latent["samples"], guider, None, latent, request, phase_conditionings={2: silent_conds})
+
+        expected = ["chunk dialogue"] * len(request["phases"])
+        expected[1] = "no dialogue"
+        self.assertEqual(seen, expected)
+        self.assertIs(guider.original_conds, chunk_conds)
+
+
+    def test_kv_remember_default_restores_the_upstream_retention(self):
+        """The widget's default must reproduce upstream: sink plus the last two blocks."""
+        parse, select = module.parse_kv_remember, module.kv_remember_selection
+        self.assertEqual(parse("1,-2,-1"), (1, -2, -1))
+        for block_count in range(3, 9):
+            upstream = [(0, True)] + [(index, False) for index in range(block_count - 2, block_count)]
+            self.assertEqual(select(parse("1,-2,-1"), block_count), upstream, "block count %d" % block_count)
+        # Upstream leaves the first two sub-chunks unaged, so their selection is all of them.
+        self.assertEqual(select(parse("1,-2,-1"), 2), [(0, True), (1, False)])
+        # The shipped policy the widget replaces, and the two windows it makes possible.
+        self.assertEqual(select(parse("1,-1"), 4), [(0, True), (3, False)])
+        self.assertEqual(select(parse("-2,-1"), 4), [(2, False), (3, False)])
+        self.assertEqual(select(parse("-3,-2,-1"), 5), [(2, False), (3, False), (4, False)])
+        # A block the render has not reached yet is skipped, and 1 first is de-duplicated.
+        self.assertEqual(select(parse("1,-1,-2"), 2), [(0, True), (1, False)])
+        self.assertEqual(select(parse("1,2"), 4), [(0, True), (1, False)])
+
+    def test_kv_remember_rejects_a_typo_instead_of_narrowing_the_window(self):
+        """A malformed spec stops the render: a silent fallback would look like drift."""
+        for spec in ("1,0", "one", "", "1,,x"):
+            with self.assertRaises(ValueError):
+                module.parse_kv_remember(spec)
+
+    def test_video_subchunk_cache_ages_blocks_by_kv_remember(self):
+        """Every commit trims the retained blocks down to the ones kv_remember names."""
+        cache = module.VideoSubchunkKVCache(object(), "none", module.parse_kv_remember("1,-2,-1"))
+        cache._commit_token_counts = [4, 4, 4, 4, 4]
+        with patch.object(module.TaoMateKVCache, "_retain_commit_rows") as retained:
+            cache.prepare_commit()
+        retained.assert_called_once_with([(0, True), (3, False), (4, False)])
+        # While the spec still covers every block there is nothing to evict.
+        cache._commit_token_counts = [4, 4]
+        with patch.object(module.TaoMateKVCache, "_retain_commit_rows") as retained:
+            cache.prepare_commit()
+        retained.assert_not_called()
+
+    def test_the_node_exposes_kv_remember_above_the_compression_menu(self):
+        """The new widget sits above kv_cache_compression and turboquant4 is default."""
+        source = pathlib.Path(ROOT, "nodes.py").read_text(encoding="utf-8")
+        remember = source.index('io.String.Input("kv_remember"')
+        compression = source.index('io.Combo.Input("kv_cache_compression"')
+        self.assertLess(remember, compression)
+        self.assertIn('io.String.Input("kv_remember", default="1,-2,-1"', source)
+        self.assertIn('default="turboquant4"', source)
+        self.assertIn('kv_remember="1,-2,-1"', source)
+        self.assertIn("TaoMateStreaming(kv_cache_compression=kv_cache_compression, kv_remember=kv_remember)", source)
 
 
 if __name__ == "__main__":

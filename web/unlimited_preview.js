@@ -2,11 +2,144 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 
-function chunkPromptDescription(chunk) {
+function createControlsAutohide(elements, { delayMs = 3000, isFullscreen, isPlaying, doc = document } = {}) {
+    // Fullscreen playback hides the chrome the way a video player does: after the pointer
+    // has been quiet for the delay the transport bar, the status line and the viewport
+    // buttons fade away, and any movement brings them back at once. A paused player keeps
+    // them, because there is no picture to watch behind them.
+    let timer = null;
+
+    function setVisible(visible) {
+        for (const element of elements) {
+            element.style.opacity = visible ? "1" : "0";
+            // A faded control must not answer a click either.
+            element.style.pointerEvents = visible ? "" : "none";
+        }
+    }
+
+    function shouldHide() {
+        return Boolean(isFullscreen() && isPlaying());
+    }
+
+    function arm() {
+        if (timer != null) clearTimeout(timer);
+        timer = null;
+        setVisible(true);
+        if (!shouldHide()) return;
+        timer = setTimeout(() => {
+            timer = null;
+            if (shouldHide()) setVisible(false);
+        }, delayMs);
+    }
+
+    const onMove = () => arm();
+    const onFullscreen = () => arm();
+    doc.addEventListener("mousemove", onMove);
+    doc.addEventListener("fullscreenchange", onFullscreen);
+    for (const element of elements) element.style.transition = "opacity .3s ease";
+
+    return {
+        arm,
+        isVisible: () => elements.every(element => element.style.opacity !== "0"),
+        stop() {
+            if (timer != null) clearTimeout(timer);
+            timer = null;
+            doc.removeEventListener("mousemove", onMove);
+            doc.removeEventListener("fullscreenchange", onFullscreen);
+            setVisible(true);
+        },
+    };
+}
+
+
+function chunkPromptDescription(chunk, fallback=true) {
     // The actual H3 prompt is authoritative, including runs without a director.
     const prompt = String(chunk.h3_prompt || "");
     const field = prompt.match(/(?:^|\n)[ \t]*(?:detailed_description|integrated_multimodal_description)[ \t]*:[ \t]*([\s\S]*?)(?=\n[ \t]*(?:overall_soundscape|non_diegetic_music|retention_analysis|summary)[ \t]*:|$)/i);
-    return field ? field[1].trim() : String(chunk.gemma_detailed_description || "").trim();
+    if (field) return field[1].trim();
+    // The teacher-audio attempt view asks for that section alone, so it never
+    // falls back to Gemma's description: two attempts would read identically.
+    return fallback ? String(chunk.gemma_detailed_description || "").trim() : "";
+}
+
+
+function audioTeacherAttemptTranscripts(range) {
+    // What each take heard, in the order the takes were sampled, so entry N belongs to the
+    // attempt the prompt list names at N. Empty slots are kept: a take is identified by its
+    // position, and the take a later attempt follows is the one that caused that retry.
+    const listed = Array.isArray(range.audio_teacher_attempt_transcripts) ? range.audio_teacher_attempt_transcripts : [];
+    return listed.map(text => String(text || "").trim());
+}
+
+
+function subchunkAt(range, fraction) {
+    // Which sub-chunk of a chunk a position falls in. Every phase owns its own frames, in
+    // order, so the pointer's share of the chunk's frames names it; a chunk without frame
+    // counts per phase is split evenly.
+    const work = Array.isArray(range?.taomate_phase_work) ? range.taomate_phase_work.map(value => Math.max(0, Number(value) || 0)) : [];
+    const counts = work.length ? work : new Array(Math.max(1, Number(range?.taomate_phase_count) || 1)).fill(1);
+    const total = counts.reduce((sum, value) => sum + value, 0);
+    if (!total) return { number: 1, count: 1 };
+    let cursor = Math.max(0, Math.min(0.999999, Number(fraction) || 0)) * total;
+    for (const [index, value] of counts.entries()) {
+        if (cursor < value) return { number: index + 1, count: counts.length };
+        cursor -= value;
+    }
+    return { number: counts.length, count: counts.length };
+}
+
+
+function subchunkPrompt(range, number) {
+    // A sub-chunk whose own audio window holds no speech is prompted without the
+    // dialogue, so H3 is not told to speak where the take was silent. Every other
+    // sub-chunk is prompted with the chunk's own text.
+    const silent = Array.isArray(range?.subchunk_silent_numbers) ? range.subchunk_silent_numbers.map(value => Number(value)) : [];
+    if (silent.includes(Number(number))) {
+        return { prompt: String(range.subchunk_silent_prompt || "").trim(), silent: true };
+    }
+    return { prompt: String(range?.h3_prompt || "").trim(), silent: false };
+}
+
+
+function mergeFrameGroup(oldGroup, frames, durations, numbers) {
+    // A TaoMate sub-chunk reports only its own frames, numbered where they really sit in
+    // the chunk, so they are merged into the chunk's group instead of replacing it: every
+    // sub-chunk that already rendered keeps its own frames and nothing is smeared across
+    // the chunk. A frame a later sub-chunk re-renders (its replacement overlap) takes the
+    // new version, because the incoming entries are written last.
+    const incoming = new Map();
+    for (const [index, frame] of (frames || []).entries()) {
+        const number = Number(numbers?.[index]);
+        if (Number.isFinite(number)) incoming.set(number, { frame, duration: durations?.[index] });
+    }
+    // Without frame numbers there is no position to merge into: the event is the group.
+    if (!incoming.size) return { frames: [...(frames || [])], durations: [...(durations || [])], frameNumbers: [...(numbers || [])] };
+    const merged = new Map();
+    const kept = Array.isArray(oldGroup?.frames) ? oldGroup.frames : [];
+    for (const [index, frame] of kept.entries()) {
+        const number = Number(oldGroup?.frameNumbers?.[index]);
+        if (Number.isFinite(number)) merged.set(number, { frame, duration: oldGroup?.durations?.[index] });
+    }
+    for (const [number, entry] of incoming) merged.set(number, entry);
+    const ordered = [...merged.keys()].sort((left, right) => left - right);
+    return {
+        frames: ordered.map(number => merged.get(number).frame),
+        durations: ordered.map(number => merged.get(number).duration),
+        frameNumbers: ordered,
+    };
+}
+
+
+function audioTeacherAttempts(range) {
+    // Every prompt this chunk's teacher audio was sampled with: the take that was
+    // accepted as it was, or the first take and every retry that rejected one.
+    const listed = Array.isArray(range.audio_teacher_attempts) ? range.audio_teacher_attempts : [];
+    const attempts = listed.map(text => String(text || "").trim()).filter(Boolean);
+    if (!attempts.length) {
+        const single = String(range.audio_teacher_prompt || range.h3_prompt || "").trim();
+        if (single) attempts.push(single);
+    }
+    return attempts;
 }
 
 
@@ -111,16 +244,203 @@ function coloredShotPromptSegments(description, chunk, shotRanges, colors) {
 }
 
 
+// One tint per teacher-audio attempt, cycled: the first take and every retry must
+// stay recognizable at a glance, so one attempt index always means one color.
+const ATTEMPT_TINTS = [
+    { accent: "#45b7d1", background: "rgba(69,183,209,.14)" },
+    { accent: "#f4b942", background: "rgba(244,185,66,.14)" },
+    { accent: "#b27ce8", background: "rgba(178,124,232,.14)" },
+    { accent: "#78d078", background: "rgba(120,208,120,.14)" },
+];
+
+
+function attemptTint(index) {
+    return ATTEMPT_TINTS[index % ATTEMPT_TINTS.length];
+}
+
+
+// One distinct color per prompt section, so a section is recognizable wherever it
+// appears: summary is always the summary color, in every view and every prompt.
+const PROMPT_SECTION_COLORS = {
+    subject_definitions: "#f08a4b",
+    summary: "#f4b942",
+    retention_analysis: "#d6cf57",
+    detailed_description: "#45b7d1",
+    integrated_multimodal_description: "#45b7d1",
+    overall_soundscape: "#72c472",
+    non_diegetic_music: "#a98bea",
+    non_diegetic_audio: "#ef6f91",
+};
+// Prose that precedes the first field label belongs to no section and stays neutral.
+const PROMPT_SECTION_NEUTRAL = "#b8b8d0";
+// The section the plain tooltip shows on its own, framed exactly as the Shift view frames it.
+const PROMPT_DESCRIPTION_FIELDS = ["detailed_description", "integrated_multimodal_description"];
+
+
+// The field a section header names, without its colon: `detailed_description`.
+function promptSectionField(label) {
+    return String(label || "").replace(/\s*:\s*$/, "").toLowerCase();
+}
+
+
+function promptSectionColor(label) {
+    return PROMPT_SECTION_COLORS[promptSectionField(label)] || PROMPT_SECTION_NEUTRAL;
+}
+
+
+function promptSections(text) {
+    // A prompt is the sections its own field labels name. The match is anchored on a
+    // line start and every section keeps its header verbatim, so the text is only
+    // grouped, never rewritten on its way to the tooltip.
+    const source = String(text || "");
+    const headers = [...source.matchAll(/^[ \t]*(?:subject_definitions|summary|retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music|non_diegetic_audio)[ \t]*:/gim)];
+    const sections = [];
+    if (!headers.length) {
+        if (source) sections.push({ label: "", start: 0, headerEnd: 0, end: source.length });
+        return sections;
+    }
+    if (headers[0].index > 0) {
+        sections.push({ label: "", start: 0, headerEnd: 0, end: headers[0].index });
+    }
+    for (const [index, header] of headers.entries()) {
+        sections.push({
+            label: header[0].trim(),
+            start: header.index,
+            headerEnd: header.index + header[0].length,
+            end: index + 1 < headers.length ? headers[index + 1].index : source.length,
+        });
+    }
+    return sections;
+}
+
+
+function appendColoredRange(parent, segments, offsets, start, end) {
+    // Render one character range of an already color-mapped prompt, so a section can be
+    // framed without deciding again which shot owns which marker.
+    for (const [index, segment] of segments.entries()) {
+        const from = Math.max(start, offsets[index]);
+        const to = Math.min(end, offsets[index] + segment.text.length);
+        if (to <= from) continue;
+        const piece = segment.text.slice(from - offsets[index], to - offsets[index]);
+        // H3 dialogue tags remain literal text; only their presentation changes.
+        for (const [part, text] of piece.split(/(<d>[\s\S]*?<\/d>)/gi).entries()) {
+            const span = document.createElement("span");
+            span.textContent = text;
+            span.style.color = segment.color;
+            if (part % 2) {
+                span.style.color = `color-mix(in srgb, ${segment.color} 65%, white)`;
+                span.style.fontWeight = "700";
+            }
+            parent.appendChild(span);
+        }
+    }
+    return parent;
+}
+
+
+function promptSectionBlocks(text, chunk, shotRanges, colors, fields=null) {
+    // One block per prompt section, each on a darker shade of that section's own color.
+    // The chunk card holds the prompt, and its sections are the parts of it.
+    const segments = coloredShotPromptSegments(text, chunk, shotRanges, colors);
+    const offsets = [];
+    let cursor = 0;
+    for (const segment of segments) {
+        offsets.push(cursor);
+        cursor += segment.text.length;
+    }
+    const blocks = [];
+    for (const section of promptSections(text)) {
+        // A caller that wants one section of a prompt asks for it by field name.
+        if (fields && !fields.includes(promptSectionField(section.label))) continue;
+        const color = promptSectionColor(section.label);
+        const accent = `color-mix(in srgb, ${color} 55%, white)`;
+        const body = document.createElement("div");
+        body.style.cssText = `margin-top:4px;padding:4px 6px;border-left:2px solid ${color};border-radius:3px;background:color-mix(in srgb, ${color} 14%, black);`;
+        if (section.headerEnd > section.start) {
+            // The section's own header, emphasised in place instead of repeated.
+            const header = document.createElement("span");
+            header.textContent = text.slice(section.start, section.headerEnd);
+            header.style.cssText = `color:${accent};font-weight:700;`;
+            body.appendChild(header);
+        }
+        appendColoredRange(body, segments, offsets, Math.max(section.start, section.headerEnd), section.end);
+        blocks.push(body);
+    }
+    return blocks;
+}
+
+
+function coloredPromptBody(text, chunk, shotRanges, colors) {
+    const body = document.createElement("div");
+    for (const segment of coloredShotPromptSegments(text, chunk, shotRanges, colors)) {
+        // H3 dialogue tags remain literal text; only their presentation changes.
+        for (const [index, part] of segment.text.split(/(<d>[\s\S]*?<\/d>)/gi).entries()) {
+            const span = document.createElement("span");
+            span.textContent = part;
+            span.style.color = segment.color;
+            if (index % 2) {
+                span.style.color = `color-mix(in srgb, ${segment.color} 65%, white)`;
+                span.style.fontWeight = "700";
+            }
+            body.appendChild(span);
+        }
+    }
+    return body;
+}
+
+
 function createColoredChunkTooltip() {
     const tooltip = document.createElement("div");
-    tooltip.style.cssText = "position:fixed;z-index:100001;display:none;box-sizing:border-box;max-width:min(760px,calc(100vw - 24px));max-height:min(70vh,640px);overflow:hidden;padding:9px 11px;border:1px solid #555;border-radius:5px;background:rgba(18,18,18,.97);color:#ddd;box-shadow:0 7px 24px rgba(0,0,0,.75);font:11px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;pointer-events:none;user-select:none;";
+    // The tooltip takes the mouse so a prompt taller than the panel can be scrolled with
+    // the wheel or its scrollbar, and so its text can be selected.
+    tooltip.style.cssText = "position:fixed;z-index:100001;display:none;box-sizing:border-box;max-width:min(760px,calc(100vw - 24px));max-height:min(70vh,640px);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:#6a6a6a transparent;padding:9px 11px;border:1px solid #555;border-radius:5px;background:rgba(18,18,18,.97);color:#ddd;box-shadow:0 7px 24px rgba(0,0,0,.75);font:11px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;pointer-events:auto;user-select:text;";
     document.body.appendChild(tooltip);
+    // True while the pointer is on the tooltip: it is showing its own content, so the
+    // timeline must not take it away before the pointer is back on the timeline.
+    let hovered = false;
+    let leaveGuard = null;
 
-    function line(text, style="") {
+    // The panel and the canvas react to presses, and scrolling a prompt must not start a
+    // node drag or a pan behind the tooltip.
+    tooltip.addEventListener("pointerdown", event => event.stopPropagation());
+    tooltip.addEventListener("mouseenter", () => { hovered = true; });
+    tooltip.addEventListener("mouseleave", event => {
+        hovered = false;
+        if (leaveGuard && leaveGuard(event)) return;
+        hide();
+    });
+
+    // The frontend claims Ctrl+wheel on document.body in the capture phase to switch tabs
+    // and zoom, which cancels the tooltip's own scrolling and hands the rest to the
+    // browser's page zoom. The tooltip therefore takes the wheel first, from the window's
+    // capture phase, and scrolls itself.
+    function onWheel(event) {
+        // The pointer stays on the timeline, which is what keeps the tooltip on screen, so
+        // what decides is that a tooltip is showing a prompt taller than itself.
+        if (tooltip.style.display === "none") return;
+        const limit = tooltip.scrollHeight - tooltip.clientHeight;
+        if (limit <= 0) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        // A wheel can report lines rather than pixels.
+        const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+        tooltip.scrollTop = Math.max(0, Math.min(limit, tooltip.scrollTop + delta));
+    }
+    window.addEventListener("wheel", onWheel, { capture: true, passive: false });
+
+    function hide() {
+        hovered = false;
+        tooltip.style.display = "none";
+        // A tooltip that opens again starts at its own top, while a rebuild of the content
+        // it is already showing keeps the reader where they scrolled to.
+        tooltip.scrollTop = 0;
+    }
+
+    function line(text, style="", container=tooltip) {
         const element = document.createElement("div");
         element.textContent = text;
         if (style) element.style.cssText = style;
-        tooltip.appendChild(element);
+        container.appendChild(element);
         return element;
     }
 
@@ -137,59 +457,188 @@ function createColoredChunkTooltip() {
     }
 
     return {
-        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, teacherAudioPrompt, showFullPrompt, shotRanges, colors, waitingText }) {
+        element: tooltip,
+        isHovered: () => hovered,
+        setLeaveGuard(guard) {
+            leaveGuard = guard;
+        },
+        show(event, { help, chunk, timing, description, retentionAnalysis, fullPrompt, teacherAudioPrompt, showFullPrompt, attempts, attemptTranscripts, showAttempts, showNothing, subchunk, subchunkBody, subchunkHeard, shotRanges, colors, waitingText }) {
             tooltip.replaceChildren();
             line(help, "color:#999;margin-bottom:6px;");
             const chunkNumber = Number(chunk.chunk) || 1;
             const chunkColor = colors[(Math.max(1, chunkNumber) - 1) % colors.length] || "#fff";
-            line(`Chunk ${chunkNumber}`, `color:${chunkColor};font-weight:700;`);
+            // The chunk's own card starts at its number and holds everything the chunk
+            // owns, on a very dark shade of the chunk color, so the prompt sections and
+            // their own colors are what stands out.
+            const card = document.createElement("div");
+            card.style.cssText = `padding:6px 8px;border-left:3px solid ${chunkColor};border-radius:3px;background:color-mix(in srgb, ${chunkColor} 7%, black);`;
+            tooltip.appendChild(card);
+            const entry = (text, style="") => line(text, style, card);
+            // A chunk with sub-chunks names the one under the pointer on its own title, so the
+            // prompt below is never mistaken for the whole chunk's.
+            const pointed = subchunk && subchunk.count > 1 ? subchunk : null;
+            entry(pointed ? `Chunk ${chunkNumber}.${pointed.number} / ${pointed.count}` : `Chunk ${chunkNumber}`, `color:${chunkColor};font-weight:700;`);
             if (timing.length) {
-                for (const item of timing) line(item, "color:#bbb;");
+                for (const item of timing) entry(item, "color:#bbb;");
             } else {
-                line("Timing: waiting for this chunk to finish.", "color:#888;");
+                entry("Timing: waiting for this chunk to finish.", "color:#888;");
             }
-            if (!showFullPrompt && retentionAnalysis) {
-                line("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
-                line(retentionAnalysis, "color:#d8c7a0;");
+            // The chunk's own reasoning belongs to the views that show more than the plain one:
+            // Shift shows everything, Ctrl shows the teacher takes, and the plain view keeps to
+            // the prompt itself.
+            if ((showFullPrompt || showAttempts) && retentionAnalysis) {
+                entry("Per-chunk retention_analysis:", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+                entry(retentionAnalysis, "color:#d8c7a0;");
             }
-            const prompts = showFullPrompt
-                ? teacherAudioPrompt && teacherAudioPrompt !== fullPrompt
-                    ? [["Audio prompt:", teacherAudioPrompt], ["Video prompt:", fullPrompt]]
-                    : [[teacherAudioPrompt ? "Chunk prompt (audio and video):" : "Chunk prompt:", fullPrompt || teacherAudioPrompt]]
-                : [["chunk detailed_description:", description]];
-            for (const [label, text] of prompts) {
-                line(label, "color:#bbb;margin-top:7px;margin-bottom:2px;");
-                if (!text) {
-                    line(waitingText, "color:#888;");
-                    continue;
-                }
-                const prompt = document.createElement("div");
-                for (const segment of coloredShotPromptSegments(text, chunk, shotRanges, colors)) {
-                    // H3 dialogue tags remain literal text; only their presentation changes.
-                    for (const [index, part] of segment.text.split(/(<d>[\s\S]*?<\/d>)/gi).entries()) {
-                        const span = document.createElement("span");
-                        span.textContent = part;
-                        span.style.color = segment.color;
-                        if (index % 2) {
-                            span.style.color = `color-mix(in srgb, ${segment.color} 65%, white)`;
-                            span.style.fontWeight = "700";
-                        }
-                        prompt.appendChild(span);
+            if (showNothing) {
+                // Ctrl+Shift clears the prompt text, leaving the card's own numbers.
+                entry("Prompt text hidden.", "color:#888;margin-top:7px;");
+            } else if (showAttempts) {
+                // Ctrl: one tinted block per prompt the teacher audio was sampled
+                // with, each cut down to its detailed_description section.
+                const listed = attempts || [];
+                entry(
+                    listed.length > 1 ? `Teacher-audio prompts: ${listed.length} attempts` : "Teacher-audio prompt:",
+                    "color:#bbb;margin-top:7px;margin-bottom:2px;"
+                );
+                if (!listed.length) entry(waitingText, "color:#888;");
+                for (const [index, attempt] of listed.entries()) {
+                    const tint = attemptTint(index);
+                    entry(
+                        index === 0 ? "Teacher audio prompt:" : `Retry ${index}:`,
+                        `color:${tint.accent};font-weight:700;margin-top:7px;margin-bottom:2px;`
+                    );
+                    // A prompt without that section still shows its real text
+                    // rather than an empty block.
+                    const text = chunkPromptDescription({ h3_prompt: attempt }, false) || String(attempt);
+                    const body = coloredPromptBody(text, chunk, shotRanges, colors);
+                    body.style.cssText = `padding:5px 7px;border-left:3px solid ${tint.accent};border-radius:3px;background:${tint.background};`;
+                    card.appendChild(body);
+                    // What this take heard, below its own prompt. The take a later attempt
+                    // follows is the one that caused that retry, so its hearing is red: that is
+                    // the text the retry answered.
+                    const heard = String((attemptTranscripts || [])[index] || "").trim();
+                    entry("Teacher audio heard:", `color:${tint.accent};margin-top:5px;margin-bottom:2px;font-weight:700;`);
+                    if (!heard) {
+                        entry("nothing heard in this window", "color:#888;");
+                        continue;
                     }
+                    const causedRetry = index + 1 < listed.length;
+                    const block = document.createElement("div");
+                    block.textContent = heard;
+                    block.style.cssText = causedRetry
+                        ? "padding:5px 7px;border-left:3px solid #e05252;border-radius:3px;color:#ffe3e3;background:color-mix(in srgb, #e05252 26%, black);"
+                        : `padding:5px 7px;border-left:3px solid ${tint.accent};border-radius:3px;color:#cfcfcf;background:color-mix(in srgb, ${tint.accent} 32%, black);`;
+                    card.appendChild(block);
                 }
-                tooltip.appendChild(prompt);
+            } else if (showFullPrompt) {
+                // Shift shows everything: both prompts when they differ, every section of each.
+                // Two prompts need their names to be told apart; one carries its own headers.
+                const prompts = teacherAudioPrompt && teacherAudioPrompt !== fullPrompt
+                    ? [["Audio prompt:", teacherAudioPrompt], ["Video prompt:", fullPrompt]]
+                    : [["", fullPrompt || teacherAudioPrompt]];
+                for (const [label, text] of prompts) {
+                    if (label) entry(label, "color:#bbb;margin-top:7px;margin-bottom:2px;");
+                    if (!text) {
+                        entry(waitingText, "color:#888;");
+                        continue;
+                    }
+                    for (const section of promptSectionBlocks(text, chunk, shotRanges, colors)) card.appendChild(section);
+                }
+            } else {
+                // The plain view is the Shift view's detailed_description section alone, framed
+                // the same way: its own color, its bold header and its own background.
+                const framed = fullPrompt ? promptSectionBlocks(fullPrompt, chunk, shotRanges, colors, PROMPT_DESCRIPTION_FIELDS) : [];
+                // A description that carries no such field (a legacy chunk, or Gemma's own text)
+                // still shows its body, unframed.
+                const blocks = framed.length ? framed : promptSectionBlocks(description, chunk, shotRanges, colors);
+                if (!blocks.length) entry(waitingText, "color:#888;margin-top:7px;");
+                for (const section of blocks) card.appendChild(section);
+            }
+            // What the pointed sub-chunk's own slice of the take heard, under whichever prompt
+            // this view showed. It is speech rather than prompt text, so it carries no shot
+            // colors of its own, and a window the take said nothing in says so.
+            if (pointed && subchunkHeard !== null) {
+                entry("Teacher audio transcript (this sub-chunk's window):", "color:#bbb;margin-top:7px;margin-bottom:2px;");
+                if (subchunkHeard) {
+                    const heard = document.createElement("div");
+                    heard.textContent = subchunkHeard;
+                    heard.style.cssText = "padding:5px 7px;border-left:3px solid #8d8d8d;border-radius:3px;color:#eee;background:rgba(255,255,255,.07);";
+                    card.appendChild(heard);
+                } else {
+                    entry("nothing heard in this window", "color:#888;");
+                }
             }
             tooltip.style.display = "block";
             position(event);
         },
         move: position,
-        hide() {
-            tooltip.style.display = "none";
-        },
+        hide,
         remove() {
+            window.removeEventListener("wheel", onWheel, { capture: true });
             tooltip.remove();
         },
     };
+}
+
+
+function mixHex(from, to, amount) {
+    // Mix two six digit colors, so a chunk can carry its sub-chunks in luminance alone.
+    const parse = value => [1, 3, 5].map(at => parseInt(String(value).slice(at, at + 2), 16));
+    const left = parse(from);
+    const right = parse(to);
+    return `#${left.map((value, index) => Math.round(value + (right[index] - value) * amount).toString(16).padStart(2, "0")).join("")}`;
+}
+
+
+function subchunkEdges(work) {
+    // Where each sub-chunk of a chunk ends, as a fraction of the chunk. A chunk whose
+    // sub-chunk frames are unknown has no edges, and keeps the flat bar it always had.
+    const counts = Array.isArray(work) ? work.map(value => Math.max(0, Number(value) || 0)) : [];
+    const total = counts.reduce((sum, value) => sum + value, 0);
+    if (counts.length < 2 || total <= 0) return null;
+    const edges = [0];
+    let done = 0;
+    for (const value of counts) {
+        done += value;
+        edges.push(done / total);
+    }
+    return edges;
+}
+
+
+function subchunkTimelineStops(stops, { color, start, end, work, alpha = "e8", renderedFraction = null }) {
+    // One chunk's timeline span alternates sub-chunk by sub-chunk between the chunk's own
+    // color and a step brighter one — the odd sub-chunks keep the color, the even ones are
+    // brighter — so where the sub-chunks are reads at a glance, each band staying flat. The
+    // part of a filling chunk that is still pending keeps the dimmed recipe it always had,
+    // in the same bands, and the step at the render boundary stays a step.
+    const edges = subchunkEdges(work);
+    const span = end - start;
+    const bands = edges || [0, 1];
+    const shadeOf = band => edges && (band + 1) % 2 === 0 ? mixHex(color, "#ffffff", 0.3) : color;
+    const painted = (fraction, band) => {
+        const shade = shadeOf(band);
+        if (renderedFraction === null || fraction < renderedFraction - 1e-9) return `${shade}${alpha}`;
+        return `color-mix(in srgb, ${shade} 50%, black)`;
+    };
+    const cutAt = fraction => Math.round((start + span * Math.max(0, Math.min(1, fraction))) * 1000) / 1000;
+    for (let band = 0; band < bands.length - 1; band++) {
+        const from = bands[band];
+        const to = bands[band + 1];
+        if (to <= from) continue;
+        if (renderedFraction !== null && renderedFraction > from && renderedFraction <= to) {
+            // The band holds the frames the render has reached, which usually ends exactly on a
+            // sub-chunk edge: it keeps the rendered color right up to that step and the pending
+            // color starts there, so the band stays flat instead of ramping across itself.
+            const edge = Math.max(from, renderedFraction - 1e-4);
+            stops.push(`${painted(from, band)} ${cutAt(from)}%`, `${painted(edge, band)} ${cutAt(edge)}%`);
+            stops.push(`${painted(renderedFraction, band)} ${cutAt(renderedFraction)}%`);
+            if (renderedFraction < to) stops.push(`${painted(to, band)} ${cutAt(to)}%`);
+            continue;
+        }
+        stops.push(`${painted(from, band)} ${cutAt(from)}%`, `${painted(to, band)} ${cutAt(to)}%`);
+    }
 }
 
 
@@ -318,6 +767,32 @@ function projectedRenderTiming(elapsedSeconds, workDone, workTotal, fallbackEtaS
 }
 
 
+const PLAYER_STATE_STORAGE_KEY = "hr_endless_sampler_preview_player";
+
+
+function readStoredPlayerState() {
+    // The player buttons must survive a browser refresh and a ComfyUI restart, and
+    // the workflow's node properties only survive a workflow *save*, so the same
+    // state is mirrored into browser storage as well.
+    try {
+        const stored = JSON.parse(window.localStorage.getItem(PLAYER_STATE_STORAGE_KEY) || "null");
+        return stored && typeof stored === "object" ? stored : {};
+    } catch (error) {
+        console.warn("HR Endless Sampler could not read the stored player state", error);
+        return {};
+    }
+}
+
+
+function writeStoredPlayerState(state) {
+    try {
+        window.localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(state));
+    } catch (error) {
+        console.warn("HR Endless Sampler could not store the player state", error);
+    }
+}
+
+
 api.addEventListener("hr_endless_sampler_preview", event => {
     const data = event.detail;
     const node = data?.node_id == null ? null : findNode(app.graph, data.node_id);
@@ -342,10 +817,15 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             previousCreated?.apply(this, arguments);
             const node = this;
-            // LiteGraph serializes node properties with the workflow, including this local player state.
-            const savedPlayerState = node.properties?.hr_endless_sampler_preview_player || {};
+            // LiteGraph serializes node properties with the workflow, but only when
+            // that workflow is saved. The stored state is newer in every other case,
+            // because each button press writes it, so it wins the merge.
+            const savedPlayerState = {
+                ...(node.properties?.hr_endless_sampler_preview_player || {}),
+                ...readStoredPlayerState(),
+            };
             const root = document.createElement("div");
-            root.style.cssText = "display:flex;flex-direction:column;width:100%;height:100%;min-height:410px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
+            root.style.cssText = "position:relative;display:flex;flex-direction:column;width:100%;height:100%;min-height:410px;background:#111;border-radius:6px;overflow:hidden;color:#ddd;font:12px sans-serif;outline:none;";
             root.tabIndex = 0;
 
             const viewport = document.createElement("div");
@@ -515,7 +995,11 @@ app.registerExtension({
                 fullscreenButton.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
             }
 
-            const fullscreenChanged = () => updateFullscreenButton();
+            const fullscreenChanged = () => {
+                updateFullscreenButton();
+                applyFullscreenLayout();
+                controlsAutohide.arm();
+            };
             document.addEventListener("fullscreenchange", fullscreenChanged);
             fullscreenButton.addEventListener("click", event => {
                 event.preventDefault();
@@ -525,9 +1009,15 @@ app.registerExtension({
                 root.focus({ preventScroll: true });
             });
 
+            // The transport bar and the status line share one block, so fullscreen can float
+            // them over the whole picture as a single panel.
+            const controls = document.createElement("div");
+            controls.style.cssText = "display:flex;flex-direction:column;flex:0 0 auto;";
+            root.appendChild(controls);
+
             const transport = document.createElement("div");
             transport.style.cssText = "display:flex;align-items:center;gap:7px;box-sizing:border-box;height:43px;padding:4px 8px;background:#181818;border-top:1px solid #242424;";
-            root.appendChild(transport);
+            controls.appendChild(transport);
 
             const playButton = document.createElement("button");
             playButton.type = "button";
@@ -542,7 +1032,7 @@ app.registerExtension({
             muteButton.title = "Mute/unmute finalized preview audio (M)";
             transport.appendChild(muteButton);
 
-            const timelineHelp = "Click or drag to seek; colors identify chunks. Hold Shift to show the full prompt sent to H3.";
+            const timelineHelp = "Click or drag to seek; colors identify chunks. Hold Shift to show the full prompt sent to H3; hold Ctrl for every teacher-audio attempt, the first take and each retry.";
             const timelineShell = document.createElement("div");
             timelineShell.style.cssText = "position:relative;flex:1;height:33px;cursor:pointer;touch-action:none;";
             transport.appendChild(timelineShell);
@@ -628,13 +1118,30 @@ app.registerExtension({
             // restored by the current sampler execution.
             let cachedChunkCount = 0;
             let cachedChunkIndices = new Set();
+            // TaoMate chunks that have stored teacher audio on disk; one of them
+            // can be deleted from the timeline menu to force a new take.
+            let audioCacheChunkIndices = new Set();
             function renderCacheReuseLabel() {
                 // TaoMate has no cached video chunks; its only reusable state is
                 // the teacher audio stored by the last audio-first pass.
                 if (taomateMode) {
                     const audio = lastCacheStatus?.audio_cache || null;
-                    const reused = audio?.run_state === "reused" && Number(audio.reused_chunks) > 0;
-                    cacheReuseLabel.textContent = `reusing cached teacher audio (${Number(audio?.reused_chunks) || 0} chunks)`;
+                    if (audio?.run_state === "incompatible") {
+                        // The cache cannot be used for this render, and the run replaces
+                        // it, so warn at the top of the UI instead of painting the node.
+                        cacheReuseLabel.style.display = "none";
+                        warnToast("Teacher audio cache is incompatible with this render", audio.run_reason || "");
+                        return;
+                    }
+                    cacheReuseLabel.style.color = "#69b76f";
+                    const settled = audio?.run_state === "reused" || audio?.run_state === "resumed";
+                    const reused = settled && Number(audio.reused_chunks) > 0;
+                    const reusedChunks = Math.max(0, Number(audio?.reused_chunks) || 0);
+                    // The sampler composes this sentence: a resume can keep chunks on
+                    // both sides of the one it generates again, so only it knows which.
+                    cacheReuseLabel.textContent = audio?.run_state === "resumed"
+                        ? String(audio.run_reason || "kept the settled teacher audio and resumed the teacher")
+                        : `reusing cached teacher audio (${reusedChunks} chunks)`;
                     cacheReuseLabel.style.display = reused ? "block" : "none";
                     return;
                 }
@@ -652,7 +1159,11 @@ app.registerExtension({
                 const bytes = Math.max(0, Number(audioStatus?.bytes) || 0);
                 const size = bytes ? ` (${(bytes / 1048576).toFixed(1)} MiB)` : "";
                 if (!chunks) return "No teacher audio is stored yet.";
-                return `${chunks} chunks of teacher audio are stored${size}${audioStatus?.created ? `, recorded ${audioStatus.created}` : ""}.`;
+                const recorded = Math.max(0, Number(audioStatus?.recorded) || 0);
+                // A stopped pass stores fewer chunks than it planned: its prompt is
+                // still the pass a refresh restores and the next render continues.
+                const progress = recorded && recorded < chunks ? `${recorded} of ${chunks} chunks are stored so far (the render was stopped)` : `${chunks} chunks of teacher audio are stored${size}`;
+                return `${progress}${audioStatus?.created ? `, recorded ${audioStatus.created}` : ""}.`;
             }
             function applyReplayCacheStatus(cacheStatus) {
                 lastCacheStatus = cacheStatus;
@@ -674,6 +1185,11 @@ app.registerExtension({
                     cachedChunkCount = 0;
                     cachedChunkIndices.clear();
                 }
+                audioCacheChunkIndices = new Set(
+                    (Array.isArray(cacheStatus?.audio_cache?.kv_chunks) ? cacheStatus.audio_cache.kv_chunks : [])
+                        .map(value => Math.round(Number(value)))
+                        .filter(index => index >= 0 && (!chunkCount || index < chunkCount)),
+                );
                 cacheButton.disabled = Boolean(cacheStatus?.active);
                 cacheButton.style.background = replayCacheEnabled ? "#28662d" : "#202020";
                 cacheButton.style.borderColor = replayCacheEnabled ? "#69b76f" : "#444";
@@ -714,10 +1230,35 @@ app.registerExtension({
                 }
             }
 
+            // ComfyUI's own warning toast, at the top of the UI and dismissed with its X.
+            // The status poll runs every few seconds, so an identical warning is only
+            // raised once until the message changes.
+            let lastWarnToast = "";
+            function warnToast(summary, detail="") {
+                const text = `${summary || ""}\n${detail || ""}`;
+                if (text === lastWarnToast) return true;
+                const toast = app?.extensionManager?.toast;
+                if (!toast || typeof toast.add !== "function") {
+                    // Say so in the console: a missing toast API must not turn a cache
+                    // problem into silence the owner cannot see.
+                    console.warn("HR Endless Sampler has no toast API to show:", summary, detail);
+                    return false;
+                }
+                lastWarnToast = text;
+                toast.add({
+                    severity: "warn",
+                    summary: String(summary || ""),
+                    detail: String(detail || ""),
+                    life: 8000,
+                });
+                return true;
+            }
+
             cacheButton.addEventListener("click", async event => {
                 event.preventDefault();
                 event.stopPropagation();
                 if (cacheButton.disabled) return;
+                let refusal = "";
                 cacheButton.disabled = true;
                 cacheButton.textContent = "…";
                 try {
@@ -730,11 +1271,19 @@ app.registerExtension({
                     if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
                     renderTransport();
                 } catch (error) {
+                    // A refused change used to look like the button flipping back by
+                    // itself. Say why instead: the owner cannot act on a silent revert.
+                    refusal = error instanceof Error ? error.message : String(error);
                     console.warn("HR Endless Sampler could not update its replay cache policy", error);
                     await refreshReplayCacheStatus();
                 } finally {
                     cacheButton.textContent = "cache";
                     renderCacheReuseLabel();
+                    if (refusal) {
+                        // A refused change is a warning, not node decoration: raise it at
+                        // the top of the UI where ComfyUI shows its own warnings.
+                        warnToast("Teacher audio cache policy was not changed", refusal);
+                    }
                 }
             });
 
@@ -778,20 +1327,30 @@ app.registerExtension({
                 menu.appendChild(annotationButton);
                 const canDeleteChunk = replayCacheEnabled && !cacheButton.disabled && Number.isInteger(chunkIndex)
                     && chunkIndex >= 0 && cachedChunkIndices.has(chunkIndex);
-                if (!canDeleteChunk) {
+                // TaoMate stores no video chunks, so the same gesture deletes this
+                // chunk's stored teacher audio instead and the next render rebuilds it.
+                // Offered for every TaoMate chunk while the cache button is on: the
+                // item exists so the owner can see it and knows which chunk still has
+                // stored audio, instead of wondering why the menu is empty.
+                const offersTeacherAudio = replayCacheEnabled && !cacheButton.disabled && taomateMode
+                    && Number.isInteger(chunkIndex) && chunkIndex >= 0;
+                const canDeleteTeacherAudio = offersTeacherAudio && audioCacheChunkIndices.has(chunkIndex);
+                if (!canDeleteChunk && !offersTeacherAudio) {
                     document.body.appendChild(menu);
                     previewContextMenu = menu;
                     return;
                 }
                 const chunkNumber = chunkIndex + 1;
+                const menuItemStyle = "display:block;width:100%;padding:4px 7px;border:0;border-radius:2px;background:transparent;color:#f0f0f0;text-align:left;font:11px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;";
                 const divider = document.createElement("div");
                 divider.style.cssText = "height:1px;margin:3px 2px;background:#505050;";
                 menu.appendChild(divider);
+                if (canDeleteChunk) {
                 const removeButton = document.createElement("button");
                 removeButton.type = "button";
                 removeButton.textContent = "Delete cached chunk";
                 removeButton.title = `Delete cached Chunk ${chunkNumber}. The next sampler run rerenders it and reuses intact later cached chunks.`;
-                removeButton.style.cssText = "display:block;width:100%;padding:4px 7px;border:0;border-radius:2px;background:transparent;color:#f0f0f0;text-align:left;font:11px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;";
+                removeButton.style.cssText = menuItemStyle;
                 removeButton.addEventListener("mouseenter", () => { removeButton.style.background = "#8d302d"; });
                 removeButton.addEventListener("mouseleave", () => { removeButton.style.background = "transparent"; });
                 removeButton.addEventListener("click", async clickEvent => {
@@ -819,6 +1378,51 @@ app.registerExtension({
                     }
                 });
                 menu.appendChild(removeButton);
+                }
+                if (offersTeacherAudio) {
+                    const teacherAudioButton = document.createElement("button");
+                    teacherAudioButton.type = "button";
+                    teacherAudioButton.textContent = "Delete teacher audio cached chunk";
+                    teacherAudioButton.style.cssText = menuItemStyle;
+                    if (!canDeleteTeacherAudio) {
+                        // The audio and its attention rows are cached together, so a
+                        // chunk without rows has no stored audio to drop either.
+                        teacherAudioButton.disabled = true;
+                        teacherAudioButton.style.color = "#777";
+                        teacherAudioButton.style.cursor = "default";
+                        teacherAudioButton.title = `Chunk ${chunkNumber} has no stored teacher audio: the audio and its attention rows are cached together, and this chunk has neither. Chunks that do have a stored pair: ${[...audioCacheChunkIndices].map(index => index + 1).join(", ") || "none"}.`;
+                        menu.appendChild(teacherAudioButton);
+                    } else {
+                    teacherAudioButton.title = `Delete the stored teacher audio for Chunk ${chunkNumber}. The next TaoMate render keeps every other chunk and generates this one again.`;
+                    teacherAudioButton.addEventListener("mouseenter", () => { teacherAudioButton.style.background = "#8d302d"; });
+                    teacherAudioButton.addEventListener("mouseleave", () => { teacherAudioButton.style.background = "transparent"; });
+                    teacherAudioButton.addEventListener("click", async clickEvent => {
+                        clickEvent.preventDefault();
+                        clickEvent.stopPropagation();
+                        chunkTooltip.hide();
+                        tooltipChunkIndex = null;
+                        tooltipSignature = null;
+                        teacherAudioButton.disabled = true;
+                        teacherAudioButton.textContent = "Deleting…";
+                        try {
+                            const response = await api.fetchApi(
+                                `/hr_endless_sampler_preview/teacher_audio_chunk?chunk=${chunkIndex}`,
+                                { method: "POST", cache: "no-store" },
+                            );
+                            const payload = await response.json();
+                            applyReplayCacheStatus(payload);
+                            renderTransport();
+                            if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+                        } catch (error) {
+                            console.warn("HR Endless Sampler could not delete the cached teacher audio", error);
+                            await refreshReplayCacheStatus();
+                        } finally {
+                            closePreviewContextMenu();
+                        }
+                    });
+                    menu.appendChild(teacherAudioButton);
+                    }
+                }
                 document.body.appendChild(menu);
                 previewContextMenu = menu;
             }
@@ -841,11 +1445,47 @@ app.registerExtension({
             statusProgressFill.style.cssText = "position:absolute;left:0;top:0;height:100%;width:0;border-radius:2px;background:#65b9ff;transform:translateX(0);transition:width .15s linear;";
             statusProgress.appendChild(statusProgressFill);
             status.append(statusPhase, statusMetrics, statusProgress);
-            root.appendChild(status);
+            controls.appendChild(status);
 
             const graphs = document.createElement("div");
             graphs.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:6px;background:#151515;";
             root.appendChild(graphs);
+
+            // In fullscreen the picture owns the whole screen and the chrome floats on top of
+            // it, translucent, so the transport, the status line and the graphs never resize
+            // the video. Leaving fullscreen puts every one of them back in the column.
+            function applyFullscreenLayout() {
+                const active = document.fullscreenElement === root;
+                const blur = active ? "blur(3px)" : "";
+                viewport.style.position = active ? "absolute" : "relative";
+                viewport.style.inset = active ? "0" : "";
+                controls.style.position = active ? "absolute" : "";
+                controls.style.left = active ? "0" : "";
+                controls.style.right = active ? "0" : "";
+                controls.style.bottom = active ? "0" : "";
+                controls.style.zIndex = active ? "6" : "";
+                graphs.style.position = active ? "absolute" : "";
+                graphs.style.left = active ? "8px" : "";
+                graphs.style.top = active ? "8px" : "";
+                graphs.style.width = active ? "min(430px,44vw)" : "";
+                graphs.style.zIndex = active ? "6" : "";
+                transport.style.background = active ? "rgba(20,20,20,.72)" : "#181818";
+                transport.style.backdropFilter = blur;
+                status.style.background = active ? "rgba(24,24,24,.72)" : "#1b1b1b";
+                status.style.backdropFilter = blur;
+                graphs.style.background = active ? "rgba(18,18,18,.72)" : "#151515";
+                graphs.style.backdropFilter = blur;
+            }
+
+            // Fullscreen playback hides that chrome once the pointer has been quiet for three
+            // seconds; a paused preview keeps it, and any movement brings it back.
+            const controlsAutohide = createControlsAutohide(
+                [controls, graphs, linearDisplayButton, subtitleButton, fullscreenButton],
+                {
+                    isFullscreen: () => document.fullscreenElement === root,
+                    isPlaying: () => !paused,
+                },
+            );
 
             function graphCell(label) {
                 const cell = document.createElement("div");
@@ -888,6 +1528,10 @@ app.registerExtension({
             let waitingAfterChunk = null;
             let paused = false;
             let timelineDragging = false;
+            // Where a drag put the cursor: a chunk the render has only partly filled
+            // cannot place the cursor, but the pointer can, so this is what the
+            // playhead follows until playback or a step moves the position again.
+            let timelineScrub = null;
             let sigmas = [];
             let deltas = [];
             let stepTimes = [];
@@ -922,6 +1566,7 @@ app.registerExtension({
             let tooltipSignature = null;
             let tooltipPointer = null;
             let shiftPromptVisible = false;
+            let ctrlPromptVisible = false;
             let audioGroup = null;
             let standbyAudioGroup = null;
             let audioMuted = Boolean(savedPlayerState.muted);
@@ -1122,12 +1767,28 @@ app.registerExtension({
                 standbyAudioGroup = group;
             }
 
+            function rememberPlayerState(state) {
+                // Both copies get the same mapping: the workflow keeps the buttons
+                // across a saved reload, browser storage across a plain one.
+                node.properties = node.properties || {};
+                node.properties.hr_endless_sampler_preview_player = state;
+                writeStoredPlayerState(state);
+            }
+
             function persistPlayerState() {
                 const frame = displayedFrameNumber();
-                // Retain a restored target until its chunk arrives from the server.
-                if (Number.isFinite(pendingFrame) && frame !== pendingFrame) return;
-                node.properties = node.properties || {};
-                node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled };
+                // A restored frame may still be on its way, so keep asking for it while
+                // storing everything else: a button press must never be dropped just
+                // because no frame has arrived yet, which is the normal case for a
+                // TaoMate preview that carries audio and no video at all.
+                const frameStillPending = Number.isFinite(pendingFrame) && frame !== pendingFrame;
+                rememberPlayerState({
+                    frame: frameStillPending ? pendingFrame : frame,
+                    muted: audioMuted,
+                    inverseGammaDisplay,
+                    subtitlesEnabled,
+                    paused,
+                });
             }
 
             function restorePersistedFrame() {
@@ -1136,13 +1797,34 @@ app.registerExtension({
                     const group = chunks[chunkIndex];
                     const frameIndex = group?.frameNumbers?.findIndex(value => Number(value) === pendingFrame);
                     if (frameIndex >= 0) {
-                        paused = true;
+                        // Resume the button's state with the frame: an explicit
+                        // "playing" keeps playing, and a state written before the
+                        // play button existed still restores paused, as it did then.
+                        paused = savedPlayerState.paused === undefined ? true : Boolean(savedPlayerState.paused);
                         const frame = pendingFrame;
                         pendingFrame = null;
                         show(chunkIndex, frameIndex);
-                        node.properties.hr_endless_sampler_preview_player = { frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled };
+                        rememberPlayerState({ frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled, paused });
                         return true;
                     }
+                    // A TaoMate preview carries audio and no frames, so there is no frame
+                    // number to match: land on the chunk whose frame range holds the
+                    // stored position, which is what the timeline cursor shows. Only
+                    // frame-less groups take this path, so a later real frame still wins.
+                    if (group?.frameNumbers?.length) continue;
+                    const start = Number(group?.output_start ?? group?.start ?? chunkRanges[chunkIndex]?.start);
+                    const end = Number(group?.output_end ?? group?.end ?? chunkRanges[chunkIndex]?.end);
+                    if (!Number.isFinite(start) || !Number.isFinite(end) || pendingFrame < start || pendingFrame > end) continue;
+                    paused = savedPlayerState.paused === undefined ? true : Boolean(savedPlayerState.paused);
+                    const frame = pendingFrame;
+                    pendingFrame = null;
+                    playing = chunkIndex;
+                    playingFrame = 0;
+                    show(chunkIndex, 0);
+                    renderTransport();
+                    renderStatus();
+                    rememberPlayerState({ frame, muted: audioMuted, inverseGammaDisplay, subtitlesEnabled, paused });
+                    return true;
                 }
                 return false;
             }
@@ -1228,6 +1910,11 @@ app.registerExtension({
                 "#f08a4b", "#55c7b3", "#d6cf57", "#6f9ee8", "#d676d4",
             ];
 
+            // The picture of a position nothing has rendered yet. The teacher-audio
+            // placeholder groups and the scrub use one asset, so an empty timeline
+            // position looks exactly like a chunk whose video has not started.
+            const EMPTY_FRAME_SOURCE = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E";
+
             function chunkSpan(index, estimate=1) {
                 const group = chunks[index];
                 const planned = chunkRanges[index];
@@ -1288,18 +1975,31 @@ app.registerExtension({
                 }
             }
 
-            function chunkIndexAtTimelinePointer(event) {
+            function chunkPointerPosition(event) {
+                // Where on the timeline a pointer sits: the chunk under it and how far
+                // into that chunk it is.
                 const rect = timelineShell.getBoundingClientRect();
-                if (!rect.width) return null;
-                const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                if (!rect.width || chunkCount < 1) return null;
+                const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
                 const { spans, total } = timelineLayout();
+                const cursor = ratio * total;
                 let offset = 0;
                 for (let index = 0; index < spans.length; index++) {
-                    offset += spans[index];
-                    if (fraction * total <= offset || index === spans.length - 1) return index;
+                    const next = offset + spans[index];
+                    if (cursor <= next || index === spans.length - 1) {
+                        return { index, fraction: Math.max(0, Math.min(1, (cursor - offset) / Math.max(1, spans[index]))) };
+                    }
+                    offset = next;
                 }
                 return null;
             }
+
+
+            function chunkIndexAtTimelinePointer(event) {
+                const position = chunkPointerPosition(event);
+                return position === null ? null : position.index;
+            }
+
 
             function setChunkTooltip(index, event) {
                 if (previewContextMenu) {
@@ -1316,13 +2016,27 @@ app.registerExtension({
                 }
                 tooltipPointer = { clientX: event.clientX, clientY: event.clientY };
                 const range = chunkRanges[index];
-                const description = chunkPromptDescription(range);
                 const retentionAnalysis = String(range.gemma_retention_analysis || "").trim();
-                const fullPrompt = String(range.h3_prompt || "").trim();
                 const teacherAudioPrompt = String(range.audio_teacher_prompt || "").trim();
-                const showFullPrompt = Boolean(event.shiftKey || shiftPromptVisible);
+                const attempts = audioTeacherAttempts(range);
+                const attemptTranscripts = audioTeacherAttemptTranscripts(range);
+                // The sub-chunk the pointer sits in owns the prompt the tooltip reads, so a
+                // chunk with sub-chunks reads differently along its own timeline: no key shows
+                // that sub-chunk's detailed_description, Shift its whole prompt. Ctrl alone
+                // keeps the teacher-audio attempts, and Ctrl+Shift clears the prompt text.
+                const pointer = chunkPointerPosition(event);
+                const subchunk = pointer ? subchunkAt(range, pointer.fraction) : null;
+                const subchunkBody = subchunk ? subchunkPrompt(range, subchunk.number) : null;
+                const subchunkHeard = subchunk && Array.isArray(range.subchunk_transcripts)
+                    ? String(range.subchunk_transcripts[subchunk.number - 1] || "").trim()
+                    : null;
+                const fullPrompt = String(subchunkBody?.prompt || range.h3_prompt || "").trim();
+                const description = chunkPromptDescription({ h3_prompt: fullPrompt, gemma_detailed_description: range.gemma_detailed_description });
+                const showAttempts = Boolean(event.ctrlKey || ctrlPromptVisible);
+                const showFullPrompt = Boolean(!showAttempts && (event.shiftKey || shiftPromptVisible));
+                const showNothing = Boolean((event.ctrlKey || ctrlPromptVisible) && (event.shiftKey || shiftPromptVisible));
                 const timing = chunkTimingLines(range);
-                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, teacherAudioPrompt, showFullPrompt, timing, shotRanges]);
+                const signature = JSON.stringify([description, retentionAnalysis, fullPrompt, teacherAudioPrompt, attempts, attemptTranscripts, showAttempts, showFullPrompt, showNothing, subchunk?.number, subchunk?.count, subchunkBody?.prompt, subchunkBody?.silent, subchunkHeard, timing, shotRanges]);
                 if (tooltipChunkIndex === index && tooltipSignature === signature) {
                     chunkTooltip.move(event);
                     return;
@@ -1338,6 +2052,13 @@ app.registerExtension({
                     fullPrompt,
                     teacherAudioPrompt,
                     showFullPrompt,
+                    attempts,
+                    attemptTranscripts,
+                    showAttempts,
+                    showNothing,
+                    subchunk,
+                    subchunkBody,
+                    subchunkHeard,
                     shotRanges,
                     colors: chunkColors,
                     waitingText: "Waiting for this chunk's prompt.",
@@ -1450,6 +2171,9 @@ app.registerExtension({
                     offset += spans[index];
                     const end = offset / total * 100;
                     const color = chunkColors[index % chunkColors.length];
+                    // Each sub-chunk of the chunk is drawn as a brighter step in the same
+                    // color, so the timeline shows where they are inside it.
+                    const work = chunkRanges[index]?.taomate_phase_work;
                     const completedFrames = chunkRanges[index]?.taomate_completed_frames;
                     if (Number.isFinite(completedFrames)) {
                         // A live latent preview makes its current sub-chunk available before completion.
@@ -1457,14 +2181,11 @@ app.registerExtension({
                             ? Math.max(0, (Number(chunks[index].outputEnd) + 1) - Number(chunkRanges[index]?.start)) || 0
                             : 0;
                         const fraction = Math.max(0, Math.min(1, Math.max(completedFrames, previewFrames) / spans[index]));
-                        const boundary = start + (end - start) * fraction;
-                        const pendingColor = `color-mix(in srgb, ${color} 50%, black)`;
-                        if (fraction > 0) stops.push(`${color}e8 ${start}%`, `${color}e8 ${boundary}%`);
-                        if (fraction < 1) stops.push(`${pendingColor} ${boundary}%`, `${pendingColor} ${end}%`);
+                        subchunkTimelineStops(stops, { color, start, end, work, renderedFraction: fraction >= 1 ? null : fraction });
                         continue;
                     }
                     const alpha = available(index) && !chunks[index].audioOnlyPlaceholder ? "e8" : "35";
-                    stops.push(`${color}${alpha} ${start}%`, `${color}${alpha} ${end}%`);
+                    subchunkTimelineStops(stops, { color, start, end, work, alpha });
                 }
                 timelineTrack.style.background = stops.length
                     ? `linear-gradient(to right, ${stops.join(",")})`
@@ -1473,6 +2194,15 @@ app.registerExtension({
                 renderOverlapReplacementLines(spans, total);
                 renderShotBrackets();
 
+                const scrubPosition = scrubPlayheadPosition(spans, total, timelineScrub);
+                if (scrubPosition !== null) {
+                    // A drag owns the cursor: it follows the pointer even where no frame
+                    // exists yet, so it never lags behind the mouse or leaps to the
+                    // nearest rendered chunk.
+                    timelinePlayhead.style.left = `${Math.max(0, Math.min(100, scrubPosition))}%`;
+                    timelinePlayhead.style.display = "block";
+                    return;
+                }
                 if (!available(playing)) {
                     timelinePlayhead.style.display = "none";
                     return;
@@ -1522,6 +2252,8 @@ app.registerExtension({
 
             function playFrameGroup(index, group, frameIndex, serial, seekAudio=false) {
                 if (serial !== playbackSerial || paused || hoverStep != null || !group?.frames?.length) return;
+                // Playback moves the position itself, so a drag's cursor is over.
+                timelineScrub = null;
                 const boundedFrame = Math.max(0, Math.min(frameIndex, group.frames.length - 1));
                 playing = index;
                 playingFrame = boundedFrame;
@@ -1604,6 +2336,9 @@ app.registerExtension({
             function show(index, frameIndex=0) {
                 if (!available(index) || hoverStep != null) return;
                 stop();
+                // Showing a frame is a position of its own: the drag's own cursor is
+                // over, and the playhead follows what is displayed again.
+                timelineScrub = null;
                 playing = index;
                 playingFrame = Math.max(0, Math.min(frameIndex, chunks[index].frames.length - 1));
                 persistPlayerState();
@@ -1623,7 +2358,27 @@ app.registerExtension({
                 }
             }
 
+            function showEmptyPosition(index) {
+                // Nothing has been rendered at this position yet, so the picture is black
+                // and the transport reports no frame: the timeline shows the frames that
+                // exist, never the frames that will exist. The drag's own cursor still
+                // follows the pointer, because renderTransport reads it.
+                stop();
+                playing = index;
+                playingFrame = -1;
+                framePending = false;
+                displaySource(EMPTY_FRAME_SOURCE, () => true, () => {});
+            }
+
             function restorePlayback() {
+                if (playingFrame < 0 && available(playing)) {
+                    // The last position asked for has nothing rendered there yet. It stays
+                    // black, unless playback is asked for: that starts from the chunk
+                    // instead of leaving the picture black for good.
+                    if (paused) showEmptyPosition(playing);
+                    else show(playing, 0);
+                    return;
+                }
                 if (available(playing)) {
                     show(playing, playingFrame);
                     return;
@@ -1640,11 +2395,16 @@ app.registerExtension({
 
             function setPaused(value) {
                 paused = Boolean(value);
+                // A paused player keeps its chrome: there is nothing to watch behind it.
+                controlsAutohide.arm();
                 leaveGraphInspection();
                 stop();
                 renderTransport();
                 restorePlayback();
                 renderStatus();
+                // The play button is a state like the others: store it at once so a
+                // refresh resumes the same way even before a frame is displayed.
+                persistPlayerState();
             }
 
             function stepPreviewFrame(direction) {
@@ -1660,12 +2420,50 @@ app.registerExtension({
                 renderStatus();
             }
 
+            function scrubPlayheadPosition(spans, total, scrub) {
+                // Return the playhead's percentage for a scrub position, or null. The
+                // pointer's own position on the slider is the position: a chunk that is
+                // still being rendered has fewer frames than its span, so placing the
+                // cursor at its newest frame would leave the cursor behind the mouse.
+                if (scrub === null || !spans.length) return null;
+                const chunk = Math.max(0, Math.min(spans.length - 1, Number(scrub.chunk) || 0));
+                const before = spans.slice(0, chunk).reduce((sum, value) => sum + value, 0);
+                const fraction = Math.max(0, Math.min(1, Number(scrub.fraction) || 0));
+                // A span of zero is a chunk with no frames and no known length: its
+                // start is the only position it can offer.
+                return (before + fraction * Math.max(0, spans[chunk])) / Math.max(1, total) * 100;
+            }
+
+            function scrubFrameIndex(chunkIndex, fraction) {
+                // The pointer names a position inside the chunk. One preview image stands
+                // for the whole H3 temporal token it was decoded from, so a position shows
+                // the last image numbered at or before it, and only a position the render
+                // has not reached has nothing to show. A chunk whose later sub-chunks are
+                // still to come is black past its rendered end, never stretched.
+                const group = chunks[chunkIndex];
+                if (!Array.isArray(group?.frames) || !group.frames.length) return -1;
+                const frames = group.frames.length;
+                const span = Math.max(1, chunkSpan(chunkIndex, frames));
+                const local = Math.min(Math.max(0, Math.floor(fraction * span)), span - 1);
+                const numbers = Array.isArray(group.frameNumbers) && group.frameNumbers.length === frames ? group.frameNumbers : null;
+                if (!numbers) return local < frames ? local : -1;
+                const start = Number(chunkRanges[chunkIndex]?.start);
+                const position = Number.isFinite(start) ? start + local : Number(numbers[0]) + local;
+                const renderedEnd = Number(group.outputEnd);
+                if (Number.isFinite(renderedEnd) && position > renderedEnd) return -1;
+                // The numbers are ordered, so the covering image is the last one at or
+                // before the position.
+                let covering = -1;
+                for (let index = 0; index < numbers.length && Number(numbers[index]) <= position; index++) covering = index;
+                return covering;
+            }
+
             function seekTimeline(clientX) {
                 const rect = timelineShell.getBoundingClientRect();
                 if (rect.width <= 0 || chunkCount < 1) return;
                 const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
                 const { spans, total } = timelineLayout();
-                let cursor = ratio * total;
+                const cursor = ratio * total;
                 let targetChunk = spans.length - 1;
                 let chunkStart = 0;
                 for (let index = 0, offset = 0; index < spans.length; index++) {
@@ -1676,23 +2474,19 @@ app.registerExtension({
                     }
                     offset += spans[index];
                 }
-                if (!available(targetChunk)) {
-                    const candidates = chunks
-                        .map((_, index) => available(index) ? index : -1)
-                        .filter(index => index >= 0);
-                    if (!candidates.length) return;
-                    targetChunk = candidates.reduce((best, index) =>
-                        Math.abs(index - targetChunk) < Math.abs(best - targetChunk) ? index : best
-                    );
-                    chunkStart = spans.slice(0, targetChunk).reduce((sum, value) => sum + value, 0);
-                    cursor = chunkStart + (targetChunk < playing ? spans[targetChunk] : 0);
-                }
-                const group = chunks[targetChunk];
                 const fraction = Math.max(0, Math.min(1, (cursor - chunkStart) / Math.max(1, spans[targetChunk])));
-                const targetFrame = Math.round(fraction * Math.max(0, group.frames.length - 1));
                 paused = true;
                 leaveGraphInspection();
-                show(targetChunk, targetFrame);
+                // Show the frame that really lives at the pointed position. A position
+                // inside a chunk whose later sub-chunks are not rendered yet, and a chunk
+                // the pass has not reached at all, both have no frame and stay black.
+                const frame = scrubFrameIndex(targetChunk, fraction);
+                if (frame >= 0) show(targetChunk, frame);
+                else showEmptyPosition(targetChunk);
+                // Set after show(): showing a frame is the position, and this is the
+                // position the pointer asked for, which the cursor keeps.
+                timelineScrub = { chunk: targetChunk, fraction };
+                renderTransport();
                 renderStatus();
             }
 
@@ -1906,8 +2700,11 @@ app.registerExtension({
                 shotBracketKey = null;
                 playing = -1;
                 playingFrame = 0;
-                paused = false;
+                // A restored previous render keeps the play button as it was; a live
+                // reset is a new run and always starts playing.
+                paused = restoringCache && savedPlayerState.paused !== undefined ? Boolean(savedPlayerState.paused) : false;
                 timelineDragging = false;
+                timelineScrub = null;
                 sigmas = Array.isArray(data.sigmas) ? data.sigmas : [];
                 deltas = [];
                 stepTimes = [];
@@ -2003,6 +2800,19 @@ app.registerExtension({
                     if (range && typeof data.audio_teacher_prompt === "string") {
                         range.audio_teacher_prompt = data.audio_teacher_prompt;
                     }
+                    if (range && Array.isArray(data.audio_teacher_attempts)) {
+                        range.audio_teacher_attempts = data.audio_teacher_attempts.map(text => String(text));
+                    }
+                    if (range && Array.isArray(data.audio_teacher_attempt_transcripts)) {
+                        range.audio_teacher_attempt_transcripts = data.audio_teacher_attempt_transcripts.map(text => String(text || ""));
+                    }
+                    if (range && Array.isArray(data.subchunk_silent_numbers)) {
+                        range.subchunk_silent_numbers = data.subchunk_silent_numbers.map(number => Number(number));
+                        range.subchunk_silent_prompt = String(data.subchunk_silent_prompt || "");
+                    }
+                    if (range && Array.isArray(data.subchunk_transcripts)) {
+                        range.subchunk_transcripts = data.subchunk_transcripts.map(text => String(text || ""));
+                    }
                     if (range && typeof data.subtitle === "string") {
                         range.subtitle = data.subtitle;
                     }
@@ -2018,7 +2828,7 @@ app.registerExtension({
                             const value = Number(data[key]);
                             if (Number.isFinite(value) && value >= 0) range[key] = value;
                         }
-                        if (tooltipChunkIndex === index && tooltipPointer) setChunkTooltip(index, { ...tooltipPointer, shiftKey: shiftPromptVisible });
+                        if (tooltipChunkIndex === index && tooltipPointer) setChunkTooltip(index, { ...tooltipPointer, shiftKey: shiftPromptVisible, ctrlKey: ctrlPromptVisible });
                     }
                     return;
                 }
@@ -2047,7 +2857,6 @@ app.registerExtension({
                     audioFirstSeconds = Number.isFinite(data.elapsed_ms) ? data.elapsed_ms / 1000 : (startedAt == null ? 0 : (performance.now() - startedAt) / 1000);
                     const source = `data:${data.audio_mime || "audio/wav"};base64,${data.audio}`;
                     const fps = validFps(data.fps) || currentPlaybackFps();
-                    const black = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E";
                     let firstPlaceholder = -1;
                     for (let index = 0; index < chunkCount; index++) {
                         const range = chunkRanges[index] || {};
@@ -2055,7 +2864,7 @@ app.registerExtension({
                         const end = Math.max(start, Math.round(Number(range.end) || start));
                         const numbers = Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
                         chunks[index] = {
-                            frames: numbers.map(() => black),
+                            frames: numbers.map(() => EMPTY_FRAME_SOURCE),
                             durations: numbers.map(() => 1000 / fps),
                             frameNumbers: numbers,
                             outputStart: start,
@@ -2102,9 +2911,8 @@ app.registerExtension({
                     const start = Math.max(0, Math.round(Number(data.output_start) || 0));
                     const end = Math.max(start, Math.round(Number(data.output_end) || start));
                     const numbers = Array.from({ length: end - start + 1 }, (_, offset) => start + offset);
-                    const black = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2' height='2'%3E%3Crect width='2' height='2' fill='black'/%3E%3C/svg%3E";
                     chunks[index] = {
-                        frames: numbers.map(() => black),
+                        frames: numbers.map(() => EMPTY_FRAME_SOURCE),
                         durations: numbers.map(() => 1000 / fps),
                         frameNumbers: numbers,
                         outputStart: start,
@@ -2228,14 +3036,26 @@ app.registerExtension({
                 // latent and latent → decoded-video replacements.
                 const keptTimelineAudio = !restoredAudioSource && Boolean(oldGroup?.audioSource);
                 if (keptTimelineAudio) restoredAudioSource = oldGroup.audioSource;
+                // The final decoded video covers the whole chunk and is authoritative; a
+                // live sub-chunk only owns its own frames and is merged in. The teacher-audio
+                // placeholder is span coverage with a black picture rather than frames, so a
+                // real sub-chunk replaces it instead of merging into its black frames, which
+                // would put empty steps between the frames the arrow keys walk.
+                const incomingFrames = encodedFrames.map(frame => `data:image/webp;base64,${frame}`);
+                const incomingNumbers = Array.isArray(data.frame_numbers) ? data.frame_numbers.map(Number) : [];
+                const merged = finalized
+                    ? { frames: incomingFrames, durations: frameDurations, frameNumbers: incomingNumbers }
+                    : mergeFrameGroup(oldGroup?.audioOnlyPlaceholder ? null : oldGroup, incomingFrames, frameDurations, incomingNumbers);
                 // Audio scheduling and the running frame callback retain this
                 // object. Update it in place as live video frames arrive.
                 const group = Object.assign(oldGroup || {}, {
-                    frames: encodedFrames.map(frame => `data:image/webp;base64,${frame}`),
-                    durations: frameDurations,
-                    frameNumbers: Array.isArray(data.frame_numbers) ? data.frame_numbers : [],
-                    outputStart: data.output_start,
-                    outputEnd: data.output_end,
+                    frames: merged.frames,
+                    durations: merged.durations,
+                    frameNumbers: merged.frameNumbers,
+                    outputStart: merged.frameNumbers.length ? merged.frameNumbers[0] : data.output_start,
+                    // The rendered end is the phase that finished, not the last image: an
+                    // image stands for its whole token, and its frames are rendered too.
+                    outputEnd: merged.frameNumbers.length ? Math.max(Number(data.output_end) || 0, merged.frameNumbers[merged.frameNumbers.length - 1]) : data.output_end,
                     sourceFps: data.fps,
                     step: currentStep,
                     finalized,
@@ -2352,6 +3172,9 @@ app.registerExtension({
                 } finally {
                     restoringCache = false;
                     renderStatus();
+                    // The restored play state is only visible once the button is
+                    // painted again, and a restore does not repaint it by itself.
+                    renderTransport();
                 }
             }
 
@@ -2414,24 +3237,32 @@ app.registerExtension({
             }
 
             timelineShell.addEventListener("mousemove", event => setChunkTooltip(chunkIndexAtTimelinePointer(event), event));
+            // The tooltip takes the mouse so its scrollbar can be dragged and its text
+            // selected. It therefore stays open while the pointer is on it, and closes when
+            // the pointer leaves it for anything but the timeline, which owns its hover.
+            chunkTooltip.setLeaveGuard(event => Boolean(event.relatedTarget && timelineShell.contains(event.relatedTarget)));
             timelineShell.addEventListener("mouseleave", () => {
+                // Moving onto the tooltip hands the pointer over without closing it.
+                if (chunkTooltip.isHovered()) return;
                 tooltipChunkIndex = null;
                 tooltipSignature = null;
                 tooltipPointer = null;
                 chunkTooltip.hide();
             });
-            const updateShiftPrompt = event => {
-                if (event.key !== "Shift") return;
-                shiftPromptVisible = event.type === "keydown";
+            const updatePromptKeys = event => {
+                if (event.key !== "Shift" && event.key !== "Control") return;
+                if (event.key === "Shift") shiftPromptVisible = event.type === "keydown";
+                else ctrlPromptVisible = event.type === "keydown";
                 if (tooltipChunkIndex == null || tooltipPointer == null) return;
                 setChunkTooltip(tooltipChunkIndex, {
                     clientX: tooltipPointer.clientX,
                     clientY: tooltipPointer.clientY,
                     shiftKey: shiftPromptVisible,
+                    ctrlKey: ctrlPromptVisible,
                 });
             };
-            document.addEventListener("keydown", updateShiftPrompt);
-            document.addEventListener("keyup", updateShiftPrompt);
+            document.addEventListener("keydown", updatePromptKeys);
+            document.addEventListener("keyup", updatePromptKeys);
 
             const resizeObserver = new ResizeObserver(redrawGraphs);
             resizeObserver.observe(graphs);
@@ -2465,9 +3296,10 @@ app.registerExtension({
                 if (elapsedTimer != null) clearInterval(elapsedTimer);
                 clearInterval(replayCacheStatusTimer);
                 document.removeEventListener("pointerdown", dismissPreviewContextMenu, true);
-                document.removeEventListener("keydown", updateShiftPrompt);
-                document.removeEventListener("keyup", updateShiftPrompt);
+                document.removeEventListener("keydown", updatePromptKeys);
+                document.removeEventListener("keyup", updatePromptKeys);
                 document.removeEventListener("fullscreenchange", fullscreenChanged);
+                controlsAutohide.stop();
                 closePreviewContextMenu();
                 resizeObserver.disconnect();
                 chunkTooltip.remove();

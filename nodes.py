@@ -47,7 +47,7 @@ from .gemma4 import (
     reset_gemma4_live_output_log,
     reset_gemma4_raw_output_log,
 )
-from .preview import begin_preview_execution, build_cached_final_preview_snapshot
+from .preview import begin_preview_execution, build_cached_final_preview_snapshot, build_teacher_audio_preview_snapshot
 from .python.audio_sr import AudioSR, fix_audio
 from .python.preproduction import HRPreProduction, ENABLE_GEMMA4_MTP
 from .video_io import HREndlessTimeline, IntermediateChunkVideoWriter, load_replay_preview_proxy, normalize_timeline, save_replay_preview_proxy
@@ -129,9 +129,22 @@ ENABLE_DEBUG_MEMORY_PREFLIGHT = True
 # the first one, at the cost of one re-capture per chunk. False keeps the graphs
 # warm and restores the previous behavior.
 TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS = True
+# The captured pools can also fill the card *during* a chunk, where the next DiT
+# evaluation, the tiny preview or a sub-chunk's LoRA materialization then fail to
+# allocate. Below this much free device memory the sampler hands the pools back at
+# a sub-chunk start and before a DiT evaluation instead of waiting for the next
+# chunk boundary. Each drop costs one re-capture, so a roomy card keeps its graphs.
+GRAPH_POOL_RELEASE_FREE_GIB = 1.5
 # Experimental A/B switch. False regenerates complete AV noise for every
 # chunk with seed * chunk_number; True preserves one sliced full-sequence noise.
 TOGGLE_SINGLE_NOISE = True
+# One <d> group per failed phrase, on a retry only. MiniMax speaks a group as one
+# delivery, so a group holding several phrases can lose the ones it does not fit — but
+# only the phrase the transcript says failed is asked for on its own, and the phrases
+# the take already spoke keep the prompt's grouping. True keeps that retry behaviour;
+# False changes only the delivery band. The first attempt never re-groups: the owner's
+# own <d> groups are what the model must speak.
+TOGGLE_SPLIT_DIALOGUE_PHRASES = True
 # Set this to False only for the isolation experiment that retains the
 # native visual boundary keyframe while suppressing Video1/Audio1 in Qwen,
 # DiT references, and prompt text.
@@ -150,6 +163,7 @@ USE_COLOR_CORRECTED_H3_CONTEXT = True
 INCLUDE_PER_CHUNK_RETENTION_ANALYSIS = False
 GEMMA_PROMPT_LOG_DIRNAME = "comfyui-hr-endless-sampler"
 GEMMA_PROMPT_LOG_FILENAME = "last_gemma_chunk_prompts.txt"
+CHUNK_PROMPT_LOG_FILENAME = "last_chunk_prompts.txt"
 GEMMA_IMAGE_LOG_DIRNAME = "last_gemma_images"
 REPLAY_CACHE_DIRNAME = "last_run_replay"
 REPLAY_CACHE_FORMAT = 10
@@ -158,7 +172,10 @@ REPLAY_CACHE_FORMAT = 10
 # need to repeat; it therefore keeps its own disposable entry in the same
 # temporary root and is governed by the same preview cache button.
 TEACHER_AUDIO_CACHE_DIRNAME = "teacher_audio"
-TEACHER_AUDIO_CACHE_FORMAT = 1
+TEACHER_AUDIO_CACHE_FORMAT = 3
+# The preview button's on/off choice outlives the process: a restart must not
+# silently flip a render back to cache reuse (or back to deleting the caches).
+CACHE_POLICY_FILENAME = "cache_policy.json"
 _REPLAY_CACHE_ACTIVITY_LOCK = threading.Lock()
 _REPLAY_CACHE_ACTIVE_RUNS = 0
 # The last render's teacher-audio decision, published to the preview button.
@@ -176,7 +193,91 @@ SUMMARY_FIELD = re.compile(r"(?im)^(\s*summary\s*:\s*)(.*)$")
 RETENTION_FIELD = re.compile(r"(?im)^\s*retention_analysis\s*:\s*$")
 PICTURE_LABEL = re.compile(r"<Picture\s+\d+>", re.IGNORECASE)
 DIALOGUE_BLOCK = re.compile(r"<d>(.*?)</d>", re.IGNORECASE | re.DOTALL)
+# A delivery band sits in front of the clause that hands the line over, so removing the
+# line must remove it too: "Speaking slowly, with pauses, <Subject 1> (S1) then says:"
+# with no dialogue after it is exactly what a silenced sub-chunk must not keep.
+SPEECH_RATE_PREFIX = r"(?:speaking [^.\n]*?, )?"
+# The clause that hands the next spoken line to a speaker: it names the speaker with a
+# <Subject N> tag and may add a delivery, but it never crosses a sentence or a line, so
+# the prose around a dialogue block survives removing the spoken line itself.
+DIALOGUE_LEAD = re.compile(
+    r"(?:then\s+|and\s+)?" + SPEECH_RATE_PREFIX + r"<Subject[^>]*>(?:(?!<d>)[^<>.\n])*?\b(?:say|speak|ask|whisper|shout|mutter|tell)\w*\b[^<>.\n]*:\s*(?=<d>)",
+    re.IGNORECASE,
+)
+# The same clause without a speaker tag, and only where it stands on its own: at the
+# start of a line or straight after a finished sentence, never inside the prose that
+# merely mentions that somebody speaks.
+DIALOGUE_LEAD_BARE = re.compile(
+    r"(?:^|(?<=[.!?\n]))[ \t]*(?:then\s+|and\s+)?" + SPEECH_RATE_PREFIX + r"[^<>\n]*?\b(?:say|speak|ask|whisper|shout|mutter|tell)\w*\b[^<>.\n]*:\s*(?=<d>)",
+    re.IGNORECASE,
+)
 SUBJECT_SPEAKER = re.compile(r"(<Subject\s+\d+>)\s*\((S\d+)\)", re.IGNORECASE)
+# The complete spoken block, header included, as the legacy slicer removes it to
+# leave the shot's visual prose. The action table unitizes exactly that prose,
+# so both must use one pattern. The header accepts the delivery wording the
+# vendored guides allow next to the speaker ID, such as "says:",
+# "shout together," or "says in an off-screen voiceover"; requiring the literal
+# word "says" rejected valid prompt text.
+LEGACY_DIALOGUE_PATTERN = re.compile(r"(?P<header>(?:<Subject\s+\d+>|[\w'-]+)\s*\(S\d+\)[^<\n]{0,80}?)<d>\s*(?P<language>\[[^]\n]+\])\s*(?P<speech>.*?)</d>", re.IGNORECASE | re.DOTALL)
+
+# Explicit English camera vocabulary, shared by the still-camera reinforcement
+# and by the action table. The wording follows the vendored MiniMax guides
+# (references/base-en.txt), which use camera movement, camera moves, pushes,
+# cuts, trucks, pans, rolls, pulls, holds and follows.
+CAMERA_MOTION = re.compile(r"\b(?:pan(?:s|ning)?|tilt(?:s|ing)?|zoom(?:s|ing)?|dolly|dollies|dollying|truck(?:s|ing)?|orbit(?:s|ing)?|arc(?:s|ing)?|tracking\s+shot|handheld)\b|\bcamera\b[^.!?\n]{0,100}\b(?:move[sd]?|moving|movement|follow[s]?|track[s]?|shake[s]?|shaking|rotate[s]?|rotating|push(?:es)?|pull[s]?|crane[s]?|rolls?|holds?)\b", re.IGNORECASE)
+# A cut is an instantaneous event, so it starts a new ordered beat rather than
+# running alongside what precedes it.
+CAMERA_CUT = re.compile(r"\b(?:cut|cuts|cutting)\b\s*(?:to|away|back|in)?\b|\bhard cut\b|\bwe cut\b", re.IGNORECASE)
+# A still camera is a state, not an action, so it is the one camera clause that
+# belongs in every chunk of its shot. A clause that also configures the opening,
+# such as "starts with <Picture 1> as the exact first frame", is a one-time setup
+# and must not be carried into later chunks.
+CAMERA_STATIC = re.compile(r"\bcamera\b[^.!?\n]{0,60}\b(?:stays?|stayed|remains?|remained|is|holds?|held)\b[^.!?\n]{0,40}\b(?:static|fixed|still|stationary|unchanged|locked)\b", re.IGNORECASE)
+ACTION_SETUP_REFERENCE = re.compile(r"(?i)<Picture\s+\d+>|\bstarts?\s+with\b|\bbegins?\s+with\b|\bexact\s+first\s+frame\b|\bfirst\s+frame\s+for\s+the\s+target\b|\bin\s+silence\s+for\b|\bopening\s+frame\b")
+
+# Clause boundaries inside one sentence. A marker only breaks a clause when it
+# introduces a subject-like continuation, so "as fast as he can" stays whole.
+# The outer group must capture: the splitter pairs each clause with the marker
+# that preceded it, and only a capturing group keeps that marker in the result.
+ACTION_CLAUSE_BREAK = re.compile(
+    r"(?i)("
+    r",\s*(?:and\s+then|and|then|as|while|meanwhile|when|before|after|once|next|finally|simultaneously|continuously)\s+"
+    r"|;\s*(?:then\s+)?"
+    r"|,\s*(?=\w+ing\b)"
+    r"|\s+(?:as|while|when|then|before|after|once)\s+(?=<Subject\s+\d+>|the\s+camera\b|\w+\s*\(S\d+\))"
+    r")"
+)
+ACTION_PARALLEL_LEAD = re.compile(r"(?i)^\s*,?\s*(?:as|while|meanwhile|when|simultaneously|continuously)\b|^\s*,?\s*(?:at\s+the\s+same\s+time|in\s+(?:a|the)\s+continuous\s+movement|in\s+the\s+same\s+movement|continuing\s+to|still|without\s+stopping)\b")
+ACTION_SEQUENTIAL_LEAD = re.compile(r"(?i)^\s*,?\s*(?:and\s+then|then|afterwards?|after\s+that|before|once|next|finally|later|as\s+soon\s+as)\b|^\s*,\s*and\b|^\s*;")
+# The sentence splitter the action table unitizes with, shared so the same text is
+# never treated as one sentence by the table and two by the slot map.
+ACTION_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|(?<=[.!?][\"'])\s+|\n\s*\n+")
+ACTION_SUBJECT_REFERENCE = re.compile(r"(?i)<Subject\s+\d+>|\(\s*S\d+\s*\)|\b(?:he|she|they|it|him|her|them|his|their|our\s+heroes)\b")
+
+# A shot's dialogue is timed at this nominal delivery; when the estimate does
+# not fit its window the prompt asks for a different rate instead of failing,
+# because H3 accepts a speaking-rate delivery outside <d>. The phrases are
+# participial so they can open the sentence that introduces the dialogue. Past
+# the cap the requested delivery would be absurd, so the render stops.
+ACTION_SPEECH_RATE_BANDS = ((1.25, "speaking a little faster than usual"), (1.50, "speaking quickly"), (float("inf"), "speaking very quickly, rushing the words"))
+# The absolute pace no human reaches, which stops the render rather than asking H3 for it.
+ACTION_MAX_SPEECH_RATE = 1.40
+# The bands compare a chunk's own words-per-second with the pace the whole shot settles
+# into, not with a nominal pace: a chunk has no more time than its neighbours, so more
+# words in the same window means speaking faster and fewer means speaking slower. A chunk
+# within this ratio of the shot's pace asks for nothing at all; below it the chunk's
+# dialogue is sparser than the shot's and the delivery is asked for slowly.
+ACTION_MIN_SPEECH_RATIO = 0.90
+ACTION_MAX_SPEECH_RATIO = 1.10
+# How much of a sub-chunk a word that started earlier must fill before the sub-chunk
+# counts as speaking: a word's tail must not keep the dialogue in a silent sub-chunk.
+ACTION_MIN_SPEECH_SHARE = 0.25
+ACTION_SLOW_SPEECH_INSTRUCTION = "speaking slowly, with pauses"
+# The retry instruction. It is deliberately relative rather than a band, because
+# the take already knows how fast it spoke: its own audio is in the retained KV
+# cache, so "much faster than before" is measurable to the model in a way a
+# second absolute band would not be.
+ACTION_FORCED_SPEECH_INSTRUCTION = "speaking much faster than before"
 
 
 def _preserve_global_prompt_sections(chunk_prompt, global_prompt):
@@ -406,6 +507,35 @@ def _replay_cache_enabled():
         return bool(REPLAY_CACHE_ENABLED)
 
 
+def _cache_policy_path():
+    """Return the small file that remembers the preview's cache button."""
+    return Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / CACHE_POLICY_FILENAME
+
+
+def _load_cache_policy():
+    """Restore the button choice recorded by the previous process, if any."""
+    global REPLAY_CACHE_ENABLED
+    try:
+        policy = json.loads(_cache_policy_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, NotADirectoryError, OSError, json.JSONDecodeError):
+        return
+    if isinstance(policy, dict) and isinstance(policy.get("enabled"), bool):
+        REPLAY_CACHE_ENABLED = bool(policy["enabled"])
+
+
+def _save_cache_policy(enabled):
+    """Record the button choice so a restart resumes the same cache policy."""
+    try:
+        _cache_policy_path().parent.mkdir(parents=True, exist_ok=True)
+        _replay_write_json(_cache_policy_path(), {"enabled": bool(enabled), "updated": time.strftime("%Y-%m-%d %H:%M:%S %Z")})
+    except (OSError, RuntimeError, ValueError) as error:
+        logging.warning("HR Endless Sampler could not record the replay cache policy: %s", error)
+
+
+# Restore the previous session's button choice before any render can read it.
+_load_cache_policy()
+
+
 def _guard_replay_cache(function):
     @functools.wraps(function)
     def guarded(*args, **kwargs):
@@ -478,6 +608,12 @@ def _teacher_audio_cache_ui_status_unlocked():
         "chunks": max(0, int(manifest.get("chunks", 0) or 0)),
         "bytes": byte_count,
         "created": str(manifest.get("created", "")),
+        # How much of that pass really exists, and which chunks a render could
+        # keep: a stopped pass reports fewer recorded chunks than its plan, and
+        # the preview uses the records to offer a per-chunk rebuild.
+        "recorded": max(0, int(manifest.get("recorded", manifest.get("chunks", 0)) or 0)),
+        "kv_chunks": _TeacherAudioCache().kv_chunk_indices(),
+        "interrupted": bool(manifest) and str(manifest.get("status", "complete")) != "complete",
     })
     return status
 
@@ -509,13 +645,18 @@ if _PROMPT_SERVER is not None:
             return web.json_response({"error": "invalid preview fps"}, status=400)
         if fps <= 0:
             return web.json_response({"error": "preview fps must be greater than zero"}, status=400)
-        snapshot = await asyncio.to_thread(
-            _cached_replay_preview_snapshot,
-            request.rel_url.query.get("node_id", ""),
-            max_resolution=max_resolution,
-            quality=quality,
-            fps=fps,
-        )
+        node_id = request.rel_url.query.get("node_id", "")
+        snapshot = None
+        if await asyncio.to_thread(_newest_cached_preview_source) == "audio":
+            snapshot = await asyncio.to_thread(_cached_teacher_audio_preview_snapshot, node_id, fps=fps)
+        if snapshot is None:
+            snapshot = await asyncio.to_thread(
+                _cached_replay_preview_snapshot,
+                node_id,
+                max_resolution=max_resolution,
+                quality=quality,
+                fps=fps,
+            )
         # The restored frame payload can be large; serialize it off-loop too.
         return await asyncio.to_thread(web.json_response, snapshot or {}, headers={"Cache-Control": "no-store"})
 
@@ -542,6 +683,7 @@ if _PROMPT_SERVER is not None:
                 )
             global REPLAY_CACHE_ENABLED
             REPLAY_CACHE_ENABLED = requested == "1"
+            _save_cache_policy(REPLAY_CACHE_ENABLED)
             status = _replay_cache_ui_status_unlocked()
         logging.info(
             "HR Endless Sampler replay cache is %s for future sampler runs.",
@@ -601,6 +743,57 @@ if _PROMPT_SERVER is not None:
             {**status, "deleted_from_chunk": chunk_number},
             headers={"Cache-Control": "no-store"},
         )
+
+    @_PROMPT_SERVER.routes.post("/hr_endless_sampler_preview/teacher_audio_chunk")
+    async def hr_endless_sampler_delete_teacher_audio_chunk(request):
+        """Run disk mutation and lock acquisition off the event loop."""
+        return await asyncio.to_thread(_delete_teacher_audio_chunk_response, request)
+
+    def _delete_teacher_audio_chunk_response(request):
+        """Delete one cached teacher-audio chunk under the cache lock.
+
+        The next TaoMate render keeps the chunks before it and generates this one
+        and everything after it again, which is how the owner forces a new take of
+        a single chunk without replaying the whole teacher pass.
+        """
+        try:
+            chunk_index = int(request.query.get("chunk", ""))
+        except (TypeError, ValueError):
+            chunk_index = -1
+        if chunk_index < 0:
+            return web.json_response(
+                {"error": "chunk must be a non-negative integer"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        with _REPLAY_CACHE_ACTIVITY_LOCK:
+            if _REPLAY_CACHE_ACTIVE_RUNS > 0:
+                return web.json_response(
+                    {**_replay_cache_ui_status_unlocked(), "error": "Cached chunks can change only between sampler renders."},
+                    status=409,
+                    headers={"Cache-Control": "no-store"},
+                )
+            cache = _TeacherAudioCache()
+            if chunk_index not in cache.kv_chunk_indices():
+                return web.json_response(
+                    {**_replay_cache_ui_status_unlocked(), "error": f"Cached teacher audio for Chunk {chunk_index + 1} is unavailable."},
+                    status=404,
+                    headers={"Cache-Control": "no-store"},
+                )
+            try:
+                cache.delete_chunk(chunk_index)
+            except (OSError, RuntimeError, ValueError) as error:
+                return web.json_response(
+                    {**_replay_cache_ui_status_unlocked(), "error": str(error)},
+                    status=500,
+                    headers={"Cache-Control": "no-store"},
+                )
+            status = _replay_cache_ui_status_unlocked()
+        logging.info(
+            "HR Endless Sampler deleted cached teacher audio for Chunk %d; the next TaoMate render regenerates it and every chunk after it.",
+            chunk_index + 1,
+        )
+        return web.json_response(status, headers={"Cache-Control": "no-store"})
 
 
 def _replay_cpu_copy(value):
@@ -677,89 +870,64 @@ def _replay_fingerprint(video, audio, plan, *, fps, chunk_frames,
     }
 
 
-def _teacher_audio_patch_digest(patch):
-    """Hash one applied patch's key names and a bounded sample of its values."""
-    hasher = hashlib.sha256()
-    if not isinstance(patch, dict):
-        hasher.update(repr(patch).encode("utf-8"))
-        return hasher.hexdigest()
-    for key in sorted(patch.keys(), key=str):
-        hasher.update(str(key).encode("utf-8"))
-        values = patch[key] if isinstance(patch[key], (list, tuple)) else (patch[key],)
-        for value in values:
-            if not isinstance(value, torch.Tensor):
-                hasher.update(repr(value).encode("utf-8"))
-                continue
-            hasher.update(f"{tuple(value.shape)}{value.dtype}".encode("utf-8"))
-            # Only a prefix of each patch tensor is sampled: enough to separate
-            # two different LoRAs without reading a whole adapter per render.
-            flat = value.detach().reshape(-1)[:256].cpu()
-            if torch.is_floating_point(flat):
-                hasher.update(flat.to(torch.float32).numpy().tobytes())
-            else:
-                hasher.update(repr(flat.tolist()).encode("utf-8"))
-    return hasher.hexdigest()
+def _teacher_audio_key(chunk_prompts, chunk_ticks):
+    """Describe a teacher-audio pass by its chunk prompts and chunk structure.
 
+    The owner's rule is "drop everything but the chunk prompt": a user iterates on
+    video parameters and workflow far more often than on dialogue, and an audio
+    they like should survive those changes. So the key is the ordered per-chunk
+    prompts, plus the audio length of each chunk.
 
-def _teacher_audio_model_signature(model_patcher):
-    """Identify the patched weights that produced one teacher-audio pass.
+    Those prompts exist before the pass starts, which is what makes them a usable
+    key: the legacy planner derives them from the source description and the
+    "legacy chunk prompts" provider hands them in as an editable table. A Gemma
+    director authors them one at a time from the previous transcript, so a render
+    driven that way has no pre-flight prompt list; it has to fall back to the
+    source prompt and the provider fingerprint, which is what the caller passes.
 
-    ComfyUI assigns every applied patch a random identifier, so the digest is
-    built from the patch contents instead: strengths, key names and sampled
-    values. Replacing the base H3 weights while keeping the same LoRA, prompt
-    and seed is not covered here, exactly as the video replay cache does not
-    cover it; the cache button remains the manual escape hatch.
+    Not in the key, on purpose: the seed, the sigma schedule, the KV codec, the
+    model/LoRA digest, the TaoMate toggles, the continuation settings, the
+    resolution, the compute precision and the latent shapes. Those change what the
+    video pass does, or nudge the audio numerically, but a stored pass is a
+    deliberate choice to keep the audio. Changing ``chunk_frames`` still redraws
+    the audio, because it changes the chunk count, their tick lengths and every
+    chunk prompt. The cache button remains the way to force a fresh pass.
     """
-    entries = []
-    for _identifier, entry in dict(getattr(model_patcher, "patches", None) or {}).items():
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            continue
-        strength, patch = entry
-        try:
-            rounded = round(float(strength), 6)
-        except (TypeError, ValueError):
-            rounded = repr(strength)
-        entries.append([rounded, _teacher_audio_patch_digest(patch)])
-    return {"class": type(getattr(model_patcher, "model", None)).__qualname__, "patches": sorted(entries, key=repr)}
-
-
-def _teacher_audio_fingerprint(replay_fingerprint, *, prompt, noise_seed, sigmas, kv_cache_compression, model_patcher, toggles):
-    """Describe every input that changes one audio-first teacher-audio pass.
-
-    The owner's key is the source prompt plus the render seed, but the teacher
-    audio also depends on the chunk layout, the shifts, the compute precision,
-    the KV codec, the pre-production provider, the applied LoRA and the
-    TaoMate divergence toggles. ``replay_fingerprint`` already carries the
-    layout, the latent shapes and the audio-affecting flags, so it is the base
-    of this key rather than a second layout description.
-    """
-    fingerprint = dict(replay_fingerprint)
-    fingerprint["source_prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    fingerprint["noise_seed"] = int(noise_seed)
-    fingerprint["sigmas"] = [float(value) for value in sigmas.detach().float().cpu().tolist()] if sigmas is not None else []
-    fingerprint["kv_cache_compression"] = str(kv_cache_compression)
-    fingerprint["model"] = _teacher_audio_model_signature(model_patcher)
-    fingerprint["toggles"] = dict(toggles)
-    return fingerprint
-
-
-def _teacher_audio_toggle_signature():
-    """Name the TaoMate switches whose state changes the generated audio.
-
-    Imported lazily because the backend is imported the same way inside the
-    sampler, which keeps this module loadable without the TaoMate runtime.
-    """
-    from .python import taomate, taomate_audio_teacher
     return {
-        "audio_first": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_AUDIO_FIRST),
-        "transcript_retry": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY),
-        "condition_attends_current_av": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_CONDITION_ATTENDS_CURRENT_AV),
-        "move_prompt_references": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_MOVE_PROMPT_REFERENCES),
-        "equal_sub_chunks": bool(taomate.TOGGLE_TAOMATE_EQUAL_SUB_CHUNKS),
-        "compress_kv": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_COMPRESS_KV),
-        "gpu_decompress_kv": bool(taomate.TOGGLE_TAOMATE_DIVERGENCY_GPU_DECOMPRESS_KV),
-        "renorm_teacher_audio": bool(taomate_audio_teacher.TOGGLE_TAOMATE_DIVERGENCY_RENORM_TEACHER_AUDIO),
+        "chunk_prompts": [hashlib.sha256(str(text).encode("utf-8")).hexdigest() for text in chunk_prompts],
+        "chunk_ticks": [int(ticks) for ticks in chunk_ticks],
     }
+
+
+def _teacher_audio_key_difference(stored, current):
+    """Name what changed, so a miss is a one-line answer.
+
+    "prompt, seed, or a setting changed" once cost a full teacher pass and an
+    hour of reading logs to attribute.
+    """
+    parts = []
+    before = list(stored.get("chunk_prompts") or [])
+    after = list(current.get("chunk_prompts") or [])
+    if before != after:
+        if len(before) != len(after):
+            parts.append("the render now plans %d chunks, the cache has %d" % (len(after), len(before)))
+        else:
+            index = next(index for index, (left, right) in enumerate(zip(before, after)) if left != right)
+            parts.append("Chunk %d's prompt changed" % (index + 1))
+    before_ticks = list(stored.get("chunk_ticks") or [])
+    after_ticks = list(current.get("chunk_ticks") or [])
+    if before_ticks != after_ticks:
+        if len(before_ticks) != len(after_ticks):
+            parts.append("the render now plans %d chunks, the cache has %d" % (len(after_ticks), len(before_ticks)))
+        else:
+            index = next(index for index, (left, right) in enumerate(zip(before_ticks, after_ticks)) if left != right)
+            parts.append("Chunk %d now spans %d audio ticks, the cache has %d" % (index + 1, after_ticks[index], before_ticks[index]))
+    for name in sorted(set(stored) | set(current)):
+        if name in ("chunk_prompts", "chunk_ticks"):
+            continue
+        if stored.get(name) != current.get(name):
+            parts.append(str(name))
+    return ", ".join(parts) if parts else "the stored key no longer matches this render"
 
 
 def _teacher_audio_payload_problem(payload, chunk_count):
@@ -781,6 +949,122 @@ def _teacher_audio_payload_problem(payload, chunk_count):
         if not isinstance(observation, tuple) or len(observation) != 2 or not isinstance(observation[0], torch.Tensor):
             return f"teacher audio cache Chunk {index + 1} is missing its decoded observation"
     return None
+
+def _teacher_audio_resume_index(cache, key, chunk_count):
+    """Return the first chunk this render must generate, or 0 when nothing can be kept.
+
+    The pass is sequential: chunk k attends over the audio of the chunks before it,
+    so a resume needs their rows on disk and their settled guidance states in the
+    stored payload. Three things move that point forward: an edited prompt, a chunk
+    the owner deleted on purpose, and the stop point of an interrupted render, which
+    is what lets a stopped pass continue instead of replaying approved dialogue.
+    """
+    stored = cache.stored_key()
+    if not stored:
+        return 0
+    before = list(stored.get("chunk_prompts") or [])
+    after = list(key.get("chunk_prompts") or [])
+    if len(before) != len(after) or len(after) != int(chunk_count):
+        return 0
+    if list(stored.get("chunk_ticks") or []) != list(key.get("chunk_ticks") or []):
+        # The chunk boundaries moved, so the stored audio windows no longer line
+        # up with this render and nothing before the edit can be reused.
+        return 0
+    # Keep at most what the stored pass really settled; an identical key then
+    # continues at the stop point rather than restarting the whole pass.
+    settled = min(cache.settled_chunk_count(), int(chunk_count))
+    edited = next((position for position, (left, right) in enumerate(zip(before, after)) if left != right), None)
+    deleted = cache.deleted_chunk_indices()
+    if edited is None and not deleted and settled >= int(chunk_count):
+        # A finished pass with the identical key is a full reuse, which the caller
+        # already tried and rejected; a resume here would only repeat a pass whose
+        # stored products could not be loaded.
+        return 0
+    index = settled
+    if edited is not None:
+        index = min(index, edited)
+    if deleted:
+        index = min(index, min(deleted))
+    if index <= 0:
+        return 0
+    # ponytail: a pass past twelve chunks dropped the audio history of its earliest
+    # chunks and their records with it, so those long passes still restart at
+    # Chunk 1. Priming from the live twelve-chunk window is the upgrade path. The
+    # rows can also lag the payload by one chunk, because a chunk's stored rows land
+    # with the next chunk's forward, so the prefix stops where the rows stop instead
+    # of throwing the whole pass away.
+    available = set(cache.kv_chunk_indices())
+    contiguous = 0
+    while contiguous < index and contiguous in available:
+        contiguous += 1
+    if contiguous <= 0:
+        return 0
+    return min(index, contiguous)
+
+
+def _chunk_span(first, last):
+    """Name a 1-based inclusive chunk range the way the preview labels chunks."""
+    if int(last) < int(first):
+        return ""
+    if int(first) == int(last):
+        return f"Chunk {int(first)}"
+    return f"Chunks {int(first)}-{int(last)}"
+
+
+def _teacher_audio_resume_reason(resume_index, chunk_count, keeps_tail):
+    """Name what a resumed pass keeps and what it generates again."""
+    resume_index = max(0, int(resume_index))
+    chunk_count = int(chunk_count)
+    kept = []
+    if resume_index > 0:
+        kept.append(_chunk_span(1, resume_index))
+    if keeps_tail:
+        kept.append(_chunk_span(resume_index + 2, chunk_count))
+    generated = _chunk_span(resume_index + 1, resume_index + 1 if keeps_tail else chunk_count)
+    parts = []
+    if any(kept):
+        parts.append("kept teacher audio for " + " and ".join(span for span in kept if span))
+    parts.append(f"generating {generated}")
+    return "; ".join(parts)
+
+
+def _teacher_audio_kept_tail(cached_prefix, resume_index, chunk_count, available_rows):
+    """Return the chunks after the resume point whose stored audio this pass keeps.
+
+    A finished pass offers them: the audio is already approved, the pass generates
+    the edited chunk and stops there. Only a tail whose chunks still have their
+    attention rows can be kept at all, because the stored audio and its rows are
+    cached together: a chunk without rows would have to be generated and a hole
+    inside the tail is not something a later resume can rebuild. An interrupted
+    pass cannot offer a complete tail either, so those passes regenerate the suffix
+    as before.
+    """
+    resume_index = max(0, int(resume_index))
+    chunk_count = int(chunk_count)
+    if resume_index + 1 >= chunk_count:
+        return None
+    prompts = cached_prefix.get("prompts") or []
+    milestones = cached_prefix.get("milestones") or []
+    observations = cached_prefix.get("observations") or []
+    transcripts = cached_prefix.get("transcripts") or []
+    settled = min(len(prompts), len(milestones), len(observations), len(transcripts))
+    if settled < chunk_count:
+        return None
+    offsets = list(range(resume_index + 1, chunk_count))
+    stored_rows = set(int(index) for index in available_rows)
+    if any(offset not in stored_rows for offset in offsets):
+        logging.info(
+            "HR Endless Sampler regenerates %s instead of keeping it: their stored attention rows are incomplete.",
+            _chunk_span(resume_index + 2, chunk_count),
+        )
+        return None
+    return {
+        "prompts": [str(prompts[offset]) for offset in offsets],
+        "milestones": [milestones[offset] for offset in offsets],
+        "observations": [observations[offset] for offset in offsets],
+        "transcripts": [transcripts[offset] for offset in offsets],
+        "latents": [milestones[offset][-1] for offset in offsets],
+    }
 
 
 class _TeacherAudioCache:
@@ -809,30 +1093,299 @@ class _TeacherAudioCache:
         """Remove this entry from whichever root the cache is bound to."""
         _remove_cache_directory(self.root)
 
-    def save(self, fingerprint, source_prompt, payload):
-        """Replace the stored pass with this render's finished products."""
-        self.clear()
-        self.root.mkdir(parents=True, exist_ok=True)
-        # The payload is written before its manifest: a manifest without a
-        # payload would claim a reusable pass that cannot be loaded.
-        _replay_write_tensor_file(self.payload_path, payload)
-        _replay_write_json(self.manifest_path, {
-            "format": TEACHER_AUDIO_CACHE_FORMAT,
-            "created": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "fingerprint": fingerprint,
-            "source_prompt_sha256": hashlib.sha256(source_prompt.encode("utf-8")).hexdigest(),
-            "chunks": len(payload["prompts"]),
-        })
+    def save(self, key, payload):
+        """Replace the stored pass with this render's finished products.
+
+        The per-chunk KV records are written while the pass runs, so they are
+        kept: they describe this same pass and are what lets a later edit resume
+        from a settled chunk. Clearing is a separate, explicit act.
+        """
+        self.write_payload(payload)
+        self._write_manifest(
+            key,
+            len(payload["prompts"]),
+            len(payload["prompts"]),
+            "complete",
+            created=self._read_manifest().get("created"),
+        )
         logging.info("HR Endless Sampler recorded %d chunks of reusable teacher audio in %s", len(payload["prompts"]), self.root)
 
-    def load_if_compatible(self, fingerprint, chunk_count):
-        """Return the stored pass only when it matches this render exactly."""
+    def _write_manifest(self, key, chunk_count, recorded, status, deleted=None, created=None):
+        """Write the small identity file the status, preview and resume checks read.
+
+        It is written before the payload of a fresh pass exists as well as after
+        the last chunk, because "which pass is on disk" has to stay answerable
+        while a render is still running. The recorded creation time is kept across
+        those rewrites: it names the pass, not the last update.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        _replay_write_json(self.manifest_path, {
+            "format": TEACHER_AUDIO_CACHE_FORMAT,
+            "created": created or time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "key": key,
+            "chunks": max(0, int(chunk_count)),
+            "recorded": max(0, int(recorded)),
+            "status": str(status),
+            "deleted": [int(item) for item in (deleted or [])],
+        })
+
+    def write_payload(self, payload):
+        """Store one payload; the manifest alone decides when it is loadable.
+
+        ponytail: the write is not atomic, so a process killed inside it leaves a
+        payload the loaders reject and this render's reuse is lost. A temporary
+        file plus a rename would cost a second copy of every tensor.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        _replay_write_tensor_file(self.payload_path, payload)
+
+    def begin_pass(self, key, chunk_count, resume_index, keep_payload=False):
+        """Identify this pass before it samples, so a stop leaves a usable entry.
+
+        A fresh pass replaces the stored one completely: either its key differs or
+        its payload could not be reused, so the rows on disk describe the pass this
+        render is replacing. A resumed pass keeps the settled prefix, because that
+        prefix is exactly what this render continues from, and drops the later rows
+        that belong to the take it is regenerating. A pass that keeps its tail
+        generates exactly one chunk, so only that chunk's rows go: the audio of the
+        chunks it keeps never outlives the rows that describe it.
+        """
+        resume_index = max(0, int(resume_index))
+        if resume_index <= 0 and not keep_payload:
+            _remove_cache_directory(self.payload_path)
+            self.clear_kv_records()
+        elif keep_payload:
+            # One chunk is sampled again and the chunks around it keep their
+            # approved audio, so their rows stay next to it and a later edit can
+            # still resume inside the kept tail.
+            self.discard_kv_chunk(resume_index)
+        else:
+            for stale in self.kv_chunk_indices():
+                if stale >= resume_index:
+                    self.discard_kv_chunk(stale)
+        self._write_manifest(key, chunk_count, resume_index, "recording")
+        logging.info(
+            "HR Endless Sampler teacher audio pass records %d chunks in %s%s.",
+            int(chunk_count), self.root,
+            ", continuing after the %d settled chunks" % resume_index if resume_index else "",
+        )
+
+    def save_chunk_state(self, index, payload):
+        """Keep the settled prefix on disk while the pass is still running.
+
+        An interrupted render would otherwise leave rows with no identity: the next
+        render could not tell they were the newest pass, and a refreshed browser
+        would restore an older render instead of the chunks this one finished.
+        """
+        self.write_payload(payload)
+        manifest = self._read_manifest()
+        self._write_manifest(
+            dict(manifest.get("key") or {}),
+            int(manifest.get("chunks", int(index) + 1) or int(index) + 1),
+            int(index) + 1,
+            "recording",
+            created=manifest.get("created"),
+        )
+
+    def _read_manifest(self):
+        """Return the stored manifest, or an empty mapping when there is none."""
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, NotADirectoryError, OSError, json.JSONDecodeError):
+            return {}
+        return manifest if isinstance(manifest, dict) else {}
+
+    def settled_chunk_count(self):
+        """Return how many chunks of the stored pass really exist, in order."""
+        manifest = self._read_manifest()
+        return max(0, int(manifest.get("recorded", manifest.get("chunks", 0)) or 0))
+
+    def deleted_chunk_indices(self):
+        """Return the chunks a render removed on purpose, e.g. to force a new take."""
+        return sorted(int(item) for item in (self._read_manifest().get("deleted") or []) if isinstance(item, int))
+
+    def load_complete_payload(self, chunk_count):
+        """Return the stored pass when it holds every chunk this render needs.
+
+        The first chunk changing leaves no prefix to continue from, but a *finished*
+        stored pass still offers the chunks after it, which is the audio the owner
+        approved and this render keeps.
+        """
+        try:
+            payload = _replay_load_tensor_file(self.payload_path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None, "no stored teacher audio exists"
+        except (OSError, RuntimeError, ValueError) as error:
+            return None, f"could not load the stored teacher audio: {error}"
+        problem = _teacher_audio_payload_problem(payload, chunk_count)
+        if problem is not None:
+            return None, problem
+        return payload, None
+
+    def delete_chunk(self, index):
+        """Drop one chunk's stored audio so the next render rebuilds it.
+
+        Removing the rows alone would not be enough: a complete payload would
+        still let the next render reuse the whole pass, so the manifest names the
+        deleted chunk as well and the next pass regenerates it and everything
+        after it.
+        """
+        index = int(index)
+        self.discard_kv_chunk(index)
+        manifest = self._read_manifest()
+        if not manifest:
+            return
+        deleted = sorted(set(int(item) for item in (manifest.get("deleted") or []) if isinstance(item, int)) | {index})
+        self._write_manifest(
+            dict(manifest.get("key") or {}),
+            int(manifest.get("chunks", 0) or 0),
+            int(manifest.get("recorded", 0) or 0),
+            str(manifest.get("status", "complete")),
+            deleted,
+            created=manifest.get("created"),
+        )
+
+    @property
+    def kv_root(self):
+        return self.root / "kv"
+
+    def save_kv_chunk(self, index, snapshot):
+        """Write one chunk's committed audio rows, returning the tick count.
+
+        The rows are the teacher's attention state for that chunk's audio, which
+        is what a later render needs in order to continue from a chosen chunk
+        instead of regenerating the dialogue before it.
+        """
+        from .python import taomate
+        pairs, block_index, tags = snapshot
+        self.kv_root.mkdir(parents=True, exist_ok=True)
+        payload = taomate.serialize_stored_kv_chunk(pairs)
+        record = {
+            "format": taomate.TEACHER_KV_RECORD_FORMAT,
+            "layers": payload,
+            "block": int(block_index),
+            "tags": [int(tag) for tag in tags],
+            "ticks": len(tags),
+        }
+        _replay_write_tensor_file(self.kv_root / ("chunk-%03d.pt" % int(index)), record)
+        return record["ticks"]
+
+    def kv_chunk_indices(self):
+        """Return the chunk indices that have a stored KV record, in order."""
+        if not self.kv_root.is_dir():
+            return []
+        indices = []
+        for path in sorted(self.kv_root.glob("chunk-*.pt")):
+            try:
+                indices.append(int(path.stem.split("-", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        return indices
+
+    def clear_kv_records(self):
+        """Drop every stored record, e.g. before a pass that starts from Chunk 1."""
+        _remove_cache_directory(self.kv_root)
+
+    def discard_kv_chunk(self, index):
+        """Remove one stored record, e.g. after the pass dropped that history."""
+        try:
+            (self.kv_root / ("chunk-%03d.pt" % int(index))).unlink()
+        except FileNotFoundError:
+            pass
+
+    def load_kv_chunk(self, index):
+        """Return one stored record as rows ready to commit, or None."""
+        from .python import taomate
+        path = self.kv_root / ("chunk-%03d.pt" % int(index))
+        if not path.is_file():
+            return None
+        record = _replay_load_tensor_file(path)
+        if not isinstance(record, dict):
+            return None
+        if record.get("format") != taomate.TEACHER_KV_RECORD_FORMAT:
+            logging.info("HR Endless Sampler teacher KV record %s is obsolete; the pass restarts from Chunk 1.", path.name)
+            return None
+        layers = record.get("layers")
+        tags = record.get("tags")
+        if not isinstance(layers, dict) or not layers or not isinstance(tags, list) or not tags:
+            return None
+        return {"pairs": taomate.deserialize_stored_kv_chunk(layers), "block": int(record.get("block", 0)), "tags": tags, "ticks": int(record.get("ticks", len(tags)))}
+
+    def stored_key(self):
+        """Return the key the stored pass was recorded under, or None."""
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, NotADirectoryError, OSError, json.JSONDecodeError):
+            return None
+        if manifest.get("format") != TEACHER_AUDIO_CACHE_FORMAT:
+            return None
+        key = manifest.get("key")
+        return dict(key) if isinstance(key, dict) else None
+
+    def load_prefix(self, resume_index, chunk_ticks):
+        """Return the stored pass when its settled chunks can be kept.
+
+        A resume only needs the chunks before the first changed prompt, so the
+        payload may be longer than that; every chunk up to the resume point must
+        exist and must still describe the same number of audio ticks, or the
+        restored milestones would not fit their chunk windows.
+        """
+        if resume_index <= 0:
+            return None, "nothing to resume"
+        try:
+            payload = _replay_load_tensor_file(self.payload_path)
+        except FileNotFoundError:
+            return None, "the stored pass payload is gone"
+        except (OSError, RuntimeError, ValueError) as error:
+            return None, f"could not load the stored pass payload: {error}"
+        if not isinstance(payload, dict):
+            return None, "the stored pass payload is not a mapping"
+        prompts = payload.get("prompts")
+        milestones = payload.get("milestones")
+        if not isinstance(prompts, list) or not isinstance(milestones, list) or len(prompts) < resume_index or len(milestones) < resume_index:
+            return None, "the stored pass is shorter than the resume point"
+        for index in range(resume_index):
+            chunk_milestones = milestones[index]
+            if not isinstance(chunk_milestones, list) or not chunk_milestones or not isinstance(chunk_milestones[-1], torch.Tensor):
+                return None, f"the stored pass has no clean audio for Chunk {index + 1}"
+            ticks = int(chunk_milestones[-1].shape[-1])
+            if index < len(chunk_ticks) and ticks != int(chunk_ticks[index]):
+                return None, f"Chunk {index + 1} now spans {int(chunk_ticks[index])} audio ticks, the stored pass has {ticks}"
+        return payload, None
+
+    def load_available_kv_prefix(self, resume_index):
+        """Return this entry's stored rows for every chunk before the resume point.
+
+        A resume needs the whole prefix: the pass continues from the chosen chunk,
+        so a missing record anywhere before it means the KV cannot be rebuilt and
+        the caller has to regenerate from Chunk 1.
+        """
+        if resume_index <= 0:
+            return []
+        records = []
+        for index in range(resume_index):
+            record = self.load_kv_chunk(index)
+            if record is None:
+                return []
+            records.append(record)
+        return records
+
+    def load_if_compatible(self, key, chunk_count):
+        """Return the stored pass when the prompt and the chunk structure match.
+
+        Everything else is deliberately ignored, so a changed seed, schedule,
+        codec, LoRA, continuation setting or resolution still reuses the audio the
+        owner liked. The cache button is the way to force a fresh pass.
+        """
         try:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             if manifest.get("format") != TEACHER_AUDIO_CACHE_FORMAT:
                 return None, "teacher audio cache format is obsolete"
-            if dict(manifest.get("fingerprint") or {}) != fingerprint:
-                return None, "prompt, seed, or a teacher-audio setting changed"
+            if dict(manifest.get("key") or {}) != key:
+                return None, _teacher_audio_key_difference(dict(manifest.get("key") or {}), key)
+            deleted = [int(item) for item in (manifest.get("deleted") or []) if isinstance(item, int)]
+            if deleted:
+                return None, f"Chunk {min(deleted) + 1} of the stored teacher audio was deleted, so this render records a new take from there"
             payload = _replay_load_tensor_file(self.payload_path)
         except FileNotFoundError:
             return None, "no teacher audio cache exists"
@@ -1036,6 +1589,37 @@ class _LastRunReplayCache:
         except FileNotFoundError:
             pass
         self.mark_interrupted(chunk_number - 1)
+
+
+def _cached_teacher_audio_preview_snapshot(node_id, *, fps):
+    """Rebuild a dormant player from the last TaoMate render's stored audio."""
+    cache = _TeacherAudioCache()
+    if cache.stored_key() is None:
+        return None
+    try:
+        payload = _replay_load_tensor_file(cache.payload_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        logging.warning("HR Endless Sampler could not read the stored teacher audio for the preview: %s", error)
+        return None
+    return build_teacher_audio_preview_snapshot(node_id, payload, fps=fps)
+
+
+def _newest_cached_preview_source():
+    """Name the newest restorable cache: the teacher audio, the replay checkpoint, or neither.
+
+    Only one of them belongs to the last render, and a refresh must show that one
+    rather than a checkpoint left behind by an older, unrelated run.
+    """
+    candidates = []
+    audio_manifest = _teacher_audio_cache_root() / "manifest.json"
+    if audio_manifest.is_file():
+        candidates.append((audio_manifest.stat().st_mtime, "audio"))
+    replay_manifest = _LastRunReplayCache().manifest_path
+    if replay_manifest.is_file():
+        candidates.append((replay_manifest.stat().st_mtime, "replay"))
+    if not candidates:
+        return None
+    return max(candidates)[1]
 
 
 def _cached_replay_preview_snapshot(node_id, *, max_resolution, quality, fps):
@@ -1634,22 +2218,8 @@ def _dialogue_phrase_ids(speech):
     return tuple(phrases)
 
 
-def _seam_orphans_a_phrase_word(phrase_ids, first_word, last_word, word_count):
-    """Report whether a seam hands a single word of the phrase it cuts to either side."""
-    if last_word + 1 >= word_count or phrase_ids[last_word] != phrase_ids[last_word + 1]:
-        return False
-    phrase = phrase_ids[last_word]
-    left = last_word
-    while left >= first_word and phrase_ids[left] == phrase:
-        left -= 1
-    right = last_word + 1
-    while right < word_count and phrase_ids[right] == phrase:
-        right += 1
-    return last_word - left == 1 or right - last_word - 1 == 1
-
-
 def _dialogue_owner_spans(weights, phrase_ids, range_seconds):
-    """Give each range the words nearest its clock position, never a lone phrase word."""
+    """Give each range the phrase nearest its clock position, never a cut phrase."""
     total_weight = sum(weights)
     total_seconds = sum(range_seconds)
     cumulative_weights = []
@@ -1657,6 +2227,12 @@ def _dialogue_owner_spans(weights, phrase_ids, range_seconds):
     for weight in weights:
         weight_sum += weight
         cumulative_weights.append(weight_sum)
+    # A chunk has to end where the speaker can stop, which is a phrase terminal,
+    # so its dialogue always finishes on punctuation. Splitting a phrase was the
+    # old way to fit speech into a short window; the speaking-rate delivery
+    # covers that now, so a phrase that cannot fit simply overruns the seam and
+    # the chunk asks for a faster delivery instead.
+    terminals = [index for index in range(len(weights)) if index + 1 == len(weights) or phrase_ids[index] != phrase_ids[index + 1]]
     spans = []
     first_word = 0
     elapsed_seconds = 0.0
@@ -1664,25 +2240,20 @@ def _dialogue_owner_spans(weights, phrase_ids, range_seconds):
         elapsed_seconds += duration
         desired_weight = total_weight * elapsed_seconds / total_seconds if total_seconds else total_weight
         remaining_ranges = len(range_seconds) - range_index - 1
-        # Keep words contiguous while putting each weight boundary as close as
-        # possible to the output-time boundary. Fewer words than ranges leaves
-        # the trailing ranges silent rather than overflowing the word list.
+        # Keep phrases contiguous while putting each phrase boundary as close as
+        # possible to the output-time boundary. Fewer phrases than ranges leaves
+        # the trailing ranges silent rather than overflowing the phrase list.
         upper_bound = min(len(weights), max(first_word + 1, len(weights) - remaining_ranges))
         if first_word >= upper_bound:
             spans.append((first_word, first_word - 1))
             continue
-        final_word = min(range(first_word, upper_bound), key=lambda word_index: abs(cumulative_weights[word_index] - desired_weight))
-        # The chunk's own clock wins over sentence punctuation, but a phrase is
-        # never cut so that one side of the seam holds a single word of it:
-        # hand that word back to the earlier chunk instead, which keeps the
-        # words out of the following chunks (the short tail cannot absorb them)
-        # and stops the retries from starving the end of the dialogue. The last
-        # range is the only one allowed to end empty because of this rule.
-        while (
-            _seam_orphans_a_phrase_word(phrase_ids, first_word, final_word, len(weights))
-            and final_word + 1 <= len(weights) - remaining_ranges + 1
-        ):
-            final_word += 1
+        bounded = [index for index in terminals if first_word <= index < upper_bound]
+        pool = bounded or [index for index in terminals if index >= first_word]
+        if not pool:
+            spans.append((first_word, len(weights) - 1))
+            first_word = len(weights)
+            continue
+        final_word = min(pool, key=lambda word_index: abs(cumulative_weights[word_index] - desired_weight))
         spans.append((first_word, final_word))
         first_word = final_word + 1
     spans.append((first_word, len(weights) - 1))
@@ -1725,12 +2296,134 @@ def _dialogue_word_schedule(speech, language, start_seconds, end_seconds):
     return tuple(schedule)
 
 
-def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges=(), sampled_start=None):
-    """Assign whole phoneme-timed words once on the global source-shot clock."""
-    pattern = re.compile(r"(?P<header>(?:<Subject\s+\d+>|[\w'-]+)\s*\(S\d+\)\s*says\s*:\s*)<d>\s*(?P<language>\[[^]\n]+\])\s*(?P<speech>.*?)</d>", re.IGNORECASE | re.DOTALL)
+def _dialogue_error_location(origin):
+    """Name the source shot and output chunk a legacy dialogue failure belongs to.
+
+    A render stops on the first impossible shot, so the message must identify it
+    without the owner re-deriving the shot clock by hand.
+    """
+    return "" if not origin else f"{origin}: "
+
+
+def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges=(), sampled_start=None, origin=None):
+    """Return the spoken pieces this window owns, one string per delivery."""
+    _visual, pieces = _legacy_dialogue_pieces(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start, origin)
+    return _visual, [piece[1] for piece in pieces]
+
+
+def _prompt_without_dialogue(prompt):
+    """Drop every spoken line and the sentence that hands it to a speaker.
+
+    H3 animates a mouth from the prompt, so a sub-chunk that carries no speech must
+    not be told the words at all. The sentence introducing a line exists only to
+    introduce it, so it goes with the line; the rest of the prose, the line breaks
+    and the blank lines stay exactly as the owner wrote them.
+    """
+    without_lines = DIALOGUE_BLOCK.sub("", DIALOGUE_LEAD_BARE.sub("", DIALOGUE_LEAD.sub("", str(prompt or ""))))
+    # The removal leaves the spaces and the empty lines that framed the clause.
+    collapsed = re.sub(r"[ \t]{2,}", " ", without_lines)
+    return re.sub(r"[ \t]+\n", "\n", re.sub(r"\n{3,}", "\n\n", collapsed))
+
+
+def _subchunk_speaks(phase, chunk, transcript):
+    """Report whether the take speaks during one sub-chunk's own audio window.
+
+    Whisper's word times are seconds from the chunk's audio start, and a phase covers its
+    own slice of that window, so a word belongs to the sub-chunk it *starts* in: the voice
+    begins there and the mouth must move. A word that began in the previous sub-chunk still
+    drives the mouth while its sound lasts, but only when that sound fills at least a
+    quarter of this sub-chunk — otherwise a word's tail would keep the whole dialogue in a
+    sub-chunk that is otherwise silent, which is exactly the mouth-moving-with-no-audio the
+    owner saw. A transcript that never arrived keeps today's prompt, and a transcript with
+    no words at all is a take that says nothing anywhere.
+    """
+    if not isinstance(transcript, dict) or "words" not in transcript:
+        return True
+    words = transcript.get("words") or ()
+    if not words:
+        return False
+    first = (int(phase["audio_start"]) - int(chunk["audio_start"])) / float(AUDIO_LATENT_FPS)
+    last = (int(phase["audio_end"]) - int(chunk["audio_start"])) / float(AUDIO_LATENT_FPS)
+    if last <= first:
+        return False
+    carried_seconds = 0.0
+    for word in words:
+        start = float(word.get("start", 0))
+        end = float(word.get("end", 0))
+        if first <= start < last:
+            return True
+        carried_seconds += max(0.0, min(end, last) - max(start, first))
+    return carried_seconds >= ACTION_MIN_SPEECH_SHARE * (last - first)
+
+
+def _silent_subchunk_prompts(chunk, transcript, chunk_prompt):
+    """Return the dialogue-less prompt for every sub-chunk whose audio is silent.
+
+    Every phase of a chunk shares one encoded conditioning, so a phase with silence in
+    its own window otherwise reads the chunk's whole dialogue and moves the mouth.
+    A sub-chunk that does speak keeps the chunk's text exactly as it is.
+    """
+    phases = chunk.get("phases") or (chunk,)
+    silent = [number for number, phase in enumerate(phases, 1) if not _subchunk_speaks(phase, chunk, transcript)]
+    if not silent:
+        return None
+    without_dialogue = _prompt_without_dialogue(chunk_prompt)
+    if without_dialogue == str(chunk_prompt or ""):
+        return None
+    # The silent sub-chunks share one text, so one encode serves all of them.
+    return {number: without_dialogue for number in silent}
+
+
+def _subchunk_transcript(phase, chunk, transcript):
+    """Return the words the take spoke inside one sub-chunk's own audio window.
+
+    Whisper's word times are seconds from the chunk's audio start and a phase covers its own
+    slice of that window, so a word belongs to a sub-chunk when its time overlaps that
+    slice. A word straddling a boundary belongs to both, exactly as it does for the speech
+    test, and a take that said nothing in the slice reports nothing.
+    """
+    words = (transcript or {}).get("words") or ()
+    if not words:
+        return ""
+    first = (int(phase["audio_start"]) - int(chunk["audio_start"])) / float(AUDIO_LATENT_FPS)
+    last = (int(phase["audio_end"]) - int(chunk["audio_start"])) / float(AUDIO_LATENT_FPS)
+    heard = [str(word.get("word", "")).strip() for word in words if float(word.get("end", 0)) > first and float(word.get("start", 0)) < last]
+    return " ".join(text for text in heard if text)
+
+
+def _publish_subchunk_prompts(preview_execution, range_item, index, silent_prompts, chunk, transcript):
+    """Record what each sub-chunk of one chunk is prompted with, and what it heard.
+
+    Every phase of a chunk shares one conditioning, so the silent sub-chunks are the only
+    ones that deviate from the chunk's own prompt, and they all share one dialogue-less
+    text. The transcripts are cut to each phase's own audio window, so the preview can show
+    what that slice of the take actually says. A transcript that never arrived, or holds no
+    words, publishes none at all: the preview must not claim a silence it cannot know.
+    """
+    transcripts = None
+    if isinstance(transcript, dict) and transcript.get("words"):
+        transcripts = [_subchunk_transcript(phase, chunk, transcript) for phase in (chunk.get("phases") or (chunk,))]
+        range_item["subchunk_transcripts"] = transcripts
+    if silent_prompts:
+        numbers = sorted(int(number) for number in silent_prompts)
+        text = str(next(iter(silent_prompts.values()))).strip()
+        range_item["subchunk_silent_numbers"] = numbers
+        range_item["subchunk_silent_prompt"] = text
+    if preview_execution is not None:
+        preview_execution.set_subchunk_prompts(index, range_item.get("subchunk_silent_numbers") or [], range_item.get("subchunk_silent_prompt") or "", transcripts)
+
+
+def _legacy_dialogue_pieces(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges=(), sampled_start=None, origin=None):
+    """Assign whole phoneme-timed words once on the global source-shot clock.
+
+    Each piece carries the index of the spoken block it came from, which is also
+    its slot: prose sits between two blocks, so a chunk body can interleave the two
+    in the order the global prompt writes them.
+    """
+    pattern = LEGACY_DIALOGUE_PATTERN
     matches = list(pattern.finditer(body))
     if len(matches) != len(re.findall(r"<d>", body, re.IGNORECASE)) or len(matches) != len(re.findall(r"</d>", body, re.IGNORECASE)):
-        raise ValueError("Legacy dialogue needs complete '<Subject N> (SN) says: <d>[Language] words</d>' blocks (a character name may replace <Subject N>).")
+        raise ValueError(f"{_dialogue_error_location(origin)}Legacy dialogue needs complete '<Subject N> (SN) says: <d>[Language] words</d>' blocks (a character name may replace <Subject N>).")
     if not matches:
         return body, []
     silence = re.search(
@@ -1751,17 +2444,31 @@ def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_en
     if not total_weight:
         return pattern.sub("", body), []
     available_seconds = max(0.0, dialogue_end - opening_silence)
-    if total_weight > available_seconds:
-        raise ValueError(f"Legacy dialogue phoneme estimate estimates {total_weight:.2f}s of speech, but the shot allows only {available_seconds:.2f}s after opening silence. Increase the shot duration, shorten its dialogue, or connect a pre-production director.")
+    # The word schedule already stretches speech into its window, so a rate is
+    # never impossible by arithmetic. What matters is whether H3 is told to
+    # speak at that rate: each chunk is told its pace next to this one, which is
+    # what the guides' speaking-rate delivery supports outside <d>. Only a rate
+    # no human pace can reach stops the render.
+    speech_rate = total_weight / available_seconds if available_seconds else float("inf")
+    if speech_rate > ACTION_MAX_SPEECH_RATE:
+        spoken = " ".join(match.group("speech").strip() for match, _words in source_dialogues)
+        excerpt = spoken if len(spoken) <= 80 else spoken[:77] + "..."
+        raise ValueError(f"{_dialogue_error_location(origin)}Legacy dialogue phoneme estimate estimates {total_weight:.2f}s of speech, but the shot allows only {available_seconds:.2f}s after opening silence, a speaking rate of {speech_rate:.2f}x. Its dialogue is \"{excerpt}\". Lengthen the shot, shorten its dialogue, split the shot, or connect a pre-production director.")
+    logging.info("HR Endless Sampler dialogue delivery: %s settles at %.2fx over its %d chunk(s); each chunk is asked for its own pace next to that.", origin or "a source shot", speech_rate, len(dialogue_ranges) or 1)
     speech_start = shot_start + int(math.ceil(opening_silence * fps))
     owned_ranges = tuple((max(shot_start, speech_start, start), min(shot_end, end)) for start, end in dialogue_ranges if start < shot_end and end > speech_start)
     word_owners = {}
     word_start_frames = {}
     word_end_frames = {}
+    gap_owner = {}
     if owned_ranges:
         all_words = [(match_index, word_index, weight) for match_index, (_match, weighted_words) in enumerate(source_dialogues) for word_index, (_word, weight) in enumerate(weighted_words)]
         if len(all_words) < len(owned_ranges):
-            raise ValueError(f"Legacy dialogue has {len(all_words)} words for {len(owned_ranges)} output chunks. Add dialogue, use longer chunks, or shorten the shot so every dialogue chunk can contain a complete word.")
+            # Fewer words than chunks is not an error: the owner walk leaves the
+            # trailing chunks silent while the words that exist stay contiguous,
+            # which is what a long shot with sparse dialogue looks like. Refusing
+            # here rejected valid prompts such as a 43-second shot with one line.
+            logging.info("HR Endless Sampler dialogue timing: %s has %d words for %d output chunks; the later chunks stay silent.", origin or "a source shot", len(all_words), len(owned_ranges))
         # Keep words contiguous while putting each weight boundary as close as
         # possible to the output-time boundary. Every dialogue chunk receives a
         # whole word, and each local phoneme schedule finishes at its seam.
@@ -1775,6 +2482,11 @@ def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_en
         for range_index, (span_start, span_end) in enumerate(spans):
             for word_index in range(span_start, span_end + 1):
                 word_owners[all_words[word_index][:2]] = range_index
+        # The prose before a block belongs to the chunk that speaks its *first* word,
+        # never to every chunk that carries a later slice of it.
+        for word_index, (match_index, _word_index, _weight) in enumerate(all_words):
+            if word_index == 0 or all_words[word_index - 1][0] != match_index:
+                gap_owner[match_index] = word_owners[(match_index, _word_index)]
         for range_index, (range_start, range_end) in enumerate(owned_ranges):
             owned_words = [item for item in all_words if word_owners[item[:2]] == range_index]
             if not owned_words:
@@ -1797,8 +2509,17 @@ def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_en
     current_range_index = owned_ranges.index(current_range) if current_range in owned_ranges else None
     for match_index, (match, weighted_words) in enumerate(source_dialogues):
         speech = match.group("speech")
+        # Prose the prompt puts between this block and the previous one belongs right
+        # here, immediately before this delivery, so it stays between the two.
+        # The prose the prompt wrote before this block goes with the chunk that speaks
+        # the block's first word, so a block spread over two chunks cannot repeat it.
+        gap = ""
+        if match_index and (not gap_owner or current_range_index is None or gap_owner.get(match_index) == current_range_index):
+            gap = _legacy_dialogue_gaps(body)[match_index]
         selected = []
         selected_index = None
+        selected_weight = 0.0
+        piece_is_cut = False
         for word_index, (word, weight) in enumerate(weighted_words):
             cursor += weight * scale
             # A word is owned where its spoken sound finishes. This lets a word
@@ -1813,77 +2534,617 @@ def _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_en
                 owns_prefix = current_range_index and word_owners[(match_index, word_index)] == current_range_index - 1 and sampled_start <= word_start_frames[(match_index, word_index)] < current_range[0]
                 selected_here = owns_prefix or owns_output
                 carries_boundary_words = carries_boundary_words or bool(owns_prefix)
+                piece_is_cut = piece_is_cut or bool(owns_prefix)
             else:
                 selected_here = max(frame_start, shot_start) < word_end_frame <= min(frame_end, shot_end)
             if selected_here:
                 if selected_index is None:
                     selected_index = word_index
                 selected.append(word)
+                selected_weight += weight
         if selected:
             words = re.sub(r"\s+", " ", speech[selected[0].start():selected[-1].end()]).strip()
             # A slice that starts inside a phrase keeps its leading seam space,
             # so H3 does not glue it onto a new word at the boundary.
             phrases = _dialogue_phrase_ids(speech)
             carried_prefix = bool(selected_index) and phrases[selected_index] == phrases[selected_index - 1]
-            dialogue.append(match.group("header") + "<d>" + match.group("language") + _dialogue_segment_text(words.split(), carried_prefix) + "</d>")
+            # A piece earns a pace instruction only when it *continues* a delivery: the
+            # owner's rule is that nothing is said about speed before the start of a
+            # dialogue the cutter cut, because that piece begins the delivery rather than
+            # resuming one. Its first selected word not being the block's first word, or
+            # words carried from the previous chunk, is what makes it a continuation.
+            piece_is_cut = piece_is_cut or bool(selected_index)
+            # The speaking-rate delivery belongs outside <d>, where the guides put a
+            # speaker's identifying phrase and delivery; the spoken words themselves
+            # stay byte-identical. It is only for a *cut* delivery: a block a chunk
+            # boundary cut. A delivery the chunk holds whole needs no instruction, so
+            # it must not gain one.
+            piece_delivery = None
+            if piece_is_cut or carried_prefix:
+                # The pace is this chunk's own next to the shot's: a chunk has no more
+                # time than its neighbours, so more words in the same window means
+                # speaking faster and fewer means slower.
+                piece_seconds = (current_range[1] - current_range[0]) / fps
+                piece_rate = selected_weight / piece_seconds if piece_seconds > 0 else float("inf")
+                piece_delivery = _dialogue_delivery_instruction(piece_rate, speech_rate)
+                if piece_delivery is not None:
+                    logging.info("HR Endless Sampler dialogue delivery: %s speaks %.2fs of dialogue in %.2fs (%.2fx against the shot's %.2fx); asking H3 to %s.", origin or "a source shot", selected_weight, piece_seconds, piece_rate, speech_rate, piece_delivery)
+            delivery_prefix = "" if piece_delivery is None else f"{piece_delivery[:1].upper()}{piece_delivery[1:]}, "
+            piece = delivery_prefix + match.group("header") + "<d>" + match.group("language") + _dialogue_segment_text(words.split(), carried_prefix) + "</d>"
+            # Everything the source wrote between the previous block and this one is
+            # kept verbatim: the leading run becomes the piece's separator and what
+            # follows it (the in-between prose and the break before the header) stays
+            # inside the piece, so its empty lines survive into the chunk prompt.
+            if match_index:
+                between = body[matches[match_index - 1].end():match.start()]
+            else:
+                # The first block has no prose before it that this piece owns: only
+                # the break that led into its header belongs to it.
+                head = body[:match.start()]
+                between = head[len(head.rstrip()):]
+            leading = between[:len(between) - len(between.lstrip())]
+            inner = between.lstrip()
+            dialogue.append((match_index, f"{inner}{piece}" if inner else piece, leading))
     if dialogue and carries_boundary_words:
         # The selected words are a source-clock slice, not a fresh utterance.
         # State this once outside <d> so H3 continues the prefix's phonemes.
-        dialogue.insert(0, "The dialogue is already in progress at this video opening.")
+        dialogue.insert(0, (dialogue[0][0], "The dialogue is already in progress at this video opening.", dialogue[0][2]))
     return pattern.sub("", body), dialogue
 
 
-def _legacy_shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None):
-    """Pre-Gemma proportional word slicing, restored from 12a771b's parent."""
-    if frame_start > shot_start:
-        # Remove explicit opening-image setup BEFORE slicing can truncate it.
-        # Protect spoken text even when it mentions a picture or first frame.
-        parts = re.split(r"(<d>.*?</d>)", body, flags=re.IGNORECASE | re.DOTALL)
-        opening = re.compile(r"(?:^\s*|(?<=[.!?])\s+)(?:starts?\s+with|begins?\s+with|use|using)\s+<Picture\s+\d+>\s+as\s+(?:the\s+)?(?:exact\s+)?(?:first|opening|initial)\s+frame\b[^.!?]*(?:[.!?]|$)\s*", re.IGNORECASE)
-        body = "".join(part if index % 2 else opening.sub("", part) for index, part in enumerate(parts))
-    visual_body, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start)
-    if visual_body != body:
-        if frame_start > shot_start:
-            # Opening-only setup belongs only to the source shot's beginning.
-            # Its former proportional visual slice could reintroduce a one-second
-            # silence in later chunks even while their dialogue words progressed.
-            visual_body = re.sub(
-                r"(?is)(?:<Subject\s+\d+>|[\w'-]+)\s+start(?:s)?\s+(?:the\s+)?video\s+in\s+silence\s+for\s+"
-                r"\d+(?::\d+)?(?:\.\d+)?\s*(?:seconds?|s)?\s*,?\s*(?:then\s*)?",
-                "",
-                visual_body,
-            )
-        visual = _legacy_shot_body_for_range(visual_body, shot_start, shot_end, frame_start, frame_end, fps) if visual_body.strip() else ""
-        return " ".join([visual.strip()] + dialogue).strip() or "Continue the established shot without additional dialogue."
-    if frame_start <= shot_start and frame_end >= shot_end:
-        return body
-    # ponytail: this estimates action timing by word count, not scene semantics;
-    # connect a pre-production provider for visual, model-authored direction.
+def _action_clauses(sentence):
+    """Split one sentence into ordered clauses with the connector that joins them.
+
+    ponytail: this is an English connector heuristic, not a parse. It splits on
+    commas before connectors, on semicolons, on participial clauses, and on a
+    connector that introduces a subject-like continuation. The ceiling is a
+    sentence whose two actions share no marker; the upgrade path is a real
+    dependency parse (spaCy en_core_web_sm) behind the same entry point.
+    """
+    parts = ACTION_CLAUSE_BREAK.split(sentence)
+    clauses = []
+    connector = None
+    for index, part in enumerate(parts):
+        if index % 2 == 1:
+            # Kept raw so rejoining reproduces the source punctuation exactly:
+            # ", as " rejoins two clauses as "first, as second", ", " as
+            # "first, second", and a sentence break keeps its own period.
+            connector = re.sub(r"\s+", " ", part)
+            continue
+        text = re.sub(r"\s+", " ", part).strip()
+        if text:
+            clauses.append({"text": text, "connector": connector})
+        connector = None
+    return clauses or [{"text": re.sub(r"\s+", " ", sentence).strip(), "connector": None}]
+
+
+def _action_units(body, sentence_slots=None, sentence_separators=None):
+    """Return the shot's visual prose as ordered action units.
+
+    Each unit carries its own sentence text, the connector that links it to the
+    previous unit, and its category. Categories exist so timing and repetition
+    can differ per kind: a still camera is a state, a cut is instantaneous, and
+    everything else is an owned action. When `sentence_slots` maps a sentence to
+    the number of spoken blocks that precede it in the source, every unit gets
+    that slot: it is what lets a chunk interleave prose and dialogue in the order
+    the global prompt writes them.
+    """
     units = []
-    for sentence in re.split(r"(?<=[.!?])\s+|(?<=[.!?][\"'])\s+|\n\s*\n+", body):
+    for sentence in ACTION_SENTENCE_BREAK.split(body):
         sentence = sentence.strip()
         if not sentence:
             continue
-        # Keep complete visual sentences: fixed word blocks can leave a
-        # dangling camera instruction immediately before dialogue prose.
-        units.append(sentence)
-    weights = [max(1, len(re.findall(r"\w+", unit))) for unit in units]
-    total_weight = sum(weights)
-    start_weight = total_weight * (max(frame_start, shot_start) - shot_start) / (shot_end - shot_start)
-    end_weight = total_weight * (min(frame_end, shot_end) - shot_start) / (shot_end - shot_start)
-    selected = []
-    offset = 0
-    for unit, weight in zip(units, weights):
-        if offset < end_weight and offset + weight > start_weight:
-            selected.append(unit)
-        offset += weight
-    return " " + " ".join(selected) if selected else " Continue the established shot and its ongoing action."
+        slot = 0 if not sentence_slots else int(sentence_slots.get(sentence, 0))
+        leading = "" if not sentence_separators else str(sentence_separators.get(sentence, ""))
+        for clause in _action_clauses(sentence):
+            text = clause["text"]
+            if not text:
+                continue
+            if CAMERA_STATIC.search(text):
+                category = "camera_state"
+            elif CAMERA_CUT.search(text):
+                category = "camera_cut"
+            elif CAMERA_MOTION.search(text):
+                category = "camera_move"
+            elif ACTION_SUBJECT_REFERENCE.search(text):
+                category = "subject"
+            else:
+                category = "other"
+            # The source's own whitespace leads the connector, so a sentence that
+            # began on a new line keeps its break and its empty line.
+            units.append({"text": text, "connector": clause["connector"], "category": category, "slot": slot, "separator": leading + str(clause["connector"] or "")})
+    return units
 
 
-def _legacy_opening_body_with_timed_dialogue(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None):
-    """Keep opening visual prose whole while assigning only its dialogue to time."""
-    visual_body, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start)
-    return " ".join([visual_body.strip()] + dialogue).strip()
+def _action_relation(previous, current):
+    """Return 'parallel' when two units share one time window, else 'sequential'.
+
+    A still camera and a cut always describe a state or a new beat, so they are
+    ordered rather than overlapped. A camera move runs alongside its subject
+    unless the text explicitly sequences it, which is what "as the camera zooms
+    in" and "then the camera zooms in" differ about.
+    """
+    if previous["category"] == "camera_state" or current["category"] == "camera_state":
+        return "sequential"
+    if previous["category"] == "camera_cut" or current["category"] == "camera_cut":
+        return "sequential"
+    lead = current["connector"] or ""
+    if ACTION_SEQUENTIAL_LEAD.match(lead):
+        return "sequential"
+    if ACTION_PARALLEL_LEAD.match(lead or current["text"]):
+        return "parallel"
+    # A participial clause continues the beat it is attached to, and a camera
+    # move runs alongside its subject unless the text sequenced it above.
+    if re.match(r"(?i)^\s*\w+ing\b", current["text"]):
+        return "parallel"
+    if current["category"] == "camera_move" or previous["category"] == "camera_move":
+        return "parallel"
+    return "sequential"
+
+
+def _action_unit_weight(text):
+    """Estimate one action unit's duration in seconds of screen time.
+
+    ponytail: word count with a floor, unchanged from the previous slicer. It
+    measures prose length, not screen semantics; the upgrade path is the same
+    dependency parse as _action_clauses.
+    """
+    return max(1, len(re.findall(r"\w+", text)))
+
+
+def _action_groups(body, sentence_slots=None, sentence_separators=None):
+    """Group the shot's units, and separate carry-over from opening setup.
+
+    Returns the ownable parallel groups, the still-camera clauses that repeat in
+    every chunk, and the opening setup clauses. A setup clause configures the
+    shot's first frame or its opening silence, so it is neither repeated nor
+    allowed to be cut across a seam: it belongs to the shot's opening chunk.
+    A parallel group, likewise, must stay in one chunk, because half of
+    "Tila smiles as the camera zooms in" alone would change what H3 renders.
+    """
+    carry_over = []
+    opening = []
+    groups = []
+    for unit in _action_units(body, sentence_slots, sentence_separators):
+        if ACTION_SETUP_REFERENCE.search(unit["text"]):
+            opening.append(unit)
+            continue
+        if unit["category"] == "camera_state":
+            carry_over.append(unit)
+            continue
+        if groups and _action_relation(groups[-1]["units"][-1], unit) == "parallel":
+            groups[-1]["units"].append(unit)
+            continue
+        groups.append({"units": [unit]})
+    for group in groups:
+        # Parallel members share their window, so the group lasts as long as its
+        # longest member; the previous slicer summed every clause.
+        group["weight"] = max(_action_unit_weight(unit["text"]) for unit in group["units"])
+    return groups, carry_over, opening
+
+
+def _action_group_text(group):
+    """Join one group's units, reproducing the punctuation between them."""
+    text = group["units"][0]["text"]
+    for unit in group["units"][1:]:
+        text = f"{text}{unit['connector'] or ' '}{unit['text']}"
+    return text
+
+
+def _action_owner_index(group_weights, windows, shot_start, shot_end, fps):
+    """Give each group to exactly one chunk, cutting at the nearest clock boundary.
+
+    This is the same walk `_dialogue_owner_spans` uses for words, so a group is
+    never split across a seam and never dropped, and every planned chunk takes
+    at least one group while groups remain. A chunk ahead of the remaining
+    groups stays empty rather than repeating prose the earlier chunks own.
+    """
+    total_weight = sum(group_weights) or 1
+    shot_seconds = (shot_end - shot_start) / fps
+    boundaries = []
+    cumulative = 0.0
+    for weight in group_weights:
+        cumulative += weight
+        boundaries.append(cumulative)
+    owners = []
+    first_group = 0
+    for window_index, (_window_start, window_end) in enumerate(windows[:-1]):
+        elapsed = max(0.0, window_end / fps - shot_start / fps)
+        desired = total_weight * elapsed / shot_seconds if shot_seconds else total_weight
+        remaining = len(windows) - window_index - 1
+        upper_bound = min(len(group_weights), max(first_group + 1, len(group_weights) - remaining))
+        if first_group >= upper_bound:
+            continue
+        final_group = min(range(first_group, upper_bound), key=lambda group_index: abs(boundaries[group_index] - desired))
+        owners.extend([window_index] * (final_group - first_group + 1))
+        first_group = final_group + 1
+    owners.extend([len(windows) - 1] * max(0, len(group_weights) - first_group))
+    return owners
+
+
+def _legacy_action_plan(visual_body, shot_start, shot_end, windows, fps, sentence_slots=None, sentence_separators=None):
+    """Return the action prose each planned chunk of one shot should carry."""
+    texts, _pieces = _legacy_action_outputs(visual_body, shot_start, shot_end, windows, fps, sentence_slots, sentence_separators)
+    return texts
+
+
+def _legacy_action_outputs(visual_body, shot_start, shot_end, windows, fps, sentence_slots=None, sentence_separators=None):
+    """Return each planned chunk's action prose as one string and as ordered pieces.
+
+    Each parallel group is owned by exactly one chunk, and a still camera is
+    carried into every chunk because it describes a state that stays true for
+    the whole shot. This is what stops a long description sentence from being
+    re-announced in chunk after chunk.
+
+    Every piece carries the slot its sentence sat in and the separator that led
+    into it, so a chunk body can place the prose around the deliveries in the
+    order the global prompt writes them. The joined text is what the other
+    callers read, byte for byte as before.
+    """
+    groups, carry_over, opening = _action_groups(visual_body, sentence_slots, sentence_separators)
+    carry_text = " ".join(unit["text"] for unit in carry_over)
+    opening_text = _action_group_text({"units": opening}) if opening else ""
+    texts = {}
+    pieces = {}
+    # Only a window that reaches this shot may own any of its prose, so a chunk
+    # before the shot can never claim it.
+    windows = tuple(window for window in windows if window[1] > shot_start and window[0] < shot_end)
+    if not windows:
+        return texts, pieces
+    if not groups:
+        for window in windows:
+            texts[window] = carry_text
+            entry = [(-1, carry_text, "")] if carry_text else []
+            pieces[window] = entry
+        if opening_text:
+            texts[windows[0]] = " ".join(part for part in [carry_text.strip(), opening_text] if part)
+            pieces[windows[0]] = pieces[windows[0]] + [(-2, opening_text, " " if carry_text else "")]
+        return texts, pieces
+    owners = _action_owner_index([group["weight"] for group in groups], windows, shot_start, shot_end, fps)
+    for window_index, window in enumerate(windows):
+        text = carry_text.strip()
+        entry = [(-1, text, "")] if text else []
+        # Opening setup is stated once, in the chunk where the shot opens.
+        if window_index == 0 and opening_text:
+            entry.append((-2, opening_text, " " if text else ""))
+            text = opening_text if not text else f"{text} {opening_text}"
+        for group, owner in zip(groups, owners):
+            if owner != window_index:
+                continue
+            # The connector belongs to the group's first unit, so it survives a
+            # group that lands after another one inside the same chunk.
+            separator = group["units"][0].get("separator") or group["units"][0]["connector"] or " "
+            group_text = _action_group_text(group)
+            entry.append((int(group["units"][0].get("slot", 0)), group_text, separator if text else ""))
+            text = group_text if not text else f"{text}{separator}{group_text}"
+        texts[window] = text
+        pieces[window] = entry
+    return texts, pieces
+
+
+def _action_plan_rows(visual_body, shot_start, shot_end, windows, fps):
+    """Describe this shot's groups, their relations and their owning windows.
+
+    Owners are indexed against the same filtered window tuple
+    `_legacy_action_plan` uses, so the debug table names the chunk that really
+    received each unit.
+    """
+    groups, carry_over, opening = _action_groups(visual_body)
+    windows = tuple(window for window in windows if window[1] > shot_start and window[0] < shot_end)
+    owners = _action_owner_index([group["weight"] for group in groups], windows, shot_start, shot_end, fps) if windows and groups else []
+    rows = []
+    for index, group in enumerate(groups):
+        relation = "first" if index == 0 else _action_relation(groups[index - 1]["units"][-1], group["units"][0])
+        owner = owners[index] if index < len(owners) else None
+        rows.append({"category": group["units"][0]["category"], "relation": relation, "window": windows[owner] if owner is not None else None, "text": _action_group_text(group), "carry": False})
+    for unit in opening:
+        rows.append({"category": "opening_setup", "relation": "setup", "window": windows[0] if windows else None, "text": unit["text"], "carry": False})
+    for unit in carry_over:
+        rows.append({"category": unit["category"], "relation": "carry-over", "window": None, "text": unit["text"], "carry": True})
+    return rows
+
+
+def _dialogue_delivery_instruction(rate, pace=1.0):
+    """Describe the delivery a chunk needs next to the pace its shot settles into.
+
+    ``pace`` is the whole shot's own words-per-second, so the ratio is what the chunk has
+    to do compared with its neighbours: more words in the same time means a faster
+    delivery, fewer means a slower one, and a ratio inside the dead band asks for nothing
+    at all. Only the shots that cannot be spoken at any plausible pace are refused, which
+    the caller does with the absolute rate.
+    """
+    ratio = rate / pace if pace else float("inf")
+    if ratio < ACTION_MIN_SPEECH_RATIO:
+        return ACTION_SLOW_SPEECH_INSTRUCTION
+    if ratio <= ACTION_MAX_SPEECH_RATIO:
+        return None
+    for limit, phrase in ACTION_SPEECH_RATE_BANDS:
+        if ratio <= limit:
+            return phrase
+    return ACTION_SPEECH_RATE_BANDS[-1][1]
+
+
+def _delivery_phrase_pattern():
+    """Match whichever speaking-rate delivery this prompt already carries."""
+    phrases = [ACTION_FORCED_SPEECH_INSTRUCTION, ACTION_SLOW_SPEECH_INSTRUCTION]
+    phrases.extend(phrase for _limit, phrase in ACTION_SPEECH_RATE_BANDS)
+    return re.compile(r"(?i)\b(?:%s)\b,?\s*" % "|".join(re.escape(phrase) for phrase in phrases))
+
+
+def _dialogue_phrase_was_spoken(phrase, heard_words):
+    """Report whether the take said a phrase, judging its words one by one.
+
+    A dropped or garbled word is what makes a phrase fail, so a phrase counts as
+    spoken only when every one of its words is somewhere in the transcript. The
+    comparison is the same tolerant one the take match uses, so spelling and a number
+    written as digits never count as damage.
+    """
+    heard = set(heard_words)
+    return all(any(_dialogue_same_word(word, heard_word) for heard_word in heard) for word in _dialogue_word_tokens(phrase))
+
+
+def _split_out_damaged_phrases(prompt, transcript):
+    """Give a failed take a second delivery, and never more than one.
+
+    A group holding several phrases can lose the ones it has no room for, so the take is
+    asked again with two groups instead of one: the first phrase on its own when the first
+    phrase failed, otherwise the last phrase on its own, which is what puts the failed
+    phrase next to a shorter delivery. Three groups measured worse audio than the take they
+    were meant to fix, so the split stops at two and neither the words nor their order
+    change.
+    """
+    heard = _dialogue_word_tokens(transcript.get("text") if isinstance(transcript, dict) else transcript)
+    if not heard:
+        return str(prompt or "")
+    isolated = []
+
+    def regroup(match):
+        body = match.group(1)
+        tag = re.match(r"\s*(\[[^\]]*\])\s*", body)
+        spoken = body[tag.end():] if tag else body
+        prefix = f"{tag.group(1)} " if tag else ""
+        phrases = _dialogue_phrase_groups(spoken)
+        if len(phrases) <= 1:
+            return match.group(0)
+        damaged = [index for index, phrase in enumerate(phrases) if not _dialogue_phrase_was_spoken(phrase, heard)]
+        if not damaged:
+            return match.group(0)
+        isolated.extend(phrases[index] for index in damaged)
+        # The first phrase failed: it speaks alone. Anything else failed: the last phrase
+        # speaks alone, so the failed phrase shares a shorter delivery either way.
+        cut = 1 if 0 in damaged else len(phrases) - 1
+        return " ".join(
+            f"<d>{prefix}{group}</d>" for group in (" ".join(phrases[:cut]), " ".join(phrases[cut:]))
+        )
+
+    rebuilt = DIALOGUE_BLOCK.sub(regroup, str(prompt or ""))
+    if isolated:
+        logging.info("HR Endless Sampler retry splits this group in two for the phrase(s) this take failed: %s", " | ".join(isolated))
+    return rebuilt
+
+
+def _dialogue_retry_prompt(prompt, transcript=None):
+    """Rebuild a retry: the phrases the take missed get their own <d> group.
+
+    A retry exists because the take dropped or garbled phrases, and there is a transcript
+    saying which ones, so only those phrases are asked for on their own: a take that was
+    fine keeps the prompt's own grouping, which is what stops the retry from rewriting
+    dialogue that never failed. The delivery band escalates in the same prompt, and not
+    a single word changes. Without a usable transcript the grouping is left alone.
+    """
+    rebuilt = _split_out_damaged_phrases(prompt, transcript) if TOGGLE_SPLIT_DIALOGUE_PHRASES else prompt
+    return _escalate_speech_rate(rebuilt)
+
+
+def _dialogue_phrase_groups(spoken):
+    """Split one group's spoken text into the phrases the cutter also works with."""
+    phrases = []
+    words = []
+    for word in re.finditer(r"\S+", spoken):
+        words.append(word.group())
+        if re.search(r"(?:\.{3,}|…+|[.!?])[\"')]*$", word.group()):
+            phrases.append(" ".join(words))
+            words = []
+    if words:
+        phrases.append(" ".join(words))
+    return phrases
+
+
+def _split_dialogue_phrases(prompt):
+    """Give every spoken phrase its own <d> group, repeating the language tag.
+
+    MiniMax speaks one <d> group as one delivery, so a group holding several phrases
+    can lose the ones it has no room for: "<d>[English] This is that. But that is not
+    this.</d>" becomes "<d>[English] This is that.</d> <d>[English] But that is not
+    this.</d>". Phrases end where _dialogue_phrase_ids ends them, so the split and the
+    chunk cutter agree on what a phrase is, and the words themselves are untouched.
+    Text outside the groups is returned byte-identical.
+    """
+    def split_block(match):
+        body = match.group(1)
+        # The language tag belongs to the group, so every split group repeats it.
+        tag = re.match(r"\s*(\[[^\]]*\])\s*", body)
+        spoken = body[tag.end():] if tag else body
+        spoken_prefix = f"{tag.group(1)} " if tag else ""
+        phrases = _dialogue_phrase_groups(spoken)
+        if len(phrases) <= 1:
+            return match.group(0)
+        return " ".join(f"<d>{spoken_prefix}{phrase}</d>" for phrase in phrases)
+
+    return DIALOGUE_BLOCK.sub(split_block, prompt)
+
+
+def _escalate_speech_rate(prompt, phrase=ACTION_FORCED_SPEECH_INSTRUCTION):
+    """Ask for a faster delivery without changing a single spoken word.
+
+    A retry means the take lost, garbled or mis-timed words, not that the words
+    were wrong, so the words stay byte-identical and only the delivery changes.
+    An existing band is replaced; otherwise the instruction is attached to the
+    speaker header, outside <d>, where the guides put a delivery.
+    """
+    escalated = f"{phrase[:1].upper()}{phrase[1:]}, "
+    if _delivery_phrase_pattern().search(prompt):
+        return _delivery_phrase_pattern().sub(escalated, prompt, count=1)
+    if LEGACY_DIALOGUE_PATTERN.search(prompt):
+        return LEGACY_DIALOGUE_PATTERN.sub(lambda match: escalated + match.group(0), prompt, count=1)
+    return prompt
+
+
+def _legacy_prose_slots(body):
+    """Slot per prose sentence: how many spoken blocks precede it in the source."""
+    return {sentence: layout[0] for sentence, layout in _legacy_prose_layout(body).items()}
+
+
+def _legacy_prose_layout(body):
+    """Map each prose sentence to (slot, leading whitespace) in the source.
+
+    The action table unitizes the prose with the spoken blocks stripped out, so the
+    table alone cannot know where its units sat relative to the deliveries, nor how
+    the prompt laid them out. This map restores both: slot 0 is before the first
+    block, slot k is between block k-1 and block k, the trailing slot is after the
+    last one, and the whitespace is the run the source wrote before the sentence,
+    which is what carries its line breaks and empty lines into the chunk prompt.
+    """
+    layout = {}
+    slot = 0
+    cursor = 0
+    spans = [(match.start(), match.end()) for match in LEGACY_DIALOGUE_PATTERN.finditer(body)]
+    bounds = [(0, spans[0][0])] if spans else [(0, len(body))]
+    bounds = bounds + [(spans[index][1], spans[index + 1][0]) for index in range(len(spans) - 1)] + ([(spans[-1][1], len(body))] if spans else [])
+    for index, (start, end) in enumerate(bounds):
+        slot = index
+        piece = body[start:end]
+        for sentence in ACTION_SENTENCE_BREAK.split(piece):
+            stripped = sentence.strip()
+            if not stripped:
+                continue
+            position = piece.find(stripped)
+            leading = piece[:position]
+            leading = leading[len(leading.rstrip()):]
+            layout.setdefault(stripped, (slot, leading))
+    return layout
+
+
+def _legacy_dialogue_gaps(body):
+    """Return the prose the source prompt puts between two spoken blocks.
+
+    "…says: <d>one</d> after saying, she pauses and makes a face. <Subject 1>
+    then says: <d>two</d>" — that middle prose describes what happens between the
+    two deliveries, so it must stay between them and can never be hoisted into the
+    visual prose of a chunk, where it would read as if it came before or after both.
+    The gap before the *next* block is what this returns, keyed by that block.
+    """
+    matches = list(LEGACY_DIALOGUE_PATTERN.finditer(body))
+    gaps = []
+    for index in range(len(matches)):
+        if index == 0:
+            gaps.append("")
+            continue
+        gaps.append(body[matches[index - 1].end():matches[index].start()].strip())
+    return gaps
+
+
+def _legacy_visual_body(body):
+    """Return one shot's visual prose with its spoken blocks removed.
+
+    The action table unitizes exactly the prose the dialogue slicer leaves
+    behind, so both must strip the same pattern. The prose *between* two spoken
+    blocks is stripped as well: it is emitted with the block it precedes, so
+    leaving it here would both duplicate it and move it out of position.
+    """
+    matches = list(LEGACY_DIALOGUE_PATTERN.finditer(body))
+    prose = body
+    for index in range(len(matches) - 1, 0, -1):
+        prose = prose[:matches[index - 1].end()] + prose[matches[index].start():]
+    return LEGACY_DIALOGUE_PATTERN.sub("", prose)
+
+
+def _legacy_shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None, origin=None, action_plan=None, action_pieces=None, sentence_slots=None, emitted=None):
+    """Emit this chunk's owned prose and its deliveries in the prompt's own order.
+
+    The table is built once per shot across every planned chunk by
+    `_legacy_action_plan` and handed in here, so ownership is decided exactly as
+    before. What the chunk body now respects is the *sequence*: every prose piece
+    carries the slot its sentence sat in and every delivery carries the spoken
+    block it came from, so action, direction and dialogue interleave the way the
+    global prompt writes them instead of all prose followed by all dialogue.
+    """
+    _visual_body, dialogue_pieces = _legacy_dialogue_pieces(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start, origin)
+    window = (frame_start, frame_end)
+    own_pieces = None if action_pieces is None else action_pieces.get(window)
+    if own_pieces is None:
+        if action_plan is None:
+            # A direct caller asks about one window; that window owns the whole
+            # shot, which is the same answer the planner gives a single-chunk shot.
+            if sentence_slots is None:
+                sentence_slots = _legacy_prose_slots(body)
+            action_plan, outputs = _legacy_action_outputs(_legacy_visual_body(body), shot_start, shot_end, (window,), fps, sentence_slots)
+            own_pieces = outputs.get(window) or []
+        else:
+            own_pieces = _legacy_plan_pieces(action_plan.get(window, ""))
+    # Every owned unit and every piece of in-between prose is consumed the moment it
+    # lands in a chunk prompt, so nothing can be placed in two chunks. The still-camera
+    # state and the opening setup are states rather than units: they are meant to
+    # repeat, so they are not claimed.
+    if emitted is None:
+        emitted = set()
+    claimed = []
+    for slot, text, separator in own_pieces:
+        if int(slot) < 0:
+            claimed.append((slot, text, separator))
+            continue
+        key = (int(slot), text)
+        if key in emitted:
+            logging.warning("HR Endless Sampler action table: %r already went into an earlier chunk, so it is not repeated here.", text[:80])
+            continue
+        emitted.add(key)
+        claimed.append((slot, text, separator))
+    own_pieces = claimed
+    gaps = _legacy_dialogue_gaps(body)
+    claimed = []
+    for block, text, separator in dialogue_pieces:
+        gap = gaps[block] if 0 <= block < len(gaps) else ""
+        if gap and (int(block), gap) in emitted:
+            logging.warning("HR Endless Sampler action table: %r already went into an earlier chunk, so it is not repeated here.", gap[:80])
+            text = text.replace(gap, "", 1).lstrip()
+        elif gap:
+            emitted.add((int(block), gap))
+        claimed.append((block, text, separator))
+    dialogue_pieces = claimed
+    merged = [(int(slot), 0, text, separator) for slot, text, separator in own_pieces]
+    merged.extend((int(block), 1, text, separator) for block, text, separator in dialogue_pieces)
+    merged.sort(key=lambda item: (item[0], item[1]))
+    parts = []
+    for _slot, _rank, text, separator in merged:
+        text = text.strip()
+        if not text:
+            continue
+        # A piece's separator is the whitespace the global prompt wrote before it, so
+        # its line breaks and empty lines survive into the chunk prompt.
+        separator = re.sub(r"\n{3,}", "\n\n", str(separator or ""))
+        parts.append(text if not parts else f"{separator or ' '}{text}")
+    return "".join(parts).strip() or "Continue the established shot without additional dialogue."
+
+
+def _legacy_plan_pieces(plan_text):
+    """Wrap an already-joined plan text as one leading piece.
+
+    Callers that hand in only the joined string keep the old arrangement: the
+    prose first, then the deliveries.
+    """
+    text = str(plan_text or "").strip()
+    return [] if not text else [(-1, text, "")]
+
+
+def _legacy_opening_body_with_timed_dialogue(body, shot_start, shot_end, frame_start, frame_end, fps=24.0, dialogue_ranges=(), sampled_start=None, origin=None, action_plan=None, action_pieces=None, sentence_slots=None, emitted=None):
+    """Answer for the chunk where a shot opens; ownership decides the prose now.
+
+    Kept as its own entry point because callers distinguish the opening chunk of
+    a shot. Handing the whole shot prose to that chunk is what used to make a
+    state sentence reappear in later chunks, so it delegates to the owned-slice
+    path instead.
+    """
+    return _legacy_shot_body_for_range(body, shot_start, shot_end, frame_start, frame_end, fps, dialogue_ranges, sampled_start, origin, action_plan, action_pieces, sentence_slots, emitted)
 
 
 def _legacy_static_camera_prompt(prompt, previous_prompt=None):
@@ -1897,7 +3158,7 @@ def _legacy_static_camera_prompt(prompt, previous_prompt=None):
 
     # ponytail: explicit English camera-motion vocabulary, not semantic parsing.
     # Unknown/implicit movement needs a director; never infer it from dialogue.
-    motion = re.compile(r"\b(?:pan(?:s|ning)?|tilt(?:s|ing)?|zoom(?:s|ing)?|dolly|dollies|dollying|truck(?:s|ing)?|orbit(?:s|ing)?|arc(?:s|ing)?|tracking\s+shot|handheld)\b|\bcamera\b[^.!?\n]{0,100}\b(?:move[sd]?|moving|movement|follow[s]?|track[s]?|shake[s]?|shaking|rotate[s]?|rotating|push(?:es)?|pull[s]?|crane[s]?)\b", re.IGNORECASE)
+    motion = CAMERA_MOTION
     for text in (prompt, previous_prompt or ""):
         start, end = description_bounds(text)
         description = re.sub(r"<d>.*?</d>", "", text[start:end], flags=re.IGNORECASE | re.DOTALL)
@@ -1934,6 +3195,30 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
     previous_bodies = {}
     source_shots = _parse_prompt_shots(prompt, total_frames, fps)[1] if legacy else ()
     dialogue_ranges = [(chunk["frame_start"] + chunk.get("output_trim_frames", 0), chunk["frame_end"]) for chunk in plan] if legacy else ()
+    # One action table per shot, covering every planned chunk the shot reaches.
+    # Ownership has to be decided across the whole shot, because a chunk cannot
+    # know which prose its neighbours already claimed.
+    action_plans = {}
+    action_piece_maps = {}
+    slots_by_shot = {}
+    plan_windows = tuple((other["frame_start"] + other.get("output_trim_frames", 0), other["frame_end"]) for other in active_plan)
+    if legacy:
+        for number, start, end, body in source_shots:
+            if not any(window[1] > start and window[0] < end for window in plan_windows):
+                continue
+            # The layout tells the chunk body where each owned sentence sat relative to
+            # the deliveries and what whitespace the source wrote before it, which is
+            # what keeps both the sequence of events and the prompt's own line breaks.
+            layout = _legacy_prose_layout(body)
+            slots_by_shot[number] = {sentence: pair[0] for sentence, pair in layout.items()}
+            action_plans[number], action_piece_maps[number] = _legacy_action_outputs(
+                _legacy_visual_body(body), start, end, plan_windows, fps,
+                {sentence: pair[0] for sentence, pair in layout.items()},
+                {sentence: pair[1] for sentence, pair in layout.items()},
+            )
+    # Shared by every chunk of this render: an item that lands in one chunk prompt
+    # comes out of the table here, so no later chunk can pick it up again.
+    emitted_units = set()
     for index, chunk in enumerate(active_plan):
         continuation = index > 0
         content_start = chunk["frame_start"] + chunk.get("output_trim_frames", 0)
@@ -1952,12 +3237,25 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
                 opening = content_start <= start
                 body_for_range = _legacy_opening_body_with_timed_dialogue if opening else _legacy_shot_body_for_range
                 sampled_start = chunk["frame_start"] if include_dialogue_prefix else content_start
-                local_body = body_for_range(body, start, end, content_start, chunk["frame_end"], fps, dialogue_ranges, sampled_start)
+                # Name the shot and the output chunk in any dialogue failure:
+                # the render stops on the first impossible shot, and the owner
+                # needs to know which source shot to lengthen or trim.
+                origin = "source Shot %d (frames %d-%d = %.2fs-%.2fs at %g fps), output Chunk %d (frames %d-%d = %.2fs-%.2fs)" % (number + 1, start, end, start / fps, end / fps, fps, index + 1, content_start, chunk["frame_end"], content_start / fps, chunk["frame_end"] / fps)
+                local_body = body_for_range(body, start, end, content_start, chunk["frame_end"], fps, dialogue_ranges, sampled_start, origin=origin, action_plan=action_plans.get(number), action_pieces=action_piece_maps.get(number), sentence_slots=slots_by_shot.get(number), emitted=emitted_units)
                 if not opening:
                     prior_body = previous_bodies.get(number, "")
                     local_body = _legacy_static_camera_prompt(local_body, prior_body)
                 body_overrides[number] = local_body
             previous_bodies = body_overrides
+        action_lines = []
+        for number, start, end, body in source_shots:
+            if start >= chunk["frame_end"] or end <= content_start:
+                continue
+            window = (content_start, chunk["frame_end"])
+            for row in _action_plan_rows(_legacy_visual_body(body), start, end, plan_windows, fps):
+                if not row["carry"] and row["window"] != window:
+                    continue
+                action_lines.append("Shot %d action [%s/%s]: %s" % (number + 1, row["category"], row["relation"], row["text"]))
         chunk_prompt = _prompt_for_chunk(
             prompt,
             chunk["frame_start"],
@@ -1973,7 +3271,7 @@ def _planned_chunk_prompts(prompt, plan, active_plan, fps, guide_frames, video_c
             body_overrides=body_overrides,
         )
         chunk_prompt = _preserve_global_prompt_sections(chunk_prompt, prompt)
-        debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt)
+        debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, action_report="\n".join(action_lines))
         planned.append((chunk_prompt, debug_prompt))
     return planned
 
@@ -2013,6 +3311,85 @@ def _preview_subtitle(prompt):
     return " ".join(subtitles)
 
 
+def _log_chunk_prompts(chunk_prompts):
+    """Show every chunk's final prompt, in the log and in a file to inspect later.
+
+    The cutter decides wording, ownership, order and line structure, so a chunk that
+    came out wrong has to be visible exactly as it was written. Guessing at it from the
+    render has cost more than this dump ever will.
+    """
+    texts = [str(text).strip() for text in chunk_prompts if str(text).strip()]
+    if not texts:
+        return
+    body = "\n\n".join("--- Chunk %d ---\n%s" % (index + 1, text) for index, text in enumerate(texts))
+    path = Path(tempfile.gettempdir()) / GEMMA_PROMPT_LOG_DIRNAME / CHUNK_PROMPT_LOG_FILENAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body + "\n", encoding="utf-8")
+    except (OSError, RuntimeError, ValueError) as error:
+        logging.warning("HR Endless Sampler could not write the chunk prompt dump: %s", error)
+    logging.info("HR Endless Sampler chunk prompts, %d chunks, also in %s:\n%s", len(texts), path, body)
+
+
+def _teacher_audio_chunk_prompt(chunk_ranges, requested_prompts, index):
+    """Return the prompt to show for one chunk: the generated one, or the plan's.
+
+    A chunk the pass has not reached yet has no requested prompt, but it still owns
+    its timeline slot, so the plan's own prompt describes it until it is generated.
+    """
+    if index < len(requested_prompts):
+        return str(requested_prompts[index])
+    if index < len(chunk_ranges):
+        planned = chunk_ranges[index].get("audio_teacher_prompt") or chunk_ranges[index].get("h3_prompt")
+        if planned:
+            return str(planned)
+    return ""
+
+
+def _remember_audio_teacher_transcript(range_item, attempt, transcript):
+    """Record what one teacher-audio take heard, in the order the takes were sampled.
+
+    Entry ``attempt`` belongs to the attempt the prompt list names at the same index, so the
+    preview can show every take's own hearing below its prompt. The take a later attempt
+    follows is the one that caused that retry, which is what the preview marks.
+    """
+    heard = [str(item or "") for item in (range_item.get("audio_teacher_attempt_transcripts") or [])]
+    # A range that never recorded a take of its own starts at zero rather than before it.
+    index = max(0, int(attempt))
+    while len(heard) <= index:
+        heard.append("")
+    heard[index] = str(transcript or "").strip()
+    range_item["audio_teacher_attempt_transcripts"] = heard
+    return heard
+
+
+def _remember_audio_teacher_attempt(range_item, retry_prompt, transcript=""):
+    """Add one retry to a chunk's teacher-audio prompt sequence.
+
+    The list starts with the take that was rejected and then names every retry in
+    the order it was sampled, which is what the preview shows on Ctrl-hover. The
+    first entry is read from the range because a retry overwrites the prompt-of-
+    record with the wording it is about to use. What the rejected take heard is
+    stored beside it, so the preview can show what each take said and mark the one
+    that caused a retry.
+    """
+    attempts = [str(item) for item in (range_item.get("audio_teacher_attempts") or [])]
+    if not attempts:
+        first = range_item.get("audio_teacher_prompt") or range_item.get("h3_prompt")
+        if first:
+            attempts.append(str(first))
+    attempts.append(str(retry_prompt).strip())
+    range_item["audio_teacher_attempts"] = attempts
+    # The take this retry replaces is the one before it in the sequence, and a range whose
+    # first recorded prompt is this retry belongs to the retry itself.
+    heard = _remember_audio_teacher_transcript(range_item, max(0, len(attempts) - 2), transcript)
+    # One slot per attempt, so a take that has not been transcribed yet keeps its own place.
+    while len(heard) < len(attempts):
+        heard.append("")
+    range_item["audio_teacher_attempt_transcripts"] = heard
+    return attempts
+
+
 def _dialogue_segment_text(words, carried_prefix=False):
     """Format a local dialogue slice, keeping one space on each side of a split."""
     text = " ".join(words).strip()
@@ -2023,20 +3400,6 @@ def _dialogue_segment_text(words, carried_prefix=False):
     if carried_prefix:
         text = " " + text
     return text if re.search(r"(?:\.{3,}|…+|[.!?])[\"')\]]*$", text) else text + " "
-
-
-def _audio_transcript_approved_tail_prompt(prompt, transcript):
-    """Keep a take that spoke an exact case- and punctuation-insensitive dialogue prefix."""
-    expected = _dialogue_word_tokens(_preview_subtitle(prompt))
-    heard = _dialogue_word_tokens(transcript.get("text", ""))
-    if not heard or len(heard) >= len(expected) or not _dialogue_words_equal(expected[:len(heard)], heard):
-        return None
-    parsed = _dialogue_block_words(prompt)
-    if parsed is None:
-        return None
-    # Keep the seam space the plan already put after the language tag, so the
-    # shortened take still reads as a continuation.
-    return _replace_dialogue_block_words(prompt, _dialogue_prefix_tokens(parsed[3], len(heard)), parsed[1] != parsed[1].rstrip())
 
 
 def _dialogue_block_words(prompt):
@@ -2076,102 +3439,6 @@ def _transcript_is_certain(transcript):
     if not words:
         return True
     return sum(float(word.get("probability", 0)) >= 0.5 for word in words) >= max(1, len(words) // 2)
-
-
-def _recut_dialogue_prompts(prompts, plan, fps, dialogue_index, first_index, kept_words=0, shrink_frames=0):
-    """Re-author the leftover dialogue over the leftover chunks with the initial cut.
-
-    `dialogue_index` supplies the leftover words and the speaker, `first_index`
-    is the first chunk that receives a new slice, `kept_words` skips a prefix the
-    take already spoke, and `shrink_frames` makes the initial cut believe that
-    chunk's window is shorter, which is how a diverged take asks for fewer words.
-    """
-    if len(prompts) != len(plan) or not 0 <= dialogue_index < len(prompts) or not dialogue_index <= first_index <= len(prompts):
-        return None
-    parsed = _dialogue_block_words(prompts[dialogue_index])
-    if parsed is None:
-        return None
-    _dialogue, _prefix, language, words, speaker = parsed
-    leftover = [word.group() for word in words][kept_words:]
-    chain = []
-    for index in range(dialogue_index, len(prompts)):
-        later = _dialogue_block_words(prompts[index])
-        if later is None or later[2].casefold() != language.casefold() or later[4] != speaker:
-            break
-        if index > dialogue_index:
-            leftover.extend(word.group() for word in later[3])
-        if index >= first_index:
-            chain.append(index)
-    if not leftover:
-        return None
-    output = list(prompts)
-    keeping_prefix = bool(kept_words) and first_index > dialogue_index
-    if keeping_prefix:
-        # A take that spoke a clean prefix keeps exactly that prefix as its own
-        # dialogue, so the plan and the accepted audio stay in step. The seam
-        # space the plan already put after the language tag is kept with it.
-        output[dialogue_index] = _replace_dialogue_block_words(prompts[dialogue_index], _dialogue_prefix_tokens(words, kept_words), parsed[1] != parsed[1].rstrip())
-        if output[dialogue_index] is None:
-            return None
-    if not chain:
-        return output if keeping_prefix else None
-    ranges = []
-    for index in chain:
-        chunk = plan[index]
-        start = int(chunk["frame_start"]) + int(chunk.get("output_trim_frames", 0))
-        end = int(chunk["frame_end"])
-        if index == dialogue_index and shrink_frames:
-            end = max(start + 1, end - int(shrink_frames))
-        ranges.append((start, end))
-    speech = " ".join(leftover)
-    phrase_ids = _dialogue_phrase_ids(speech)
-    spans = _dialogue_owner_spans(
-        [weight for _word, weight in _dialogue_word_weights(speech, language)],
-        phrase_ids,
-        [(end - start) / float(fps) for start, end in ranges],
-    )
-    # A re-cut slice keeps its leading seam space whenever it starts inside a
-    # phrase: the first one continues the chunk before it, and every later one
-    # continues the slice before it.
-    before = _dialogue_block_words(output[chain[0] - 1]) if chain[0] else None
-    carried_first = bool(before and before[3]) and not re.search(r"(?:\.{3,}|…+|[.!?])[\"')]*$", before[3][-1].group())
-    for position, index in enumerate(chain):
-        span_start, span_end = spans[position]
-        if position:
-            carried_prefix = bool(span_start) and phrase_ids[span_start] == phrase_ids[span_start - 1]
-        else:
-            carried_prefix = carried_first
-        replacement = _replace_dialogue_block_words(prompts[index], leftover[span_start:span_end + 1], carried_prefix)
-        if replacement is None:
-            return None
-        output[index] = replacement
-    return output
-
-
-def _retry_take_prompts(prompts, plan, fps, index):
-    """Re-cut a diverged chunk and its leftovers, shortening that chunk until its words change.
-
-    Missing or wrong words usually mean H3 ran out of time for them, so the same
-    cut is asked for a shorter chunk until it hands that chunk fewer words.
-    """
-    original = _preview_subtitle(prompts[index])
-    chunk = plan[index]
-    window_frames = int(chunk["frame_end"]) - int(chunk["frame_start"]) - int(chunk.get("output_trim_frames", 0))
-    for shrink_frames in range(1, max(2, window_frames)):
-        revised = _recut_dialogue_prompts(prompts, plan, fps, index, index, shrink_frames=shrink_frames)
-        if revised is not None and _preview_subtitle(revised[index]) != original:
-            return revised, shrink_frames
-    return _recut_dialogue_prompts(prompts, plan, fps, index, index), 0
-
-
-def _publish_revised_dialogue(planned_prompts, revised, first_index, preview_chunk_ranges, preview_execution):
-    """Adopt re-authored dialogue in the plan, the captions and the live preview."""
-    for prompt_index, revised_prompt in enumerate(revised):
-        planned_prompts[prompt_index] = (revised_prompt, planned_prompts[prompt_index][1])
-        preview_chunk_ranges[prompt_index]["h3_prompt"] = revised_prompt.strip()
-        preview_chunk_ranges[prompt_index]["subtitle"] = _preview_subtitle(revised_prompt)
-        if preview_execution is not None and prompt_index >= first_index:
-            preview_execution.set_audio_prompt(prompt_index, revised_prompt.strip(), preview_chunk_ranges[prompt_index]["subtitle"])
 
 
 def _reconcile_native_dialogue(previous_prompt, current_prompt, transcript):
@@ -2232,9 +3499,10 @@ def _debug_chunk_header(index, chunk, content_start):
     )
 
 
-def _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report=None):
+def _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report=None, action_report=None):
+    table = "" if not action_report else f"\n\n{action_report}"
     report = "" if not gemma_report else f"\n\n{gemma_report}"
-    return f"{_debug_chunk_header(index, chunk, content_start)}{report}\n{chunk_prompt}"
+    return f"{_debug_chunk_header(index, chunk, content_start)}{report}{table}\n{chunk_prompt}"
 
 
 def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, target):
@@ -2291,7 +3559,7 @@ def _gemma_shot_records(shots, range_start, range_end, sampled_start, fps, targe
     return records
 
 
-def _deterministic_dialogue_segments(body, shot_start, shot_end, chunks, fps):
+def _deterministic_dialogue_segments(body, shot_start, shot_end, chunks, fps, origin=None):
     """Return exact phoneme-timed dialogue fragments owned by output chunks."""
     segments = []
     dialogue_ranges = [(item["output_start"], item["output_end"]) for item in chunks]
@@ -2300,7 +3568,10 @@ def _deterministic_dialogue_segments(body, shot_start, shot_end, chunks, fps):
         end = min(shot_end, int(chunk["output_end"]))
         if start >= end:
             continue
-        _visual, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, start, end, fps, dialogue_ranges)
+        # The caller names the source shot; this loop adds which output chunk
+        # of it could not hold the dialogue.
+        located = None if not origin else "%s, output Chunk %d (frames %d-%d = %.2fs-%.2fs)" % (origin, chunk_index, start, end, start / fps, end / fps)
+        _visual, dialogue = _legacy_dialogue_for_range(body, shot_start, shot_end, start, end, fps, dialogue_ranges, origin=located)
         for item in dialogue:
             if "<d>" not in item:
                 continue
@@ -2352,6 +3623,7 @@ def _gemma_preproduction_request(prompt, shots, full_plan, fps, ref2va):
     for shot in source_shots:
         shot["deterministic_dialogue_segments"] = _deterministic_dialogue_segments(
             shot["source_body"], shot["shot_start"], shot["shot_end"], chunks, fps,
+            origin="source Shot %d (frames %d-%d)" % (shot["shot_number"], shot["shot_start"], shot["shot_end"]),
         )
     return source_shots, {
         "chunk_count": len(full_plan),
@@ -4133,16 +5405,23 @@ def _allocator_active_reserved(device):
     )
 
 
-def _release_captured_graph_pools(device, stage):
+def _release_captured_graph_pools(device, stage, free_below_gib=None):
     """Hand back ComfyUI's captured CUDA-graph pools, which a cache flush cannot.
 
     `torch.cuda.empty_cache()` only returns the caching allocator's own blocks.
     The model compiler's captured graphs keep private device pools that never
     appear there, so they are dropped explicitly before a stage that needs the
-    card to itself. The next DiT evaluation re-captures what it needs.
+    card to itself. The next DiT evaluation re-captures what it needs. With
+    `free_below_gib` the drop only happens while the card is that short of
+    memory, which leaves a roomy render's graphs warm.
     """
     if not TOGGLE_RELEASE_CAPTURED_GRAPH_POOLS:
         return
+    device = comfy.model_management.get_torch_device() if device is None else device
+    if free_below_gib is not None:
+        free_gib = comfy.model_management.get_free_memory(device, torch_free_too=True)[0] / (1024 ** 3)
+        if free_gib >= free_below_gib:
+            return
     before = comfy.model_management.get_free_memory(device, torch_free_too=True)[0]
     prefetch = getattr(comfy, "model_prefetch", None)
     if prefetch is not None:
@@ -4364,6 +5643,10 @@ class _VRAMMonitor:
         scope = self.scope or f"chunk {self.chunk + 1}/{self.chunk_count}"
         label = f"{scope} DiT evaluation {self.call}"
         tensors = {"model input": x, "cross attention": c_crossattn, "model conditions": kwargs}
+        # A step that starts with the card nearly full is the one whose own
+        # weights, KV staging or tiny preview will fail to allocate, so hand the
+        # captured pools back here rather than after the failure.
+        _release_captured_graph_pools(self.device, label, free_below_gib=GRAPH_POOL_RELEASE_FREE_GIB)
         self.report(label + " before", tensors, sample_group="dit")
         try:
             result = executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
@@ -5191,7 +6474,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 io.Combo.Input("color_correction", options=list(COLOR_CORRECTION_MODES), default="disable", tooltip="Disable grading, match chunk boundaries with ColorMatchV2's MKL transfer, match entire shots after generation, or apply both. This changes preview/final pixels only; H3 continuation latents remain native and unchanged. Changing this setting requires a fresh cache."),
                 io.Boolean.Input("linear_color_compute", default=False, tooltip="Use float32 inverse-gamma compute color: convert input reference RGB with sRGB^(1/2.4) before H3/VAE encoding, then restore preview and IMAGE output with value^2.4. Changes inference behavior and requires a fresh cache."),
                 io.Combo.Input("compute_precision", options=["default", "fp32 (full precision but more VRAM needed)"], default="default", tooltip="default preserves the incoming model precision. fp32 forces diffusion computation to 32-bit for video and audio, increasing memory use and runtime. VAE and text encoder precision are unchanged."),
-                io.Combo.Input("kv_cache_compression", options=["none", "zstd lossless", "int8", "turboquant"], default="turboquant", tooltip="TaoMate only: none keeps exact BF16 KV in RAM. zstd lossless stores exact BF16 bytes with Zstd. int8 uses per-vector signed INT8 plus a scale. turboquant uses a GPU 4-bit rotated-vector codec. The last two are lossy and experimental."),
+                io.String.Input("kv_remember", default="1,-2,-1", tooltip="TaoMate only: which committed video sub-chunk blocks a new sub-chunk attends to, as comma-separated numbers. 1 is the first sub-chunk (upstream keeps it as a video-only sink), -1 the newest, -2 the one before it, and so on. The upstream policy is \"1,-2,-1\": the sink plus the last two sub-chunks. \"1,-1\" halves the recent window and \"-2,-1\" drops the sink. Remembering fewer blocks saves CPU RAM; remembering more keeps the camera steadier across sub-chunk seams."),
+                io.Combo.Input("kv_cache_compression", options=["none", "zstd lossless", "int8", "turboquant4", "turboquant3", "turboquant2"], default="turboquant4", tooltip="TaoMate only: none keeps exact BF16 KV in RAM. zstd lossless stores exact BF16 bytes with Zstd. int8 uses per-vector signed INT8 plus a scale. turboquant4, turboquant3, and turboquant2 use GPU rotated-vector codecs with the matching number of bits per value; lower bit widths save more RAM and add more quantization error. Quantized modes are lossy and experimental."),
                 io.Boolean.Input("audio_sr", default=False, tooltip="Apply AudioSR to each decoded chunk for preview, then separately to the assembled original decoded audio for the final 48 kHz AUDIO output. Requires audio_vae and python/audio_sr.py --install. Adds processing time; does not change H3 reference latents."),
                 HRPreProduction.Input("pre_production", optional=True, tooltip="Connect Gemma 4 for model-directed prompts or Legacy Chunk Prompts for editable, pre-baked prompts. Unconnected uses native legacy prompts without an LLM."),
                 io.Boolean.Input("debug", default=False,
@@ -5241,7 +6525,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 linear_color_compute=False,
                 audio_feathered_overlap=False,
                 compute_precision="default",
-                kv_cache_compression="turboquant",
+                kv_cache_compression="turboquant4",
+                kv_remember="1,-2,-1",
                 audio_sr=False,
                 **_deprecated_inputs):
         use_taomate = video_continuation_method == VIDEO_CONTINUATION_METHOD_TAOMATE
@@ -5265,7 +6550,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
             incoming_video, incoming_audio = incoming.unbind()
             if incoming_video.ndim != 5 or incoming_video.shape[1] != 24 or incoming_audio.ndim != 4 or incoming_audio.shape[1] != 32:
                 raise ValueError("TaoMate-H3 requires 24-channel video and 32-channel audio latents")
-            taomate_backend = TaoMateStreaming(kv_cache_compression=kv_cache_compression)
+            taomate_backend = TaoMateStreaming(kv_cache_compression=kv_cache_compression, kv_remember=kv_remember)
             guider = taomate_backend.patch_guider(guider)
             logging.warning("TaoMate-H3: using supplied sampler %s and %d-step sigma schedule; fixed streaming geometry, CPU clean-KV cache and SDPA. Audio teacher uses the supplied model/LoRA and model shifts; audio-first=%s.", getattr(getattr(sampler, "sampler_function", None), "__name__", type(sampler).__name__), len(sigmas) - 1, audio_first_enabled)
         if audio_sr and audio_vae is not None:
@@ -5473,6 +6758,8 @@ class HREndlessSampler(SamplerCustomAdvanced):
             planned_prompts = [(manual_prompts.get_chunk_prompt(index + 1), _debug_chunk_prompt(index, chunk, chunk["frame_start"] + chunk.get("output_trim_frames", 0), manual_prompts.get_chunk_prompt(index + 1))) for index, chunk in enumerate(active_plan)]
         elif use_taomate and audio_first_enabled:
             planned_prompts = [(_preserve_global_prompt_sections(_chunk_summary_prompt(item[0], prompt, index > 0), prompt), item[1]) for index, item in enumerate(planned_prompts)]
+        # What each chunk will actually say, in the log and in a file, before sampling.
+        _log_chunk_prompts([item[0] for item in planned_prompts])
         if debug:
             logging.info(
                 "HR Endless Sampler independent continuation controls: "
@@ -5531,7 +6818,21 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 debug_start_chunk,
             )
             debug_start_chunk = 0
-        if not replay_cache_enabled and not use_taomate:
+        if not _replay_cache_enabled():
+            # A non-cached render starts clean: every last cache goes away, because
+            # this run will not read any of them and records its own replacement.
+            _remove_replay_cache()
+            _remove_teacher_audio_cache()
+            _set_teacher_audio_cache_state("disabled", "the cache button is off, so this render recomputes and replaces the caches")
+            logging.info("HR Endless Sampler cache button is off; deleted the last replay checkpoint and the last teacher audio before sampling; this run records fresh replacements.")
+        elif use_taomate:
+            # A TaoMate render reads no video checkpoint: it has none of its own and
+            # cannot continue another render's. Keeping one from an earlier render
+            # would let a refresh restore a video that no TaoMate pass can use or
+            # replace, so the last cache stays the one this render is about to write.
+            _remove_replay_cache()
+            logging.info("HR Endless Sampler deleted the video replay checkpoint of an earlier render; a TaoMate pass carries no video cache and records its teacher audio instead.")
+        else:
             logging.info(
                 "HR Endless Sampler replay cache is disabled; this run will ignore the old cache and record a fresh replacement."
             )
@@ -5584,6 +6885,15 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     # manifest from before lifecycle tracking is a new render
                     # rather than an automatic continuation candidate.
                     candidate_cache.clear()
+            else:
+                # The button asked for the cache and this render cannot use it, so
+                # it must not survive as if it belonged here: one render keeps one
+                # cache, and this one is about to record its own.
+                candidate_cache.clear()
+                logging.info(
+                    "HR Endless Sampler cache button is on but the stored checkpoint cannot drive this render (%s); deleted it and recording a fresh replacement.",
+                    _cache_reason or "no compatible state",
+                )
         if replay_cache_enabled and debug_start_chunk:
             candidate_cache = _LastRunReplayCache()
             loaded_cache, cache_reason = candidate_cache.load_if_compatible(replay_fingerprint)
@@ -6472,21 +7782,252 @@ class HREndlessSampler(SamplerCustomAdvanced):
             teacher_audio_reused = False
             cached_teacher_audio = None
             teacher_audio_cache = None
+            teacher_audio_resume = 0
+            teacher_audio_prime_records = ()
+            teacher_audio_prefix_segments = []
+            # The chunks after an edited one whose approved audio this pass keeps.
+            teacher_audio_kept_tail = None
+            teacher_audio_kept_tail_merged = False
+            teacher_audio_kv_capture = None
             if use_taomate and audio_first_enabled and replay_start_index == 0 and replay_sample_end:
                 teacher_audio_cache = _TeacherAudioCache()
-                teacher_audio_fingerprint = _teacher_audio_fingerprint(replay_fingerprint, prompt=prompt, noise_seed=replay_noise_seed, sigmas=sigmas, kv_cache_compression=kv_cache_compression, model_patcher=guider.model_patcher, toggles=_teacher_audio_toggle_signature())
-                if not _replay_cache_enabled():
-                    teacher_audio_cache.clear()
-                    _set_teacher_audio_cache_state("disabled", "the cache button is off, so this render recomputes and replaces the teacher audio")
-                    logging.info("HR Endless Sampler cache button is off; cleared the teacher audio cache so this TaoMate render regenerates and replaces it.")
+                # The key is the per-chunk prompts plus each chunk's audio length,
+                # so video-side parameters no longer discard an audio the owner
+                # liked, while an edited chunk prompt always does. The same lengths
+                # are what the resume check measures the stored milestones against.
+                teacher_audio_chunk_ticks = [int(chunk["audio_end"]) - int(chunk["audio_start"]) for chunk in active_plan[:replay_sample_end]]
+                # What the key hashes is what the owner controls: the chunk prompts of
+                # their own table when there is one, otherwise the planned prompts, plus
+                # the per-chunk audio lengths that say how the audio is divided. Nothing
+                # else — no model, LoRA, seed, sigmas, resolution, continuation or KV
+                # precision — may rebuild audio that was already approved.
+                if manual_prompts is not None:
+                    teacher_audio_key_prompts = [str(text) for text in manual_prompts.prompts()[:replay_sample_end]]
                 else:
-                    cached_teacher_audio, teacher_audio_reason = teacher_audio_cache.load_if_compatible(teacher_audio_fingerprint, replay_sample_end)
+                    teacher_audio_key_prompts = [item[0] for item in planned_prompts[:replay_sample_end]]
+                teacher_audio_key = _teacher_audio_key(teacher_audio_key_prompts, teacher_audio_chunk_ticks)
+                # The key decides every reuse, so make it auditable: when an audio
+                # rebuilds, this line says whether the prompts or the chunk lengths
+                # moved, and whether the cache button was even on.
+                logging.info(
+                    "HR Endless Sampler teacher audio key: %d chunks, ticks %s, prompt hashes %s, cache button %s.",
+                    replay_sample_end, teacher_audio_chunk_ticks,
+                    [str(digest)[:8] for digest in teacher_audio_key["chunk_prompts"]],
+                    "on" if _replay_cache_enabled() else "off",
+                )
+                teacher_audio_kv_index = {"next": teacher_audio_resume}
+
+                def teacher_audio_kv_capture(snapshot):
+                    """Keep one chunk's audio KV so a later edit can resume from here."""
+                    index = teacher_audio_kv_index["next"]
+                    teacher_audio_kv_index["next"] = index + 1
+                    try:
+                        teacher_audio_cache.save_kv_chunk(index, snapshot)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        logging.warning("HR Endless Sampler could not store the teacher KV for Chunk %d, so a later edit restarts the pass: %s", index + 1, error)
+
+                def teacher_audio_payload(audio_latent=None):
+                    """Describe the pass as far as it has settled.
+
+                    The same mapping is written after every chunk and again when the
+                    pass finishes: an interrupted render has to stay identifiable,
+                    resumable and worth showing, and the finished one only adds the
+                    clean latent that a later reuse decodes from.
+                    """
+                    settled = min(len(audio_requested_prompts), int(replay_sample_end))
+                    prompts = list(audio_requested_prompts[:settled])
+                    transcripts = list(audio_transcripts[:settled])
+                    observations = list(audio_observations[:settled])
+                    milestones = [taomate_backend.audio_first_milestones.get(index) for index in range(settled)]
+                    if teacher_audio_kept_tail is not None and not teacher_audio_kept_tail_merged and settled > teacher_audio_resume:
+                        # The kept tail reaches the pass products only after the whole
+                        # pass, but the stored payload has to describe it as soon as the
+                        # edited chunk settles, or a stop right after would lose it.
+                        # Before that the previous payload is still on disk untouched.
+                        prompts.extend(teacher_audio_kept_tail["prompts"])
+                        transcripts.extend(teacher_audio_kept_tail["transcripts"])
+                        observations.extend(teacher_audio_kept_tail["observations"])
+                        milestones.extend(teacher_audio_kept_tail["milestones"])
+                    stored = len(prompts)
+                    payload = {
+                        "milestones": milestones,
+                        "prompts": prompts,
+                        "transcripts": transcripts,
+                        "observations": observations,
+                        # Per-pass teacher state: a resume that reuses these lands
+                        # on the coordinates the original pass used.
+                        "audio_time_origin": getattr(taomate_backend.audio_teacher, "audio_time_origin", None),
+                        "audio_anchor": getattr(taomate_backend.audio_teacher, "audio_anchor", None),
+                        # What a refreshed browser needs to rebuild this render's
+                        # chunks, prompts, subtitles and audio without any frames.
+                        # The whole plan is described, not only the settled prefix:
+                        # a truncated timeline would drop the chunks this pass has
+                        # not reached yet, and they are still part of the render.
+                        "preview": {
+                            "fps": float(fps),
+                            "chunks": [
+                                {
+                                    "index": audio_index,
+                                    "start": int(preview_chunk_ranges[audio_index].get("start", 0)),
+                                    "end": int(preview_chunk_ranges[audio_index].get("end", 0)),
+                                    "prompt": _teacher_audio_chunk_prompt(preview_chunk_ranges, prompts, audio_index),
+                                    "subtitle": _preview_subtitle(_teacher_audio_chunk_prompt(preview_chunk_ranges, prompts, audio_index)),
+                                    # The whole attempt sequence, so a refreshed
+                                    # browser can still show the first take and
+                                    # every retry this chunk was sampled with.
+                                    "attempts": [str(item) for item in (preview_chunk_ranges[audio_index].get("audio_teacher_attempts") or [])],
+                                    # The hearing each retry answered, aligned with
+                                    # the retries above it.
+                                    "attempt_transcripts": [str(item or "") for item in (preview_chunk_ranges[audio_index].get("audio_teacher_attempt_transcripts") or [])],
+                                    # The sub-chunks prompted without the dialogue, so
+                                    # Ctrl+Shift still names them after a reload.
+                                    "subchunk_silent_numbers": [int(number) for number in (preview_chunk_ranges[audio_index].get("subchunk_silent_numbers") or [])],
+                                    "subchunk_silent_prompt": str(preview_chunk_ranges[audio_index].get("subchunk_silent_prompt") or ""),
+                                    # What each sub-chunk's slice of the take heard, so
+                                    # Ctrl+Shift still reads it after a reload.
+                                    "subchunk_transcripts": [str(item or "") for item in (preview_chunk_ranges[audio_index].get("subchunk_transcripts") or [])],
+                                    # Without stored audio there is nothing to publish
+                                    # yet, but the chunk still owns its slot.
+                                    "settled": audio_index < stored,
+                                }
+                                for audio_index in range(min(int(replay_sample_end), len(preview_chunk_ranges)))
+                            ],
+                        },
+                    }
+                    if audio_latent is not None:
+                        payload["audio_latent"] = audio_latent
+                    return payload
+
+                def teacher_audio_note_settled_chunk(audio_index):
+                    """Keep the settled prefix on disk while the pass is still running."""
+                    if teacher_audio_cache is None:
+                        return
+                    try:
+                        teacher_audio_cache.save_chunk_state(audio_index, teacher_audio_payload())
+                    except (OSError, RuntimeError, ValueError) as error:
+                        logging.warning("HR Endless Sampler could not store the settled teacher audio for Chunk %d; a stopped render would lose it: %s", audio_index + 1, error)
+
+                if not _replay_cache_enabled():
+                    # The decision line below reads this whatever branch ran, so the
+                    # branch that never looks at the cache names its own answer.
+                    teacher_audio_reason = "the cache button is off, so this render records a fresh teacher audio pass"
+                    logging.info("HR Endless Sampler cache button is off; the last teacher audio was deleted as this render started, and this TaoMate pass records a fresh replacement.")
+                else:
+                    cached_teacher_audio, teacher_audio_reason = teacher_audio_cache.load_if_compatible(teacher_audio_key, replay_sample_end)
                     if cached_teacher_audio is None:
-                        _set_teacher_audio_cache_state("miss", teacher_audio_reason)
-                        logging.info("HR Endless Sampler has no reusable teacher audio: %s.", teacher_audio_reason)
-                    else:
-                        teacher_audio_reused = True
-                        _set_teacher_audio_cache_state("reused", "reused the stored teacher audio for this render", replay_sample_end)
+                        # An edited chunk prompt cannot reuse the whole pass, but
+                        # the chunks before the edit can be kept: their audio is
+                        # already settled and their KV rows are on disk, so the
+                        # pass resumes at the first changed chunk instead of
+                        # replaying the dialogue the owner already approved.
+                        resume_index = _teacher_audio_resume_index(teacher_audio_cache, teacher_audio_key, replay_sample_end)
+                        if not resume_index:
+                            # Chunk 1 is the changed one, so there is no prefix to
+                            # continue from — but the chunks after it keep the audio
+                            # they already had, exactly as with a later edit. A
+                            # finished stored pass is what offers them, and only
+                            # while their attention rows are still on disk.
+                            stored_pass, _stored_reason = teacher_audio_cache.load_complete_payload(replay_sample_end)
+                            if stored_pass is not None:
+                                teacher_audio_kept_tail = _teacher_audio_kept_tail(stored_pass, 0, replay_sample_end, teacher_audio_cache.kv_chunk_indices())
+                                if teacher_audio_kept_tail is not None:
+                                    cached_teacher_audio = stored_pass
+                                    logging.info("HR Endless Sampler regenerates the first chunk and keeps %s: %s.", _chunk_span(2, replay_sample_end), teacher_audio_reason)
+                        if resume_index:
+                            prefix_records = teacher_audio_cache.load_available_kv_prefix(resume_index)
+                            cached_prefix, prefix_reason = teacher_audio_cache.load_prefix(resume_index, teacher_audio_chunk_ticks)
+                            if prefix_records and cached_prefix is not None:
+                                cached_teacher_audio = cached_prefix
+                                teacher_audio_resume = resume_index
+                                teacher_audio_prime_records = prefix_records
+                                # The chunks after the edit keep the audio they already
+                                # had, as long as their stored rows are still there.
+                                teacher_audio_kept_tail = _teacher_audio_kept_tail(cached_prefix, resume_index, replay_sample_end, teacher_audio_cache.kv_chunk_indices())
+                                logging.info(
+                                    "HR Endless Sampler resumes teacher audio at Chunk %d of %d, keeping %s because %s.",
+                                    resume_index + 1, replay_sample_end,
+                                    _teacher_audio_resume_reason(resume_index, replay_sample_end, teacher_audio_kept_tail is not None),
+                                    teacher_audio_reason,
+                                )
+                            else:
+                                teacher_audio_reason = prefix_reason or "the stored attention state for the earlier chunks is incomplete"
+                        if cached_teacher_audio is None:
+                            if teacher_audio_cache.stored_key() is None:
+                                _set_teacher_audio_cache_state("miss", teacher_audio_reason)
+                                logging.info("HR Endless Sampler has no reusable teacher audio: %s.", teacher_audio_reason)
+                            else:
+                                # The button asked for the cache but this render cannot
+                                # use it: say so, and let the new pass overwrite it.
+                                _set_teacher_audio_cache_state("incompatible", teacher_audio_reason)
+                                logging.warning("HR Endless Sampler cannot reuse the stored teacher audio and this render overwrites it: %s.", teacher_audio_reason)
+                        elif teacher_audio_resume or teacher_audio_kept_tail is not None:
+                            # The pass still runs, so this is not a reuse: the kept
+                            # chunks are restored and the teacher generates the rest.
+                            kept_chunks = teacher_audio_resume + (len(teacher_audio_kept_tail["prompts"]) if teacher_audio_kept_tail is not None else 0)
+                            _set_teacher_audio_cache_state(
+                                "resumed",
+                                _teacher_audio_resume_reason(teacher_audio_resume, replay_sample_end, teacher_audio_kept_tail is not None),
+                                kept_chunks,
+                            )
+                        else:
+                            teacher_audio_reused = True
+                            _set_teacher_audio_cache_state("reused", "reused the stored teacher audio for this render", replay_sample_end)
+
+                # One unconditional line: whichever branch ran, the log says whether
+                # this render reused the stored audio and, when it did not, why. A
+                # silent rebuild is impossible to diagnose from the outside.
+                logging.info(
+                    "HR Endless Sampler teacher audio cache decision: %s (%s)%s.",
+                    _teacher_audio_cache_state_snapshot()["run_state"],
+                    teacher_audio_reason or "the cache button asked for reuse",
+                    ", keeping %d chunks" % teacher_audio_resume if teacher_audio_resume else "",
+                )
+
+            def publish_settled_teacher_chunks(upto):
+                """Show the settled chunks in the preview exactly as recorded."""
+                for audio_index in range(upto):
+                    cached_prompt = audio_requested_prompts[audio_index]
+                    preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = cached_prompt.strip()
+                    preview_chunk_ranges[audio_index]["h3_prompt"] = cached_prompt.strip()
+                    preview_chunk_ranges[audio_index]["subtitle"] = _preview_subtitle(cached_prompt)
+                    if preview_execution is not None:
+                        preview_execution.set_audio_prompt(audio_index, cached_prompt.strip(), preview_chunk_ranges[audio_index]["subtitle"])
+                        cached_waveform, cached_rate = audio_observations[audio_index]
+                        cached_range = preview_chunk_ranges[audio_index]
+                        preview_execution.publish_chunk_audio_first(audio_index, cached_waveform, cached_rate, cached_range["start"], cached_range["end"])
+                        preview_execution.set_audio_chunk_complete(audio_index)
+
+            if teacher_audio_kept_tail is not None and teacher_audio_resume == 0:
+                # Only the first chunk is generated: the kept chunks after it need
+                # their guidance states in place before the video pass pops them.
+                for offset, tail_milestones in enumerate(teacher_audio_kept_tail["milestones"]):
+                    taomate_backend.audio_first_milestones[1 + offset] = tail_milestones
+                logging.info("TaoMate audio-first: regenerating Chunk 1 only, keeping the approved audio of %s.", _chunk_span(2, replay_sample_end))
+
+            if teacher_audio_resume:
+                # Keep the settled chunks: their milestones guide the video pass
+                # and their clean rows are the teacher's starting context, so the
+                # continuation sees the history the original pass had there.
+                for settled_index in range(teacher_audio_resume):
+                    taomate_backend.audio_first_milestones[settled_index] = cached_teacher_audio["milestones"][settled_index]
+                if teacher_audio_kept_tail is not None:
+                    # The video pass pops one guidance state per chunk, so the kept
+                    # tail's states have to be in place before it runs.
+                    for offset, tail_milestones in enumerate(teacher_audio_kept_tail["milestones"]):
+                        taomate_backend.audio_first_milestones[teacher_audio_resume + 1 + offset] = tail_milestones
+                audio_requested_prompts.extend(cached_teacher_audio["prompts"][:teacher_audio_resume])
+                audio_transcripts.extend(cached_teacher_audio["transcripts"][:teacher_audio_resume])
+                audio_observations.extend(cached_teacher_audio["observations"][:teacher_audio_resume])
+                publish_settled_teacher_chunks(teacher_audio_resume)
+                teacher_audio_prefix_segments = [milestones[-1] for milestones in cached_teacher_audio["milestones"][:teacher_audio_resume]]
+                if taomate_backend.audio_teacher is not None:
+                    # The normalisation anchor and the rope origin are per-pass
+                    # state; restoring both is what makes the continuation land on
+                    # the coordinates the pass that produced the prefix used.
+                    taomate_backend.audio_teacher.audio_anchor = cached_teacher_audio.get("audio_anchor")
+                logging.info("TaoMate audio-first: keeping Chunks 1-%d from the stored pass and resuming the teacher at Chunk %d of %d.", teacher_audio_resume, teacher_audio_resume + 1, replay_sample_end)
+                if teacher_audio_kept_tail is not None:
+                    logging.info("TaoMate audio-first: %s, so only that chunk is generated and the approved audio after it stays as it is.", _teacher_audio_resume_reason(teacher_audio_resume, replay_sample_end, True))
 
             if teacher_audio_reused:
                 first_started = time.perf_counter()
@@ -6498,16 +8039,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                 audio_requested_prompts.extend(cached_teacher_audio["prompts"])
                 audio_transcripts.extend(cached_teacher_audio["transcripts"])
                 audio_observations.extend(cached_teacher_audio["observations"])
-                for audio_index, cached_prompt in enumerate(audio_requested_prompts):
-                    preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = cached_prompt.strip()
-                    preview_chunk_ranges[audio_index]["h3_prompt"] = cached_prompt.strip()
-                    preview_chunk_ranges[audio_index]["subtitle"] = _preview_subtitle(cached_prompt)
-                    if preview_execution is not None:
-                        preview_execution.set_audio_prompt(audio_index, cached_prompt.strip(), preview_chunk_ranges[audio_index]["subtitle"])
-                        cached_waveform, cached_rate = audio_observations[audio_index]
-                        cached_range = preview_chunk_ranges[audio_index]
-                        preview_execution.publish_chunk_audio_first(audio_index, cached_waveform, cached_rate, cached_range["start"], cached_range["end"])
-                        preview_execution.set_audio_chunk_complete(audio_index)
+                publish_settled_teacher_chunks(len(audio_requested_prompts))
                 decode_full_teacher_audio(cached_teacher_audio["audio_latent"])
                 timing.add("taomate_audio_first", first_started)
                 logging.info("TaoMate audio-first: reused the cached teacher audio for %d chunks; skipped teacher inference, its Gemma audio requests, VAE decode and transcription.", replay_sample_end)
@@ -6574,6 +8106,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         teacher_prompt = _preserve_global_prompt_sections(_chunk_summary_prompt(teacher_prompt, prompt, audio_index > 0), prompt)
                     else:
                         teacher_prompt = _native_prompt_for_stage(planned_prompts[audio_index][0], "audio", audio_requested_prompts[-1] if audio_index else None, audio_transcripts[-1] if audio_index else None)
+                    # The prompt's own <d> groups reach the model untouched: only a
+                    # retry re-groups them, because a retry exists to speak phrases
+                    # this take lost.
                     audio_requested_prompts.append(teacher_prompt)
                     preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = teacher_prompt.strip()
                     preview_chunk_ranges[audio_index]["h3_prompt"] = teacher_prompt.strip()
@@ -6618,6 +8153,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         expected_words = re.findall(r"\w+(?:['’]\w+)?", expected_dialogue.casefold())
                         heard_words = re.findall(r"\w+(?:['’]\w+)?", recognized["text"].casefold())
                         logging.info("TaoMate audio teacher transcript %d/%d (%s): expected=%r, heard=%r", audio_index + 1, replay_sample_end, "exact word match" if expected_words == heard_words else "review dialogue", expected_dialogue, recognized["text"])
+                        # What this take heard belongs to the attempt it is: the rejected first
+                        # take or the retry that replaced it.
+                        _remember_audio_teacher_transcript(audio_range, 1 if audio_index in audio_retried_chunks else 0, recognized["text"])
                         if audio_index in audio_retried_chunks and expected_words != heard_words:
                             logging.warning("TaoMate audio teacher %d/%d still differs from its dialogue after one retry", audio_index + 1, replay_sample_end)
                         if preview_execution is not None:
@@ -6625,57 +8163,42 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 preview_execution.set_audio_retry(audio_index, finished=True)
                             preview_execution.publish_chunk_audio_first(audio_index, waveform, sample_rate, audio_range["start"], audio_range["end"])
                             preview_execution.set_audio_chunk_complete(audio_index)
+                        # This chunk is settled, so its audio is part of what a later
+                        # render may keep and what a refresh must be able to show.
+                        teacher_audio_note_settled_chunk(audio_index)
                     finally:
                         comfy.model_management.unload_model_and_clones(audio_vae.patcher)
                         timing.add("vae_audio_preview", audio_started)
 
                 def retry_audio_first_candidate(audio_index, audio_latent, previous_latent, context_ticks):
-                    """Keep a clean spoken prefix, otherwise re-cut the dialogue and re-sample once."""
+                    """Keep the words, ask for a much faster delivery, re-sample once."""
                     comfy.model_management.unload_model_and_clones(guider.model_patcher)
                     waveform, sample_rate = taomate_backend.decode_audio_preview_segment(audio_vae, audio_latent, previous_latent, context_ticks, AUDIO_LATENT_FPS)
                     recognized = audio_transcriber.transcribe(waveform, sample_rate)
                     requested = audio_requested_prompts[audio_index]
-                    native_dialogue = manual_prompts is None and gemma_director is None
-                    approved_prompt = _audio_transcript_approved_tail_prompt(requested, recognized) if native_dialogue else None
-                    if approved_prompt is not None:
-                        # The take spoke a clean prefix of its dialogue, so its KV
-                        # stays. Only the words it did not say are re-authored with
-                        # the initial cut, over the chunks still to be sampled.
-                        texts = [item[0] for item in planned_prompts]
-                        texts[audio_index] = requested
-                        revised = _recut_dialogue_prompts(texts, active_plan, fps, audio_index, audio_index + 1, kept_words=len(_dialogue_block_words(approved_prompt)[3]))
-                        if revised is None:
-                            logging.info("TaoMate audio teacher %d/%d accepted its spoken dialogue prefix.", audio_index + 1, replay_sample_end)
-                            revised = texts
-                            revised[audio_index] = approved_prompt
-                        else:
-                            logging.info("TaoMate audio teacher %d/%d accepted its spoken dialogue prefix and re-authored the remaining dialogue.", audio_index + 1, replay_sample_end)
-                        _publish_revised_dialogue(planned_prompts, revised, audio_index, preview_chunk_ranges, preview_execution)
-                        audio_requested_prompts[audio_index] = revised[audio_index]
-                        preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = revised[audio_index].strip()
-                        return None
                     if _teacher_take_matches_dialogue(_preview_subtitle(requested), recognized["text"]):
                         return None
                     if not _transcript_is_certain(recognized):
                         logging.warning("Teacher audio transcript is uncertain; skipping prompt retry")
                         return None
-                    logging.warning("TaoMate audio teacher %d/%d dialogue mismatch; retrying once: expected=%r, heard=%r", audio_index + 1, replay_sample_end, _preview_subtitle(requested), recognized["text"])
-                    retry_prompt = requested
-                    if native_dialogue:
-                        texts = [item[0] for item in planned_prompts]
-                        texts[audio_index] = requested
-                        revised, shrink_frames = _retry_take_prompts(texts, active_plan, fps, audio_index)
-                        if revised is not None:
-                            _publish_revised_dialogue(planned_prompts, revised, audio_index, preview_chunk_ranges, preview_execution)
-                            retry_prompt = revised[audio_index]
-                            logging.info("TaoMate audio teacher %d/%d re-cut the leftover dialogue over the remaining chunks, %d frames shorter.", audio_index + 1, replay_sample_end, shrink_frames)
+                    logging.warning("TaoMate audio teacher %d/%d dialogue mismatch; retrying once with the failed phrase(s) on their own and a faster delivery: expected=%r, heard=%r", audio_index + 1, replay_sample_end, _preview_subtitle(requested), recognized["text"])
+                    # The words were missed, garbled or mis-timed, so they stay
+                    # exactly as they are: only the phrases the transcript says the
+                    # take failed are asked for on their own, so a take that spoke the
+                    # rest correctly keeps the prompt's own grouping, and the delivery
+                    # changes. The take knows how fast it spoke, because its own audio
+                    # is in the retained KV cache, which is what makes a relative
+                    # instruction meaningful in a way a second absolute band is not.
+                    retry_prompt = _dialogue_retry_prompt(requested, recognized)
+                    logging.info("TaoMate audio teacher %d/%d asks H3 to speak much faster than before instead of re-cutting its dialogue.", audio_index + 1, replay_sample_end)
                     audio_retried_chunks.add(audio_index)
                     audio_requested_prompts[audio_index] = retry_prompt
+                    attempts = _remember_audio_teacher_attempt(preview_chunk_ranges[audio_index], retry_prompt, recognized["text"])
                     preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = retry_prompt.strip()
                     preview_chunk_ranges[audio_index]["h3_prompt"] = retry_prompt.strip()
                     if preview_execution is not None:
                         preview_execution.set_audio_retry(audio_index)
-                        preview_execution.set_audio_prompt(audio_index, retry_prompt.strip(), _preview_subtitle(retry_prompt))
+                        preview_execution.set_audio_prompt(audio_index, retry_prompt.strip(), _preview_subtitle(retry_prompt), attempts, preview_chunk_ranges[audio_index]["audio_teacher_attempt_transcripts"])
                         preview_execution.set_phase("TaoMate: retrying teacher audio %d/%d after transcript mismatch" % (audio_index + 1, replay_sample_end), chunk=audio_index)
                     comfy.model_management.unload_model_and_clones(audio_vae.patcher)
                     encoded = _encode_prompt(clip, retry_prompt, None if text_only_teacher else h3_images, () if text_only_teacher else positive, width, height, text_only_teacher or audio_index > 0)
@@ -6686,7 +8209,24 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         result["minimax_token_tags"] = tags.detach().to(device="cpu")
                     return result
 
-                full_teacher_audio = taomate_backend.prepare_audio_first(audio_teacher_conditioning, audio_noise, video, active_plan[:replay_sample_end], sigmas, video_shift, audio_shift, on_status=(lambda message: preview_execution.set_phase(message)) if preview_execution is not None else None, on_progress=(lambda chunk_number, chunk_total, step, steps: preview_execution.set_phase("TaoMate: audio teacher %d/%d · step %d/%d" % (chunk_number, chunk_total, step, steps), chunk=chunk_number - 1, audio_step_ms=taomate_backend.audio_teacher.average_step_ms)) if preview_execution is not None else None, on_chunk_complete=publish_audio_first_chunk, on_audio_candidate=retry_audio_first_candidate if TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY and audio_vae is not None else None)
+                # The pass identifies itself and its settled prefix before it
+                # samples: a render that is stopped must still leave the newest,
+                # resumable cache behind rather than rows with no owner.
+                teacher_audio_cache.begin_pass(teacher_audio_key, replay_sample_end, teacher_audio_resume, keep_payload=teacher_audio_kept_tail is not None)
+                full_teacher_audio = taomate_backend.prepare_audio_first(audio_teacher_conditioning, audio_noise, video, active_plan[:replay_sample_end], sigmas, video_shift, audio_shift, on_status=(lambda message: preview_execution.set_phase(message)) if preview_execution is not None else None, on_progress=(lambda chunk_number, chunk_total, step, steps: preview_execution.set_phase("TaoMate: audio teacher %d/%d · step %d/%d" % (chunk_number, chunk_total, step, steps), chunk=chunk_number - 1, audio_step_ms=taomate_backend.audio_teacher.average_step_ms)) if preview_execution is not None else None, on_chunk_complete=publish_audio_first_chunk, on_audio_candidate=retry_audio_first_candidate if TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY and audio_vae is not None else None, start_index=teacher_audio_resume, prefix_segments=teacher_audio_prefix_segments, prefix_origin=cached_teacher_audio.get("audio_time_origin") if teacher_audio_resume and cached_teacher_audio else None, prime_records=teacher_audio_prime_records, on_kv_commit=teacher_audio_kv_capture, generate_count=1 if teacher_audio_kept_tail is not None else None)
+                if teacher_audio_kept_tail is not None and full_teacher_audio is not None:
+                    # The chunks after the edited one keep exactly the audio the owner
+                    # already approved, so the pass products are completed here: the
+                    # video pass, the preview and the stored payload all read them in
+                    # chunk order from these lists.
+                    audio_requested_prompts.extend(teacher_audio_kept_tail["prompts"])
+                    audio_transcripts.extend(teacher_audio_kept_tail["transcripts"])
+                    audio_observations.extend(teacher_audio_kept_tail["observations"])
+                    full_teacher_audio = torch.cat([full_teacher_audio, *teacher_audio_kept_tail["latents"]], dim=-1)
+                    taomate_backend.audio_first_audio_latent = full_teacher_audio
+                    teacher_audio_kept_tail_merged = True
+                    publish_settled_teacher_chunks(len(audio_requested_prompts))
+                    logging.info("TaoMate audio-first: kept the approved audio of %s; generated %s only.", _chunk_span(teacher_audio_resume + 2, replay_sample_end), _chunk_span(teacher_audio_resume + 1, teacher_audio_resume + 1))
                 del audio_transcriber
                 timing.add("taomate_audio_first", first_started)
                 if full_teacher_audio is not None:
@@ -6694,13 +8234,14 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     # pass is the reusable part, and a preview decode failure
                     # must not cost the next render the whole teacher inference.
                     try:
-                        teacher_audio_cache.save(teacher_audio_fingerprint, prompt, {
-                            "milestones": list(taomate_backend.audio_first_milestones.values()),
-                            "audio_latent": full_teacher_audio,
-                            "prompts": list(audio_requested_prompts),
-                            "transcripts": list(audio_transcripts),
-                            "observations": list(audio_observations),
-                        })
+                        teacher_audio_cache.save(teacher_audio_key, teacher_audio_payload(full_teacher_audio))
+                        # Past twelve chunks the pass drops the audio history, so
+                        # records from before that point no longer describe the KV.
+                        last_drop = ((replay_sample_end - 1) // 12) * 12
+                        if last_drop:
+                            for stale in teacher_audio_cache.kv_chunk_indices():
+                                if stale < last_drop:
+                                    teacher_audio_cache.discard_kv_chunk(stale)
                         _set_teacher_audio_cache_state("recorded", "recorded this render's teacher audio for reuse", replay_sample_end)
                     except (OSError, RuntimeError, ValueError) as error:
                         _set_teacher_audio_cache_state("failed", str(error))
@@ -7435,6 +8976,12 @@ class HREndlessSampler(SamplerCustomAdvanced):
                         qwen_cross_attn.numel() * qwen_cross_attn.element_size() / (1024 ** 2),
                     )
                 retry_video_items = video_items if use_taomate and not audio_first_enabled and TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY else None
+                # The audio-first pass finished before this video pass, so the take's own
+                # word times are here to say which sub-chunks carry speech. The other flow
+                # learns them inside the chunk, where publish_chunk_teacher_audio fills the
+                # very same mapping in.
+                phase_conditionings = {}
+                phase_references = video_items
                 del video_items
                 if vram_monitor is not None:
                     vram_monitor.report(
@@ -7460,19 +9007,42 @@ class HREndlessSampler(SamplerCustomAdvanced):
                     f"chunk {index + 1}/{len(active_plan)} after Qwen/VAE release",
                     {"encoded prompt": encoded_prompt, "DiT video references": video_refs},
                 )
-                guider.original_conds = _conditioning_for_chunk(
-                    original_conds,
-                    chunk["frame_start"] + chunk["output_trim_frames"] if use_taomate else chunk["frame_start"],
-                    chunk["frame_end"],
-                    encoded_prompt,
-                    video_context,
-                    audio_context,
-                    audio_end_frame,
-                    video_refs,
-                    video_context_start,
-                    video_contexts,
-                    linear_original_refs,
-                )
+                def chunk_conditions(encoded):
+                    """Build the guider's conditioning for one text over this chunk's window."""
+                    return _conditioning_for_chunk(
+                        original_conds,
+                        chunk["frame_start"] + chunk["output_trim_frames"] if use_taomate else chunk["frame_start"],
+                        chunk["frame_end"],
+                        encoded,
+                        video_context,
+                        audio_context,
+                        audio_end_frame,
+                        video_refs,
+                        video_context_start,
+                        video_contexts,
+                        linear_original_refs,
+                    )
+
+                guider.original_conds = chunk_conditions(encoded_prompt)
+                if use_taomate:
+                    # A sub-chunk with no speech in its own window must not read the chunk's
+                    # dialogue: H3 animates the mouth from the prompt, and every phase of a
+                    # chunk otherwise shares one conditioning. Only the silent sub-chunks
+                    # change, and they share one dialogue-less text and one encode.
+                    silent_prompts = _silent_subchunk_prompts(chunk, audio_transcripts[index] if index < len(audio_transcripts) else None, chunk_prompt)
+                    _publish_subchunk_prompts(preview_execution, preview_chunk_ranges[index], index, silent_prompts, chunk, audio_transcripts[index] if index < len(audio_transcripts) else None)
+                    if silent_prompts:
+                        comfy.model_management.unload_model_and_clones(guider.model_patcher)
+                        encoded_silent = _encode_prompt(clip, next(iter(silent_prompts.values())), h3_images, positive, width, height, continuation, phase_references)
+                        comfy.model_management.unload_model_and_clones(clip.patcher)
+                        for number in silent_prompts:
+                            phase_conditionings[number] = chunk_conditions(encoded_silent)
+                        logging.info(
+                            "HR Endless Sampler chunk %d/%d has no speech in sub-chunk(s) %s, so their prompts drop the dialogue.",
+                            index + 1,
+                            len(active_plan),
+                            ", ".join(str(number) for number in sorted(silent_prompts)),
+                        )
 
                 # Every dependency on the previous sampler container has now
                 # been converted into the bounded guide/reference tensors in
@@ -7552,6 +9122,9 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                     audio_transcripts.append(recognized)
                                     audio_observations.append((waveform.detach().to(device="cpu"), int(sample_rate)))
                                     logging.info("TaoMate audio teacher transcript %d/%d: expected=%r, heard=%r", audio_index + 1, len(active_plan), _preview_subtitle(audio_requested_prompts[audio_index]), recognized["text"])
+                                    # What this take heard belongs to the attempt it is: the
+                                    # rejected first take or the retry that replaced it.
+                                    _remember_audio_teacher_transcript(preview_chunk_ranges[audio_index], 1 if audio_index in audio_retried_chunks else 0, recognized["text"])
                                     if audio_index in audio_retried_chunks and re.findall(r"\w+(?:['’]\w+)?", _preview_subtitle(audio_requested_prompts[audio_index]).casefold()) != re.findall(r"\w+(?:['’]\w+)?", recognized["text"].casefold()):
                                         logging.warning("TaoMate audio teacher %d/%d still differs from its dialogue after one retry", audio_index + 1, len(active_plan))
                                     teacher_audio_latents.clear()
@@ -7562,40 +9135,36 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                             preview_execution.set_audio_retry(audio_index, finished=True)
                                         audio_range = preview_chunk_ranges[audio_index]
                                         preview_execution.publish_chunk_audio_first(audio_index, waveform, sample_rate, audio_range["start"], audio_range["end"])
+                                    # This chunk's own take is transcribed now, before its
+                                    # sub-chunks are sampled: the sub-chunks whose slice of
+                                    # the take holds no word lose the dialogue, so H3 is
+                                    # not told to speak where the audio is silent.
+                                    silent_prompts = _silent_subchunk_prompts(chunk, recognized, chunk_prompt)
+                                    _publish_subchunk_prompts(preview_execution, preview_chunk_ranges[index], index, silent_prompts, chunk, recognized)
+                                    if silent_prompts:
+                                        comfy.model_management.unload_model_and_clones(clip.patcher)
+                                        encoded_silent = _encode_prompt(clip, next(iter(silent_prompts.values())), h3_images, positive, width, height, continuation, phase_references)
+                                        comfy.model_management.unload_model_and_clones(clip.patcher)
+                                        for number in silent_prompts:
+                                            phase_conditionings[number] = chunk_conditions(encoded_silent)
+                                        logging.info(
+                                            "HR Endless Sampler chunk %d/%d has no speech in sub-chunk(s) %s, so their prompts drop the dialogue.",
+                                            index + 1,
+                                            len(active_plan),
+                                            ", ".join(str(number) for number in sorted(silent_prompts)),
+                                        )
                                 finally:
                                     comfy.model_management.unload_model_and_clones(audio_vae.patcher)
                                     timing.add("vae_audio_preview", audio_started)
 
                             def retry_chunk_teacher_audio(audio_index, audio_latent):
-                                """Reject a mismatched take and re-encode one shared AV prompt."""
+                                """Reject a mismatched take and re-encode the same words, spoken faster."""
                                 nonlocal retry_video_items, chunk_prompt, debug_prompt
                                 previous_teacher = teacher_audio_latents.get(audio_index - 1)
                                 comfy.model_management.unload_model_and_clones(guider.model_patcher)
                                 waveform, sample_rate = taomate_backend.decode_audio_preview_segment(audio_vae, audio_latent, previous_teacher, chunk["context_audio_t"], AUDIO_LATENT_FPS)
                                 recognized = audio_transcriber.transcribe(waveform, sample_rate)
                                 requested = audio_requested_prompts[audio_index]
-                                native_dialogue = manual_prompts is None and gemma_director is None
-                                approved_prompt = _audio_transcript_approved_tail_prompt(requested, recognized) if native_dialogue else None
-                                if approved_prompt is not None:
-                                    # The take spoke a clean prefix of its dialogue, so
-                                    # its audio stays; only the words it did not say are
-                                    # re-authored with the initial cut over the chunks
-                                    # still to be sampled.
-                                    texts = [item[0] for item in planned_prompts]
-                                    texts[audio_index] = requested
-                                    revised = _recut_dialogue_prompts(texts, active_plan, fps, audio_index, audio_index + 1, kept_words=len(_dialogue_block_words(approved_prompt)[3]))
-                                    if revised is None:
-                                        logging.info("TaoMate audio teacher %d/%d accepted its spoken dialogue prefix.", audio_index + 1, len(active_plan))
-                                        revised = texts
-                                        revised[audio_index] = approved_prompt
-                                    else:
-                                        logging.info("TaoMate audio teacher %d/%d accepted its spoken dialogue prefix and re-authored the remaining dialogue.", audio_index + 1, len(active_plan))
-                                    _publish_revised_dialogue(planned_prompts, revised, audio_index, preview_chunk_ranges, preview_execution)
-                                    audio_requested_prompts[audio_index] = revised[audio_index]
-                                    chunk_prompt = revised[audio_index]
-                                    debug_prompt = _debug_chunk_prompt(index, chunk, content_start, chunk_prompt, gemma_report)
-                                    preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = chunk_prompt.strip()
-                                    return None
                                 if _teacher_take_matches_dialogue(_preview_subtitle(requested), recognized["text"]):
                                     retry_video_items = None
                                     return None
@@ -7603,25 +9172,25 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                     logging.warning("Teacher audio transcript is uncertain; skipping prompt retry")
                                     retry_video_items = None
                                     return None
-                                logging.warning("TaoMate audio teacher %d/%d dialogue mismatch; retrying once: expected=%r, heard=%r", audio_index + 1, len(active_plan), _preview_subtitle(requested), recognized["text"])
-                                retry_prompt = requested
-                                if native_dialogue:
-                                    texts = [item[0] for item in planned_prompts]
-                                    texts[audio_index] = requested
-                                    revised, shrink_frames = _retry_take_prompts(texts, active_plan, fps, audio_index)
-                                    if revised is not None:
-                                        _publish_revised_dialogue(planned_prompts, revised, audio_index, preview_chunk_ranges, preview_execution)
-                                        retry_prompt = revised[audio_index]
-                                        logging.info("TaoMate audio teacher %d/%d re-cut the leftover dialogue over the remaining chunks, %d frames shorter.", audio_index + 1, len(active_plan), shrink_frames)
+                                logging.warning("TaoMate audio teacher %d/%d dialogue mismatch; retrying once with the failed phrase(s) on their own and a faster delivery: expected=%r, heard=%r", audio_index + 1, len(active_plan), _preview_subtitle(requested), recognized["text"])
+                                # Words stay exactly as they are; only the phrases the
+                                # transcript says this take failed are asked for on
+                                # their own, so the ones it spoke correctly keep the
+                                # prompt's grouping, and the delivery changes, because
+                                # the take lost or garbled them rather than being
+                                # written wrong.
+                                retry_prompt = _dialogue_retry_prompt(requested, recognized)
+                                logging.info("TaoMate audio teacher %d/%d asks H3 to speak much faster than before instead of re-cutting its dialogue.", audio_index + 1, len(active_plan))
                                 audio_retried_chunks.add(audio_index)
                                 audio_requested_prompts[audio_index] = retry_prompt
                                 chunk_prompt = retry_prompt
                                 debug_prompt = _debug_chunk_prompt(index, chunk, content_start, retry_prompt, gemma_report)
+                                attempts = _remember_audio_teacher_attempt(preview_chunk_ranges[audio_index], retry_prompt, recognized["text"])
                                 preview_chunk_ranges[audio_index]["audio_teacher_prompt"] = retry_prompt.strip()
                                 preview_chunk_ranges[audio_index]["h3_prompt"] = retry_prompt.strip()
                                 if preview_execution is not None:
                                     preview_execution.set_audio_retry(audio_index)
-                                    preview_execution.set_audio_prompt(audio_index, retry_prompt.strip(), _preview_subtitle(retry_prompt))
+                                    preview_execution.set_audio_prompt(audio_index, retry_prompt.strip(), _preview_subtitle(retry_prompt), attempts, preview_chunk_ranges[audio_index]["audio_teacher_attempt_transcripts"])
                                     preview_execution.set_phase("TaoMate: retrying teacher audio %d/%d after transcript mismatch" % (audio_index + 1, len(active_plan)), chunk=audio_index)
                                 comfy.model_management.unload_model_and_clones(audio_vae.patcher)
                                 encoded_retry = _encode_prompt(clip, retry_prompt, h3_images, positive, width, height, continuation, retry_video_items)
@@ -7641,6 +9210,10 @@ class HREndlessSampler(SamplerCustomAdvanced):
 
                             def subchunk_start(phase):
                                 """Locate live previews on this phase's actual global frame range."""
+                                # The LoRA weights for this phase are materialized in
+                                # the sampler call right after this callback, so a
+                                # short card gets its graph pools back first.
+                                _release_captured_graph_pools(None, f"chunk {index + 1}/{len(active_plan)} sub-chunk {chunk['phases'].index(phase) + 1} start", free_below_gib=GRAPH_POOL_RELEASE_FREE_GIB)
                                 if preview_execution is not None:
                                     preview_execution.set_subchunk(index, taomate_backend.frames(phase["video_start"]), phase["frame_end"] - 1, phase["video_start"], chunk["phases"].index(phase) + 1)
 
@@ -7650,7 +9223,7 @@ class HREndlessSampler(SamplerCustomAdvanced):
                                 if preview_execution is not None:
                                     completed_phases = sum(1 for phase in chunk["phases"] if phase["frame_end"] - taomate_backend.frames(chunk["video_start"]) <= completed_frames)
                                     preview_execution.set_subchunk_progress(index, completed_frames, completed_phases)
-                            sampled, denoised = taomate_backend.execute_chunk(super().execute, _FixedNoise, chunk_seed, chunk_noise, guider, sigmas, chunk_latent, chunk, on_subchunk=subchunk_complete, sampler=sampler, on_subchunk_start=subchunk_start, on_status=(lambda message: preview_execution.set_phase(message, chunk=index)) if preview_execution is not None else None, debug_timing=debug, on_audio_teacher=publish_chunk_teacher_audio if audio_vae is not None and not audio_first_enabled else None, on_audio_progress=(lambda step, steps: preview_execution.set_phase("TaoMate: audio teacher %d/%d · step %d/%d" % (index + 1, len(active_plan), step, steps), chunk=index, audio_step_ms=taomate_backend.audio_teacher.average_step_ms)) if preview_execution is not None and not audio_first_enabled else None, audio_conditioning=per_chunk_audio_conditioning, on_audio_candidate=retry_chunk_teacher_audio if TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY and audio_vae is not None and not audio_first_enabled else None)
+                            sampled, denoised = taomate_backend.execute_chunk(super().execute, _FixedNoise, chunk_seed, chunk_noise, guider, sigmas, chunk_latent, chunk, on_subchunk=subchunk_complete, sampler=sampler, on_subchunk_start=subchunk_start, on_status=(lambda message: preview_execution.set_phase(message, chunk=index)) if preview_execution is not None else None, debug_timing=debug, on_audio_teacher=publish_chunk_teacher_audio if audio_vae is not None and not audio_first_enabled else None, on_audio_progress=(lambda step, steps: preview_execution.set_phase("TaoMate: audio teacher %d/%d · step %d/%d" % (index + 1, len(active_plan), step, steps), chunk=index, audio_step_ms=taomate_backend.audio_teacher.average_step_ms)) if preview_execution is not None and not audio_first_enabled else None, audio_conditioning=per_chunk_audio_conditioning, on_audio_candidate=retry_chunk_teacher_audio if TOGGLE_TAOMATE_DIVERGENCY_AUDIO_TRANSCRIPT_RETRY and audio_vae is not None and not audio_first_enabled else None, phase_conditionings=phase_conditionings or None)
                         else:
                             sampled, denoised = super().execute(
                                 _FixedNoise(chunk_seed, chunk_noise), guider, sampler, sigmas, chunk_latent
